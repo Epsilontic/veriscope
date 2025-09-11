@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Veriscope — Auditable early warnings for model collapse</title>
+  <meta name="description" content="Veriscope is an auditor-grade, low-overhead monitor for early detection of representation collapse in ML models." />
+  <link rel="icon" href="data:," />
+  <meta property="og:title" content="Veriscope" />
+  <meta property="og:description" content="Auditable early warnings for representation collapse in ML." />
+  <meta property="og:type" content="website" />
+  <meta name="theme-color" content="#0f172a" />
+  <style>
+    :root { --bg:#0b1020; --panel:#0f172a; --text:#e5e7eb; --muted:#9ca3af; --accent:#60a5fa; --ok:#34d399; --warn:#f59e0b; }
+    * { box-sizing: border-box }
+    body { margin:0; font:16px/1.55 system-ui, -apple-system, Segoe UI, Roboto, Inter, Arial, sans-serif; background:linear-gradient(180deg, #0b1020, #0b1020 60%, #0a0f1a); color:var(--text) }
+    .wrap { max-width:960px; margin:0 auto; padding:48px 20px }
+    header { display:flex; flex-wrap:wrap; gap:16px; align-items:center; justify-content:space-between; }
+    .brand { font-weight:700; letter-spacing:.3px; font-size:20px }
+    .tag { color:var(--muted); font-size:14px }
+    .hero { margin:32px 0 24px; padding:28px; background:rgba(255,255,255,.03); border:1px solid rgba(255,255,255,.08); border-radius:16px }
+    h1 { margin:0 0 8px; font-size:28px }
+    p { margin:0 0 14px }
+    code, .chip { background:rgba(255,255,255,.06); padding:.15rem .45rem; border-radius:999px; font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:13px; color:var(--muted) }
+    .grid { display:grid; gap:16px; grid-template-columns:repeat(auto-fit, minmax(260px,1fr)); margin:20px 0 }
+    .card { padding:18px; background:rgba(255,255,255,.03); border:1px solid rgba(255,255,255,.08); border-radius:14px }
+    .card h3 { margin:0 0 8px; font-size:16px }
+    .kpis { display:flex; gap:10px; flex-wrap:wrap; margin-top:8px }
+    .kpis .chip { color:#cbd5e1 }
+    a.btn { display:inline-block; margin-right:10px; margin-top:8px; padding:10px 14px; border-radius:10px; text-decoration:none; color:#0b1020; background:var(--accent); font-weight:600 }
+    a.btn.alt { background:transparent; color:var(--accent); border:1px solid rgba(96,165,250,.5) }
+    footer { margin-top:28px; color:var(--muted); font-size:14px }
+    ul { padding-left:18px; margin:8px 0 }
+    .small { color:var(--muted); font-size:14px }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div>
+        <div class="brand">Veriscope</div>
+        <div class="tag">Auditable early warnings for representation collapse</div>
+      </div>
+      <div class="kpis">
+        <span class="chip">≤ 5% run-level FAR</span>
+        <span class="chip">2–8% step-time overhead</span>
+        <span class="chip">Deterministic replay</span>
+      </div>
+    </header>
+
+    <section class="hero">
+      <h1>Surface hidden collapse before failures ship</h1>
+      <p>Veriscope monitors internal geometry and fragility signals during training/fine-tuning to raise early warnings while task metrics still look “healthy.” All decisions are <strong>preregistered, reproducible, and audit-ready</strong>.</p>
+      <p>
+        <a class="btn" href="mailto:craig.holm@protonmail.com">Contact</a>
+        <a class="btn alt" href="https://orcid.org/">ORCID</a>
+      </p>
+    </section>
+
+    <div class="grid">
+      <div class="card">
+        <h3>What it detects</h3>
+        <ul>
+          <li>Representation narrowing (effective rank/entropy drop)</li>
+          <li>Rising fragility under semantic perturbations</li>
+          <li>MoE router concentration (governance gating)</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>Why it’s different</h3>
+        <ul>
+          <li><strong>Two-channel</strong>: streaming geometry + fragility</li>
+          <li>Strict separation of detectors vs. external events</li>
+          <li>Tamper-evident logs (hashing, chaining, anchoring)</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>Status & roadmap</h3>
+        <ul>
+          <li>CV backbone (CIFAR-10) complete</li>
+          <li>LM pilots (SFT/DPO) in progress</li>
+          <li>Verifier + benchmark: public release planned</li>
+        </ul>
+      </div>
+    </div>
+
+    <section class="card">
+      <h3>Preprints & docs</h3>
+      <ul>
+        <li><a href="https://works.hcommons.org/records/yeqb5-exa68">Finite Realism: Epistemology, Metaphysics, and Physics Under Finite Conditions</a></li>
+        <li><a href="https://works.hcommons.org/records/cnw36-qdz91">Operational–Structural, Scale-Aware Epistemology and Metaphysics</a></li>
+        <li class="small">Methodological note (compression–control criterion): available on request</li>
+      </ul>
+    </section>
+
+    <footer>
+      © 2025 Craig Holmander • <a href="mailto:craig.holm@protonmail.com">craig.holm@protonmail.com</a> • Apache-2.0
+    </footer>
+  </div>
+</body>
+</html>
