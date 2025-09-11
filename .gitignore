@@ -1,0 +1,70 @@
+# ---- Python + macOS noise
+__pycache__/
+*.py[cod]
+*.pyo
+*.so
+.DS_Store
+.ipynb_checkpoints/
+.venv/
+venv/
+.env
+.python-version
+
+# ---- Veriscope/experiment outputs (keep code, ignore artifacts)
+# generic run/output dirs
+runs/
+outputs/
+logs/
+out/
+artifacts/
+**/figs/
+**/checkpoints/
+**/wandb/
+**/tensorboard/
+
+# shard/bundle artifacts
+*.parquet
+*.parquet.md5
+*.feather
+*_runs_*.csv
+bundle_runs_*.parquet
+bundle_runs_*_*.parquet
+bundle_runs_*_*.csv
+bundle_runs_eval_with_overlays_*.parquet
+*_events_*.csv
+summary_*_*.csv
+
+# per-seed shards and done markers
+runs_seed*_*.*.json
+runs_seed*_*.parquet
+runs_seed*_*.csv
+*.done.json
+
+# repro / env fingerprints
+env.json
+cfg_phase4.json
+repro.json
+env_probe.json
+seed_factor_map.json
+gt_rank_calibration_*.json
+grad_cutoff_by_factor_*.json
+ph_directions_*.json
+tau_mapping_*.json
+learned_detector_*.json
+rp_adequacy_*.json
+pip_freeze.txt
+
+# datasets & caches (adjust if you keep a small sample in-repo)
+data/
+datasets/
+cache/
+*.pt
+*.pth
+*.pkl
+*.npz
+
+# build locks / temp
+*.lock
+*.tmp
+*.tmp.*
+*.log
