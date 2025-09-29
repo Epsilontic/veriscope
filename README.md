@@ -31,7 +31,7 @@ Planned releases:
 
 ## Documentation
 
-- [Preprint: Finite Realism & Alignment](https://works.hcommons.org/records/yeqb5-exa68)  
+- [Preprint: Finite Realism & Alignment](https://doi.org/10.5281/zenodo.17226486)  
 - [Methodological note: Compression–Control Criterion](available on request)  
 
 Additional technical docs and experiment logs will be added here as the project matures.
