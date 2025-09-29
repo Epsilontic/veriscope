@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2025 Craig Holmander
+# SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Veriscope-Commercial
 # Veriscope Bundle (Phase-4; invariants + FP-calibratable GT + robust learner)
 #
 # Delta from previous Phase-3 draft based on P0/P1 critique:
