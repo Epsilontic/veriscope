@@ -20,10 +20,10 @@ Veriscope provides **auditable, reproducible monitoring signals** to surface the
 ## Getting Started
 
 ⚠️ *This is an early-stage prototype.*  
-The codebase is currently under active development and available to collaborators on request.  
+The codebase is under active development; interfaces and outputs may change.  
 
 Planned releases:  
-- ✅ CIFAR-10 reproduction suite (PyTorch, ~4k LOC)  
+- ✅ CIFAR-10 reproduction suite (PyTorch, ~5k LOC)  
 - 🔜 Extension to language model fine-tuning runs  
 - 🔜 Public Python package with verifier + benchmark tools  
 
@@ -31,10 +31,8 @@ Planned releases:
 
 ## Documentation
 
-- [Preprint: Finite Realism & Alignment](https://doi.org/10.5281/zenodo.17226486)  
-- [Methodological note: Compression–Control Criterion](available on request)  
-
-Additional technical docs and experiment logs will be added here as the project matures.
+- [Preprint: Finite Realism](https://doi.org/10.5281/zenodo.17226486)  
+- Technical notes and experiment logs will be added as the project matures.
 
 ---
 
@@ -47,17 +45,15 @@ Please open an issue or contact the maintainer directly.
 
 ## License
 
-This project is licensed under the **Apache License 2.0**.  
-You may not use this project except in compliance with the License.  
-You may obtain a copy of the License at:
+This project is dual-licensed:  
 
-[http://www.apache.org/licenses/LICENSE-2.0](http://www.apache.org/licenses/LICENSE-2.0)
+- **GNU Affero General Public License v3.0 (AGPL-3.0-only)**  
+- **Commercial license** (available for organizations who prefer not to comply with AGPL terms)  
 
-Unless required by applicable law or agreed to in writing, software  
-distributed under the License is distributed on an **"AS IS" BASIS**,  
-without warranties or conditions of any kind, either express or implied.  
-See the License for the specific language governing permissions and  
-limitations under the License.
+See the [LICENSE](./LICENSE) file for full details.  
+
+Use under AGPL-3.0 is free.  
+For commercial licensing inquiries, contact the maintainer.
 
 ---
 
@@ -65,4 +61,4 @@ limitations under the License.
 
 **Maintainer:** Craig Holmander  
 📧 craig.holm@protonmail.com  
-🌐 [ORCID Profile](https://orcid.org/) *(in preparation)*  
+🌐 [ORCID Profile](https://orcid.org/0009-0002-3145-8498)  
