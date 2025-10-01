@@ -31,7 +31,7 @@ Planned releases:
 
 ## Documentation
 
-- [Preprint: Finite Realism](https://doi.org/10.5281/zenodo.17226486)  
+- [Preprint: Finite Realism] [(https://doi.org/10.5281/zenodo.17226485)]  
 - Technical notes and experiment logs will be added as the project matures.
 
 ---
