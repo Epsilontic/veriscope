@@ -189,7 +189,7 @@ In smoke mode, some heavy metrics are skipped or reduced in cadence to keep runt
 
 ## Documentation
 
-- Preprint: **Finite Realism** — <https://doi.org/10.5281/zenodo.17226485>
+- Conceptual framework: **Finite Realism: Epistemology, Metaphysics, and Physics Under Finite Resources** — <https://doi.org/10.5281/zenodo.17226485>
 
 Technical notes and experiment logs will be added as the project matures.
 
@@ -214,9 +214,15 @@ See `LICENSE` for full details. Use under AGPL‑3.0 is free. For commercial lic
 
 ## Citation
 
-If you use Veriscope in academic work, please cite the preprint:
+If you publish results using this repository, please cite both the software and, where relevant, the underlying theory.
 
-- Holmander, C. (2025). *Finite Realism: Early warnings for representation drift*. Zenodo. <https://doi.org/10.5281/zenodo.17226485>
+**Citing the software (Veriscope).**  
+Use the repository’s `CITATION.cff` (GitHub: “Cite this repository”) and include the exact version/tag (or commit hash) you used. If a DOI is minted for a release (e.g., via Zenodo), include that DOI in your citation.
+
+**Citing the theory (Finite Realism).**  
+When discussing the conceptual framework that motivates Veriscope (e.g., window/gate formalism and finite‑resource constraints), cite:
+
+- Holmander, C. (2025). *Finite Realism: Epistemology, Metaphysics, and Physics Under Finite Resources*. Zenodo. <https://doi.org/10.5281/zenodo.17226485>
 
 ---
 
