@@ -1,5 +1,3 @@
-# SPDX-FileCopyrightText: 2025 Craig Holmander
-# SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Veriscope-Commercial
 # Veriscope Bundle (Phase-4; invariants + FP-calibratable GT + robust learner)
 #
 # Delta from previous Phase-3 draft based on P0/P1 critique:
@@ -62,7 +60,48 @@ except Exception:
 import torch.multiprocessing as mp
 import torch.nn as nn
 import torch.nn.functional as F
-from torch import amp
+# AMP compatibility shim: prefer torch.amp, fall back to torch.cuda.amp, otherwise no-op
+try:
+    from torch import amp as _amp_mod
+    _AMP_SRC = "torch.amp"
+except Exception:
+    try:
+        from torch.cuda import amp as _amp_mod  # type: ignore
+        _AMP_SRC = "torch.cuda.amp"
+    except Exception:
+        _AMP_SRC = "none"
+        class _NoAutocast:
+            def __init__(self, *args, **kwargs): pass
+            def __enter__(self): return None
+            def __exit__(self, exc_type, exc, tb): return False
+        class _NoGradScaler:
+            def __init__(self, enabled=False): self.enabled = bool(enabled)
+            def scale(self, loss): return loss
+            def unscale_(self, opt): pass
+            def step(self, opt): opt.step()
+            def update(self): pass
+        class _NoAmp:
+            autocast = _NoAutocast
+            GradScaler = _NoGradScaler
+        amp = _NoAmp()
+    else:
+        import inspect as _inspect
+        _sig = _inspect.signature(_amp_mod.autocast)
+        if "device_type" in _sig.parameters:
+            amp = _amp_mod
+        else:
+            # Wrap autocast to ignore device_type on older torch.cuda.amp
+            class _AutocastWrapper:
+                def __init__(self, device_type=None, enabled=True):
+                    self._ctx = _amp_mod.autocast(enabled=enabled)
+                def __enter__(self): return self._ctx.__enter__()
+                def __exit__(self, exc_type, exc, tb): return self._ctx.__exit__(exc_type, exc, tb)
+            class _AmpShim:
+                autocast = _AutocastWrapper
+                GradScaler = _amp_mod.GradScaler
+            amp = _AmpShim()
+else:
+    amp = _amp_mod
 from torch.utils.data import DataLoader, Sampler, Subset
 from torchvision import transforms
 
@@ -198,6 +237,298 @@ DEFAULT_WINDOW = Window(
         lambda x: np.clip(x + 0.05, 0, 1),     # shift up
     ),
 )
+
+# --- Finite Realism • Window Budgets, Fixed-Partition Gate, and Provenance ---
+from dataclasses import dataclass as _fr_dataclass  # local alias to avoid shadowing
+
+@_fr_dataclass
+class WindowBudget:
+    """Finite resource budgets for heavy metrics and the overall run."""
+    sw2_ms: int = 200                 # per-call budget for sliced W2
+    ripser_ms: int = 250              # per-call budget for H0 persistence
+    total_heavy_ms: int = 180_000     # total wall-clock budget for heavy metrics in a run
+    sw2_calls: int = 1_000_000        # defensive ceiling; tuned by CFG
+    ripser_calls: int = 1_000_000     # defensive ceiling; tuned by CFG
+
+class BudgetLedger:
+    """Per-process budget ledger to enforce finite-window resource use."""
+    def __init__(self, limits: WindowBudget):
+        self.lim = limits
+        self.spent_ms = {"sw2": 0.0, "ripser": 0.0, "heavy_total": 0.0}
+        self.calls = {"sw2": 0, "ripser": 0}
+
+    def allow(self, what: str) -> bool:
+        if what == "sw2":
+            return (
+                self.calls["sw2"] < int(self.lim.sw2_calls)
+                and self.spent_ms["heavy_total"] < float(self.lim.total_heavy_ms)
+            )
+        if what == "ripser":
+            return (
+                self.calls["ripser"] < int(self.lim.ripser_calls)
+                and self.spent_ms["heavy_total"] < float(self.lim.total_heavy_ms)
+            )
+        return True
+
+    def charge(self, what: str, ms: float):
+        v = float(max(0.0, ms))
+        if what in self.spent_ms:
+            self.spent_ms[what] += v
+            self.calls[what] += 1
+        self.spent_ms["heavy_total"] += v
+
+# Global ledger is instantiated after CFG is defined.
+BUDGET: Optional[BudgetLedger] = None
+
+
+def _window_hash(window: Window) -> str:
+    """Deterministic id for the admissible window; used in provenance."""
+    try:
+        payload = {
+            "epsilon": float(window.epsilon),
+            "weights": {str(k): float(v) for k, v in (window.weights or {}).items()},
+            "bins": int(window.bins),
+            "interventions": len(tuple(window.interventions or ())),
+        }
+        s = json.dumps(payload, sort_keys=True)
+        return hashlib.sha256(s.encode()).hexdigest()
+    except Exception:
+        return ""
+
+
+def write_window_provenance(outdir: Path, window: Window, cfg: dict, budget: WindowBudget):
+    """Persist a tamper-evident window provenance capsule."""
+    try:
+        capsule = {
+            "window_hash": _window_hash(window),
+            "window": {
+                "epsilon": float(window.epsilon),
+                "weights": {str(k): float(v) for k, v in (window.weights or {}).items()},
+                "bins": int(window.bins),
+                "n_interventions": len(tuple(window.interventions or ())),
+            },
+            "budgets": {
+                "sw2_ms": int(budget.sw2_ms),
+                "ripser_ms": int(budget.ripser_ms),
+                "total_heavy_ms": int(budget.total_heavy_ms),
+                "sw2_calls": int(budget.sw2_calls),
+                "ripser_calls": int(budget.ripser_calls),
+            },
+            "cfg_pointers": {
+                "heavy_every": int(cfg.get("heavy_every", 0)),
+                "sw2_n_proj": int(cfg.get("sw2_n_proj", 0)),
+                "rp_repeats": int(cfg.get("rp_repeats", 0)),
+                "rp_dim_topo": int(cfg.get("rp_dim_topo", 0)),
+            },
+        }
+        s = json.dumps(capsule, sort_keys=True)
+        capsule["sha256"] = hashlib.sha256(s.encode()).hexdigest()
+        save_json(capsule, outdir / "window_provenance.json")
+    except Exception:
+        pass
+
+# --- Fixed-partition Finite Realism declarations (Φ_W, G_T, ε_stat, κ_sens scaffolding) ---
+
+class WindowDecl:
+    def __init__(self, epsilon: float, metrics: List[str], weights: Dict[str, float],
+                 bins: int, interventions: tuple, cal_ranges: Dict[str, Tuple[float, float]]):
+        self.epsilon = float(epsilon)
+        self.metrics = list(metrics)
+        self.weights = dict(weights)
+        self.bins = int(bins)
+        self.interventions = tuple(interventions)
+        self.cal_ranges = dict(cal_ranges)
+
+    def transport(self, name: str, x: np.ndarray) -> np.ndarray:
+        lo, hi = self.cal_ranges.get(name, (None, None))
+        if lo is None or not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+            return np.zeros_like(np.asarray(x, float))
+        z = (np.asarray(x, float) - lo) / max(1e-12, (hi - lo))
+        return np.clip(z, 0.0, 1.0)
+
+# Global predeclared fixed-partition window (Φ_W); set this once per run
+WINDOW_DECL: Optional[WindowDecl] = None
+
+def install_window_decl(win: WindowDecl) -> None:
+    """Setter to install Φ_W for gating."""
+    global WINDOW_DECL
+    WINDOW_DECL = win
+
+
+def calibrate_window_from_controls(df_control: pd.DataFrame, metrics: List[str], weights: Dict[str, float],
+                                   bins: int, epsilon: float, interventions: tuple) -> WindowDecl:
+    """Predeclare Φ_W from factor=='none' controls after warm; freeze transport ranges per metric."""
+    cal_ranges: Dict[str, Tuple[float, float]] = {}
+    for m in metrics:
+        if m in df_control.columns:
+            col = pd.to_numeric(df_control[m], errors="coerce").to_numpy(dtype=float)
+            col = col[np.isfinite(col)]
+            if col.size >= 16:
+                lo = float(np.nanpercentile(col, 1.0))
+                hi = float(np.nanpercentile(col, 99.0))
+            else:
+                lo, hi = (0.0, 1.0)
+        else:
+            lo, hi = (0.0, 1.0)
+        if not (np.isfinite(lo) and np.isfinite(hi) and hi > lo):
+            lo, hi = (0.0, 1.0)
+        cal_ranges[m] = (lo, hi)
+    return WindowDecl(epsilon=epsilon, metrics=metrics, weights=weights, bins=bins,
+                      interventions=interventions, cal_ranges=cal_ranges)
+
+
+def tv_hist_fixed(z0: np.ndarray, z1: np.ndarray, bins: int) -> float:
+    ha, _ = np.histogram(z0, bins=bins, range=(0.0, 1.0), density=True)
+    hb, _ = np.histogram(z1, bins=bins, range=(0.0, 1.0), density=True)
+    if ha.sum() == 0 and hb.sum() == 0:
+        return 0.0
+    if ha.sum() == 0: ha = np.ones_like(ha)
+    if hb.sum() == 0: hb = np.ones_like(hb)
+    ha = ha / ha.sum()
+    hb = hb / hb.sum()
+    return 0.5 * float(np.abs(ha - hb).sum())
+
+
+def dPi_product_tv(window: WindowDecl, past_by_metric: Dict[str, np.ndarray],
+                   recent_by_metric: Dict[str, np.ndarray]) -> float:
+    tv = 0.0
+    for m, w in window.weights.items():
+        if m not in past_by_metric or m not in recent_by_metric:
+            continue
+        a = window.transport(m, past_by_metric[m])
+        b = window.transport(m, recent_by_metric[m])
+        tv += float(w) * tv_hist_fixed(a, b, window.bins)
+    return float(tv)
+
+
+def epsilon_statistic_bhc(n: int, k: int, alpha: float = 0.05) -> float:
+    """Bretagnolle–Huber–Carol-type bound in TV for multinomial with k bins."""
+    if n <= 0:
+        return float("inf")
+    x = float(np.log(2.0 / max(1e-12, alpha)))
+    return math.sqrt(((max(1, k) - 1) * x) / max(1, n)) + (x / max(1, n))
+
+
+def aggregate_epsilon_stat(window: WindowDecl, counts_by_metric: Dict[str, int],
+                           k_override: Optional[int] = None, alpha: float = 0.05) -> float:
+    total = 0.0
+    for m, w in window.weights.items():
+        n = int(counts_by_metric.get(m, 0))
+        k = int(k_override) if k_override is not None else int(window.bins)
+        eps_m = epsilon_statistic_bhc(n=n, k=k, alpha=alpha)
+        total += float(w) * eps_m
+    return float(total)
+
+
+@torch.no_grad()
+def collect_feature_snapshot(model: nn.Module, pool_loader, device, metrics: List[str], ref_mu_sig):
+    """Collect a light snapshot of features/metrics over a small pool."""
+    Z_geom, Z_geom_native = _features_for_loader(
+        model, pool_loader, device,
+        n_batches=max(1, CFG.get("metric_batches", 1)),
+        cap=int(CFG.get("metric_total_cap", 256)),
+        ref_mu_sig=ref_mu_sig, run_key=0, epoch=0,
+    )
+    out: Dict[str, np.ndarray] = {}
+    try:
+        v_ok, eff, *_ = variance_outside_k(Z_geom)
+        out["var_out_k"] = np.array([float(v_ok)], dtype=float)
+        out["eff_dim"]   = np.array([float(eff)], dtype=float)
+    except Exception:
+        out["var_out_k"] = np.array([float("nan")], dtype=float)
+        out["eff_dim"]   = np.array([float("nan")], dtype=float)
+    out.setdefault("ftle", np.array([float("nan")], dtype=float))
+    return out
+
+
+def kappa_sens_probe(model: nn.Module, opt: torch.optim.Optimizer, pool_loader, device,
+                     window: WindowDecl, ref_mu_sig, probe_cfg: Dict) -> float:
+    """Compute κ_sens using predeclared micro-probes. Always restores model params."""
+    base = collect_feature_snapshot(model, pool_loader, device, window.metrics, ref_mu_sig)
+    kappa = 0.0
+    if probe_cfg.get("aug_probe", True):
+        try:
+            temp_loader = probe_cfg.get("aug_loader_factory", lambda: pool_loader)()
+            interv = collect_feature_snapshot(model, temp_loader, device, window.metrics, ref_mu_sig)
+            tv = dPi_product_tv(window, base, interv)
+            if np.isfinite(tv):
+                kappa = max(kappa, float(tv))
+        except Exception:
+            pass
+    if probe_cfg.get("lr_probe", False):
+        state = {k: v.clone().cpu() for k, v in model.state_dict().items()}
+        try:
+            lr0 = float(opt.param_groups[0].get("lr", CFG.get("base_lr", 0.1)))
+            micro_lr = float(probe_cfg.get("lr_factor", 1.1)) * lr0
+            micro_opt = torch.optim.SGD(model.parameters(), lr=micro_lr, momentum=0.0, weight_decay=0.0)
+            it = iter(pool_loader)
+            for _ in range(2):
+                try:
+                    xb, yb = next(it)
+                except StopIteration:
+                    break
+                xb, yb = xb.to(device), yb.to(device)
+                logits = model(xb)
+                loss = F.cross_entropy(logits, yb)
+                micro_opt.zero_grad(set_to_none=True)
+                loss.backward()
+                micro_opt.step()
+            interv2 = collect_feature_snapshot(model, pool_loader, device, window.metrics, ref_mu_sig)
+            tv2 = dPi_product_tv(window, base, interv2)
+            if np.isfinite(tv2):
+                kappa = max(kappa, float(tv2))
+        except Exception:
+            pass
+        finally:
+            model.load_state_dict({k: v.to(device) for k, v in state.items()})
+    return float(kappa)
+
+
+def gate_check(window: WindowDecl,
+               past: Dict[str, np.ndarray],
+               recent: Dict[str, np.ndarray],
+               counts: Dict[str, int],
+               gain: float,
+               gain_thresh: float,
+               kappa_sens: float,
+               eps_stat_alpha: float = 0.05) -> Tuple[int, Dict[str, float]]:
+    """Joint gate: prequential gain + fixed-partition product–TV with ε_stat and κ_sens."""
+    worst = 0.0
+    intervs = window.interventions or (lambda x: x,)
+    for T in intervs:
+        tv_sum = 0.0
+        for m, w in window.weights.items():
+            a = T(window.transport(m, past.get(m, np.array([], dtype=float))))
+            b = T(window.transport(m, recent.get(m, np.array([], dtype=float))))
+            tv_sum += float(w) * tv_hist_fixed(a, b, window.bins)
+        worst = max(worst, tv_sum)
+    eps_stat = aggregate_epsilon_stat(window, counts_by_metric=counts, alpha=eps_stat_alpha)
+    ok_gain = np.isfinite(gain) and (gain >= gain_thresh)
+    ok_kappa = np.isfinite(kappa_sens) and (kappa_sens <= window.epsilon)
+    ok_stability = np.isfinite(worst) and ((worst + eps_stat) <= window.epsilon)
+    return int(bool(ok_gain and ok_stability and ok_kappa)), {
+        "gain": float(gain),
+        "worst_tv": float(worst),
+        "eps_stat": float(eps_stat),
+        "kappa_sens": float(kappa_sens if np.isfinite(kappa_sens) else 0.0),
+    }
+
+
+def write_window_audit(outdir: Path, window_decl: WindowDecl, note: str = ""):
+    """Persist the predeclared Φ_W (fixed partitions, transports, bins, epsilon)."""
+    try:
+        payload = {
+            "epsilon": float(window_decl.epsilon),
+            "metrics": list(window_decl.metrics),
+            "weights": {str(k): float(v) for k, v in window_decl.weights.items()},
+            "bins": int(window_decl.bins),
+            "cal_ranges": {k: [float(v[0]), float(v[1])] for k, v in window_decl.cal_ranges.items()},
+            "interventions": [f"predeclared_T_{i}" for i, _ in enumerate(window_decl.interventions)],
+            "notes": note or "Fixed partitions and transport calibrated from factor=='none' after warm",
+        }
+        save_json(payload, OUTDIR / "window_audit.json")
+    except Exception:
+        pass
 
 # ---------------------------
 # Output & config
@@ -398,6 +729,30 @@ CFG.setdefault("scheduled_ttl", 2 * CFG.get("heavy_every", 6))
 # Family gate neighborhood size (epochs) for local confirmation
 CFG.setdefault("gate_early_exit", True)
 
+# Finite-window heavy-metric budgets (env-overridable)
+CFG.setdefault("total_heavy_budget_ms", 180_000)
+CFG.setdefault("ripser_calls_cap", 1_000_000)
+CFG.setdefault("sw2_calls_cap", 1_000_000)
+
+# Gate parameters for fixed-partition finite realism (predeclared Φ_W)
+CFG.setdefault("gate_window", 16)
+CFG.setdefault("gate_bins", 16)
+CFG.setdefault("gate_epsilon", 0.08)
+CFG.setdefault("gate_gain_thresh", 5.0)
+
+# Instantiate the global budget ledger using current CFG limits
+try:
+    _wb = WindowBudget(
+        sw2_ms=int(CFG.get("sw2_budget_ms", 200)),
+        ripser_ms=int(CFG.get("ripser_budget_ms", 250)),
+        total_heavy_ms=int(CFG.get("total_heavy_budget_ms", 180_000)),
+        sw2_calls=int(CFG.get("sw2_calls_cap", 1_000_000)),
+        ripser_calls=int(CFG.get("ripser_calls_cap", 1_000_000)),
+    )
+    BUDGET = BudgetLedger(_wb)
+except Exception:
+    BUDGET = BudgetLedger(WindowBudget())
+
 # Smoke-mode overrides (fast E2E)
 CFG_SMOKE = dict(
 seeds_calib=[401, 402],
@@ -492,6 +847,13 @@ try:
             "cublas_workspace": os.environ.get("CUBLAS_WORKSPACE_CONFIG", ""),
             "deterministic": bool(CFG.get("deterministic", True)),
             }, repro_path)
+except Exception:
+    pass
+
+# Persist the finite-window provenance alongside repro info
+try:
+    if (mp.current_process().name == "MainProcess") and (BUDGET is not None):
+        write_window_provenance(OUTDIR, DEFAULT_WINDOW, CFG, BUDGET.lim)
 except Exception:
     pass
 
@@ -1217,9 +1579,13 @@ sample_n: int = 192,
     vals = []
     used_n = 0
     for r in range(repeats):
+        # Enforce both per-call and global finite-window budgets
         if (time.time() - t0) * 1000.0 > CFG["ripser_budget_ms"]:
             break
+        if (BUDGET is not None) and (not BUDGET.allow("ripser")):
+            break
         try:
+            t_rep = time.time()
             A = _JL.get(
             Z.shape[1],
             min(q, Z.shape[1]),
@@ -1245,6 +1611,12 @@ sample_n: int = 192,
             else:
                 used_n = n
             vals.append(h0_total_persistence_np(X.cpu().numpy()))
+            ms_rep = (time.time() - t_rep) * 1000.0
+            try:
+                if BUDGET is not None:
+                    BUDGET.charge("ripser", ms_rep)
+            except Exception:
+                pass
         except Exception:
             continue
     elapsed = (time.time() - t0) * 1000.0
@@ -1366,10 +1738,17 @@ def _prep_series_for_ph(g: pd.DataFrame, metric: str) -> List[float]:
 
 def sliced_w2_gpu_budget(Zt, Zt1, n_proj, seed, device, budget_ms):
     try:
+        if (BUDGET is not None) and (not BUDGET.allow("sw2")):
+            return float("nan"), 0.0, 0, False
         val, ms, nproj_done = sliced_w2_gpu(Zt, Zt1, n_proj, seed, device)
     except Exception:
         return float("nan"), 0.0, 0, False
     ok = (ms <= budget_ms) and np.isfinite(val) and (nproj_done > 0)
+    try:
+        if BUDGET is not None:
+            BUDGET.charge("sw2", ms)
+    except Exception:
+        pass
     return (val if ok else float("nan")), ms, int(nproj_done if ok else 0), bool(ok)
 
 
@@ -1871,12 +2250,12 @@ def gt_collapse_time(run_df: pd.DataFrame, grad_cutoff: float) -> Tuple[Optional
     ep = g["epoch"].to_numpy()
     nan_flag = g["nan_flag"].astype(bool).to_numpy()
     grad_rel = g["grad_norm_rel"].to_numpy()
-    warm = CFG["warmup"] + CFG["ph_burn"]
+    warm_idx = CFG["warmup"] + CFG["ph_burn"]
 
     # HARD: NaNs or gradient explosion — require 2 consecutive after warm
     consec = 0
     for t in range(len(ep)):
-        if ep[t] < warm:
+        if ep[t] < warm_idx:
             consec = 0
             continue
         hard_now = nan_flag[t] or (np.isfinite(grad_rel[t]) and grad_rel[t] >= grad_cutoff)
@@ -2446,36 +2825,35 @@ if monitor_source == "external":
 
         rng = np.random.default_rng(777000 + seed)
         N = len(monitor_ds)
-        pool_size = min(CFG["external_monitor"]["pool_size"], N)
+        pool_size = min(int(CFG["external_monitor"]["pool_size"]), N)
         if pool_size <= 0:
             raise RuntimeError("external monitor pool_size is 0")
 
         pool_idxs = rng.choice(np.arange(N, dtype=np.int64), size=pool_size, replace=False)
         pool_loader = subset_loader_from_indices(
-        monitor_ds, pool_idxs, CFG["batch"], shuffle=True, seed=seed, device=device
+            monitor_ds, pool_idxs, CFG["batch"], shuffle=True, seed=seed, device=device
         )
 
         # disjoint entropy set (fallback to pool if diff is empty)
         ent_pool = np.setdiff1d(np.arange(N, dtype=np.int64), pool_idxs, assume_unique=True)
         if ent_pool.size == 0:
-            # dataset too small; fall back to using the pool
             ent_pool = pool_idxs
 
-        ent_n = min(CFG["external_monitor"]["ent_subset"], ent_pool.size)
+        ent_n = min(int(CFG["external_monitor"]["ent_subset"]), ent_pool.size)
         if ent_n <= 0:
             raise RuntimeError("external monitor ent_subset is 0")
 
         ent_idxs = rng.choice(ent_pool, size=ent_n, replace=False)
         ent_loader = subset_loader_from_indices(
-        monitor_ds, ent_idxs, CFG["batch"], shuffle=False, seed=seed + 1, device=device
+            monitor_ds, ent_idxs, CFG["batch"], shuffle=False, seed=seed + 1, device=device
         )
 
         update_json(
-        splits_path,
-        {
-        "STL10_POOL": [int(i) for i in pool_idxs.tolist()],
-        "STL10_ENT":  [int(i) for i in ent_idxs.tolist()],
-        },
+            splits_path,
+            {
+                "STL10_POOL": [int(i) for i in pool_idxs.tolist()],
+                "STL10_ENT":  [int(i) for i in ent_idxs.tolist()],
+            },
         )
     except Exception as e:
         print(f"[WARN] external monitor failed ({e}); falling back to clean_val for this run only")
@@ -2483,30 +2861,33 @@ if monitor_source == "external":
         pool_loader = None
         ent_loader = None
 
-    if monitor_source == "noisy_train":
-        pool_loader = make_loader(
+# resolve non-external sources (or fallback) unconditionally
+if monitor_source == "noisy_train":
+    pool_loader = make_loader(
         tr_ds, CFG["batch"], True, CFG["num_workers"], new_gen(seed, 2), device, persistent=True
-        )
-        ent_loader = pool_loader
-    elif monitor_source == "clean_val" or pool_loader is None or ent_loader is None:
-        pool_loader = make_loader(
+    )
+    ent_loader = pool_loader
+elif (monitor_source == "clean_val") or (pool_loader is None) or (ent_loader is None):
+    pool_loader = make_loader(
         mon_val, CFG["batch"], True, CFG["num_workers"], new_gen(seed, 2), device, persistent=True
-        )
-        ent_loader = pool_loader
+    )
+    ent_loader = pool_loader
 
-    try:
-        mon_sig = {
+try:
+    mon_sig = {
         "source": monitor_source,
         "pool_len": len(pool_loader.dataset) if hasattr(pool_loader, "dataset") else -1,
         "ent_len": len(ent_loader.dataset) if hasattr(ent_loader, "dataset") else -1,
         "resize_to": CFG["external_monitor"]["resize_to"] if monitor_source == "external" else None,
-        }
-        update_json(splits_path, {"MONITOR_SIGNATURE": mon_sig})
-    except Exception:
-        pass
+    }
+    update_json(splits_path, {"MONITOR_SIGNATURE": mon_sig})
+except Exception:
+    pass
 
     # norm_ref loader for frozen μ,σ (model-agnostic; reused => allow persistence)
-    norm_ref_loader = make_loader(
+
+# norm_ref loader for frozen μ,σ (model-agnostic; reused => allow persistence)
+norm_ref_loader = make_loader(
     norm_ref,
     CFG["batch"],
     True,
@@ -2514,7 +2895,38 @@ if monitor_source == "external":
     new_gen(seed, 999),
     device,
     persistent=True,
-    )
+)
+
+def probe_aug_loader_factory():
+    base_loader = pool_loader
+    try:
+        class _ProbeDS(torch.utils.data.Dataset):
+            def __init__(self, base): self.base = base
+            def __len__(self): return len(self.base)
+            def __getitem__(self, i):
+                x, y = self.base[i]
+                try: dev = x.device
+                except Exception: dev = "cpu"
+                g = torch.Generator(device=dev).manual_seed(123 + seed * 997 + int(i))
+                if isinstance(x, torch.Tensor):
+                    noise = torch.randn_like(x, generator=g) * 0.02
+                    x2 = (x + noise).clamp(-3, 3)
+                    if int(_u01_from_hash("flip_probe", seed, int(i)) * 2) == 1 and x2.ndim == 3 and x2.shape[-1] >= 2:
+                        x2 = torch.flip(x2, dims=[2])
+                else:
+                    x2 = x
+                return x2, y
+        return DataLoader(
+            _ProbeDS(base_loader.dataset),
+            batch_size=base_loader.batch_size,
+            shuffle=False,
+            num_workers=getattr(base_loader, "num_workers", 0),
+            pin_memory=getattr(base_loader, "pin_memory", False),
+            drop_last=False,
+            worker_init_fn=seed_worker if getattr(base_loader, "num_workers", 0) > 0 else None,
+        )
+    except Exception:
+        return base_loader
 
     model = make_model().to(device)
     opt = make_opt(model)
@@ -2585,6 +2997,29 @@ if monitor_source == "external":
 
         ref_mu_sig = (mu, sig_ref)
         assert ref_mu_sig[0].shape[1] == H.shape[1], "ref stats dimension mismatch"
+
+        # --- Insert fallback WindowDecl if missing ---
+        if WINDOW_DECL is None:
+            try:
+                snap = collect_feature_snapshot(model, pool_loader, device, ["var_out_k", "eff_dim"], ref_mu_sig=None)
+                eff_est = float(snap.get("eff_dim", np.array([np.nan], dtype=float))[0])
+            except Exception:
+                eff_est = float("nan")
+            hi_eff = (2.0 * eff_est) if np.isfinite(eff_est) else 2.0
+            cal_ranges = {"var_out_k": (0.0, 1.0), "eff_dim": (0.0, max(1.0, float(hi_eff)))}
+            window_decl = WindowDecl(
+                epsilon=float(CFG.get("gate_epsilon", 0.08)),
+                metrics=["var_out_k", "eff_dim"],
+                weights={"var_out_k": 0.5, "eff_dim": 0.5},
+                bins=int(CFG.get("gate_bins", 16)),
+                interventions=(lambda x: x,),
+                cal_ranges=cal_ranges,
+            )
+            install_window_decl(window_decl)
+            try:
+                write_window_audit(OUTDIR, window_decl, note="Fallback per-run WindowDecl")
+            except Exception:
+                pass
     # ----------------------------------------------------------------------
 
     logs = []
@@ -2941,112 +3376,67 @@ if monitor_source == "external":
         except Exception:
             gns, gns_n = float("nan"), 0
 
-        # --- finite-window gate (uses recent history; no external deps) ---
+        # --- fixed-partition gate (Φ_W) with ε_stat and κ_sens ---
         try:
-            W_gate = int(CFG.get("gate_window", 16))
-            bins_gate = int(CFG.get("gate_bins", 16))
-            eps_gate = float(CFG.get("gate_epsilon", 0.08))
-            gain_thresh = float(CFG.get("gate_gain_thresh", 5.0))
-
             gate_warn = 0
             gate_gain = float("nan")
             gate_worst_tv = float("nan")
+            gate_eps_stat = float("nan")
+            gate_kappa = float("nan")
 
-            # Need 2W epochs of history to evaluate stability (split window: past vs recent)
-            if len(logs) >= 2 * W_gate:
+            W_gate = int(CFG.get("gate_window", 16))
+            if (WINDOW_DECL is not None) and (len(logs) >= 2 * W_gate):
                 recent = logs[-(2 * W_gate):]
 
-                # Prequential gain: baseline (ewma_loss) vs model (train_loss) over last W
+                def _series(seg, key):
+                    v = np.array([float(r.get(key, np.nan)) for r in seg], dtype=float)
+                    return v[np.isfinite(v)]
+
+                metrics_for_tv = list(WINDOW_DECL.weights.keys())
+                past_dict = {m: _series(recent[:W_gate], m) for m in metrics_for_tv}
+                recent_dict = {m: _series(recent[W_gate:], m) for m in metrics_for_tv}
+                counts = {m: int(min(past_dict[m].size, recent_dict[m].size)) for m in metrics_for_tv}
+
+                # prequential gain over last W on train vs baseline loss
                 model_losses = np.array([float(r.get("train_loss", np.nan)) for r in logs[-W_gate:]], dtype=float)
                 base_losses  = np.array([float(r.get("ewma_loss",  np.nan)) for r in logs[-W_gate:]], dtype=float)
                 mask = np.isfinite(model_losses) & np.isfinite(base_losses)
                 gate_gain = float((base_losses[mask] - model_losses[mask]).sum()) if mask.any() else float("nan")
 
-                # Product–TV across split windows for a few robust channels
-                metrics_for_tv = ["var_out_k", "eff_dim", "ftle"]
-                weights_for_tv = {"var_out_k": 0.4, "eff_dim": 0.3, "ftle": 0.3}
+                # κ_sens probe sparsely (augmentation-only by default)
+                gate_kappa = 0.0
+                try:
+                    if (epoch % max(1, int(CFG.get("heavy_every", 6)))) == 0:
+                        gate_kappa = kappa_sens_probe(
+                            model, opt, pool_loader, device, WINDOW_DECL, ref_mu_sig,
+                            probe_cfg={
+                                "aug_probe": True,
+                                "aug_loader_factory": probe_aug_loader_factory,
+                                "lr_probe": False,
+                            },
+                        )
+                except Exception:
+                    gate_kappa = 0.0
 
-                def _hist_tv_01(a, b, bins):
-                    # expects data already scaled to [0,1]
-                    ha, _ = np.histogram(a, bins=bins, range=(0, 1), density=True)
-                    hb, _ = np.histogram(b, bins=bins, range=(0, 1), density=True)
-                    if ha.sum() == 0 or hb.sum() == 0:
-                        return 0.0
-                    ha = ha / ha.sum(); hb = hb / hb.sum()
-                    return float(0.5 * np.abs(ha - hb).sum())
-
-                def _scale_01(x):
-                    lo = np.nanmin(x); hi = np.nanmax(x)
-                    if not np.isfinite(lo) or not np.isfinite(hi) or (hi - lo) <= 1e-9:
-                        return None
-                    return (x - lo) / (hi - lo)
-
-             
-                # admissible small transforms T(x)
-                transforms = (
-                    lambda x: x,
-                    lambda x: x * 1.05,
-                    lambda x: x * 0.95,
-                    lambda x: np.clip(x + 0.05, 0, 1),
+                flag, audit = gate_check(
+                    WINDOW_DECL,
+                    past_dict,
+                    recent_dict,
+                    counts,
+                    gain=gate_gain,
+                    gain_thresh=float(CFG.get("gate_gain_thresh", 5.0)),
+                    kappa_sens=(gate_kappa if np.isfinite(gate_kappa) else 0.0),
                 )
-
-                # split history into two W-wide windows: past vs recent
-                past_win = recent[:W_gate]
-                recent_win = recent[W_gate:]
-
-                # collect raw series for metrics
-                def _series(seg, key):
-                    return np.array([float(r.get(key, np.nan)) for r in seg], dtype=float)
-
-                past_raw = {m: _series(past_win, m) for m in metrics_for_tv}
-                recent_raw = {m: _series(recent_win, m) for m in metrics_for_tv}
-
-                # joint scaling to [0,1] per metric using both windows (stable for TV)
-                def _scale_pair(a, b):
-                    a = np.asarray(a, dtype=float)
-                    b = np.asarray(b, dtype=float)
-                    ab = np.concatenate([a[np.isfinite(a)], b[np.isfinite(b)]], axis=0)
-                    if ab.size == 0:
-                        return None, None
-                    lo = np.nanmin(ab); hi = np.nanmax(ab)
-                    if not np.isfinite(lo) or not np.isfinite(hi) or (hi - lo) <= 1e-9:
-                        return None, None
-                    sa = (a - lo) / (hi - lo)
-                    sb = (b - lo) / (hi - lo)
-                    return np.clip(sa, 0, 1), np.clip(sb, 0, 1)
-
-                scaled_past = {}
-                scaled_recent = {}
-                for m in metrics_for_tv:
-                    sa, sb = _scale_pair(past_raw[m], recent_raw[m])
-                    if sa is None or sb is None:
-                        # if scaling fails (constant/empty), treat as no shift for TV
-                        sa = np.zeros_like(past_raw[m], dtype=float)
-                        sb = np.zeros_like(recent_raw[m], dtype=float)
-                    scaled_past[m] = sa
-                    scaled_recent[m] = sb
-
-                # compute worst-case weighted product–TV across admissible transforms
-                worst = 0.0
-                for T in transforms:
-                    tv_sum = 0.0
-                    for m, w in weights_for_tv.items():
-                        if m not in scaled_past or m not in scaled_recent:
-                            continue
-                        a = T(scaled_past[m])
-                        b = T(scaled_recent[m])
-                        tv_sum += float(w) * _hist_tv_01(a, b, bins_gate)
-                    if tv_sum > worst:
-                        worst = tv_sum
-
-                gate_worst_tv = float(worst)
-                ok_stability = np.isfinite(gate_worst_tv) and (gate_worst_tv <= eps_gate)
-                ok_gain = np.isfinite(gate_gain) and (gate_gain >= gain_thresh)
-                gate_warn = int(bool(ok_gain and ok_stability))
+                gate_warn = int(flag)
+                gate_worst_tv = float(audit.get("worst_tv", np.nan))
+                gate_eps_stat = float(audit.get("eps_stat", np.nan))
+                gate_kappa = float(audit.get("kappa_sens", np.nan))
         except Exception:
             gate_warn = 0
             gate_gain = float("nan")
             gate_worst_tv = float("nan")
+            gate_eps_stat = float("nan")
+            gate_kappa = float("nan")
 
         logs.append(
             dict(
@@ -3132,6 +3522,9 @@ if monitor_source == "external":
                 gate_bins=int(CFG.get("gate_bins", 16)),
                 gate_epsilon=float(CFG.get("gate_epsilon", 0.08)),
                 gate_gain_thresh=float(CFG.get("gate_gain_thresh", 5.0)),
+                # fixed-partition gate diagnostics
+                gate_eps_stat=float(gate_eps_stat),
+                gate_kappa=float(gate_kappa),
             )
         )
         # hard-stop training when the finite-window gate warns for k consecutive epochs (after warm)
@@ -3175,6 +3568,8 @@ if monitor_source == "external":
                 pass
             break
 
+    df = pd.DataFrame(logs)
+    return df
 # ---------------------------
 # Direction calibration for PH & grad cutoff
 # ---------------------------
@@ -4233,7 +4628,7 @@ def evaluate(df_all: pd.DataFrame, tag: str):
             return
     except Exception:
         pass
-    warm = CFG["warmup"] + CFG["ph_burn"]
+    warm_idx = CFG["warmup"] + CFG["ph_burn"]
     cal_mask = df_all["seed"].isin(CFG["seeds_calib"])
     eval_seeds = seeds_for_eval_from_env(CFG)
     ev_mask = df_all["seed"].isin(eval_seeds)
@@ -4333,7 +4728,7 @@ def evaluate(df_all: pd.DataFrame, tag: str):
             {
             "gt_rank_min": CFG["gt_rank_min"],
             "gt_rank_q": None,
-            "warm": int(warm),
+            "warm": int(warm_idx),
             "source": "env_fixed",
             },
             OUTDIR / f"gt_rank_calibration_{tag}.json",
@@ -4347,14 +4742,14 @@ def evaluate(df_all: pd.DataFrame, tag: str):
         try:
             q_env = float(soft_q_env)
             assert 0.0 < q_env < 1.0
-            qv = _soft_quantile_from_controls(df_cal_raw, q_env, warm)
+            qv = _soft_quantile_from_controls(df_cal_raw, q_env, warm_idx)
             if qv is not None and np.isfinite(qv):
                 CFG["gt_rank_min"] = float(qv)
                 save_json(
                 {
                 "gt_rank_min": CFG["gt_rank_min"],
                 "gt_rank_q": q_env,
-                "warm": int(warm),
+                "warm": int(warm_idx),
                 "source": "env_quantile",
                 },
                 OUTDIR / f"gt_rank_calibration_{tag}.json",
@@ -4369,7 +4764,7 @@ def evaluate(df_all: pd.DataFrame, tag: str):
 
     if not fixed_thr_env and not soft_q_env:
         # Default: derive from CFG['gt_rank_q'] on calibration controls after warm
-        qv = _soft_quantile_from_controls(df_cal_raw, gtq, warm)
+        qv = _soft_quantile_from_controls(df_cal_raw, gtq, warm_idx)
         if qv is None or (not np.isfinite(qv)):
             print("[calib] WARN: gt_rank_min quantile is NaN/None; using prior CFG['gt_rank_min'].")
             qv = float(CFG.get("gt_rank_min", 8.0))
@@ -4378,12 +4773,12 @@ def evaluate(df_all: pd.DataFrame, tag: str):
         {
         "gt_rank_min": CFG["gt_rank_min"],
         "gt_rank_q": gtq,
-        "warm": int(warm),
+        "warm": int(warm_idx),
         "source": "quantile",
         },
         OUTDIR / f"gt_rank_calibration_{tag}.json",
         )
-        print(f"[calib] gt_rank_min set from factor=='none' @q={gtq:.3f} after warm={warm}: {CFG['gt_rank_min']:.3f}")
+        print(f"[calib] gt_rank_min set from factor=='none' @q={gtq:.3f} after warm={warm_idx}: {CFG['gt_rank_min']:.3f}")
 
     # Compute GT exactly once using this finalized threshold
     df_cal_raw = add_gt_final(df_cal_raw)
@@ -4414,12 +4809,11 @@ def evaluate(df_all: pd.DataFrame, tag: str):
     save_json(dir_map, OUTDIR / f"ph_directions_{tag}.json")
 
     # ---- Run-level collapse tag map for evaluation (needed by summarize_detection) ----
-    warm = CFG["warmup"] + CFG["ph_burn"]
     collapse_tag_map = {}
     for (sd, fc), g in df_eval_raw.groupby(["seed", "factor"]):
         ctag_this = "none"
         if "collapse_tag_gt" in g.columns:
-            gx = g[g["epoch"] >= warm]
+            gx = g[g["epoch"] >= warm_idx]
             vals = gx["collapse_tag_gt"].dropna().astype(str).unique().tolist()
             if not vals:
                 vals = g["collapse_tag_gt"].dropna().astype(str).unique().tolist()
@@ -4431,10 +4825,10 @@ def evaluate(df_all: pd.DataFrame, tag: str):
 
     # ---- RP adequacy on eval: JL/native agreement pre-warm ----
     rp_flags = rp_adequacy_flags(
-    df_eval_raw,
-    warm,
-    corr_min=float(CFG.get("rp_corr_min", 0.9)),
-    min_pts=int(CFG.get("rp_min_pts", 8)),
+        df_eval_raw,
+        warm_idx,
+        corr_min=float(CFG.get("rp_corr_min", 0.9)),
+        min_pts=int(CFG.get("rp_min_pts", 8)),
     )
     save_json(
     {
@@ -4490,20 +4884,20 @@ def evaluate(df_all: pd.DataFrame, tag: str):
         if pd.notna(t_c) and ctag == "soft":
             for t in range(len(g)):
                 ep = int(g.iloc[t]["epoch"])
-                if ep >= warm and (int(t_c) - ep <= CFG["detector_horizon"]):
+                if ep >= warm_idx and (int(t_c) - ep <= CFG["detector_horizon"]):
                     y[t] = 1.0
         grp = np.full(len(g), int(seed), dtype=np.int64)
         X_list.append(X)
         M_list.append(M)
         y_list.append(y)
         g_list.append(grp)
-        fp_mask = ((g["epoch"].to_numpy() >= warm) & is_nontrig).astype(np.float32)
+        fp_mask = ((g["epoch"].to_numpy() >= warm_idx) & is_nontrig).astype(np.float32)
         fp_mask_list.append(fp_mask)
         ep_list.append(g["epoch"].to_numpy().astype(np.int64))
         tc_soft_list.append(
-        np.full(
-        len(g), (int(t_c) if (pd.notna(t_c) and ctag == "soft") else np.nan), dtype=float
-        )
+            np.full(
+                len(g), (int(t_c) if (pd.notna(t_c) and ctag == "soft") else np.nan), dtype=float
+            )
         )
 
     X_raw = (
@@ -4518,7 +4912,7 @@ def evaluate(df_all: pd.DataFrame, tag: str):
     tc_arr = np.concatenate(tc_soft_list, 0) if tc_soft_list else np.zeros((0,), dtype=float)
 
     # Anchor normalization to healthy geometry: compute q10–q90 bounds on factor=='none' after warm
-    none_pool = df_cal_raw[(df_cal_raw["factor"] == "none") & (df_cal_raw["epoch"] >= warm)]
+    none_pool = df_cal_raw[(df_cal_raw["factor"] == "none") & (df_cal_raw["epoch"] >= warm_idx)]
     bounds = {}
     for m in det_features:
         if m in none_pool.columns:
@@ -4534,7 +4928,7 @@ def evaluate(df_all: pd.DataFrame, tag: str):
     # Drop post-warm rows from non-'none' factors whose post-warm median lies outside healthy bounds for any feature
     def _factor_out_of_bounds(df_fac):
         med_ok = True
-        post = df_fac[df_fac["epoch"] >= warm]
+        post = df_fac[df_fac["epoch"] >= warm_idx]
         if post.empty:
             return False
         for m in det_features:
@@ -4549,7 +4943,7 @@ def evaluate(df_all: pd.DataFrame, tag: str):
     drop_idx = []
     for (sd, fc), g in df_cal_raw.groupby(["seed", "factor"]):
         if fc != "none" and _factor_out_of_bounds(g):
-            drop_idx.extend(g[g["epoch"] >= warm].index.tolist())
+            drop_idx.extend(g[g["epoch"] >= warm_idx].index.tolist())
     df_cal_for_norm = df_cal_raw.drop(index=drop_idx) if drop_idx else df_cal_raw
 
     # (duplicate quantile-based soft-GT threshold block removed)
@@ -4559,18 +4953,18 @@ def evaluate(df_all: pd.DataFrame, tag: str):
     X_det = Xn  # det_use_missing=False
 
     best = _cv_grouped_fit(
-    X_det,
-    y,
-    groups,
-    fp_mask,
-    steps_grid=CFG["detector_steps_grid"],
-    l2_grid=CFG["detector_L2_grid"],
-    lr=CFG["detector_lr"],
-    folds=CFG["detector_cv_folds"],
-    fp_cap=SUCCESS_TARGET["max_early_fp_rate"],
-    epochs=ep_arr,
-    tc_soft=tc_arr,
-    warm_idx=warm,
+        X_det,
+        y,
+        groups,
+        fp_mask,
+        steps_grid=CFG["detector_steps_grid"],
+        l2_grid=CFG["detector_L2_grid"],
+        lr=CFG["detector_lr"],
+        folds=CFG["detector_cv_folds"],
+        fp_cap=SUCCESS_TARGET["max_early_fp_rate"],
+        epochs=ep_arr,
+        tc_soft=tc_arr,
+        warm_idx=warm_idx,
     )
     if best is None:
         steps, l2, thresh = CFG["detector_steps_grid"][0], CFG["detector_L2_grid"][0], 0.5
@@ -4622,7 +5016,6 @@ def evaluate(df_all: pd.DataFrame, tag: str):
     y_cal = np.zeros(len(meta_rows), dtype=np.float32)
     groups_cal = meta_rows["seed"].to_numpy(dtype=np.int64)
 
-    warm = CFG["warmup"] + CFG["ph_burn"]
     horiz = int(CFG["detector_horizon"])
 
     # Precompute per-(seed,factor) collapse target for labeling positives
@@ -4641,7 +5034,7 @@ def evaluate(df_all: pd.DataFrame, tag: str):
         fc = str(r["factor"])
         ep = int(r["epoch"])
         t_c, ctag = gt_by_sf.get((sd, fc), (np.nan, "none"))
-        if pd.notna(t_c) and ctag == "soft" and ep >= warm and (int(t_c) - ep) <= horiz:
+        if pd.notna(t_c) and ctag == "soft" and ep >= warm_idx and (int(t_c) - ep) <= horiz:
             y_cal[i] = 1.0
 
     p_oof = _oof_probs_for_params(
@@ -4656,10 +5049,10 @@ def evaluate(df_all: pd.DataFrame, tag: str):
 
     # RP adequacy flags on calibration
     rp_flags_cal = rp_adequacy_flags(
-    df_cal_raw,
-    warm,
-    corr_min=float(CFG.get("rp_corr_min", 0.9)),
-    min_pts=int(CFG.get("rp_min_pts", 8)),
+        df_cal_raw,
+        warm_idx,
+        corr_min=float(CFG.get("rp_corr_min", 0.9)),
+        min_pts=int(CFG.get("rp_min_pts", 8)),
     )
 
     # Family-gate parameters
@@ -4669,33 +5062,33 @@ def evaluate(df_all: pd.DataFrame, tag: str):
     fp_cap = float(SUCCESS_TARGET["max_early_fp_rate"])
 
     tau_prime, fp_measured = map_threshold_to_gated_fp(
-    meta_rows,
-    X_cal_raw,
-    p_oof,
-    det_features,
-    stats,
-    dir_map,
-    rp_flags_cal,
-    warm,
-    z_thr,
-    K,
-    warn_consec,
-    fp_cap,
+        meta_rows,
+        X_cal_raw,
+        p_oof,
+        det_features,
+        stats,
+        dir_map,
+        rp_flags_cal,
+        warm_idx,
+        z_thr,
+        K,
+        warn_consec,
+        fp_cap,
     )
 
     # Persist mapping info and adopt τ′ for evaluation
     save_json(
-    {
-    "tau_raw": float(thresh),
-    "tau_prime": float(tau_prime),
-    "fp_measured_cal_gated": float(fp_measured),
-    "fp_cap": float(fp_cap),
-    "family_z_thr": float(z_thr),
-    "warm": int(warm),
-    "steps": int(steps),
-    "l2": float(l2),
-    },
-    OUTDIR / f"tau_mapping_{tag}.json",
+        {
+            "tau_raw": float(thresh),
+            "tau_prime": float(tau_prime),
+            "fp_measured_cal_gated": float(fp_measured),
+            "fp_cap": float(fp_cap),
+            "family_z_thr": float(z_thr),
+            "warm": int(warm_idx),
+            "steps": int(steps),
+            "l2": float(l2),
+        },
+        OUTDIR / f"tau_mapping_{tag}.json",
     )
 
     # Update learned_detector to mirror deployed threshold (store both raw and deployed τ)
@@ -4717,7 +5110,7 @@ def evaluate(df_all: pd.DataFrame, tag: str):
         Xn = _apply_global_norm_impute(X_raw, stats, det_features)
         z = (Xn @ w + b)
         p = _sigmoid_stable(z)
-        mask = (gg["epoch"] >= warm) & (p >= thresh)
+        mask = (gg["epoch"] >= warm_idx) & (p >= thresh)
         hit_idx = np.where(mask.values)[0]
 
         # Build per-epoch z-scores for detector features using the same robust stats
@@ -4869,23 +5262,23 @@ def evaluate(df_all: pd.DataFrame, tag: str):
         gg = g.sort_values("epoch").reset_index(drop=True)
         # Unified PH preprocessing for pers_H0
         xs_full = _prep_series_for_ph(gg, "pers_H0")
-        # Indices eligible for sequential tests: valid finite values at/after warm
+        # Indices eligible for sequential tests: valid finite values at/after warm_idx
         idxs = [
-        i
-        for i, x in enumerate(xs_full)
-        if (np.isfinite(x) and int(gg.iloc[i]["epoch"]) >= warm)
+            i
+            for i, x in enumerate(xs_full)
+            if (np.isfinite(x) and int(gg.iloc[i]["epoch"]) >= warm_idx)
         ]
         ph_seq = [xs_full[i] for i in idxs]
 
         # Level test over preprocessed series (burn-in respects epoch timeline)
         t_level, _, _ = ph_window_sparse(
-        xs_full,
-        win=win_short,
-        lam=lam,
-        direction="down",
-        burn_in=warm,
-        min_points=CFG["ph_min_points"],
-        two_sided=False,
+            xs_full,
+            win=win_short,
+            lam=lam,
+            direction="down",
+            burn_in=warm_idx,
+            min_points=CFG["ph_min_points"],
+            two_sided=False,
         )
         # CUSUM on the post-warm valid subsequence
         zs_delta = robust_z_series(_delta(ph_seq), win=win_short, burn_in=0)
@@ -4893,9 +5286,9 @@ def evaluate(df_all: pd.DataFrame, tag: str):
 
         def _map_sub_to_epoch(t_sub):
             return (
-            None
-            if t_sub is None
-            else int(gg.iloc[idxs[t_sub]]["epoch"]) if (0 <= t_sub < len(idxs)) else None
+                None
+                if t_sub is None
+                else int(gg.iloc[idxs[t_sub]]["epoch"]) if (0 <= t_sub < len(idxs)) else None
             )
 
         t_ph = None
@@ -4904,18 +5297,18 @@ def evaluate(df_all: pd.DataFrame, tag: str):
             t_ph = _map_sub_to_epoch(min(cand))
 
         rk_seq = (
-        gg["eff_dim_gt"].astype(float).tolist()
-        if "eff_dim_gt" in gg.columns
-        else gg["eff_dim"].astype(float).tolist()
+            gg["eff_dim_gt"].astype(float).tolist()
+            if "eff_dim_gt" in gg.columns
+            else gg["eff_dim"].astype(float).tolist()
         )
         t_rank, _, _ = ph_window_sparse(
-        rk_seq,
-        win=rank_win,
-        lam=lam,
-        direction="down",
-        burn_in=warm,
-        min_points=CFG["ph_min_points"],
-        two_sided=False,
+            rk_seq,
+            win=rank_win,
+            lam=lam,
+            direction="down",
+            burn_in=warm_idx,
+            min_points=CFG["ph_min_points"],
+            two_sided=False,
         )
 
         t_warn = None
@@ -4929,27 +5322,27 @@ def evaluate(df_all: pd.DataFrame, tag: str):
             t_warn = None
 
         lead = (
-        float(t_c - t_warn)
-        if (ctag in ["soft", "hard"] and t_warn is not None and t_c is not None)
-        else float("nan")
+            float(t_c - t_warn)
+            if (ctag in ["soft", "hard"] and t_warn is not None and t_c is not None)
+            else float("nan")
         )
         seq_rows.append(
-        dict(
-        run_id=f"s{int(seed)}-{str(factor)}",
-        seed=int(seed),
-        factor=str(factor),
-        t_warn=t_warn,
-        t_collapse=t_c,
-        collapse_tag=ctag,
-        ph_win_short=win_short,
-        ph_lambda=lam,
-        rank_win=rank_win,
-        heavy_every=CFG["heavy_every"],
-        metric_batches=CFG["metric_batches"],
-        var_k_energy=CFG["var_k_energy"],
-        var_k_max=CFG["var_k_max"],
-        lead_time=lead,
-        )
+            dict(
+                run_id=f"s{int(seed)}-{str(factor)}",
+                seed=int(seed),
+                factor=str(factor),
+                t_warn=t_warn,
+                t_collapse=t_c,
+                collapse_tag=ctag,
+                ph_win_short=win_short,
+                ph_lambda=lam,
+                rank_win=rank_win,
+                heavy_every=CFG["heavy_every"],
+                metric_batches=CFG["metric_batches"],
+                var_k_energy=CFG["var_k_energy"],
+                var_k_max=CFG["var_k_max"],
+                lead_time=lead,
+            )
         )
     seq_events = pd.DataFrame(seq_rows)
     seq_events.to_csv(OUTDIR / f"baseline_events_seq_{tag}.csv", index=False)
@@ -4970,42 +5363,42 @@ def evaluate(df_all: pd.DataFrame, tag: str):
 
         xs_ph = _prep_series_for_ph(gg, "pers_H0")
         xs_eff = (
-        (gg["eff_dim_gt"] if "eff_dim_gt" in gg.columns else gg["eff_dim"])
-        .to_numpy()
-        .astype(float)
-        .tolist()
+            (gg["eff_dim_gt"] if "eff_dim_gt" in gg.columns else gg["eff_dim"])
+            .to_numpy()
+            .astype(float)
+            .tolist()
         )
         xs_var = gg["var_out_k"].to_numpy().astype(float).tolist()
         xs_ftle = _mask_with_valid(
-        gg["ftle"], gg["ftle_valid"] if "ftle_valid" in gg.columns else None
+            gg["ftle"], gg["ftle_valid"] if "ftle_valid" in gg.columns else None
         ).tolist()
         t1 = newma_warn_epoch(
-        xs_ph,
-        fast=CFG["newma_fast"],
-        slow=CFG["newma_slow"],
-        lam=CFG["ph_lambda"],
-        burn_in=warm,
+            xs_ph,
+            fast=CFG["newma_fast"],
+            slow=CFG["newma_slow"],
+            lam=CFG["ph_lambda"],
+            burn_in=warm_idx,
         )
         t2 = newma_warn_epoch(
-        xs_eff,
-        fast=CFG["newma_fast"],
-        slow=CFG["newma_slow"],
-        lam=CFG["ph_lambda"],
-        burn_in=warm,
+            xs_eff,
+            fast=CFG["newma_fast"],
+            slow=CFG["newma_slow"],
+            lam=CFG["ph_lambda"],
+            burn_in=warm_idx,
         )
         t3 = newma_warn_epoch(
-        xs_var,
-        fast=CFG["newma_fast"],
-        slow=CFG["newma_slow"],
-        lam=CFG["ph_lambda"],
-        burn_in=warm,
+            xs_var,
+            fast=CFG["newma_fast"],
+            slow=CFG["newma_slow"],
+            lam=CFG["ph_lambda"],
+            burn_in=warm_idx,
         )
         t4 = newma_warn_epoch(
-        xs_ftle,
-        fast=CFG["newma_fast"],
-        slow=CFG["newma_slow"],
-        lam=CFG["ph_lambda"],
-        burn_in=warm,
+            xs_ftle,
+            fast=CFG["newma_fast"],
+            slow=CFG["newma_slow"],
+            lam=CFG["ph_lambda"],
+            burn_in=warm_idx,
         )
         cand = [t for t in [t1, t2, t3, t4] if t is not None]
         t_warn = int(min(cand)) if cand else None
@@ -5014,25 +5407,25 @@ def evaluate(df_all: pd.DataFrame, tag: str):
         if t_warn is not None and t_c is not None and not (t_warn < t_c):
             t_warn = None
         lead = (
-        float(t_c - t_warn)
-        if (ctag in ["soft", "hard"] and t_warn is not None and t_c is not None)
-        else float("nan")
+            float(t_c - t_warn)
+            if (ctag in ["soft", "hard"] and t_warn is not None and t_c is not None)
+            else float("nan")
         )
         newma_rows.append(
-        dict(
-        run_id=f"s{int(seed)}-{str(factor)}",
-        seed=int(seed),
-        factor=str(factor),
-        t_warn=t_warn,
-        t_collapse=t_c,
-        collapse_tag=ctag,
-        ph_lambda=CFG["ph_lambda"],
-        heavy_every=CFG["heavy_every"],
-        metric_batches=CFG["metric_batches"],
-        var_k_energy=CFG["var_k_energy"],
-        var_k_max=CFG["var_k_max"],
-        lead_time=lead,
-        )
+            dict(
+                run_id=f"s{int(seed)}-{str(factor)}",
+                seed=int(seed),
+                factor=str(factor),
+                t_warn=t_warn,
+                t_collapse=t_c,
+                collapse_tag=ctag,
+                ph_lambda=CFG["ph_lambda"],
+                heavy_every=CFG["heavy_every"],
+                metric_batches=CFG["metric_batches"],
+                var_k_energy=CFG["var_k_energy"],
+                var_k_max=CFG["var_k_max"],
+                lead_time=lead,
+            )
         )
     base_newma = pd.DataFrame(newma_rows)
     base_newma.to_csv(OUTDIR / f"baseline_events_newma_{tag}.csv", index=False)
@@ -5083,23 +5476,23 @@ def evaluate(df_all: pd.DataFrame, tag: str):
     base_gate.to_csv(OUTDIR / f"baseline_events_gate_{tag}.csv", index=False)
 
     # ---- Summaries ----
-    summ_det = summarize_detection(det_rows, warm_idx=warm)
-    summ_ewma = summarize_detection(base_ewma, warm_idx=warm)
-    summ_sma = summarize_detection(base_sma, warm_idx=warm)
-    summ_vote = summarize_detection(base_vote, warm_idx=warm)
-    summ_seq = summarize_detection(seq_events, warm_idx=warm)
-    summ_newma = summarize_detection(base_newma, warm_idx=warm)
-    summ_gate = summarize_detection(base_gate, warm_idx=warm)
+    summ_det = summarize_detection(det_rows, warm_idx=warm_idx)
+    summ_ewma = summarize_detection(base_ewma, warm_idx=warm_idx)
+    summ_sma = summarize_detection(base_sma, warm_idx=warm_idx)
+    summ_vote = summarize_detection(base_vote, warm_idx=warm_idx)
+    summ_seq = summarize_detection(seq_events, warm_idx=warm_idx)
+    summ_newma = summarize_detection(base_newma, warm_idx=warm_idx)
+    summ_gate = summarize_detection(base_gate, warm_idx=warm_idx)
     summ_gate.to_csv(OUTDIR / f"summary_baseline_gate_{tag}.csv", index=False)
 
     # ---- Run-level FP (any warn on 'none' after warm) ----
-    run_fp_learned = float("nan") if no_eval else summarize_runlevel_fp(det_rows, warm_idx=warm+1)
-    run_fp_ewma = summarize_runlevel_fp(base_ewma, warm_idx=warm+1)
-    run_fp_sma = summarize_runlevel_fp(base_sma, warm_idx=warm+1)
-    run_fp_vote = summarize_runlevel_fp(base_vote, warm_idx=warm+1)
-    run_fp_seq = summarize_runlevel_fp(seq_events, warm_idx=warm+1)
-    run_fp_newma = summarize_runlevel_fp(base_newma, warm_idx=warm+1)
-    run_fp_gate = summarize_runlevel_fp(base_gate, warm_idx=warm+1)
+    run_fp_learned = float("nan") if no_eval else summarize_runlevel_fp(det_rows, warm_idx=warm_idx+1)
+    run_fp_ewma = summarize_runlevel_fp(base_ewma, warm_idx=warm_idx+1)
+    run_fp_sma = summarize_runlevel_fp(base_sma, warm_idx=warm_idx+1)
+    run_fp_vote = summarize_runlevel_fp(base_vote, warm_idx=warm_idx+1)
+    run_fp_seq = summarize_runlevel_fp(seq_events, warm_idx=warm_idx+1)
+    run_fp_newma = summarize_runlevel_fp(base_newma, warm_idx=warm_idx+1)
+    run_fp_gate = summarize_runlevel_fp(base_gate, warm_idx=warm_idx+1)
 
     summ_det.to_csv(OUTDIR / f"summary_learned_{tag}.csv", index=False)
     summ_ewma.to_csv(OUTDIR / f"summary_baseline_ewma_{tag}.csv", index=False)
@@ -5269,4 +5662,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
