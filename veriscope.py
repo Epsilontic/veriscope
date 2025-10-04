@@ -754,13 +754,15 @@ except Exception:
 
 # Smoke-mode overrides (fast E2E)
 CFG_SMOKE = dict(
-seeds_calib=[401, 402],
-seeds_eval=[511, 512],
-epochs=16,
-heavy_every=16,
-rp_repeats=1,
-sw2_n_proj=64,
-gate_window=6,
+    seeds_calib=[401, 402],
+    seeds_eval=[511, 512],
+    epochs=16,
+    heavy_every=16,      # will be overwritten by the update below
+    rp_repeats=1,
+    sw2_n_proj=64,
+    gate_window=6,       # 2*W=12 <= 16 so the gate runs
+    warmup=4,            # NEW
+    ph_burn=0,           # NEW
 )
 
 # Ensure smoke mode executes at least one heavy pass
@@ -2906,7 +2908,7 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
                     except Exception: dev = "cpu"
                     g = torch.Generator(device=dev).manual_seed(123 + seed * 997 + int(i))
                     if isinstance(x, torch.Tensor):
-                        noise = torch.randn_like(x, generator=g) * 0.02
+                        noise = torch.randn(x.shape, dtype=x.dtype, device=dev, generator=g) * 0.02
                         x2 = (x + noise).clamp(-3, 3)
                         if int(_u01_from_hash("flip_probe", seed, int(i)) * 2) == 1 and x2.ndim == 3 and x2.shape[-1] >= 2:
                             x2 = torch.flip(x2, dims=[2])
