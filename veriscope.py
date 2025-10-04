@@ -760,6 +760,7 @@ epochs=16,
 heavy_every=16,
 rp_repeats=1,
 sw2_n_proj=64,
+gate_window=6,
 )
 
 # Ensure smoke mode executes at least one heavy pass
