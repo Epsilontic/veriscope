@@ -157,7 +157,6 @@ def _sigmoid_stable(z, cap: float = 60.0):
 
 # === Finite‑window guard primitives (product–TV + prequential gain) ===
 from dataclasses import dataclass  # already imported above; safe if duplicate
-import numpy as np  # already imported above; safe if duplicate
 
 @dataclass
 class Window:
@@ -2802,8 +2801,6 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
         _DET_LOGGED = True
     amp_enabled = CFG["amp"] and (not CFG["deterministic"]) and device.type == "cuda"
 
-    monitor_source = CFG["monitor_source"]
-
     tr_aug, tr_take, mon_val, norm_ref, splits_path = load_splits(seed)
     run_id = f"s{seed}-{factor['name']}"
     tr_ds = FactorisedTrainDataset(tr_aug, tr_take, factor=factor, seed=seed)
@@ -2813,119 +2810,119 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
     else None
     )
 
-# monitor loaders
-ent_every = int(CFG.get("external_monitor", {}).get("ent_every", 2))
-pool_loader = None
-ent_loader = None
-monitor_source = str(CFG.get("monitor_source", "clean_val"))
+    # monitor loaders
+    ent_every = int(CFG.get("external_monitor", {}).get("ent_every", 2))
+    pool_loader = None
+    ent_loader = None
+    monitor_source = str(CFG.get("monitor_source", "clean_val"))
 
-if monitor_source == "external":
+    if monitor_source == "external":
+        try:
+            if monitor_ds is None:
+                raise RuntimeError("external monitor dataset unavailable")
+
+            rng = np.random.default_rng(777000 + seed)
+            N = len(monitor_ds)
+            pool_size = min(int(CFG["external_monitor"]["pool_size"]), N)
+            if pool_size <= 0:
+                raise RuntimeError("external monitor pool_size is 0")
+
+            pool_idxs = rng.choice(np.arange(N, dtype=np.int64), size=pool_size, replace=False)
+            pool_loader = subset_loader_from_indices(
+                monitor_ds, pool_idxs, CFG["batch"], shuffle=True, seed=seed, device=device
+            )
+
+            # disjoint entropy set (fallback to pool if diff is empty)
+            ent_pool = np.setdiff1d(np.arange(N, dtype=np.int64), pool_idxs, assume_unique=True)
+            if ent_pool.size == 0:
+                ent_pool = pool_idxs
+
+            ent_n = min(int(CFG["external_monitor"]["ent_subset"]), ent_pool.size)
+            if ent_n <= 0:
+                raise RuntimeError("external monitor ent_subset is 0")
+
+            ent_idxs = rng.choice(ent_pool, size=ent_n, replace=False)
+            ent_loader = subset_loader_from_indices(
+                monitor_ds, ent_idxs, CFG["batch"], shuffle=False, seed=seed + 1, device=device
+            )
+
+            update_json(
+                splits_path,
+                {
+                    "STL10_POOL": [int(i) for i in pool_idxs.tolist()],
+                    "STL10_ENT":  [int(i) for i in ent_idxs.tolist()],
+                },
+            )
+        except Exception as e:
+            print(f"[WARN] external monitor failed ({e}); falling back to clean_val for this run only")
+            monitor_source = "clean_val"
+            pool_loader = None
+            ent_loader = None
+
+    # resolve non-external sources (or fallback) unconditionally
+    if monitor_source == "noisy_train":
+        pool_loader = make_loader(
+            tr_ds, CFG["batch"], True, CFG["num_workers"], new_gen(seed, 2), device, persistent=True
+        )
+        ent_loader = pool_loader
+    elif (monitor_source == "clean_val") or (pool_loader is None) or (ent_loader is None):
+        pool_loader = make_loader(
+            mon_val, CFG["batch"], True, CFG["num_workers"], new_gen(seed, 2), device, persistent=True
+        )
+        ent_loader = pool_loader
+
     try:
-        if monitor_ds is None:
-            raise RuntimeError("external monitor dataset unavailable")
-
-        rng = np.random.default_rng(777000 + seed)
-        N = len(monitor_ds)
-        pool_size = min(int(CFG["external_monitor"]["pool_size"]), N)
-        if pool_size <= 0:
-            raise RuntimeError("external monitor pool_size is 0")
-
-        pool_idxs = rng.choice(np.arange(N, dtype=np.int64), size=pool_size, replace=False)
-        pool_loader = subset_loader_from_indices(
-            monitor_ds, pool_idxs, CFG["batch"], shuffle=True, seed=seed, device=device
-        )
-
-        # disjoint entropy set (fallback to pool if diff is empty)
-        ent_pool = np.setdiff1d(np.arange(N, dtype=np.int64), pool_idxs, assume_unique=True)
-        if ent_pool.size == 0:
-            ent_pool = pool_idxs
-
-        ent_n = min(int(CFG["external_monitor"]["ent_subset"]), ent_pool.size)
-        if ent_n <= 0:
-            raise RuntimeError("external monitor ent_subset is 0")
-
-        ent_idxs = rng.choice(ent_pool, size=ent_n, replace=False)
-        ent_loader = subset_loader_from_indices(
-            monitor_ds, ent_idxs, CFG["batch"], shuffle=False, seed=seed + 1, device=device
-        )
-
-        update_json(
-            splits_path,
-            {
-                "STL10_POOL": [int(i) for i in pool_idxs.tolist()],
-                "STL10_ENT":  [int(i) for i in ent_idxs.tolist()],
-            },
-        )
-    except Exception as e:
-        print(f"[WARN] external monitor failed ({e}); falling back to clean_val for this run only")
-        monitor_source = "clean_val"
-        pool_loader = None
-        ent_loader = None
-
-# resolve non-external sources (or fallback) unconditionally
-if monitor_source == "noisy_train":
-    pool_loader = make_loader(
-        tr_ds, CFG["batch"], True, CFG["num_workers"], new_gen(seed, 2), device, persistent=True
-    )
-    ent_loader = pool_loader
-elif (monitor_source == "clean_val") or (pool_loader is None) or (ent_loader is None):
-    pool_loader = make_loader(
-        mon_val, CFG["batch"], True, CFG["num_workers"], new_gen(seed, 2), device, persistent=True
-    )
-    ent_loader = pool_loader
-
-try:
-    mon_sig = {
-        "source": monitor_source,
-        "pool_len": len(pool_loader.dataset) if hasattr(pool_loader, "dataset") else -1,
-        "ent_len": len(ent_loader.dataset) if hasattr(ent_loader, "dataset") else -1,
-        "resize_to": CFG["external_monitor"]["resize_to"] if monitor_source == "external" else None,
-    }
-    update_json(splits_path, {"MONITOR_SIGNATURE": mon_sig})
-except Exception:
-    pass
-
-# norm_ref loader for frozen μ,σ (model-agnostic; reused => allow persistence)
-norm_ref_loader = make_loader(
-    norm_ref,
-    CFG["batch"],
-    True,
-    CFG["num_workers"],
-    new_gen(seed, 999),
-    device,
-    persistent=True,
-)
-
-def probe_aug_loader_factory():
-    base_loader = pool_loader
-    try:
-        class _ProbeDS(torch.utils.data.Dataset):
-            def __init__(self, base): self.base = base
-            def __len__(self): return len(self.base)
-            def __getitem__(self, i):
-                x, y = self.base[i]
-                try: dev = x.device
-                except Exception: dev = "cpu"
-                g = torch.Generator(device=dev).manual_seed(123 + seed * 997 + int(i))
-                if isinstance(x, torch.Tensor):
-                    noise = torch.randn_like(x, generator=g) * 0.02
-                    x2 = (x + noise).clamp(-3, 3)
-                    if int(_u01_from_hash("flip_probe", seed, int(i)) * 2) == 1 and x2.ndim == 3 and x2.shape[-1] >= 2:
-                        x2 = torch.flip(x2, dims=[2])
-                else:
-                    x2 = x
-                return x2, y
-        return DataLoader(
-            _ProbeDS(base_loader.dataset),
-            batch_size=base_loader.batch_size,
-            shuffle=False,
-            num_workers=getattr(base_loader, "num_workers", 0),
-            pin_memory=getattr(base_loader, "pin_memory", False),
-            drop_last=False,
-            worker_init_fn=seed_worker if getattr(base_loader, "num_workers", 0) > 0 else None,
-        )
+        mon_sig = {
+            "source": monitor_source,
+            "pool_len": len(pool_loader.dataset) if hasattr(pool_loader, "dataset") else -1,
+            "ent_len": len(ent_loader.dataset) if hasattr(ent_loader, "dataset") else -1,
+            "resize_to": CFG["external_monitor"]["resize_to"] if monitor_source == "external" else None,
+        }
+        update_json(splits_path, {"MONITOR_SIGNATURE": mon_sig})
     except Exception:
-        return base_loader
+        pass
+
+    # norm_ref loader for frozen μ,σ (model-agnostic; reused => allow persistence)
+    norm_ref_loader = make_loader(
+        norm_ref,
+        CFG["batch"],
+        True,
+        CFG["num_workers"],
+        new_gen(seed, 999),
+        device,
+        persistent=True,
+    )
+
+    def probe_aug_loader_factory():
+        base_loader = pool_loader
+        try:
+            class _ProbeDS(torch.utils.data.Dataset):
+                def __init__(self, base): self.base = base
+                def __len__(self): return len(self.base)
+                def __getitem__(self, i):
+                    x, y = self.base[i]
+                    try: dev = x.device
+                    except Exception: dev = "cpu"
+                    g = torch.Generator(device=dev).manual_seed(123 + seed * 997 + int(i))
+                    if isinstance(x, torch.Tensor):
+                        noise = torch.randn_like(x, generator=g) * 0.02
+                        x2 = (x + noise).clamp(-3, 3)
+                        if int(_u01_from_hash("flip_probe", seed, int(i)) * 2) == 1 and x2.ndim == 3 and x2.shape[-1] >= 2:
+                            x2 = torch.flip(x2, dims=[2])
+                    else:
+                        x2 = x
+                    return x2, y
+            return DataLoader(
+                _ProbeDS(base_loader.dataset),
+                batch_size=base_loader.batch_size,
+                shuffle=False,
+                num_workers=getattr(base_loader, "num_workers", 0),
+                pin_memory=getattr(base_loader, "pin_memory", False),
+                drop_last=False,
+                worker_init_fn=seed_worker if getattr(base_loader, "num_workers", 0) > 0 else None,
+            )
+        except Exception:
+            return base_loader
 
     model = make_model().to(device)
     opt = make_opt(model)
@@ -5661,4 +5658,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
