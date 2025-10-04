@@ -2814,9 +2814,10 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
     )
 
 # monitor loaders
-ent_every = CFG["external_monitor"]["ent_every"]
+ent_every = int(CFG.get("external_monitor", {}).get("ent_every", 2))
 pool_loader = None
 ent_loader = None
+monitor_source = str(CFG.get("monitor_source", "clean_val"))
 
 if monitor_source == "external":
     try:
@@ -2883,8 +2884,6 @@ try:
     update_json(splits_path, {"MONITOR_SIGNATURE": mon_sig})
 except Exception:
     pass
-
-    # norm_ref loader for frozen μ,σ (model-agnostic; reused => allow persistence)
 
 # norm_ref loader for frozen μ,σ (model-agnostic; reused => allow persistence)
 norm_ref_loader = make_loader(
