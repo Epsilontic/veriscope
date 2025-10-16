@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "veriscope"
+version = "0.1.0"
+description = "Veriscope Bundle (Phase-4): early warning of soft collapse with finite-realism gate and learned detector"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [{ name = "Phase Catalyst" }]
+dependencies = [
+  "numpy>=1.20",
+  "pandas>=1.2",
+  "matplotlib>=3.4",
+  "filelock>=3.12"
+]
+# Prefer users install the correct CUDA/CPU wheel for torch themselves.
+# Document this in README: `pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121`
+
+[project.optional-dependencies]
+topology = ["ripser>=0.6"]
+
+[project.scripts]
+veriscope = "veriscope.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["veriscope*"]
