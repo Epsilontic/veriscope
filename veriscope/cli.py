@@ -5882,6 +5882,26 @@ def evaluate(df_all: pd.DataFrame, tag: str):
 # Main
 # ---------------------------
 def main():
+    # ---- FAST PATHS: avoid heavy imports/side effects for help/version ----
+    import sys as _sys
+    _argv = _sys.argv[1:]
+
+    # If user only asked for help/version, print and exit quickly.
+    if any(a in ("-h", "--help") for a in _argv):
+        # Minimal usage to avoid importing argparse or any heavy deps.
+        print("veriscope: early warning of soft collapse (Phase-4)\n"
+              "Usage: veriscope [options]\n"
+              "Common: --help, --version, (env) SCAR_SMOKE=1")
+        return 0
+
+    if any(a in ("-V", "--version") for a in _argv):
+        try:
+            from . import __version__ as _ver
+        except Exception:
+            _ver = "unknown"
+        print(_ver)
+        return 0
+
     # smoke-mode overrides
     if os.environ.get("SCAR_SMOKE", "0") == "1":
         for k, v in CFG_SMOKE.items():
@@ -5938,67 +5958,80 @@ def main():
         except Exception as e:
             print(f"[WARN] bad SCAR_FAMILY_WINDOW={v_fw!r}: {e}")
 
-    OUTDIR.mkdir(parents=True, exist_ok=True)
-    env = dict(
-    torch=torch.__version__,
-    tv=torchvision.__version__,
-    cuda=torch.version.cuda,
-    cudnn=torch.backends.cudnn.version(),
-    device=str(CFG["device"]),
-    deterministic=bool(CFG["deterministic"]),
-    cuda_hash=_cuda_hash(),
-    pip_freeze_md5=_pip_freeze_md5(),
-    cfg=CFG,
-    )
-    save_json(env, OUTDIR / "env.json")
-    # --- defaults & units notes ---
-    # Provide a sensible default for the family neighborhood size (used by family gate)
-    CFG.setdefault("family_window", 1)  # set to 2 if you prefer a small neighborhood
-    # Evidence floor for the family gate (avoid acting on extremely sparse TV windows)
-    CFG.setdefault("gate_min_evidence", 16)
-    # Optional env override (SCAR_GATE_MIN_EVIDENCE) to tune evidence floor per run
-    try:
-        CFG["gate_min_evidence"] = int(os.environ.get("SCAR_GATE_MIN_EVIDENCE", CFG.get("gate_min_evidence", 16)))
-        if "SCAR_GATE_MIN_EVIDENCE" in os.environ:
-            print(f"[env] gate_min_evidence={CFG['gate_min_evidence']}")
-    except Exception as e:
-        print(f"[WARN] bad SCAR_GATE_MIN_EVIDENCE={os.environ.get('SCAR_GATE_MIN_EVIDENCE')!r}: {e}")
-    # Clarify units for gate gain everywhere we log/save config
-    CFG.setdefault("gate_gain_units", "bits/sample")
-    
-    # Clamp var_k_max to avoid degenerate k (NEW)
-    CFG["var_k_max"] = max(1, int(CFG.get("var_k_max", 32)))
-    
-    save_json(CFG, OUTDIR / "cfg_phase4.json")
-    try:
-        print("[cfg] note: 'gate_gain' is measured in bits/sample.")
-        print("[cfg] note: eps_stat aggregation uses weighted sum of per-metric BH–C bounds; see audit 'eps_aggregation' and 'counts_by_metric'.")
-    except Exception:
-        pass
-    # one-time reproducibility capsule (non-fatal)
-    try:
-        repro_path = OUTDIR / "repro.json"
-        if not repro_path.exists():
-            repro = {
-            "torch": torch.__version__,
-            "torchvision": torchvision.__version__,
-            "cuda": torch.version.cuda,
-            "cudnn": torch.backends.cudnn.version(),
-            "device": str(CFG["device"]),
-            "deterministic": bool(CFG["deterministic"]),
-            "cuda_hash": _cuda_hash(),
-            "pip_freeze_md5": _pip_freeze_md5(),
-            }
-            save_json(repro, repro_path)
-    except Exception:
-        pass
-    # pip freeze artifact
-    try:
-        Path(OUTDIR / "pip_freeze.txt").write_text(
-        subprocess.check_output([sys.executable, "-m", "pip", "freeze"], text=True)
+    # Heavy-path setup (imports & side effects only when not in help/version fast path)
+    _heavy_path = True  # set by fast path above; remains True here if we didn't early-return
+    if _heavy_path:
+        OUTDIR.mkdir(parents=True, exist_ok=True)
+
+        # Import heavy libs lazily inside the heavy path
+        try:
+            import torch as _torch
+            import torchvision as _tv
+        except Exception:
+            # Defer hard failure until an actual run needs them; keep env fields sparse.
+            _torch = None
+            _tv = None
+
+        env = dict(
+            torch=(getattr(_torch, "__version__", None) or "missing"),
+            tv=(getattr(_tv, "__version__", None) or "missing"),
+            cuda=(getattr(getattr(_torch, "version", None), "cuda", None) if _torch else None),
+            cudnn=(getattr(getattr(getattr(_torch, "backends", None), "cudnn", None), "version", lambda: None)() if _torch else None),
+            device=str(CFG.get("device", "cpu")),
+            deterministic=bool(CFG.get("deterministic", False)),
+            cuda_hash=_cuda_hash(),
+            pip_freeze_md5=_pip_freeze_md5(),
+            cfg=CFG,
         )
-    except Exception as e:
-        Path(OUTDIR / "pip_freeze.txt").write_text(f"<pip freeze failed: {repr(e)}>")
+        save_json(env, OUTDIR / "env.json")
+        # --- defaults & units notes ---
+        # Provide a sensible default for the family neighborhood size (used by family gate)
+        CFG.setdefault("family_window", 1)  # set to 2 if you prefer a small neighborhood
+        # Evidence floor for the family gate (avoid acting on extremely sparse TV windows)
+        CFG.setdefault("gate_min_evidence", 16)
+        # Optional env override (SCAR_GATE_MIN_EVIDENCE) to tune evidence floor per run
+        try:
+            CFG["gate_min_evidence"] = int(os.environ.get("SCAR_GATE_MIN_EVIDENCE", CFG.get("gate_min_evidence", 16)))
+            if "SCAR_GATE_MIN_EVIDENCE" in os.environ:
+                print(f"[env] gate_min_evidence={CFG['gate_min_evidence']}")
+        except Exception as e:
+            print(f"[WARN] bad SCAR_GATE_MIN_EVIDENCE={os.environ.get('SCAR_GATE_MIN_EVIDENCE')!r}: {e}")
+        # Clarify units for gate gain everywhere we log/save config
+        CFG.setdefault("gate_gain_units", "bits/sample")
+        
+        # Clamp var_k_max to avoid degenerate k (NEW)
+        CFG["var_k_max"] = max(1, int(CFG.get("var_k_max", 32)))
+        
+        save_json(CFG, OUTDIR / "cfg_phase4.json")
+        try:
+            print("[cfg] note: 'gate_gain' is measured in bits/sample.")
+            print("[cfg] note: eps_stat aggregation uses weighted sum of per-metric BH–C bounds; see audit 'eps_aggregation' and 'counts_by_metric'.")
+        except Exception:
+            pass
+        # one-time reproducibility capsule (non-fatal)
+        try:
+            repro_path = OUTDIR / "repro.json"
+            if not repro_path.exists():
+                repro = {
+                    "torch": getattr(_torch, "__version__", None),
+                    "torchvision": getattr(_tv, "__version__", None),
+                    "cuda": getattr(getattr(_torch, "version", None), "cuda", None) if _torch else None,
+                    "cudnn": (getattr(getattr(getattr(_torch, "backends", None), "cudnn", None), "version", lambda: None)() if _torch else None),
+                    "device": str(CFG.get("device", "cpu")),
+                    "deterministic": bool(CFG.get("deterministic", False)),
+                    "cuda_hash": _cuda_hash(),
+                    "pip_freeze_md5": _pip_freeze_md5(),
+                }
+                save_json(repro, repro_path)
+        except Exception:
+            pass
+        # pip freeze artifact
+        try:
+            Path(OUTDIR / "pip_freeze.txt").write_text(
+                subprocess.check_output([sys.executable, "-m", "pip", "freeze"], text=True)
+            )
+        except Exception as e:
+            Path(OUTDIR / "pip_freeze.txt").write_text(f"<pip freeze failed: {repr(e)}>")
 
     # Try to load a previously calibrated WindowDecl (from a prior run) before sweeping
     try:
