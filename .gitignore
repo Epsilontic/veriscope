@@ -68,3 +68,33 @@ cache/
 *.tmp
 *.tmp.*
 *.log
+
+# Veriscope output and experiment artifacts
+runs/
+figs/
+*.parquet
+*.csv
+*.md5
+*.log
+pip_freeze.txt
+env.json
+cfg_phase4.json
+repro.json
+window_decl_calibrated.json
+seed_factor_map.json
+*_events_*.csv
+summary_*.csv
+bundle_runs_*.parquet
+bundle_runs_*_with_overlays_*.parquet
+overlay_mismatches_*.json
+tau_mapping_*.json
+learned_detector_*.json
+grad_cutoff_by_factor_*.json
+rp_adequacy_*.json
+
+# Packaging/build metadata (safety redundancy)
+*.egg-info/
+.eggs/
+build/
+dist/
+pip-wheel-metadata/

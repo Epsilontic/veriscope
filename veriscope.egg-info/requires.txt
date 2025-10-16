@@ -1,7 +1,0 @@
-numpy>=1.20
-pandas>=1.2
-matplotlib>=3.4
-filelock>=3.12
-
-[topology]
-ripser>=0.6
