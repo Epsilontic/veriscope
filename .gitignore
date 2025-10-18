@@ -98,3 +98,13 @@ rp_adequacy_*.json
 build/
 dist/
 pip-wheel-metadata/
+
+# Veriscope runtime artifacts
+out_cli_smoke/
+scar_bundle_phase4/
+*.parquet
+*.csv
+figs/
+window_decl_calibrated.json
+calibration_provenance.json
+pip_freeze.txt
