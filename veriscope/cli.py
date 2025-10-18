@@ -882,6 +882,8 @@ CFG.setdefault("gate_bins", 16)
 CFG.setdefault("gate_epsilon", 0.08)
 CFG.setdefault("gate_gain_thresh", 0.05)   # bits per sample (calibrated against controls)
 CFG.setdefault("gate_epsilon_sens", 0.04)  # dedicated κ_sens budget
+CFG.setdefault("gate_min_evidence", 16)
+CFG.setdefault("gate_gain_units", "bits/sample")
 
 # Instantiate the global budget ledger using current CFG limits
 try:
@@ -895,6 +897,7 @@ try:
     BUDGET = BudgetLedger(_wb)
 except Exception:
     BUDGET = BudgetLedger(WindowBudget())
+
 
 # Smoke-mode overrides (fast E2E)
 CFG_SMOKE = dict(
@@ -977,6 +980,114 @@ def update_json(path: Path, patch: Dict):
         cur = {}
     cur.update(patch or {})
     save_json(cur, path)
+
+# --- Calibration loader (file → env overrides) + provenance capsule ---
+def _read_text_safe(p: Path) -> str:
+    try:
+        return p.read_text()
+    except Exception:
+        return ""
+
+def load_calibration(cfg_path: Optional[str]) -> tuple[dict, Optional[str], Optional[str]]:
+    """
+    Returns: (cal, sha16, cfg_path_str)
+    Priority: packaged default file -> user file (if provided) -> env overrides.
+    """
+    pkg_default = (Path(__file__).resolve().parent / "configs" / "phase4_cifar10_v0.1.0.json")
+    cal = {
+        "gate_min_evidence": 16,
+        "gate_gain_thresh": 0.05,
+        "gate_gain_units": "bits/sample",
+    }
+    sha16 = None
+    used_path: Optional[Path] = None
+
+    # 1) packaged default
+    if pkg_default.exists():
+        txt = _read_text_safe(pkg_default)
+        try:
+            obj = json.loads(txt)
+            for k in ("gate_min_evidence", "gate_gain_thresh", "gate_gain_units"):
+                if k in obj:
+                    cal[k] = obj[k]
+            sha16 = hashlib.sha256(txt.encode("utf-8")).hexdigest()[:16]
+            used_path = pkg_default
+        except Exception:
+            pass
+
+    # 2) explicit user path (overrides packaged)
+    if cfg_path:
+        user_p = Path(cfg_path)
+        if user_p.exists():
+            txt = _read_text_safe(user_p)
+            try:
+                obj = json.loads(txt)
+                for k in ("gate_min_evidence", "gate_gain_thresh", "gate_gain_units"):
+                    if k in obj:
+                        cal[k] = obj[k]
+                sha16 = hashlib.sha256(txt.encode("utf-8")).hexdigest()[:16]
+                used_path = user_p
+            except Exception:
+                pass
+
+    # 3) env overrides (highest precedence)
+    if "SCAR_GATE_MIN_EVIDENCE" in os.environ:
+        try: cal["gate_min_evidence"] = int(os.environ["SCAR_GATE_MIN_EVIDENCE"])
+        except Exception: pass
+    if "SCAR_GATE_GAIN_THRESH" in os.environ:
+        try: cal["gate_gain_thresh"] = float(os.environ["SCAR_GATE_GAIN_THRESH"])
+        except Exception: pass
+    if "SCAR_GATE_GAIN_UNITS" in os.environ:
+        cal["gate_gain_units"] = os.environ["SCAR_GATE_GAIN_UNITS"]
+
+    # micro-validation
+    try:
+        if cal["gate_min_evidence"] < 1:
+            cal["gate_min_evidence"] = 16
+    except Exception:
+        cal["gate_min_evidence"] = 16
+    try:
+        x = float(cal["gate_gain_thresh"])
+        if not (0.0 <= x < 1.0):
+            cal["gate_gain_thresh"] = 0.05
+    except Exception:
+        cal["gate_gain_thresh"] = 0.05
+    if not isinstance(cal.get("gate_gain_units", None), str):
+        cal["gate_gain_units"] = "bits/sample"
+
+    return cal, sha16, (str(used_path) if used_path is not None else None)
+
+def write_calibration_capsule(outdir: Path, cal: dict, src_path: Optional[str], sha16: Optional[str]) -> None:
+    """Persist calibration details alongside other provenance files."""
+    try:
+        payload = {
+            "source_path": src_path or "",
+            "sha16": sha16 or "",
+            "gate_min_evidence": int(cal.get("gate_min_evidence", 16)),
+            "gate_gain_thresh": float(cal.get("gate_gain_thresh", 0.05)),
+            "gate_gain_units": str(cal.get("gate_gain_units", "bits/sample")),
+        }
+        update_json(outdir / "calibration_provenance.json", payload)
+    except Exception:
+        pass
+
+# Load packaged/user/env calibration and stamp provenance
+try:
+    _cal, _cal_sha16, _cal_path = load_calibration(os.environ.get("SCAR_CALIBRATION"))
+    CFG["gate_min_evidence"] = int(_cal["gate_min_evidence"])
+    CFG["gate_gain_thresh"]  = float(_cal["gate_gain_thresh"])
+    CFG["gate_gain_units"]   = str(_cal["gate_gain_units"])
+    try:
+        write_calibration_capsule(OUTDIR, _cal, _cal_path, _cal_sha16)
+    except Exception:
+        pass
+    if mp.current_process().name == "MainProcess":
+        print(f"[cal] min_evidence={CFG['gate_min_evidence']} gain_thresh={CFG['gate_gain_thresh']:.3f} ({CFG['gate_gain_units']})")
+except Exception as e:
+    try:
+        print(f"[WARN] calibration load failed: {e!r}; using defaults")
+    except Exception:
+        pass
 
 
 # Repro capsule: persist environment/cuda/library hashes once per sweep

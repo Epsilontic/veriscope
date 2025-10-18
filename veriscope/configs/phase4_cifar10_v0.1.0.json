@@ -1,0 +1,11 @@
+{
+  "schema": "veriscope.phase4.calibration.v1",
+  "dataset": "CIFAR-10",
+  "model_family": "Phase4-default",
+  "code_version": "0.1.0",
+  "calibrated_at": "2025-10-14T16:05:00Z",
+  "gate_min_evidence": 16,
+  "gate_gain_thresh": 0.074,
+  "gate_gain_units": "bits/sample",
+  "notes": "Calibrated on /runs/veriscope_20251014-1605/veriscope/scar_bundle_phase4; control q99 ≈ 0.068–0.069; τ = q99.9 + 0.005."
+}
