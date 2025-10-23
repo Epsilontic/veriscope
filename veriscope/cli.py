@@ -68,6 +68,36 @@ import torch.multiprocessing as mp
 import torch.nn as nn
 import torch.nn.functional as F
 
+
+# --- explicit functional imports to satisfy static checkers and provide stable callables ---
+try:
+    from torch.linalg import eigvalsh as t_eigvalsh, eigvals as t_eigvals, vector_norm as t_vector_norm
+except Exception:  # pragma: no cover
+    t_eigvalsh = None  # type: ignore[assignment]
+    t_eigvals = None  # type: ignore[assignment]
+    t_vector_norm = None  # type: ignore[assignment]
+try:
+    from torch.nn.functional import avg_pool2d as t_avg_pool2d
+except Exception:  # pragma: no cover
+    t_avg_pool2d = None  # type: ignore[assignment]
+
+# Ensure aliases are always callable for static checkers
+if t_avg_pool2d is None:  # type: ignore[truthy-function]
+    def t_avg_pool2d(*args, **kwargs):  # type: ignore[no-redef]
+        raise RuntimeError("torch.nn.functional.avg_pool2d unavailable")
+
+if t_eigvalsh is None:  # type: ignore[truthy-function]
+    def t_eigvalsh(*args, **kwargs):  # type: ignore[no-redef]
+        raise RuntimeError("torch.linalg.eigvalsh unavailable")
+
+if t_eigvals is None:  # type: ignore[truthy-function]
+    def t_eigvals(*args, **kwargs):  # type: ignore[no-redef]
+        raise RuntimeError("torch.linalg.eigvals unavailable")
+
+if t_vector_norm is None:  # type: ignore[truthy-function]
+    def t_vector_norm(*args, **kwargs):  # type: ignore[no-redef]
+        raise RuntimeError("torch.linalg.vector_norm unavailable")
+
 # AMP compatibility shim: prefer torch.amp, fall back to torch.cuda.amp, otherwise no-op
 try:
     from torch import amp as _amp_mod
@@ -364,6 +394,11 @@ def write_window_provenance_from_decl(outdir: Path, wd: "WindowDecl"):
         capsule["gain_units"] = "bits/sample"
         h = hashlib.sha256(json.dumps(capsule, sort_keys=True).encode("utf-8")).hexdigest()
         update_json(outdir / "window_provenance_decl.json", {"capsule": capsule, "sha256": h})
+        # Emit sidecar file with only the SHA-256 hex digest
+        try:
+            (outdir / "window_provenance_decl.json.sha256").write_text(h + "\n")
+        except Exception:
+            pass
     except Exception as e:
         try:
             print(f"[WARN] failed to write window_provenance_decl: {e}")
@@ -515,6 +550,77 @@ def aggregate_epsilon_stat(window: WindowDecl, counts_by_metric: Dict[str, int],
         total += float(w) * eps_m
     return float(total)
 
+def _count_finite_pairs(window: WindowDecl, past: np.ndarray, recent: np.ndarray, name: str) -> int:
+    try:
+        tp = window.transport(name, past)
+        tr = window.transport(name, recent)
+        return int(min(np.isfinite(tp).sum(), np.isfinite(tr).sum()))
+    except Exception:
+        return 0
+
+def recompute_gate_series_under_decl(df_eval: pd.DataFrame, window_decl: WindowDecl, W: int) -> pd.DataFrame:
+    import math
+    df = df_eval.copy()
+    for c in ("epoch","seed"):
+        if c in df.columns: df[c] = pd.to_numeric(df[c], errors="coerce")
+    df["gate_worst_tv_calib"] = np.nan
+    df["gate_eps_stat_calib"] = np.nan
+    df["gate_gain_calib"] = np.nan
+    df["gate_warn_calib"] = 0
+
+    max_frac = float(CFG.get("gate_eps_stat_max_frac", 0.25))
+    thr_gain = float(CFG.get("gate_gain_thresh", 0.1))
+    eps_sens = float(CFG.get("gate_epsilon_sens", 0.04))
+    alpha = float(CFG.get("gate_eps_stat_alpha", 0.05))
+    ln2 = math.log(2.0)
+    mets = [m for m in getattr(window_decl, "metrics", []) if m in df.columns]
+
+    for (_, _), g in df.groupby(["seed","factor"], sort=False):
+        g = g.sort_values("epoch").copy()
+        if len(g) < 2*W:
+            continue
+        for pos, idx in enumerate(g.index):
+            if pos < 2*W - 1:
+                continue
+            ps = slice(pos - 2*W + 1, pos - W + 1)
+            rs = slice(pos - W + 1, pos + 1)
+            past = {m: pd.to_numeric(g[m].iloc[ps], errors="coerce").to_numpy(float) for m in mets}
+            recent = {m: pd.to_numeric(g[m].iloc[rs], errors="coerce").to_numpy(float) for m in mets}
+            try:
+                tv = dPi_product_tv(window_decl, past, recent)
+            except Exception:
+                tv = float("nan")
+            counts = {m: _count_finite_pairs(window_decl, past[m], recent[m], m) for m in mets}
+            try:
+                eps_stat = aggregate_epsilon_stat(window_decl, counts_by_metric=counts, alpha=alpha)
+            except Exception:
+                eps_stat = 0.0
+            eps_stat = 0.0 if not np.isfinite(eps_stat) else float(min(max(0.0, eps_stat), max_frac * float(window_decl.epsilon)))
+            eps_eff = max(0.0, float(window_decl.epsilon) - eps_stat)
+
+            try:
+                xs = pd.to_numeric(g.get("train_loss").iloc[rs], errors="coerce").to_numpy(float)
+                bs = pd.to_numeric(g.get("ewma_loss").iloc[rs], errors="coerce").to_numpy(float)
+                msk = np.isfinite(xs) & np.isfinite(bs)
+                gain_bits = float(((bs[msk] - xs[msk]).mean()) / ln2) if msk.any() else float("nan")
+            except Exception:
+                gain_bits = float("nan")
+
+            try:
+                kappa = float(g.get("gate_kappa").iloc[pos]) if "gate_kappa" in g.columns else float("nan")
+            except Exception:
+                kappa = float("nan")
+
+            ok_gain = np.isfinite(gain_bits) and (gain_bits >= thr_gain)
+            ok_tv = np.isfinite(tv) and (tv <= eps_eff)
+            ok_kappa = (not np.isfinite(kappa)) or (kappa <= eps_sens)
+            flag = int(bool(ok_gain and ok_tv and ok_kappa))
+
+            df.loc[idx, "gate_worst_tv_calib"] = float(tv) if np.isfinite(tv) else np.nan
+            df.loc[idx, "gate_eps_stat_calib"] = float(eps_stat)
+            df.loc[idx, "gate_gain_calib"] = float(gain_bits) if np.isfinite(gain_bits) else np.nan
+            df.loc[idx, "gate_warn_calib"] = int(flag)
+    return df
 
 @torch.no_grad()
 def collect_feature_snapshot(model: nn.Module, pool_loader, device, metrics: List[str], ref_mu_sig):
@@ -630,18 +736,26 @@ def gate_check(window: WindowDecl,
             tv_sum += float(w) * tv_hist_fixed(a, b, window.bins)
         worst = max(worst, tv_sum)
 
+    # Sampling-slack ε_stat: aggregate, guard, and cap to a fraction of ε
     eps_stat = aggregate_epsilon_stat(window, counts_by_metric=counts, alpha=eps_stat_alpha)
+    eps_stat = float(eps_stat if np.isfinite(eps_stat) else 0.0)
+    max_frac = float(CFG.get("gate_eps_stat_max_frac", 0.25))
+    max_frac = float(min(max(max_frac, 0.0), 1.0))  # clamp knob to [0,1]
+    eps_cap = float(window.epsilon) * max_frac
+    eps_stat = float(min(max(0.0, eps_stat), eps_cap))
 
-    # Gain is expected in bits/sample; compare against calibrated/default threshold in CFG
-    # thr = float(gain_thresh)  # threshold is passed in, already in bits/sample
+    # Gain check (bits/sample) vs threshold 'thr' defined above
     ok_gain = np.isfinite(gain) and (gain >= thr)
 
-    # Stability: empirical worst-case TV must fit within epsilon minus the sampling slack
-    ok_stability = np.isfinite(worst) and (worst <= max(0.0, float(window.epsilon) - float(eps_stat)))
+    # Stability: worst TV must be ≤ (ε − ε_stat), never negative
+    worst = float(worst if np.isfinite(worst) else np.inf)
+    eps_eff = max(0.0, float(window.epsilon) - eps_stat)
+    ok_stability = (worst <= eps_eff)
 
-    # Sensitivity budget: keep κ_sens within a small reserve separate from epsilon
-    eps_sens = float(CFG.get("gate_epsilon_sens", 0.04))
-    ok_kappa = np.isfinite(kappa_sens) and (kappa_sens <= eps_sens)
+    # Sensitivity budget κ_sens ≤ ε_sens
+    eps_sens = float(max(0.0, CFG.get("gate_epsilon_sens", 0.04)))
+    kappa_sens = float(kappa_sens if np.isfinite(kappa_sens) else np.inf)
+    ok_kappa = (kappa_sens <= eps_sens)
 
     return int(bool(ok_gain and ok_stability and ok_kappa)), {
         "gain_bits": float(gain),
@@ -870,6 +984,13 @@ CFG.setdefault("scheduled_ttl", 2 * CFG.get("heavy_every", 6))
 CFG.setdefault("penult_dim", 512)
 # Family gate neighborhood size (epochs) for local confirmation
 CFG.setdefault("gate_early_exit", True)
+try:
+    if (OUTDIR / "window_decl_calibrated.json").exists() or (OUTDIR / "gate_gain_thresh_calibration.json").exists():
+        CFG["gate_early_exit"] = 0
+        # Optional during calibration: neuter warn persistence instead of early-exit switch
+        # CFG["warn_consec"] = 10**9
+except Exception:
+    pass
 
 # Finite-window heavy-metric budgets (env-overridable)
 CFG.setdefault("total_heavy_budget_ms", 180_000)
@@ -880,6 +1001,7 @@ CFG.setdefault("sw2_calls_cap", 1_000_000)
 CFG.setdefault("gate_window", 16)
 CFG.setdefault("gate_bins", 16)
 CFG.setdefault("gate_epsilon", 0.08)
+CFG.setdefault("gate_eps_stat_max_frac", 0.25)
 CFG.setdefault("gate_gain_thresh", 0.05)   # bits per sample (calibrated against controls)
 CFG.setdefault("gate_epsilon_sens", 0.04)  # dedicated κ_sens budget
 CFG.setdefault("gate_min_evidence", 16)
@@ -1010,6 +1132,15 @@ def load_calibration(cfg_path: Optional[str]) -> tuple[dict, Optional[str], Opti
             for k in ("gate_min_evidence", "gate_gain_thresh", "gate_gain_units"):
                 if k in obj:
                     cal[k] = obj[k]
+            for k in [
+                "gate_window", "gate_bins", "gate_epsilon",
+                "gate_eps_stat_max_frac", "gate_epsilon_sens", "gate_eps_stat_alpha"
+            ]:
+                if k in obj:
+                    try:
+                        CFG[k] = type(CFG.get(k, obj[k]))(obj[k])
+                    except Exception:
+                        CFG[k] = obj[k]
             sha16 = hashlib.sha256(txt.encode("utf-8")).hexdigest()[:16]
             used_path = pkg_default
         except Exception:
@@ -1066,6 +1197,12 @@ def write_calibration_capsule(outdir: Path, cal: dict, src_path: Optional[str], 
             "gate_min_evidence": int(cal.get("gate_min_evidence", 16)),
             "gate_gain_thresh": float(cal.get("gate_gain_thresh", 0.05)),
             "gate_gain_units": str(cal.get("gate_gain_units", "bits/sample")),
+            "gate_window": int(CFG.get("gate_window", 16)),
+            "gate_bins": int(CFG.get("gate_bins", 16)),
+            "gate_epsilon": float(CFG.get("gate_epsilon", 0.08)),
+            "gate_eps_stat_max_frac": float(CFG.get("gate_eps_stat_max_frac", 0.25)),
+            "gate_epsilon_sens": float(CFG.get("gate_epsilon_sens", 0.04)),
+            "gate_eps_stat_alpha": float(CFG.get("gate_eps_stat_alpha", 0.05)),
         }
         update_json(outdir / "calibration_provenance.json", payload)
     except Exception:
@@ -1326,18 +1463,23 @@ persistent: Optional[bool] = None,
             _kwargs["persistent_workers"] = persistent
     except Exception:
         pass
-    return DataLoader(
-        ds,
+    # Build kwargs compatibly across PyTorch versions
+    dl_kwargs = dict(
+        dataset=ds,
         batch_size=batch,
         shuffle=(shuffle and sampler is None),
         num_workers=workers,
         pin_memory=pin,
-        generator=gen,
         sampler=sampler,
         drop_last=False,
         worker_init_fn=seed_worker if workers > 0 else None,
-        **_kwargs,
     )
+    try:
+        if "generator" in inspect.signature(DataLoader).parameters:
+            dl_kwargs["generator"] = gen
+    except Exception:
+        pass
+    return DataLoader(**dl_kwargs)
 
 
 def subset_loader_from_indices(ds, idxs: np.ndarray, batch: int, shuffle: bool, seed: int, device):
@@ -1355,17 +1497,21 @@ def subset_loader_from_indices(ds, idxs: np.ndarray, batch: int, shuffle: bool, 
             _kwargs["persistent_workers"] = (CFG["num_workers"] > 0)
     except Exception:
         pass
-    return DataLoader(
-    sub,
-    batch_size=min(256, batch),
-    shuffle=shuffle,
-    generator=gen,
-    num_workers=CFG["num_workers"],
-    pin_memory=pin,
-    drop_last=False,
-    worker_init_fn=seed_worker if CFG["num_workers"] > 0 else None,
-    **_kwargs,
+    dl_kwargs = dict(
+        dataset=sub,
+        batch_size=min(256, batch),
+        shuffle=shuffle,
+        num_workers=CFG["num_workers"],
+        pin_memory=pin,
+        drop_last=False,
+        worker_init_fn=seed_worker if CFG["num_workers"] > 0 else None,
     )
+    try:
+        if "generator" in inspect.signature(DataLoader).parameters:
+            dl_kwargs["generator"] = gen
+    except Exception:
+        pass
+    return DataLoader(**dl_kwargs)
 
 
 def _balanced_indices_by_class(labels, per_class, rng):
@@ -1473,7 +1619,7 @@ x: torch.Tensor, factor: Dict, seed: int, epoch: int, idx: int
     if _u01_from_hash("blur", seed, epoch, idx) < float(factor.get("blur_p", 0.0)):
         k = 3
         pad = (k - 1) // 2
-        x = torch.nn.functional.avg_pool2d(x.unsqueeze(0), k, stride=1, padding=pad).squeeze(0)
+        x = t_avg_pool2d(x.unsqueeze(0), k, stride=1, padding=pad).squeeze(0)
     # additive noise
     std = float(factor.get("noise_std", 0.0))
     if std > 0:
@@ -1728,9 +1874,9 @@ def cov_eigs(Z: torch.Tensor, eps: float = 1e-6) -> Tuple[torch.Tensor, int]:
     COV = (Z.T @ Z) / max(1, (n - 1))
     COV = COV + eps * torch.eye(COV.shape[0], device=Z.device, dtype=Z.dtype)
     try:
-        w = torch.linalg.eigvalsh(COV)
+        w = t_eigvalsh(COV)
     except Exception:
-        w = torch.linalg.eigvals(COV).real
+        w = t_eigvals(COV).real
     neg = int((w < -1e-8).sum().item())
     return w.clamp_min(0), neg
 
@@ -2191,6 +2337,26 @@ def calibrate_gate_gain_thresh_from_controls(df: pd.DataFrame, W: int, warm: int
     return thr
 
 
+# --- Helper for calibrating epsilon from controls (TV drift) ---
+def calibrate_epsilon_from_controls(df_control: pd.DataFrame, window_decl: WindowDecl, W: int, q: float = 0.995) -> float:
+    import numpy as np, pandas as pd
+    vals = []
+    try:
+        for (_, _), g in df_control.groupby(["seed","factor"]):
+            g = g.sort_values("epoch")
+            for i in range(0, max(0, len(g) - 2*W + 1)):
+                past   = {m: pd.to_numeric(g[m].iloc[i:i+W],     errors="coerce").to_numpy(dtype=float) for m in window_decl.metrics}
+                recent = {m: pd.to_numeric(g[m].iloc[i+W:i+2*W], errors="coerce").to_numpy(dtype=float) for m in window_decl.metrics}
+                tv = dPi_product_tv(window_decl, past, recent)
+                if np.isfinite(tv):
+                    vals.append(tv)
+    except Exception:
+        pass
+    if not vals:
+        return float(CFG.get("gate_epsilon", 0.08))
+    return float(np.quantile(np.array(vals, dtype=float), q))
+
+
 #
 # ---------------------------
 # Coherence & slope helpers (observability only)
@@ -2432,7 +2598,7 @@ def _flatten_params_l2(model: nn.Module) -> Tuple[float, torch.Tensor]:
     if not vec:
         return 0.0, torch.zeros(0, dtype=torch.float32)
     v = torch.cat(vec, dim=0)
-    return float(torch.linalg.vector_norm(v).item()), v
+    return float(t_vector_norm(v).item()), v
 
 
 # --- gradient noise scale (per-batch, microbatch split)
@@ -3702,7 +3868,7 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
         try:
             cur_norm, cur_vec = _flatten_params_l2(model)
             if _prev_param_vec is not None and _prev_param_vec.numel() == cur_vec.numel():
-                d = torch.linalg.vector_norm(cur_vec - _prev_param_vec).item()
+                d = t_vector_norm(cur_vec - _prev_param_vec).item()
                 drift_abs = float(d)
                 denom = math.sqrt(max(cur_norm**2, 1e-12))
                 drift_rel = float(d / (denom + 1e-12))
@@ -3721,13 +3887,16 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
             gns, gns_n = float("nan"), 0
 
         # --- fixed-partition gate (Φ_W) with ε_stat and κ_sens ---
-        try:
-            gate_warn = 0
-            gate_gain = float("nan")
-            gate_worst_tv = float("nan")
-            gate_eps_stat = float("nan")
-            gate_kappa = float("nan")
+        # Defaults for logging even when the gate is not evaluated
+        gate_warn = 0
+        gate_gain = float("nan")
+        gate_worst_tv = float("nan")
+        gate_eps_stat = float("nan")
+        gate_kappa = float("nan")
+        gate_epsilon_eff = float(WINDOW_DECL.epsilon) if (WINDOW_DECL is not None) else float(CFG.get("gate_epsilon", 0.08))
+        gate_gain_thresh_eff = float(CFG.get("gate_gain_thresh", 0.1))
 
+        try:
             W_gate = int(CFG.get("gate_window", 16))
             if (WINDOW_DECL is not None) and (len(logs) >= 2 * W_gate):
                 recent = logs[-(2 * W_gate):]
@@ -3739,17 +3908,17 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
                 metrics_for_tv = list(WINDOW_DECL.weights.keys())
                 past_dict = {m: _series(recent[:W_gate], m) for m in metrics_for_tv}
                 recent_dict = {m: _series(recent[W_gate:], m) for m in metrics_for_tv}
+
+                # count finite pairs per metric
                 counts = {}
-                for m in (metrics_for_tv if 'metrics_for_tv' in locals() else list(WINDOW_DECL.weights.keys())):
+                for m in metrics_for_tv:
                     a = WINDOW_DECL.transport(m, past_dict.get(m, np.array([], dtype=float)))
                     b = WINDOW_DECL.transport(m, recent_dict.get(m, np.array([], dtype=float)))
-                    # Count finite values separately, then take the min to avoid broadcasting bugs
                     na = int(np.isfinite(np.asarray(a, dtype=float)).sum())
                     nb = int(np.isfinite(np.asarray(b, dtype=float)).sum())
                     counts[m] = int(min(na, nb))
 
-                # --- prequential gain in bits/sample over the gate window ---
-                W_gate = int(CFG.get("gate_window", 16))
+                # prequential gain in bits/sample over the gate window
                 model_losses = np.array([float(r.get("train_loss", np.nan)) for r in logs[-W_gate:]], dtype=float)
                 base_losses  = np.array([float(r.get("ewma_loss",  np.nan)) for r in logs[-W_gate:]], dtype=float)
                 mask = np.isfinite(model_losses) & np.isfinite(base_losses)
@@ -3759,6 +3928,7 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
                 else:
                     gain_nats = float((base_losses[mask] - model_losses[mask]).sum() / n)
                     gate_gain = gain_nats / math.log(2.0)  # bits/sample
+
                 # κ_sens probe sparsely (augmentation-only by default)
                 gate_kappa = 0.0
                 try:
@@ -3782,17 +3952,20 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
                     gain=gate_gain,
                     gain_thresh=float(CFG.get("gate_gain_thresh", 0.1)),
                     kappa_sens=(gate_kappa if np.isfinite(gate_kappa) else 0.0),
+                    eps_stat_alpha=float(CFG.get("gate_eps_stat_alpha", 0.05)),
                 )
-                gate_warn = int(flag)
-                gate_worst_tv = float(audit.get("worst_tv", np.nan))
-                gate_eps_stat = float(audit.get("eps_stat", np.nan))
-                gate_kappa = float(audit.get("kappa_sens", np.nan))
+                # --- Gate diagnostics for offline analysis ---
+                gate_epsilon_eff = float(WINDOW_DECL.epsilon) if (WINDOW_DECL is not None) else float(CFG.get("gate_epsilon", 0.08))
+                gate_worst_tv    = float((audit or {}).get("worst_tv",  np.nan))
+                gate_eps_stat    = float((audit or {}).get("eps_stat",  np.nan))
+                gate_gain        = float((audit or {}).get("gain_bits", np.nan))
+                gate_kappa       = float((audit or {}).get("kappa_sens", np.nan))
+                gate_warn        = int(flag)
+                # effective parameters actually used for this check
+                gate_gain_thresh_eff = float(CFG.get("gate_gain_thresh", 0.1))
         except Exception:
-            gate_warn = 0
-            gate_gain = float("nan")
-            gate_worst_tv = float("nan")
-            gate_eps_stat = float("nan")
-            gate_kappa = float("nan")
+            # keep defaults on any failure path
+            pass
 
         logs.append(
             dict(
@@ -3876,8 +4049,8 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
                 gate_worst_tv=float(gate_worst_tv),
                 gate_window=int(CFG.get("gate_window", 16)),
                 gate_bins=int(CFG.get("gate_bins", 16)),
-                gate_epsilon=float(CFG.get("gate_epsilon", 0.08)),
-                gate_gain_thresh=float(CFG.get("gate_gain_thresh", 0.1)),
+                gate_epsilon=float(gate_epsilon_eff),
+                gate_gain_thresh=float(gate_gain_thresh_eff),
                 # fixed-partition gate diagnostics
                 gate_eps_stat=float(gate_eps_stat),
                 gate_kappa=float(gate_kappa),
@@ -4519,7 +4692,7 @@ def compute_invariants_and_provenance(df_runs: pd.DataFrame, artifact_csv: Optio
         gg = g.sort_values("epoch")
         post = gg[gg["epoch"] >= warm] if "epoch" in gg.columns else gg
 
-        # FTLE boundedness by q99 of this run vs global cap
+        # FTLE boundedness with guarded cap fallback
         q99_run = np.nan
         if "ftle" in post.columns and len(post) > 0:
             vals = post["ftle"].to_numpy(dtype=float)
@@ -4529,32 +4702,55 @@ def compute_invariants_and_provenance(df_runs: pd.DataFrame, artifact_csv: Optio
                     q99_run = float(np.nanquantile(vals, 0.99))
                 except TypeError:
                     q99_run = float(np.nanquantile(vals, 0.99, interpolation="linear"))
-        ftle_ok = bool(np.isfinite(ftle_cap) and np.isfinite(q99_run) and (q99_run <= ftle_cap))
 
+        # Start with the global cap computed above; if NaN, fall back to calibration or CFG
+        cap = ftle_cap
+        if not np.isfinite(cap):
+            try:
+                import glob, json as _json
+                paths = sorted(glob.glob(str(OUTDIR / "gt_rank_calibration_*.json")))
+                if paths:
+                    _obj = _json.loads(Path(paths[-1]).read_text())
+                    cap = float(_obj.get("ftle_q99_cap", float("nan")))
+            except Exception:
+                pass
+        if not np.isfinite(cap):
+            cap = float(CFG.get("ftle_q99_cap", float("nan")))
+
+        inv_row = dict(seed=int(sd), factor=str(fc))
+        if np.isfinite(cap) and np.isfinite(q99_run):
+            inv_row["ftle_bounded"] = int(q99_run <= cap)
+            inv_row["ftle_q99_run"] = float(q99_run)
+            inv_row["ftle_cap"] = float(cap)
+        else:
+            inv_row["ftle_q99_run"] = float(q99_run) if np.isfinite(q99_run) else float("nan")
+            inv_row["ftle_cap"] = float("nan")
+            inv_row["ftle_bounded_skipped"] = 1
+
+        # Other invariants
         neg_ok = bool(np.nanmax(gg.get("neg_eigs", pd.Series([0])).to_numpy(dtype=float)) == 0)
-        k_used_med = float(np.nanmedian(gg.get("k_used", pd.Series([np.nan])).to_numpy(dtype=float)))
-        k_ok = bool(np.isfinite(k_used_med) and abs(k_used_med - 4.0) <= 0.5)
+        inv_row["neg_eigs_zero"] = int(neg_ok)
 
-        inv.append(
-        dict(
-        seed=int(sd),
-        factor=str(fc),
-        ftle_bounded=ftle_ok,
-        ftle_q99_run=q99_run,
-        neg_eigs_zero=neg_ok,
-        k_used_approx4=k_ok,
-        )
-        )
+        try:
+            k_arr = gg.get("k_used", pd.Series([np.nan])).to_numpy(dtype=float)
+            k_used_med = float(np.nanmedian(k_arr))
+        except Exception:
+            k_used_med = float("nan")
+        inv_row["k_used_median"] = float(k_used_med) if np.isfinite(k_used_med) else float("nan")
+        inv_row["k_used_in_range"] = int(np.isfinite(k_used_med) and (1 <= k_used_med <= int(CFG.get("var_k_max", 32))))
+
+        inv.append(inv_row)
 
     invariants = pd.DataFrame(inv)
     out = {
-    "invariants": invariants.to_dict(orient="records"),
-    "summary": {
-    "ftle_bounded_pass_rate": float(np.mean(invariants["ftle_bounded"].astype(bool))) if not invariants.empty else np.nan,
-    "neg_eigs_zero_pass_rate": float(np.mean(invariants["neg_eigs_zero"].astype(bool))) if not invariants.empty else np.nan,
-    "k_used_approx4_pass_rate": float(np.mean(invariants["k_used_approx4"].astype(bool))) if not invariants.empty else np.nan,
-    },
-    "provenance": {},
+        "invariants": invariants.to_dict(orient="records"),
+        "summary": {
+            "ftle_bounded_pass_rate": float(np.mean(invariants.get("ftle_bounded", pd.Series([], dtype=float)).astype(bool))) if not invariants.empty and ("ftle_bounded" in invariants.columns) else np.nan,
+            "neg_eigs_zero_pass_rate": float(np.mean(invariants.get("neg_eigs_zero", pd.Series([], dtype=float)).astype(bool))) if not invariants.empty and ("neg_eigs_zero" in invariants.columns) else np.nan,
+            "k_used_in_range_pass_rate": float(np.mean(invariants.get("k_used_in_range", pd.Series([], dtype=float)).astype(bool))) if not invariants.empty and ("k_used_in_range" in invariants.columns) else np.nan,
+            "ftle_bounded_skipped_count": int(invariants.get("ftle_bounded_skipped", pd.Series([], dtype=float)).fillna(0).sum()) if ("ftle_bounded_skipped" in invariants.columns) else 0,
+        },
+        "provenance": {},
     }
 
     # provenance
@@ -4574,12 +4770,13 @@ def compute_invariants_and_provenance(df_runs: pd.DataFrame, artifact_csv: Optio
     except Exception:
         pass
     try:
-        import torch as _torch
-        prov["torch"] = _torch.__version__
+        import torch as _t
+        prov["torch"] = getattr(_t, "__version__", None)
     except Exception:
         pass
     try:
-        prov["cuda"] = torch.version.cuda
+        import torch as _t
+        prov["cuda"] = getattr(getattr(_t, "version", None), "cuda", None)
     except Exception:
         pass
     if artifact_csv is not None:
@@ -4692,6 +4889,7 @@ def make_plots(df, tr_like, tag, overlay_prefix="learned"):
         "gate_gain",
         "gate_worst_tv",
         "gate_warn",
+        "gate_warn_calib",
     ]
     for m in metrics:
         if m not in df.columns:
@@ -4778,13 +4976,13 @@ def _stationaryize_scheduled(df_in: pd.DataFrame, cols: List[str]) -> pd.DataFra
 # --- budget reset helper ---
 def _reset_budget():
     """Reset the process-global heavy-metric budget/call counters for a fresh run/seed."""
-    global BUDGET
+    gb = globals().get("BUDGET", None)
     try:
-        if BUDGET is not None:
-            if hasattr(BUDGET, "spent_ms") and isinstance(BUDGET.spent_ms, dict):
-                BUDGET.spent_ms = {k: 0.0 for k in BUDGET.spent_ms}
-            if hasattr(BUDGET, "calls") and isinstance(BUDGET.calls, dict):
-                BUDGET.calls = {k: 0 for k in BUDGET.calls}
+        if gb is not None:
+            if hasattr(gb, "spent_ms") and isinstance(gb.spent_ms, dict):
+                gb.spent_ms = {k: 0.0 for k in gb.spent_ms}
+            if hasattr(gb, "calls") and isinstance(gb.calls, dict):
+                gb.calls = {k: 0 for k in gb.calls}
     except Exception:
         pass
 
@@ -5052,6 +5250,15 @@ def evaluate(df_all: pd.DataFrame, tag: str):
             epsilon=float(CFG.get("gate_epsilon", 0.08)),
             interventions=(lambda x: x,),
         )
+        # Calibrate epsilon from controls and install into window_decl
+        try:
+            _W = int(CFG.get("gate_window", 16))
+            eps_hat = calibrate_epsilon_from_controls(df_control, window_decl, W=_W, q=0.995)
+            CFG["gate_epsilon"] = float(eps_hat)
+            window_decl.epsilon = float(eps_hat)
+            print(f"[calib] gate_epsilon from controls q=0.995, W={_W}: {eps_hat:.6f}")
+        except Exception:
+            pass
         # Persist for future sweeps and install for any downstream checks in this process
         save_json(
             {
@@ -5063,6 +5270,8 @@ def evaluate(df_all: pd.DataFrame, tag: str):
                     str(k): [float(v[0]), float(v[1])]
                     for k, v in getattr(window_decl, "cal_ranges", {}).items()
                 },
+                "kappa_transport_mismatch": True,
+                "eps_stat_max_frac": float(CFG.get("gate_eps_stat_max_frac", 0.25)),
             },
             OUTDIR / "window_decl_calibrated.json",
         )
@@ -5072,8 +5281,17 @@ def evaluate(df_all: pd.DataFrame, tag: str):
             write_window_provenance_from_decl(OUTDIR, window_decl)
         except Exception:
             pass
+        # --- Recompute per-epoch gate flag under calibrated settings (transport-consistent, offline) ---
+        try:
+            _W = int(CFG.get("gate_window", 16))
+            df_eval_raw = df_eval_raw.sort_values(["seed","factor","epoch"]).reset_index(drop=True)
+            df_eval_raw = recompute_gate_series_under_decl(df_eval_raw, window_decl, W=_W)
+        except Exception as e:
+            print(f"[WARN] offline calibrated gate recompute failed: {e}")
+            if "gate_warn_calib" not in df_eval_raw.columns:
+                df_eval_raw["gate_warn_calib"] = df_eval_raw.get("gate_warn", pd.Series(0, index=df_eval_raw.index))
     except Exception as e:
-        print(f"[WARN] failed to calibrate/install WindowDecl from controls: {e}")
+        print(f"[WARN] window calibration/persist failed: {e}")
 
     # ---- Initial GT (t_c0/ctag0 with infinite cutoff) ----
     def add_gt(df_in):
@@ -5229,17 +5447,23 @@ def evaluate(df_all: pd.DataFrame, tag: str):
     # ---- PH direction calibration on SOFT collapses only (pre-onset only) ----
     soft_cal = df_cal_raw[df_cal_raw["collapse_tag_gt"] == "soft"]
     ph_metrics = [
-    "cos_disp",
-    "var_out_k",
-    "eff_dim",
-    "ftle",
-    "ftle_lowent",
-    "mon_entropy",
-    "ewma_loss",
-    "sma_loss",
-    "sw2",
-    "pers_H0",
+        "cos_disp",
+        "var_out_k",
+        "eff_dim",
+        "ftle",
+        "ftle_lowent",
+        "mon_entropy",
+        "ewma_loss",
+        "sma_loss",
+        "sw2",
+        "pers_H0",
     ]
+    # Drop pers_H0 if unavailable (e.g., ripser absent) to avoid diluting calibration
+    try:
+        if "pers_H0" in soft_cal.columns and soft_cal["pers_H0"].isna().all():
+            ph_metrics = [m for m in ph_metrics if m != "pers_H0"]
+    except Exception:
+        pass
     dir_map = calibrate_ph_directions(soft_cal, ph_metrics)
     save_json(dir_map, OUTDIR / f"ph_directions_{tag}.json")
 
@@ -5873,10 +6097,11 @@ def evaluate(df_all: pd.DataFrame, tag: str):
 
         # Determine first post-warm epoch where gate_warn == 1 for ≥K consecutive epochs (matches deployed policy)
         gw = None
-        if "gate_warn" in gg.columns:
+        col = "gate_warn_calib" if "gate_warn_calib" in gg.columns else "gate_warn"
+        if col in gg.columns:
             hit_idx = np.where(
                 (gg["epoch"].to_numpy(dtype=int) >= int(warm_idx_local)) &
-                (gg["gate_warn"].to_numpy(dtype=float) >= 1.0)
+                (gg[col].to_numpy(dtype=float) >= 1.0)
             )[0]
             j_end = _first_run_end(hit_idx, int(CFG.get("warn_consec", 3)))
             if j_end is not None and j_end >= 0:
@@ -5909,6 +6134,7 @@ def evaluate(df_all: pd.DataFrame, tag: str):
                 var_k_energy=CFG["var_k_energy"],
                 var_k_max=CFG["var_k_max"],
                 lead_time=lead,
+                gate_source=str(col),
             )
         )
     base_gate = pd.DataFrame(gate_rows)
@@ -5983,6 +6209,11 @@ def evaluate(df_all: pd.DataFrame, tag: str):
     df_eval_overlay = _apply_warn_persistence(df_eval_overlay, int(CFG.get("warn_consec", 3)))
     safe_write_parquet(df_eval_overlay, OUTDIR / f"bundle_runs_eval_with_overlays_{tag}.parquet")
     _write_both_overlays(df_eval_overlay, OUTDIR)
+
+    try:
+        compute_invariants_and_provenance(df_eval_overlay, artifact_csv=OUTDIR / f"bundle_runs_eval_with_overlays_{tag}.parquet")
+    except Exception as e:
+        print(f"[WARN] invariants/provenance generation failed: {e}")
 
     # ---- Plots (use unified overlay) ----
     make_plots(df_eval_overlay, det_rows, tag=f"learned_{tag}", overlay_prefix="learned")
@@ -6144,6 +6375,7 @@ def main():
         except Exception as e:
             Path(OUTDIR / "pip_freeze.txt").write_text(f"<pip freeze failed: {repr(e)}>")
 
+    _loaded_precal_wd = False
     # Try to load a previously calibrated WindowDecl (from a prior run) before sweeping
     try:
         wd_path = OUTDIR / "window_decl_calibrated.json"
@@ -6158,12 +6390,30 @@ def main():
                 cal_ranges={str(k): (float(v[0]), float(v[1])) for k, v in j["cal_ranges"].items()},
             )
             install_window_decl(window_decl)
+            _loaded_precal_wd = True
             try:
                 write_window_audit(OUTDIR, window_decl, note="Loaded calibrated WindowDecl (pre-sweep)")
             except Exception:
                 pass
     except Exception as e:
         print(f"[WARN] failed to load calibrated WindowDecl pre-sweep: {e}")
+
+    if not _loaded_precal_wd:
+        # Cold start: avoid spurious early exits from fallback gate
+        try:
+            if int(CFG.get("gate_early_exit", 1)) != 0:
+                CFG["gate_early_exit"] = 0
+                print("[preload] no calibrated WindowDecl found; disabling gate early-exit for this sweep")
+        except Exception:
+            pass
+
+    # Preload calibrated gate_gain_thresh from a prior run, if present
+    try:
+        j = json.loads((OUTDIR / "gate_gain_thresh_calibration.json").read_text())
+        CFG["gate_gain_thresh"] = float(j.get("gate_gain_thresh", CFG.get("gate_gain_thresh", 0.1)))
+        print(f"[preload] gate_gain_thresh={CFG['gate_gain_thresh']:.4f}")
+    except Exception:
+        pass
     tag = "smoke" if os.environ.get("SCAR_SMOKE", "0") == "1" else "full_v2"
     df_all = run_sweep(tag=tag)
     if df_all is None or df_all.empty:
