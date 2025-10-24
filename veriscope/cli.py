@@ -801,6 +801,39 @@ try:
                 raise RuntimeError(f"OUTDIR {OUTDIR} appears to be from a different phase: {sentinel_tag}")
 except Exception:
     pass
+# --- Calibration hard-declare & launch markers (env-driven) ---
+try:
+    if mp.current_process().name == "MainProcess":
+        _calib_env = str(os.environ.get("SCAR_CALIB", "0")).strip()
+        _CALIBRATION_ACTIVE = _calib_env in ("1", "true", "TRUE", "yes", "on")
+        _meta = {
+            "ts": time.time(),
+            "calibration": bool(_CALIBRATION_ACTIVE),
+            "veriscope_version": "0.1.0",
+            "pid": int(os.getpid()),
+            "host": os.uname().nodename if hasattr(os, "uname") else "",
+            "env": {
+                "SCAR_OUTDIR": os.environ.get("SCAR_OUTDIR", ""),
+                "SCAR_DATA": os.environ.get("SCAR_DATA", ""),
+                "SCAR_SMOKE": os.environ.get("SCAR_SMOKE", ""),
+                "SCAR_CALIB": os.environ.get("SCAR_CALIB", ""),
+            },
+        }
+        # Persist launch metadata atomically
+        save_json(_meta, OUTDIR / "launch.json")
+        if _CALIBRATION_ACTIVE:
+            # Touch a simple marker and log an explicit line for early visibility
+            try:
+                (OUTDIR / "calibration.marker").write_text("calibration=true\n")
+            except Exception:
+                pass
+            try:
+                with open(OUTDIR / "sweep.log", "a") as _lg:
+                    print("[calib] hard override active; locked calibration mode declared at launch.", file=_lg, flush=True)
+            except Exception:
+                pass
+except Exception:
+    pass
 DATA_ROOT = os.environ.get("SCAR_DATA", "./data")
 
 C = 10  # CIFAR-10 classes
@@ -1156,6 +1189,16 @@ def load_calibration(cfg_path: Optional[str]) -> tuple[dict, Optional[str], Opti
                 for k in ("gate_min_evidence", "gate_gain_thresh", "gate_gain_units"):
                     if k in obj:
                         cal[k] = obj[k]
+                # Allow user JSON to set the same CFG pointers as the packaged default
+                for k in [
+                    "gate_window", "gate_bins", "gate_epsilon",
+                    "gate_eps_stat_max_frac", "gate_epsilon_sens", "gate_eps_stat_alpha"
+                ]:
+                    if k in obj:
+                        try:
+                            CFG[k] = type(CFG.get(k, obj[k]))(obj[k])
+                        except Exception:
+                            CFG[k] = obj[k]
                 sha16 = hashlib.sha256(txt.encode("utf-8")).hexdigest()[:16]
                 used_path = user_p
             except Exception:
@@ -1220,6 +1263,57 @@ try:
         pass
     if mp.current_process().name == "MainProcess":
         print(f"[cal] min_evidence={CFG['gate_min_evidence']} gain_thresh={CFG['gate_gain_thresh']:.3f} ({CFG['gate_gain_units']})")
+    # Reapply environment overrides LAST so they win over any preloads
+    try:
+        v = os.environ.get("SCAR_GATE_MIN_EVIDENCE")
+        if v is not None:
+            try:
+                CFG["gate_min_evidence"] = int(v)
+                if mp.current_process().name == "MainProcess":
+                    print(f"[env] gate_min_evidence={CFG['gate_min_evidence']}")
+            except Exception as _e:
+                if mp.current_process().name == "MainProcess":
+                    print(f"[WARN] bad SCAR_GATE_MIN_EVIDENCE={v!r}: {_e}")
+        v = os.environ.get("SCAR_GATE_GAIN_THRESH")
+        if v is not None:
+            try:
+                CFG["gate_gain_thresh"] = float(v)
+                if mp.current_process().name == "MainProcess":
+                    print(f"[env] gate_gain_thresh={CFG['gate_gain_thresh']:.4f}")
+            except Exception as _e:
+                if mp.current_process().name == "MainProcess":
+                    print(f"[WARN] bad SCAR_GATE_GAIN_THRESH={v!r}: {_e}")
+        v = os.environ.get("SCAR_GATE_GAIN_UNITS")
+        if v is not None:
+            CFG["gate_gain_units"] = str(v)
+            if mp.current_process().name == "MainProcess":
+                print(f"[env] gate_gain_units={CFG['gate_gain_units']!r}")
+    except Exception:
+        pass
+    # Emit a simple precedence summary for auditability
+    try:
+        _prec = {
+            "calibration_loaded_from": _cal_path or "",
+            "env": {
+                "SCAR_GATE_MIN_EVIDENCE": os.environ.get("SCAR_GATE_MIN_EVIDENCE", ""),
+                "SCAR_GATE_GAIN_THRESH": os.environ.get("SCAR_GATE_GAIN_THRESH", ""),
+                "SCAR_GATE_GAIN_UNITS": os.environ.get("SCAR_GATE_GAIN_UNITS", ""),
+            },
+            "final": {
+                "gate_min_evidence": int(CFG.get("gate_min_evidence", 16)),
+                "gate_gain_thresh": float(CFG.get("gate_gain_thresh", 0.05)),
+                "gate_gain_units": str(CFG.get("gate_gain_units", "bits/sample")),
+                "gate_window": int(CFG.get("gate_window", 16)),
+                "gate_bins": int(CFG.get("gate_bins", 16)),
+                "gate_epsilon": float(CFG.get("gate_epsilon", 0.08)),
+                "gate_eps_stat_max_frac": float(CFG.get("gate_eps_stat_max_frac", 0.25)),
+                "gate_epsilon_sens": float(CFG.get("gate_epsilon_sens", 0.04)),
+                "gate_eps_stat_alpha": float(CFG.get("gate_eps_stat_alpha", 0.05)),
+            },
+        }
+        save_json(_prec, OUTDIR / "precedence_summary.json")
+    except Exception:
+        pass
 except Exception as e:
     try:
         print(f"[WARN] calibration load failed: {e!r}; using defaults")
@@ -1244,10 +1338,18 @@ try:
 except Exception:
     pass
 
+
 # Persist the finite-window provenance alongside repro info
 try:
     if (mp.current_process().name == "MainProcess") and (BUDGET is not None):
         write_window_provenance(OUTDIR, DEFAULT_WINDOW, CFG, BUDGET.lim)
+except Exception:
+    pass
+# Echo calibration state to stdout once
+try:
+    if mp.current_process().name == "MainProcess":
+        if str(os.environ.get("SCAR_CALIB", "0")).strip() in ("1", "true", "TRUE", "yes", "on"):
+            print("[calib] launch declared in calibration mode (SCAR_CALIB=1). Locked keys should be respected by drivers.")
 except Exception:
     pass
 

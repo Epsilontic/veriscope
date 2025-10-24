@@ -13,14 +13,9 @@
   "gate_gain_units": "bits/sample",
 
   "gate_epsilon": 0.16,
-  "gate_epsilon_q": 0.995,
   "gate_eps_stat_max_frac": 0.25,
   "gate_epsilon_sens": 0.04,
   "gate_eps_stat_alpha": 0.05,
-
-  "warm_epochs": 2,
-
-  "window_decl_hash": "<fill_from_outdir/window_provenance_decl.json.sha256>",
 
   "notes": "Calibrated on /runs/veriscope_20251014-1605/veriscope/scar_bundle_phase4; ε from controls at q=0.995 for W=16,bins=16; τ_gain from controls; values valid only for W=16,bins=16."
 }
