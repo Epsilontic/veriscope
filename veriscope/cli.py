@@ -40,16 +40,46 @@ from typing import Any, Dict, List, Optional, Tuple
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import torch
+import torchvision
+import torch.multiprocessing as mp
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Sampler, Subset
+from torchvision import transforms
+import traceback
 
 try:
     from filelock import FileLock
 except Exception:
     FileLock = None  # graceful fallback if filelock isn't installed
+    
+# --- local, atomic JSON writer to avoid missing-import footguns ---
+def save_json(obj, path):
+    """Atomic JSON write with indentation."""
+    p = Path(path)
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+    def _jsonable(o):
+        try:
+            json.dumps(o)
+            return o
+        except Exception:
+            if isinstance(o, torch.device):
+                return str(o)
+            return str(o)
+
+    if isinstance(obj, dict):
+        obj = {k: _jsonable(v) for k, v in obj.items()}
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    tmp.write_text(json.dumps(obj, indent=2))
+    os.replace(tmp, p)
 
 # Ensure deterministic cuBLAS workspace is configured before torch/cuBLAS init (CUDA 11.x/12.x)
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
-import torch
-import torchvision
 
 # Strict determinism hygiene: disable TF32 matmul/cudnn paths
 try:
@@ -64,14 +94,12 @@ try:
     torch.set_num_interop_threads(1)
 except Exception:
     pass
-import torch.multiprocessing as mp
-import torch.nn as nn
-import torch.nn.functional as F
-
 
 # --- explicit functional imports to satisfy static checkers and provide stable callables ---
 try:
-    from torch.linalg import eigvalsh as t_eigvalsh, eigvals as t_eigvals, vector_norm as t_vector_norm
+    from torch.linalg import eigvals as t_eigvals
+    from torch.linalg import eigvalsh as t_eigvalsh
+    from torch.linalg import vector_norm as t_vector_norm
 except Exception:  # pragma: no cover
     t_eigvalsh = None  # type: ignore[assignment]
     t_eigvals = None  # type: ignore[assignment]
@@ -140,16 +168,10 @@ except Exception:
             amp = _AmpShim()
 else:
     amp = _amp_mod
-from torch.utils.data import DataLoader, Sampler, Subset
-from torchvision import transforms
-
 try:
     mp.set_start_method("spawn", force=True)
 except RuntimeError:
     pass
-
-
-import traceback
 
 _SW2_CPU_WARNED = False
 
@@ -452,8 +474,24 @@ def install_window_decl(win: WindowDecl) -> None:
     except Exception:
         pass
 
+
 def calibrate_window_from_controls(df_control: pd.DataFrame, metrics: List[str], weights: Dict[str, float],
                                    bins: int, epsilon: float, interventions: tuple) -> WindowDecl:
+    # Normalize factor column and guard empty
+    try:
+        if "factor" in df_control.columns:
+            df_control = df_control.copy()
+            df_control["factor"] = df_control["factor"].astype(str).str.lower().str.strip()
+    except Exception:
+        pass
+    if df_control is None or len(df_control) == 0:
+        try:
+            print(f"[WARN] calibrate_window_from_controls: df_control empty; using defaults with epsilon={epsilon}")
+        except Exception:
+            pass
+        cal_ranges = {m: (0.0, 1.0) for m in metrics}
+        return WindowDecl(epsilon=epsilon, metrics=metrics, weights=weights, bins=bins,
+                          interventions=interventions, cal_ranges=cal_ranges)
     """Predeclare Φ_W from factor=='none' controls after warm; freeze transport ranges per metric."""
     cal_ranges: Dict[str, Tuple[float, float]] = {}
     for m in metrics:
@@ -472,6 +510,70 @@ def calibrate_window_from_controls(df_control: pd.DataFrame, metrics: List[str],
         cal_ranges[m] = (lo, hi)
     return WindowDecl(epsilon=epsilon, metrics=metrics, weights=weights, bins=bins,
                       interventions=interventions, cal_ranges=cal_ranges)
+
+# --- Calibrate epsilon from controls ---
+def calibrate_epsilon_from_controls(df_control: pd.DataFrame, window_decl: WindowDecl, W: int, q: float = 0.995) -> Tuple[float, int]:
+    """
+    Returns (epsilon, n_vals). Falls back to CFG['gate_epsilon'] on empty or invalid input.
+    """
+    import numpy as _np
+    import pandas as _pd
+    vals: List[float] = []
+    try:
+        if "factor" in df_control.columns:
+            df_control = df_control.copy()
+            df_control["factor"] = df_control["factor"].astype(str).str.lower().str.strip()
+        if df_control is None or len(df_control) == 0:
+            raise ValueError("empty_controls")
+        if "epoch" in df_control.columns:
+            df_control["epoch"] = _pd.to_numeric(df_control["epoch"], errors="coerce")
+        mets = [m for m in getattr(window_decl, "metrics", []) if m in df_control.columns]
+        if not mets:
+            raise ValueError("no_metric_columns")
+        for (_, _), g in df_control.groupby(["seed", "factor"], sort=False):
+            g = g.sort_values("epoch")
+            if len(g) < 2 * max(1, int(W)):
+                continue
+            for i in range(0, max(0, len(g) - 2 * int(W) + 1)):
+                past = {m: _pd.to_numeric(g[m].iloc[i:i+W], errors="coerce").to_numpy(dtype=float) for m in mets}
+                recent = {m: _pd.to_numeric(g[m].iloc[i+W:i+2*W], errors="coerce").to_numpy(dtype=float) for m in mets}
+                ok = True
+                for m in mets:
+                    pa = past[m]
+                    re = recent[m]
+                    pa = pa[_np.isfinite(pa)]
+                    re = re[_np.isfinite(re)]
+                    past[m] = pa
+                    recent[m] = re
+                    if pa.size < max(1, W // 2) or re.size < max(1, W // 2):
+                        ok = False
+                        break
+                if not ok:
+                    continue
+                try:
+                    tv = dPi_product_tv(window_decl, past, recent)
+                    if _np.isfinite(tv):
+                        vals.append(float(tv))
+                except Exception:
+                    continue
+    except Exception as _e:
+        try:
+            print(f"[WARN] calibrate_epsilon_from_controls failed early: {_e}; fallback to CFG gate_epsilon={CFG.get('gate_epsilon', 0.08)}")
+        except Exception:
+            pass
+        return float(CFG.get("gate_epsilon", 0.08)), 0
+    if not vals:
+        try:
+            print(f"[WARN] calibrate_epsilon_from_controls: no valid TV samples; returning CFG gate_epsilon={CFG.get('gate_epsilon', 0.08)}")
+        except Exception:
+            pass
+        return float(CFG.get("gate_epsilon", 0.08)), 0
+    arr = _np.array(vals, dtype=float)
+    try:
+        qv = _np.quantile(arr, float(q), method="linear")
+    except TypeError:
+        qv = _np.quantile(arr, float(q), interpolation="linear")
+    return float(qv), int(arr.size)
 
 
 def tv_hist_fixed(z0: np.ndarray, z1: np.ndarray, bins: int) -> float:
@@ -561,8 +663,9 @@ def _count_finite_pairs(window: WindowDecl, past: np.ndarray, recent: np.ndarray
 def recompute_gate_series_under_decl(df_eval: pd.DataFrame, window_decl: WindowDecl, W: int) -> pd.DataFrame:
     import math
     df = df_eval.copy()
-    for c in ("epoch","seed"):
-        if c in df.columns: df[c] = pd.to_numeric(df[c], errors="coerce")
+    for c in ("epoch", "seed"):
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
     df["gate_worst_tv_calib"] = np.nan
     df["gate_eps_stat_calib"] = np.nan
     df["gate_gain_calib"] = np.nan
@@ -623,25 +726,94 @@ def recompute_gate_series_under_decl(df_eval: pd.DataFrame, window_decl: WindowD
     return df
 
 @torch.no_grad()
-def collect_feature_snapshot(model: nn.Module, pool_loader, device, metrics: List[str], ref_mu_sig):
-    """Collect a light snapshot of features/metrics over a small pool."""
-    Z_geom, Z_geom_native = _features_for_loader(
-        model, pool_loader, device,
-        n_batches=max(1, CFG.get("metric_batches", 1)),
-        cap=int(CFG.get("metric_total_cap", 256)),
-        ref_mu_sig=ref_mu_sig, run_key=0, epoch=0,
+def sliced_w2_gpu(
+    Zt: torch.Tensor, Zt1: torch.Tensor, n_proj: int, seed: int, device
+) -> Tuple[float, float, int]:
+    """
+    Compute sliced W2 with deterministic generators on CPU/CUDA.
+    Respects CFG['sw2_budget_ms'] and charges BUDGET. Returns (w2, elapsed_ms, n_proj_used).
+    """
+    t0 = time.time()
+    try:
+        dev = device if isinstance(device, torch.device) else torch.device(device)
+    except Exception:
+        dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    Zt = Zt.to(dev)
+    Zt1 = Zt1.to(dev)
+    d = int(Zt.shape[1])
+    n_proj = int(max(1, n_proj))
+    used = 0
+    acc = 0.0
+    budget_ms = int(CFG.get("sw2_budget_ms", 200))
+    gen_dev = dev if dev.type == "cuda" else torch.device("cpu")
+    g = torch.Generator(device=gen_dev).manual_seed(17_4242 + int(seed))
+    chunk = min(64, n_proj)
+    while used < n_proj:
+        if (time.time() - t0) * 1000.0 > budget_ms:
+            break
+        k = min(chunk, n_proj - used)
+        if gen_dev.type == "cuda":
+            U = torch.randn(d, k, generator=g, device=gen_dev, dtype=Zt.dtype)
+        else:
+            U = torch.randn(d, k, generator=g, device=gen_dev, dtype=Zt.dtype).to(dev)
+        U = F.normalize(U, dim=0)
+        Xt = (Zt @ U)
+        Xt1 = (Zt1 @ U)
+        Xt_sorted, _ = Xt.sort(dim=0)
+        Xt1_sorted, _ = Xt1.sort(dim=0)
+        acc += float(((Xt_sorted - Xt1_sorted) ** 2).mean().item()) * k
+        used += k
+    elapsed = float((time.time() - t0) * 1000.0)
+    try:
+        if BUDGET is not None:
+            BUDGET.charge("sw2", elapsed)
+    except Exception:
+        pass
+    if used == 0:
+        return float("nan"), elapsed, 0
+    return float(acc / used), elapsed, int(used)
+
+def collect_feature_snapshot(
+    model: nn.Module,
+    loader,
+    device,
+    metrics: List[str],
+    ref_mu_sig,
+) -> Dict[str, np.ndarray]:
+    """
+    Minimal snapshot for κ_sens probes.
+    Returns a dict mapping metric name -> 1D numpy array.
+    Unknown metrics return an empty array to be ignored downstream.
+    """
+    Z_geom, Z_native = _features_for_loader(
+        model=model,
+        loader=loader,
+        device=device,
+        n_batches=int(CFG.get("metric_batches", 3)),
+        cap=int(CFG.get("metric_total_cap", 512)),
+        ref_mu_sig=ref_mu_sig,
+        run_key=0,
+        epoch=0,
     )
     out: Dict[str, np.ndarray] = {}
     try:
-        v_ok, eff, *_ = variance_outside_k(Z_geom)
-        out["var_out_k"] = np.array([float(v_ok)], dtype=float)
-        out["eff_dim"]   = np.array([float(eff)], dtype=float)
+        var_out, eff_dim, *_ = variance_outside_k(Z_native)
     except Exception:
-        out["var_out_k"] = np.array([float("nan")], dtype=float)
-        out["eff_dim"]   = np.array([float("nan")], dtype=float)
-    out.setdefault("ftle", np.array([float("nan")], dtype=float))
+        var_out, eff_dim = float("nan"), float("nan")
+    try:
+        cos = cosine_dispersion(Z_geom, seed=0, epoch=0)
+    except Exception:
+        cos = float("nan")
+    for m in metrics:
+        if m == "var_out_k":
+            out[m] = np.array([var_out], dtype=float)
+        elif m == "eff_dim":
+            out[m] = np.array([eff_dim], dtype=float)
+        elif m == "cos_disp":
+            out[m] = np.array([cos], dtype=float)
+        else:
+            out[m] = np.array([], dtype=float)
     return out
-
 
 def kappa_sens_probe(model: nn.Module, opt: torch.optim.Optimizer, pool_loader, device,
                      window: WindowDecl, ref_mu_sig, probe_cfg: Dict) -> float:
@@ -769,7 +941,7 @@ def gate_check(window: WindowDecl,
     }
 
 
-def write_window_audit(outdir: Path, window_decl: WindowDecl, note: str = ""):
+def write_window_audit(outdir: Path, window_decl: WindowDecl, note: str = "", controls_used: int = 0):
     """Persist the predeclared Φ_W (fixed partitions, transports, bins, epsilon)."""
     try:
         payload = {
@@ -779,6 +951,7 @@ def write_window_audit(outdir: Path, window_decl: WindowDecl, note: str = ""):
             "bins": int(window_decl.bins),
             "cal_ranges": {k: [float(v[0]), float(v[1])] for k, v in window_decl.cal_ranges.items()},
             "interventions": [f"predeclared_T_{i}" for i, _ in enumerate(window_decl.interventions)],
+            "controls_used": int(controls_used),
             "notes": note or "Fixed partitions and transport calibrated from factor=='none' after warm",
         }
         save_json(payload, OUTDIR / "window_audit.json")
@@ -1107,25 +1280,6 @@ def _pip_freeze_md5():
     except Exception:
         return ""
 
-
-def save_json(obj, path: Path):
-    def jsonable(o):
-        try:
-            json.dumps(o)
-            return o
-        except Exception:
-            if isinstance(o, torch.device):
-                return str(o)
-            return str(o)
-
-    if isinstance(obj, dict):
-        obj = {k: jsonable(v) for k, v in obj.items()}
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(obj, indent=2))
-    os.replace(tmp, path)
-
-
 def update_json(path: Path, patch: Dict):
     try:
         cur = json.loads(path.read_text())
@@ -1206,11 +1360,15 @@ def load_calibration(cfg_path: Optional[str]) -> tuple[dict, Optional[str], Opti
 
     # 3) env overrides (highest precedence)
     if "SCAR_GATE_MIN_EVIDENCE" in os.environ:
-        try: cal["gate_min_evidence"] = int(os.environ["SCAR_GATE_MIN_EVIDENCE"])
-        except Exception: pass
+        try:
+            cal["gate_min_evidence"] = int(os.environ["SCAR_GATE_MIN_EVIDENCE"])
+        except Exception:
+            pass
     if "SCAR_GATE_GAIN_THRESH" in os.environ:
-        try: cal["gate_gain_thresh"] = float(os.environ["SCAR_GATE_GAIN_THRESH"])
-        except Exception: pass
+        try:
+            cal["gate_gain_thresh"] = float(os.environ["SCAR_GATE_GAIN_THRESH"])
+        except Exception:
+            pass
     if "SCAR_GATE_GAIN_UNITS" in os.environ:
         cal["gate_gain_units"] = os.environ["SCAR_GATE_GAIN_UNITS"]
 
@@ -1288,8 +1446,25 @@ try:
             CFG["gate_gain_units"] = str(v)
             if mp.current_process().name == "MainProcess":
                 print(f"[env] gate_gain_units={CFG['gate_gain_units']!r}")
+        v = os.environ.get("SCAR_GATE_EPSILON")
+        if v is not None:
+            try:
+                CFG["gate_epsilon"] = float(v)
+                if mp.current_process().name == "MainProcess":
+                    print(f"[env] gate_epsilon={CFG['gate_epsilon']:.6f}")
+            except Exception as _e:
+                if mp.current_process().name == "MainProcess":
+                    print(f"[WARN] bad SCAR_GATE_EPSILON={v!r}: {_e}")
     except Exception:
         pass
+    try:
+        ge = float(CFG.get("gate_epsilon", 0.08))
+        if not (0.005 <= ge <= 0.5):
+            if mp.current_process().name == "MainProcess":
+                print(f"[WARN] gate_epsilon out of range ({ge}); clamping to [0.005, 0.5]")
+            CFG["gate_epsilon"] = float(min(max(ge, 0.005), 0.5))
+    except Exception:
+        CFG["gate_epsilon"] = 0.08
     # Emit a simple precedence summary for auditability
     try:
         _prec = {
@@ -2134,67 +2309,6 @@ sample_n: int = 192,
     return val, len(vals), elapsed, int(min_used_n if min_used_n != 10**9 else 0)
 
 
-@torch.no_grad()
-def sliced_w2_gpu(
-Zt: torch.Tensor, Zt1: torch.Tensor, n_proj: int, seed: int, device
-) -> Tuple[float, float, int]:
-    """
-    Compute sliced W2 distance with deterministic equal-N downsample.
-
-    Determinism: uses a per-(seed) torch.Generator; when shapes match the same
-    permutation index is applied to Zt and Zt1 (shared-index equal-N).
-    Numerics: direction vectors are normalized with a small epsilon to avoid
-    rare division-by-zero under deterministic seeds. Returns (value, elapsed_ms, n_proj_done).
-    """
-    t0 = time.time()
-    Zt, Zt1 = Zt.to(device), Zt1.to(device)
-    if Zt.shape[1] == 0 or Zt1.shape[1] == 0:
-        return float("nan"), (time.time() - t0) * 1000.0, 0
-    n = min(Zt.shape[0], Zt1.shape[0])
-    if n < 2:
-        return float("nan"), (time.time() - t0) * 1000.0, 0
-    # CPU/GPU-safe generator
-    if device.type == "cuda":
-        g = torch.Generator(device=device).manual_seed(91001 + seed * 1000)
-    else:
-        # Warn once per process when running SW2 on CPU
-        global _SW2_CPU_WARNED
-        if not _SW2_CPU_WARNED:
-            print("[WARN] SW2 running on CPU; this may be slow.")
-            _SW2_CPU_WARNED = True
-        g = torch.Generator().manual_seed(91001 + seed * 1000)
-
-    # Equal‑N shared‑index path: reuse the same random permutation for both epochs (deterministic)
-    if Zt.shape[0] == Zt1.shape[0] == n:
-        if device.type == "cuda":
-            idx = torch.randperm(n, generator=g, device=device)
-        else:
-            idx = torch.randperm(n, generator=g)
-        Zt = Zt[:n][idx]
-        Zt1 = Zt1[:n][idx]
-    else:
-        if device.type == "cuda":
-            idx = torch.randperm(Zt.shape[0], generator=g, device=device)[:n]
-            idx1 = torch.randperm(Zt1.shape[0], generator=g, device=device)[:n]
-        else:
-            idx = torch.randperm(Zt.shape[0], generator=g)[:n]
-            idx1 = torch.randperm(Zt1.shape[0], generator=g)[:n]
-        Zt = Zt[idx]
-        Zt1 = Zt1[idx1]
-
-    d = Zt.shape[1]
-    dirs = torch.randn(n_proj, d, generator=g, device=device, dtype=Zt.dtype)
-    norm = dirs.norm(dim=1, keepdim=True)
-    dirs = dirs / (norm + 1e-12)
-    pt_sorted, _ = torch.sort(Zt @ dirs.T, dim=0)
-    pt1_sorted, _ = torch.sort(Zt1 @ dirs.T, dim=0)
-    # --- ensure GPU ops complete before measuring elapsed time ---
-    msq = ((pt_sorted - pt1_sorted) ** 2).mean()
-    val = float(torch.sqrt(torch.clamp(msq, min=0.0)).item())
-    if device.type == "cuda":
-        torch.cuda.synchronize(device)
-    ms = (time.time() - t0) * 1000.0
-    return val, ms, n_proj
 
 
 # ---------------------------
@@ -2439,24 +2553,6 @@ def calibrate_gate_gain_thresh_from_controls(df: pd.DataFrame, W: int, warm: int
     return thr
 
 
-# --- Helper for calibrating epsilon from controls (TV drift) ---
-def calibrate_epsilon_from_controls(df_control: pd.DataFrame, window_decl: WindowDecl, W: int, q: float = 0.995) -> float:
-    import numpy as np, pandas as pd
-    vals = []
-    try:
-        for (_, _), g in df_control.groupby(["seed","factor"]):
-            g = g.sort_values("epoch")
-            for i in range(0, max(0, len(g) - 2*W + 1)):
-                past   = {m: pd.to_numeric(g[m].iloc[i:i+W],     errors="coerce").to_numpy(dtype=float) for m in window_decl.metrics}
-                recent = {m: pd.to_numeric(g[m].iloc[i+W:i+2*W], errors="coerce").to_numpy(dtype=float) for m in window_decl.metrics}
-                tv = dPi_product_tv(window_decl, past, recent)
-                if np.isfinite(tv):
-                    vals.append(tv)
-    except Exception:
-        pass
-    if not vals:
-        return float(CFG.get("gate_epsilon", 0.08))
-    return float(np.quantile(np.array(vals, dtype=float), q))
 
 
 #
@@ -4514,6 +4610,50 @@ def summarize_detection(rows: pd.DataFrame, warm_idx: int) -> pd.DataFrame:
     out = []
     trig = rows[rows["collapse_tag"] == "soft"].copy()
     n_collapse = len(trig)
+    # Short-circuit when there are zero positive (soft) collapses
+    if int(n_collapse) <= 0:
+        out = []
+        non_trig = rows[rows["collapse_tag"] == "none"]
+        fp_nontrig = (
+            float(np.mean((non_trig["t_warn"].notna()) & (non_trig["t_warn"] >= warm_idx)))
+            if len(non_trig) > 0
+            else 1.0
+        )
+        out.append(
+            dict(
+                kind="detect_rate",
+                n=0,
+                successes=0,
+                value=0.0,
+                lo=np.nan,
+                hi=np.nan,
+            )
+        )
+        out.append(dict(kind="fp_nontriggered_after_warm", n=int(len(non_trig)), value=fp_nontrig))
+        out.append(dict(kind="lead_time", n=0, med=np.nan, q1=np.nan, q3=np.nan))
+        boot = bootstrap_stratified(rows)
+        out.append(
+            dict(
+                kind="detect_rate_ci_boot",
+                lo=boot.get("detect_rate_ci", (np.nan, np.nan))[0],
+                hi=boot.get("detect_rate_ci", (np.nan, np.nan))[1],
+            )
+        )
+        out.append(
+            dict(
+                kind="fp_rate_ci_boot",
+                lo=boot.get("fp_rate_ci", (np.nan, np.nan))[0],
+                hi=boot.get("fp_rate_ci", (np.nan, np.nan))[1],
+            )
+        )
+        out.append(
+            dict(
+                kind="lead_median_ci_boot",
+                lo=boot.get("lead_median_ci", (np.nan, np.nan))[0],
+                hi=boot.get("lead_median_ci", (np.nan, np.nan))[1],
+            )
+        )
+        return pd.DataFrame(out)
     successes = int(
     (
     (trig["t_warn"].notna())
@@ -4809,7 +4949,8 @@ def compute_invariants_and_provenance(df_runs: pd.DataFrame, artifact_csv: Optio
         cap = ftle_cap
         if not np.isfinite(cap):
             try:
-                import glob, json as _json
+                import glob
+                import json as _json
                 paths = sorted(glob.glob(str(OUTDIR / "gt_rank_calibration_*.json")))
                 if paths:
                     _obj = _json.loads(Path(paths[-1]).read_text())
@@ -5098,6 +5239,15 @@ def _epoch_bounds_csv(path: Path):
     """Return (emin, emax, nrows) for a CSV shard, or (None,None,0) on failure."""
     try:
         df = pd.read_csv(path, usecols=["epoch"])
+        try:
+            if "epoch" not in df.columns:
+                return None, None, 0
+            df = df.copy()
+            df["epoch"] = pd.to_numeric(df["epoch"], errors="coerce")
+            if df["epoch"].notna().sum() == 0:
+                return None, None, 0
+        except Exception:
+            return None, None, 0
         return int(df["epoch"].min()), int(df["epoch"].max()), int(len(df))
     except Exception:
         return None, None, 0
@@ -5107,6 +5257,15 @@ def _epoch_bounds(path: Path):
     """Return (emin, emax, nrows) for a parquet shard, or (None,None,0) on failure."""
     try:
         df = pd.read_parquet(path, columns=["epoch"])
+        try:
+            if "epoch" not in df.columns:
+                return None, None, 0
+            df = df.copy()
+            df["epoch"] = pd.to_numeric(df["epoch"], errors="coerce")
+            if df["epoch"].notna().sum() == 0:
+                return None, None, 0
+        except Exception:
+            return None, None, 0
         return int(df["epoch"].min()), int(df["epoch"].max()), int(len(df))
     except Exception:
         return None, None, 0
@@ -5341,7 +5500,7 @@ def evaluate(df_all: pd.DataFrame, tag: str):
     # --- Calibrate and persist a fixed-partition WindowDecl from controls (factor=='none' post-warm) ---
     try:
         df_control = df_cal_raw[
-            (df_cal_raw["factor"] == "none")
+            (df_cal_raw["factor"].astype(str).str.lower().str.strip() == "none")
             & (pd.to_numeric(df_cal_raw["epoch"], errors="coerce") >= int(warm_idx))
         ]
         window_decl = calibrate_window_from_controls(
@@ -5355,10 +5514,12 @@ def evaluate(df_all: pd.DataFrame, tag: str):
         # Calibrate epsilon from controls and install into window_decl
         try:
             _W = int(CFG.get("gate_window", 16))
-            eps_hat = calibrate_epsilon_from_controls(df_control, window_decl, W=_W, q=0.995)
-            CFG["gate_epsilon"] = float(eps_hat)
-            window_decl.epsilon = float(eps_hat)
-            print(f"[calib] gate_epsilon from controls q=0.995, W={_W}: {eps_hat:.6f}")
+            eps_new, n_vals = calibrate_epsilon_from_controls(df_control, window_decl, W=_W, q=0.995)
+            if n_vals > 0:
+                CFG["gate_epsilon"] = float(eps_new)
+                window_decl.epsilon = float(eps_new)
+                if mp.current_process().name == "MainProcess":
+                    print(f"[cal] gate_epsilon calibrated: {CFG['gate_epsilon']:.6f} from {n_vals} TV samples")
         except Exception:
             pass
         # Persist for future sweeps and install for any downstream checks in this process
@@ -5379,7 +5540,7 @@ def evaluate(df_all: pd.DataFrame, tag: str):
         )
         install_window_decl(window_decl)
         try:
-            write_window_audit(OUTDIR, window_decl, note="Calibrated WindowDecl from controls (post-warm)")
+            write_window_audit(OUTDIR, window_decl, note="Calibrated WindowDecl from controls (post-warm)", controls_used=len(df_control))
             write_window_provenance_from_decl(OUTDIR, window_decl)
         except Exception:
             pass
