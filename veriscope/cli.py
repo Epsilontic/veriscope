@@ -17,10 +17,16 @@
 #   SCAR_SMOKE=1         # optional: tiny sweep for quick end-to-end
 
 
+from __future__ import annotations
+
+from typing import Any, Union, overload
+from typing import TYPE_CHECKING
+import math
+
+# ---- Moved mid-file imports ----
 import hashlib
 import inspect
 import json
-import math
 import os
 import random
 import shutil
@@ -35,7 +41,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from dataclasses import dataclass as _fr_dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -49,10 +55,74 @@ from torch.utils.data import DataLoader, Sampler, Subset
 from torchvision import transforms
 import traceback
 
-try:
-    from filelock import FileLock
-except Exception:
-    FileLock = None  # graceful fallback if filelock isn't installed
+# ---- typing shims for dynamic inputs (JSON/env/argparse) ----
+NumberLike = Union[int, float]
+
+@overload
+def to_float(x: NumberLike) -> float: ...
+@overload
+def to_float(x: str) -> float: ...
+
+def to_float(x: Any) -> float:
+    if isinstance(x, (int, float)):
+        return float(x)
+    if isinstance(x, str):
+        return float(x.strip())
+    raise TypeError(f"expected number-like, got {type(x).__name__}")
+
+@overload
+def to_int(x: int) -> int: ...
+@overload
+def to_int(x: float) -> int: ...
+@overload
+def to_int(x: str) -> int: ...
+def to_int(x: Any) -> int:
+    if isinstance(x, int):
+        return x
+    if isinstance(x, float):
+        return int(x)
+    if isinstance(x, str):
+        s = x.strip()
+        try:
+            return int(s, 10)
+        except ValueError:
+            return int(float(s))
+    raise TypeError(f"expected int-like, got {type(x).__name__}")
+
+# ---- percentile helper with stable semantics across NumPy versions ----
+def percentile_linear(a: Any, q: Any) -> float:
+    """Return the q-th percentile under linear interpolation semantics.
+    Accepts dynamic inputs (lists, numpy arrays) and number-like q.
+    This wraps NumPy's API change from `interpolation` -> `method`.
+    """
+    arr = np.asarray(a, dtype=float)
+    qq = to_float(q)
+    try:
+        # NumPy >= 1.22
+        return float(np.percentile(arr, qq, method="linear"))
+    except TypeError:
+        # NumPy < 1.22
+        return float(np.percentile(arr, qq, interpolation="linear"))
+
+
+if TYPE_CHECKING:
+    from filelock import SoftFileLock as FileLock
+else:
+    try:
+        from filelock import SoftFileLock as _RuntimeFileLock
+    except Exception:  # pragma: no cover
+        class _RuntimeFileLock:
+            def __init__(self, *args: Any, **kwargs: Any) -> None: ...
+    FileLock = _RuntimeFileLock  # runtime alias only
+
+# --- env truthy and centralized run tag ---
+def env_truthy(name: str, default: str = "0") -> bool:
+    v = str(os.environ.get(name, default)).strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+CAL = env_truthy("SCAR_CALIB")
+SMOKE = env_truthy("SCAR_SMOKE")
+RUN_TAG = "cal" if CAL else ("smoke" if SMOKE else "full_v2")
     
 # --- local, atomic JSON writer to avoid missing-import footguns ---
 def save_json(obj, path):
@@ -101,29 +171,29 @@ try:
     from torch.linalg import eigvalsh as t_eigvalsh
     from torch.linalg import vector_norm as t_vector_norm
 except Exception:  # pragma: no cover
-    t_eigvalsh = None  # type: ignore[assignment]
-    t_eigvals = None  # type: ignore[assignment]
-    t_vector_norm = None  # type: ignore[assignment]
+    t_eigvalsh = None
+    t_eigvals = None
+    t_vector_norm = None
 try:
     from torch.nn.functional import avg_pool2d as t_avg_pool2d
 except Exception:  # pragma: no cover
-    t_avg_pool2d = None  # type: ignore[assignment]
+    t_avg_pool2d = None
 
 # Ensure aliases are always callable for static checkers
-if t_avg_pool2d is None:  # type: ignore[truthy-function]
-    def t_avg_pool2d(*args, **kwargs):  # type: ignore[no-redef]
+if t_avg_pool2d is None:
+    def t_avg_pool2d(*args, **kwargs):
         raise RuntimeError("torch.nn.functional.avg_pool2d unavailable")
 
-if t_eigvalsh is None:  # type: ignore[truthy-function]
-    def t_eigvalsh(*args, **kwargs):  # type: ignore[no-redef]
+if t_eigvalsh is None:
+    def t_eigvalsh(*args, **kwargs):
         raise RuntimeError("torch.linalg.eigvalsh unavailable")
 
-if t_eigvals is None:  # type: ignore[truthy-function]
-    def t_eigvals(*args, **kwargs):  # type: ignore[no-redef]
+if t_eigvals is None:
+    def t_eigvals(*args, **kwargs):
         raise RuntimeError("torch.linalg.eigvals unavailable")
 
-if t_vector_norm is None:  # type: ignore[truthy-function]
-    def t_vector_norm(*args, **kwargs):  # type: ignore[no-redef]
+if t_vector_norm is None:
+    def t_vector_norm(*args, **kwargs):
         raise RuntimeError("torch.linalg.vector_norm unavailable")
 
 # AMP compatibility shim: prefer torch.amp, fall back to torch.cuda.amp, otherwise no-op
@@ -493,7 +563,7 @@ def calibrate_window_from_controls(df_control: pd.DataFrame, metrics: List[str],
         return WindowDecl(epsilon=epsilon, metrics=metrics, weights=weights, bins=bins,
                           interventions=interventions, cal_ranges=cal_ranges)
     """Predeclare Φ_W from factor=='none' controls after warm; freeze transport ranges per metric."""
-    cal_ranges: Dict[str, Tuple[float, float]] = {}
+    cal_ranges = {}
     for m in metrics:
         if m in df_control.columns:
             col = pd.to_numeric(df_control[m], errors="coerce").to_numpy(dtype=float)
@@ -561,19 +631,15 @@ def calibrate_epsilon_from_controls(df_control: pd.DataFrame, window_decl: Windo
             print(f"[WARN] calibrate_epsilon_from_controls failed early: {_e}; fallback to CFG gate_epsilon={CFG.get('gate_epsilon', 0.08)}")
         except Exception:
             pass
-        return float(CFG.get("gate_epsilon", 0.08)), 0
+        return float(_effective_gate_epsilon(CFG, OUTDIR)), 0
     if not vals:
         try:
             print(f"[WARN] calibrate_epsilon_from_controls: no valid TV samples; returning CFG gate_epsilon={CFG.get('gate_epsilon', 0.08)}")
         except Exception:
             pass
-        return float(CFG.get("gate_epsilon", 0.08)), 0
-    arr = _np.array(vals, dtype=float)
-    try:
-        qv = _np.quantile(arr, float(q), method="linear")
-    except TypeError:
-        qv = _np.quantile(arr, float(q), interpolation="linear")
-    return float(qv), int(arr.size)
+        return float(_effective_gate_epsilon(CFG, OUTDIR)), 0
+    eps_new, n_vals = _robust_eps(vals, q=float(q), CFG=CFG, out_dir=OUTDIR)
+    return float(eps_new), int(n_vals)
 
 
 def tv_hist_fixed(z0: np.ndarray, z1: np.ndarray, bins: int) -> float:
@@ -702,10 +768,10 @@ def recompute_gate_series_under_decl(df_eval: pd.DataFrame, window_decl: WindowD
             eps_eff = max(0.0, float(window_decl.epsilon) - eps_stat)
 
             try:
-                xs = pd.to_numeric(g.get("train_loss").iloc[rs], errors="coerce").to_numpy(float)
-                bs = pd.to_numeric(g.get("ewma_loss").iloc[rs], errors="coerce").to_numpy(float)
-                msk = np.isfinite(xs) & np.isfinite(bs)
-                gain_bits = float(((bs[msk] - xs[msk]).mean()) / ln2) if msk.any() else float("nan")
+                model_losses = pd.to_numeric(g.get("train_loss").iloc[rs], errors="coerce").to_numpy(dtype=np.float64)
+                base_losses  = pd.to_numeric(g.get("ewma_loss").iloc[rs],  errors="coerce").to_numpy(dtype=np.float64)
+                msk = np.isfinite(model_losses) & np.isfinite(base_losses)
+                gain_bits = float(((base_losses[msk] - model_losses[msk]).mean()) / ln2) if msk.any() else float("nan")
             except Exception:
                 gain_bits = float("nan")
 
@@ -745,14 +811,14 @@ def sliced_w2_gpu(
     used = 0
     acc = 0.0
     budget_ms = int(CFG.get("sw2_budget_ms", 200))
-    gen_dev = dev if dev.type == "cuda" else torch.device("cpu")
+    gen_dev = dev if getattr(dev, "type", "cpu") == "cuda" else torch.device("cpu")
     g = torch.Generator(device=gen_dev).manual_seed(17_4242 + int(seed))
     chunk = min(64, n_proj)
     while used < n_proj:
         if (time.time() - t0) * 1000.0 > budget_ms:
             break
         k = min(chunk, n_proj - used)
-        if gen_dev.type == "cuda":
+        if getattr(gen_dev, "type", "cpu") == "cuda":
             U = torch.randn(d, k, generator=g, device=gen_dev, dtype=Zt.dtype)
         else:
             U = torch.randn(d, k, generator=g, device=gen_dev, dtype=Zt.dtype).to(dev)
@@ -871,7 +937,7 @@ def gate_check(window: WindowDecl,
                gain: float,
                gain_thresh: float,
                kappa_sens: float,
-               eps_stat_alpha: float = 0.05) -> Tuple[int, Dict[str, float]]:
+               eps_stat_alpha: float = 0.05) -> Tuple[int, Dict[str, Any]]:
     """Joint gate: prequential gain + fixed-partition product–TV with ε_stat and κ_sens."""
     thr = float(gain_thresh)
     # Early evidence gate: require a minimum number of finite transported pairs across metrics
@@ -958,6 +1024,68 @@ def write_window_audit(outdir: Path, window_decl: WindowDecl, note: str = "", co
     except Exception:
         pass
 
+# --- resolved ε fallback from precedence_summary + robust ε estimator ---
+def _effective_gate_epsilon(CFG: dict, out_dir: Path) -> float:
+    try:
+        p = Path(out_dir) / "precedence_summary.json"
+        if p.exists():
+            data = json.loads(p.read_text())
+            final = data.get("final", {})
+            if isinstance(final, dict):
+                x = final.get("gate_epsilon", None)
+                if isinstance(x, (int, float)):
+                    return float(x)
+            for k in ("gate_epsilon_final", "final_gate_epsilon", "gate_epsilon"):
+                x = data.get(k, None)
+                if isinstance(x, (int, float)):
+                    return float(x)
+    except Exception:
+        pass
+    x = CFG.get("gate_epsilon", None)
+    if isinstance(x, (int, float)):
+        return float(x)
+    return 0.08  # last resort only
+
+def _robust_eps(vals, q: float, CFG: dict, out_dir: Path) -> Tuple[float, int]:
+    q = 0.0 if q < 0.0 else (1.0 if q > 1.0 else float(q))
+    try:
+        arr = vals.to_numpy() if hasattr(vals, "to_numpy") else np.asarray(vals)
+        if np.issubdtype(arr.dtype, np.number):
+            a = np.asarray(arr, dtype=float).ravel()
+            a = a[np.isfinite(a)]
+            if a.size == 0:
+                return _effective_gate_epsilon(CFG, out_dir), 0
+            try:
+                eps = float(np.quantile(a, q, method="linear"))
+            except TypeError:
+                eps = float(np.quantile(a, q, interpolation="linear"))
+            return eps, int(a.size)
+    except Exception:
+        pass
+    cleaned = []
+    try:
+        import torch as _torch
+    except Exception:
+        _torch = None
+    for x in vals:
+        if isinstance(x, (bool, np.bool_)):
+            continue
+        if isinstance(x, (float, np.floating)):
+            cleaned.append(float(x))
+        elif isinstance(x, (int, np.integer)):
+            cleaned.append(float(x))
+        elif (_torch is not None) and _torch.is_tensor(x) and x.numel() == 1:
+            cleaned.append(float(x.item()))
+    a = np.asarray(cleaned, dtype=float).ravel()
+    a = a[np.isfinite(a)]
+    if a.size == 0:
+        return _effective_gate_epsilon(CFG, out_dir), 0
+    try:
+        eps = float(np.quantile(a, q, method="linear"))
+    except TypeError:
+        eps = float(np.quantile(a, q, interpolation="linear"))
+    return eps, int(a.size)
+
 # ---------------------------
 # Output & config
 # ---------------------------
@@ -1011,7 +1139,7 @@ DATA_ROOT = os.environ.get("SCAR_DATA", "./data")
 
 C = 10  # CIFAR-10 classes
 
-CFG = dict(
+CFG: Dict[str, Any] = dict(
 # device & determinism
 device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
 deterministic=True,  # strict determinism ON by default
@@ -1324,10 +1452,7 @@ def load_calibration(cfg_path: Optional[str]) -> tuple[dict, Optional[str], Opti
                 "gate_eps_stat_max_frac", "gate_epsilon_sens", "gate_eps_stat_alpha"
             ]:
                 if k in obj:
-                    try:
-                        CFG[k] = type(CFG.get(k, obj[k]))(obj[k])
-                    except Exception:
-                        CFG[k] = obj[k]
+                    CFG[k] = obj[k]
             sha16 = hashlib.sha256(txt.encode("utf-8")).hexdigest()[:16]
             used_path = pkg_default
         except Exception:
@@ -1349,10 +1474,7 @@ def load_calibration(cfg_path: Optional[str]) -> tuple[dict, Optional[str], Opti
                     "gate_eps_stat_max_frac", "gate_epsilon_sens", "gate_eps_stat_alpha"
                 ]:
                     if k in obj:
-                        try:
-                            CFG[k] = type(CFG.get(k, obj[k]))(obj[k])
-                        except Exception:
-                            CFG[k] = obj[k]
+                        CFG[k] = obj[k]
                 sha16 = hashlib.sha256(txt.encode("utf-8")).hexdigest()[:16]
                 used_path = user_p
             except Exception:
@@ -1484,6 +1606,9 @@ try:
                 "gate_eps_stat_max_frac": float(CFG.get("gate_eps_stat_max_frac", 0.25)),
                 "gate_epsilon_sens": float(CFG.get("gate_epsilon_sens", 0.04)),
                 "gate_eps_stat_alpha": float(CFG.get("gate_eps_stat_alpha", 0.05)),
+                "run_tag": RUN_TAG,
+                "calibration_mode": bool(CAL),
+                "smoke_mode": bool(SMOKE),
             },
         }
         save_json(_prec, OUTDIR / "precedence_summary.json")
@@ -1731,7 +1856,7 @@ persistent: Optional[bool] = None,
     use_pin = CFG.get("pin_memory", None)
     if use_pin is None:
         # Prefer pin_memory on CUDA even when num_workers == 0
-        pin = (device.type == "cuda")
+        pin = (getattr(device, "type", "cpu") == "cuda")
     else:
         pin = bool(use_pin)
     _kwargs = {}
@@ -1764,7 +1889,7 @@ def subset_loader_from_indices(ds, idxs: np.ndarray, batch: int, shuffle: bool, 
     gen = torch.Generator().manual_seed(100000 + seed)
     use_pin = CFG.get("pin_memory", None)
     if use_pin is None:
-        pin = (device.type == "cuda")
+        pin = (getattr(device, "type", "cpu") == "cuda")
     else:
         pin = bool(use_pin)
     # This loader is reused across epochs; allow persistence.
@@ -2816,10 +2941,22 @@ def gradient_noise_scale(
     for m in model.modules():
         if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
             nbt = getattr(m, "num_batches_tracked", None)
+
+            # choose a safe device/dtype anchor
+            anchor = (
+                m.running_mean if m.running_mean is not None else
+                (m.weight if hasattr(m, "weight") and m.weight is not None else None)
+            )
+            dev = anchor.device if torch.is_tensor(anchor) else torch.device("cpu")
+            dt  = anchor.dtype  if torch.is_tensor(anchor) else torch.float32
+
+            mu_snap  = m.running_mean.clone() if m.running_mean is not None else torch.zeros(m.num_features, device=dev, dtype=dt)
+            var_snap = m.running_var.clone()  if m.running_var  is not None else torch.ones(m.num_features,  device=dev, dtype=dt)
+
             bn_state.append((
                 m,
-                m.running_mean.clone(),
-                m.running_var.clone(),
+                mu_snap,
+                var_snap,
                 nbt.clone() if torch.is_tensor(nbt) else nbt,
                 m.training,
             ))
@@ -2873,8 +3010,10 @@ def gradient_noise_scale(
         # Restore BN buffers and original BN training flags
         try:
             for m, mu, var, nbt, was_m_training in bn_state:
-                m.running_mean.copy_(mu)
-                m.running_var.copy_(var)
+                if m.running_mean is not None:
+                    m.running_mean.copy_(mu)
+                if m.running_var is not None:
+                    m.running_var.copy_(var)
                 if nbt is not None and hasattr(m, "num_batches_tracked") and torch.is_tensor(m.num_batches_tracked):
                     m.num_batches_tracked.copy_(nbt)
                 m.train() if was_m_training else m.eval()
@@ -4117,8 +4256,8 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
                     counts[m] = int(min(na, nb))
 
                 # prequential gain in bits/sample over the gate window
-                model_losses = np.array([float(r.get("train_loss", np.nan)) for r in logs[-W_gate:]], dtype=float)
-                base_losses  = np.array([float(r.get("ewma_loss",  np.nan)) for r in logs[-W_gate:]], dtype=float)
+                model_losses = pd.to_numeric(g.get("train_loss"), errors="coerce").to_numpy(dtype=float)
+                base_losses  = pd.to_numeric(g.get("ewma_loss"),  errors="coerce").to_numpy(dtype=float)
                 mask = np.isfinite(model_losses) & np.isfinite(base_losses)
                 n = int(mask.sum())
                 if n <= 0:
