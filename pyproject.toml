@@ -43,3 +43,29 @@ ignore = ["E501"]
 
 [tool.ruff.lint.per-file-ignores]
 "veriscope/cli.py" = ["E501"]
+
+[tool.mypy]
+python_version = "3.10"
+files = ["cli.py"]
+warn_unused_ignores = true
+warn_redundant_casts = true
+show_error_codes = true
+pretty = true
+
+ignore_missing_imports = true
+follow_imports = "silent"
+implicit_reexport = true
+allow_redefinition = true
+namespace_packages = true
+
+disable_error_code = [
+  "call-overload",
+  "arg-type",
+  "assignment",
+  "operator",
+  "index",
+  "return-value",
+  "var-annotated",
+]
+
+exclude = ["__main__\\.py$"]
