@@ -237,3 +237,29 @@ def write_window_provenance_from_decl(outdir: Path, wd: WindowDecl) -> None:
             pass
     except Exception:
         pass
+
+
+# ---- CLI shim for console_script `veriscope` ----
+from typing import List
+import sys
+
+def main(argv: Optional[List[str]] = None) -> int:
+    """
+    Console entrypoint for the `veriscope` CLI.
+
+    Thin shim that delegates to the refactored legacy CLI runner so that
+    the `veriscope` console script keeps working after the refactor.
+    """
+    if argv is None:
+        argv = sys.argv[1:]
+
+    # Import inside the function to avoid circular imports:
+    # legacy_cli imports FRWindow, DeclTransport, GateEngine, WindowDecl
+    # from this module, so we must not import it at top level here.
+    from veriscope.runners.legacy_cli import main as legacy_main
+
+    # legacy_main currently reads sys.argv itself and does not use argv,
+    # but we keep argv for future-proofing.
+    _ = argv  # suppress unused-variable warnings
+    rv = legacy_main()
+    return 0 if rv is None else int(rv)
