@@ -22,7 +22,14 @@ import shutil
 import subprocess
 import sys
 import time
-from typing import TYPE_CHECKING, Union, overload, Callable, Iterable, TypeAlias
+from typing import TYPE_CHECKING, Union, overload, Callable, Iterable
+
+# Python 3.10+ has TypeAlias in typing; for 3.9 use typing_extensions.
+try:  # version compatibility shim
+    from typing import TypeAlias  # type: ignore[attr-defined]
+except ImportError:  # on 3.9 this will fire
+    from typing_extensions import TypeAlias  # type: ignore[misc]
+
 from collections.abc import Iterable as _Iter
 from typing import Literal as _Literal
 
