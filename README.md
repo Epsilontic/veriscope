@@ -281,7 +281,7 @@ Prequential gain is computed as `(log p_baseline − log p_model) / ln(2)`, aver
 
 ## License
 
-See the `LICENSE` file in the repository. The package metadata currently declares “Other/Proprietary License”.
+This repository is currently released under an “Other/Proprietary License”. See `LICENSE` for the exact terms.
 
 ## Citation
 
