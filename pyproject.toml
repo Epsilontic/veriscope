@@ -4,68 +4,68 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "veriscope"
-version = "0.1.1"
-description = "Veriscope Bundle (Phase-4): early warning of soft collapse with finite-realism gate and learned detector"
+version = "0.1.0"
+description = "Finite-window early warning and gating (refactor)"
 readme = "README.md"
 requires-python = ">=3.9"
-authors = [{ name = "Phase Catalyst" }]
+license = { file = "LICENSE" }
+authors = [{name = "Craig Holmander"}]
 dependencies = [
-  "numpy>=1.20",
-  "pandas>=1.2",
-  "matplotlib>=3.4",
-  "filelock>=3.12",
+  "numpy>=1.21",
+  "pandas>=1.3",
+  "matplotlib>=3.5",
+  "filelock>=3.7",
+  "pyarrow>=14.0",
+  "torch>=2.1",
+  "torchvision>=0.16",
 ]
-# Prefer users install the correct CUDA/CPU wheel for torch themselves.
-# Document this in README: `pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121`
+classifiers = ["License :: Other/Proprietary License"]
 
 [project.optional-dependencies]
-topology = ["ripser>=0.6"]
+topo = ["ripser>=0.6.4"]
 
 [project.scripts]
-veriscope = "veriscope.cli:main"
-
-[tool.setuptools]
-include-package-data = true
-
-[tool.setuptools.package-data]
-veriscope = ["configs/*.json"]
+veriscope = "veriscope.fr_integration:main"
 
 [tool.setuptools.packages.find]
-where = ["."]
 include = ["veriscope*"]
 
 [tool.ruff]
 line-length = 120
+lint.ignore = ["E501", "E701", "E702", "E731", "E402"]
 
-[tool.ruff.lint]
-select = ["E", "F"]
-ignore = ["E501"]
-
-[tool.ruff.lint.per-file-ignores]
-"veriscope/cli.py" = ["E501"]
 
 [tool.mypy]
 python_version = "3.10"
-files = ["cli.py"]
-warn_unused_ignores = true
-warn_redundant_casts = true
-show_error_codes = true
-pretty = true
+files = ["veriscope"]
 
+# Keep third‑party libraries from exploding the error count while we type
+# our own code strictly. We’ll re-tighten after the hot spots are fixed.
 ignore_missing_imports = true
-follow_imports = "silent"
-implicit_reexport = true
-allow_redefinition = true
-namespace_packages = true
+follow_imports = "skip"
 
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+no_implicit_optional = true
+
+warn_redundant_casts = true
+warn_unused_ignores = false
+warn_return_any = false
+
+
+[[tool.mypy.overrides]]
+module = ["veriscope.runners.legacy_cli"]
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+check_untyped_defs = false
+warn_return_any = false
+warn_unused_ignores = false
+# Trim the long tail while we refactor this file:
 disable_error_code = [
-  "call-overload",
-  "arg-type",
-  "assignment",
-  "operator",
-  "index",
-  "return-value",
+  "unused-ignore",
+  "valid-type",
+  "no-redef",
+  "has-type",
   "var-annotated",
 ]
-
-exclude = ["__main__\\.py$"]
