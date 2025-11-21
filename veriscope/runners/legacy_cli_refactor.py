@@ -2935,7 +2935,13 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
 
             pool_idxs = rng.choice(np.arange(N, dtype=np.int64), size=pool_size, replace=False)
             pool_loader = subset_loader_from_indices(
-                monitor_ds, pool_idxs, CFG["batch"], shuffle=True, seed=seed, device=device
+                monitor_ds,
+                pool_idxs,
+                CFG["batch"],
+                shuffle=True,
+                seed=seed,
+                device=device,
+                num_workers=int(CFG.get("num_workers", 0)),
             )
 
             # disjoint entropy set (fallback to pool if diff is empty)
@@ -2949,7 +2955,13 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
 
             ent_idxs = rng.choice(ent_pool, size=ent_n, replace=False)
             ent_loader = subset_loader_from_indices(
-                monitor_ds, ent_idxs, CFG["batch"], shuffle=False, seed=seed + 1, device=device
+                monitor_ds,
+                ent_idxs,
+                CFG["batch"],
+                shuffle=False,
+                seed=seed + 1,
+                device=device,
+                num_workers=int(CFG.get("num_workers", 0)),
             )
 
             # Ensure Python ints and give mypy a precise type
