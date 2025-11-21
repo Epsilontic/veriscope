@@ -39,9 +39,12 @@ if TYPE_CHECKING:
     from veriscope.core.gate import GateEngine
 
 # Optional registrar slot with a precise type; None until wired
-RegisterMetrics = Callable[
-    ["Transport", Iterable[Callable[..., Any]], str], None
-] | None
+RegisterMetrics = Optional[
+    Callable[
+        ["Transport", Iterable[Callable[..., Any]], str],
+        None,
+    ]
+]
 register_metrics: RegisterMetrics = None
 
 import matplotlib
