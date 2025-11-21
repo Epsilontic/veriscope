@@ -11,7 +11,7 @@ Pulled from runners/legacy_cli_refactor.py with identical behavior:
 from __future__ import annotations
 
 from collections import OrderedDict
-from typing import Any, Mapping, Optional, Tuple
+from typing import Any, Mapping, Optional, Tuple, cast
 
 import math
 import torch
@@ -90,7 +90,7 @@ def extract_features(
     ref_mu_sig: Optional[Tuple[torch.Tensor, torch.Tensor]],
     run_key: int,
     epoch: int,
-    cfg: Mapping[str, Any],
+    cfg: Optional[Mapping[str, Any]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Formerly `_features_for_loader` in legacy_cli_refactor.
@@ -99,6 +99,9 @@ def extract_features(
         Z_geom      – JL-projected, normalized features (if geom_rp_dim > 0)
         Z_geom_full – native normalized features (no JL projection)
     """
+    # Backward-compatible default: fall back to global CFG if no cfg passed.
+    if cfg is None:
+        cfg = cast(Mapping[str, Any], CFG)
     model.eval()
     feats = []
     cnt = 0
