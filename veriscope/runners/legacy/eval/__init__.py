@@ -1,28 +1,7 @@
-# veriscope/runners/legacy/eval/__init__.py
-from __future__ import annotations
+"""
+Legacy eval package placeholder.
 
-from veriscope.runners.legacy_cli_refactor import (  # type: ignore
-    compute_events,
-    mark_events_epochwise,
-    summarize_detection,
-    summarize_runlevel_fp,
-    bootstrap_stratified,
-    rp_adequacy_flags,
-    assert_overlay_consistency,
-    recompute_gate_series_under_decl,
-    compute_invariants_and_provenance,
-    make_plots,
-)
-
-__all__ = [
-    "compute_events",
-    "mark_events_epochwise",
-    "summarize_detection",
-    "summarize_runlevel_fp",
-    "bootstrap_stratified",
-    "rp_adequacy_flags",
-    "assert_overlay_consistency",
-    "recompute_gate_series_under_decl",
-    "compute_invariants_and_provenance",
-    "make_plots",
-]
+Phase-1 boundary:
+- Must not import from legacy_cli_refactor.py.
+"""
+from .eval import *  # noqa: F401,F403

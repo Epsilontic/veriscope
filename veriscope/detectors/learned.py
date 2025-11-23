@@ -5,14 +5,12 @@ from __future__ import annotations
 Public learned detector facade.
 
 Phase-1 boundary:
-- This file must never import from legacy_cli_refactor.py.
-- It re-exports stable learned-detector and calibration APIs from
-  veriscope.runners.legacy.detectors.learned.
+- Never import from legacy_cli_refactor.py.
+- Re-export stable APIs from legacy learned-detector implementation.
 """
 
 from typing import Any, Dict, List, Optional
 
-# Public feature list (same as legacy)
 DET_FEATURES: List[str] = [
     "cos_disp",
     "var_out_k",

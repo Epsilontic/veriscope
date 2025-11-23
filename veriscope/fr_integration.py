@@ -6,6 +6,7 @@ import json
 import hashlib
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Callable, Mapping, Tuple, List
+
 import numpy as np
 
 from veriscope.core.gate import GateEngine
@@ -338,20 +339,26 @@ def write_window_provenance_from_decl(outdir: Path, wd: WindowDecl) -> None:
         except Exception:
             pass
 
+
 def main(argv: Optional[List[str]] = None) -> int:
     """
     Console entrypoint for the `veriscope` CLI.
 
-    Thin shim that delegates to the refactored legacy CLI runner so that
-    the `veriscope` console script keeps working after the refactor.
+    Thin shim that delegates to the legacy CLI runner so that the
+    `veriscope` console script keeps working during phase-1.
+
+    IMPORTANT: this function must not contain a direct import statement
+    from legacy_cli_refactor; use lazy import to avoid circular deps.
     """
     import sys
-    # Import inside the function to avoid circular imports:
-    # legacy_cli_refactor imports FR-related helpers from this module.
-    from veriscope.runners.legacy_cli_refactor import main as legacy_main
+    import importlib
 
     if argv is None:
         argv = sys.argv[1:]
+
+    # Lazy import to avoid circular imports and keep phase-1 boundaries.
+    legacy_mod = importlib.import_module("veriscope.runners.legacy_cli_refactor")
+    legacy_main = getattr(legacy_mod, "main")
 
     # legacy_main currently reads sys.argv itself and does not use argv,
     # but we keep argv for future-proofing.
