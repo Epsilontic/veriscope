@@ -31,7 +31,7 @@ from veriscope.runners.legacy.utils import save_json
 from veriscope.runners.legacy.determinism import seed_worker
 
 try:
-    from filelock import SoftFileLock as FileLock
+    from filelock import SoftFileLock as FileLock, Timeout as FileLockTimeout
 except Exception:  # pragma: no cover
     # Runtime shim: act like a no-op context manager if filelock is unavailable.
     class FileLock:  # type: ignore[no-redef]
@@ -43,6 +43,10 @@ except Exception:  # pragma: no cover
 
         def __exit__(self, exc_type, exc, tb):
             return False
+
+    class FileLockTimeout(Exception):
+        """Fallback timeout exception when filelock is unavailable."""
+        pass
 
 
 # Default data root follows the same env knob as the legacy CLI.
@@ -85,7 +89,28 @@ def _cifar_datasets(data_root: Optional[str] = None):
 
     if FileLock is not None:
         lock_path = os.path.join(root, "cifar.lock")
-        with FileLock(lock_path):
+        timeout_s = float(os.environ.get("SCAR_DATA_LOCK_TIMEOUT", "120"))
+        try:
+            with FileLock(lock_path, timeout=timeout_s):
+                tr_aug = torchvision.datasets.CIFAR10(
+                    root=root, train=True, download=True, transform=tfm_tr
+                )
+                tr_eval = torchvision.datasets.CIFAR10(
+                    root=root, train=True, download=False, transform=tfm_eval
+                )
+                te_eval = torchvision.datasets.CIFAR10(
+                    root=root, train=False, download=True, transform=tfm_eval
+                )
+        except FileLockTimeout:
+            print(
+                f"[WARN] CIFAR lock timeout after {timeout_s:.0f}s at {lock_path}. "
+                "Assuming stale lock and proceeding.",
+                flush=True,
+            )
+            try:
+                Path(lock_path).unlink()
+            except Exception:
+                pass
             tr_aug = torchvision.datasets.CIFAR10(
                 root=root, train=True, download=True, transform=tfm_tr
             )
@@ -129,7 +154,25 @@ def _stl10_monitor_dataset(cfg_ext: Dict[str, Any], data_root: Optional[str] = N
 
     if FileLock is not None:
         lock_path = os.path.join(root, "stl10.lock")
-        with FileLock(lock_path):
+        timeout_s = float(os.environ.get("SCAR_DATA_LOCK_TIMEOUT", "120"))
+        try:
+            with FileLock(lock_path, timeout=timeout_s):
+                ds = torchvision.datasets.STL10(
+                    root=root,
+                    split=str(cfg_ext["split"]),
+                    download=True,
+                    transform=tfm,
+                )
+        except FileLockTimeout:
+            print(
+                f"[WARN] STL10 lock timeout after {timeout_s:.0f}s at {lock_path}. "
+                "Assuming stale lock and proceeding.",
+                flush=True,
+            )
+            try:
+                Path(lock_path).unlink()
+            except Exception:
+                pass
             ds = torchvision.datasets.STL10(
                 root=root,
                 split=str(cfg_ext["split"]),
