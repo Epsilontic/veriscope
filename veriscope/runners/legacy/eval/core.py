@@ -13,13 +13,28 @@ import pandas as pd
 # Imports from refactored legacy modules (no CLI imports)
 # ---------------------------
 
-# Numeric / config / IO shims
+# Runtime globals: single shared CFG / OUTDIR
 try:
-    # your refactor likely centralized these
-    from veriscope.runners.legacy.runtime import (
-        CFG,
-        OUTDIR,
-        SUCCESS_TARGET,
+    from veriscope.runners.legacy import runtime as _runtime
+
+    # Shared mutable config / outdir; these are the same objects the CLI mutates.
+    CFG = _runtime.CFG
+    OUTDIR = _runtime.OUTDIR
+except Exception:  # pragma: no cover
+    CFG = {}
+    OUTDIR = Path(".")
+
+# SUCCESS_TARGET: soft-collapse lead-time requirements.
+# In the legacy CLI this may live in a config module; we provide a safe default.
+try:
+    from veriscope.runners.legacy.runtime import SUCCESS_TARGET  # type: ignore[attr-defined]
+except Exception:  # pragma: no cover
+    SUCCESS_TARGET = {"min_lead": 2}
+
+# Numeric / config / IO shims.
+# Prefer the shared helpers in legacy.utils; fall back to local definitions if missing.
+try:
+    from veriscope.runners.legacy.utils import (
         as_int,
         as_float,
         save_json,
@@ -29,9 +44,6 @@ try:
         quantile2,
     )
 except Exception:  # pragma: no cover
-    CFG = {}
-    OUTDIR = Path(".")
-    SUCCESS_TARGET = {"min_lead": 2}
 
     def as_int(x: Any, default: int = 0) -> int:
         try:
