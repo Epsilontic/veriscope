@@ -49,15 +49,22 @@ This is an early‑stage research prototype. Interfaces and outputs may change. 
   - `ripser` (H0 persistence; falls back to NaN if unavailable)  
   - `pyarrow` or `fastparquet` (for parquet output; CSV fallback automatic)
 
-Example installation:
+Example installation (editable install):
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
-# If you don’t have a requirements file yet, minimally:
-# pip install torch torchvision numpy pandas matplotlib filelock ripser pyarrow
+python -m pip install -U pip
+pip install -e .
 ```
+
+Optional extras (if configured in `pyproject.toml`):
+
+```bash
+pip install -e ".[topo]"
+```
+
+Note: dependencies are declared in `pyproject.toml`, so you normally do not need a `requirements.txt`.
 
 ---
 
