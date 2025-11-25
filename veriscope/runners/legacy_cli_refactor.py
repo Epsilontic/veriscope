@@ -8,6 +8,17 @@
 
 
 from __future__ import annotations
+# --- debug faulthandler (early) ---
+import os
+import faulthandler
+import signal
+import sys
+
+# Enable with VS_FAULTHANDLER=1. Send `kill -USR1 <pid>` to dump Python stacks.
+if os.environ.get("VS_FAULTHANDLER", "0") == "1":
+    faulthandler.register(signal.SIGUSR1, file=sys.stderr, all_threads=True)
+    print("[debug] faulthandler SIGUSR1 registered", flush=True)
+# --- end debug faulthandler ---
 from typing import Any, Optional, Dict
 from pathlib import Path
 
@@ -3991,6 +4002,58 @@ def _reset_budget() -> None:
         # Keep sweeps robust even if the budget ledger is misconfigured.
         pass
 
+
+# --- env int + canary clamps (optional) ---
+def _env_int(name: str) -> Optional[int]:
+    """Parse env var as int; returns None on missing/blank/invalid."""
+    v = os.environ.get(name)
+    if v is None:
+        return None
+    v = str(v).strip()
+    if not v:
+        return None
+    try:
+        return int(v)
+    except Exception:
+        return None
+
+
+def _apply_env_canary_clamps(cfg: Dict[str, Any]) -> None:
+    """Optionally clamp epochs and seed lists using env vars.
+
+    - Epoch clamp: SCAR_MAX_EPOCHS (preferred), else SCAR_EPOCHS, else SCAR_N_EPOCHS.
+    - Seed clamp (both splits): SCAR_SEED_COUNT.
+    - Eval-only seed clamp: SCAR_CANARY_SEEDS.
+
+    No effect unless the corresponding env var is set to a positive int.
+    """
+    # ---- epoch clamp ----
+    epoch_cap = _env_int("SCAR_MAX_EPOCHS") or _env_int("SCAR_EPOCHS") or _env_int("SCAR_N_EPOCHS")
+    if epoch_cap is not None and int(epoch_cap) > 0:
+        cfg_epochs = as_int(cfg.get("epochs", int(epoch_cap)), default=int(epoch_cap))
+        new_epochs = min(int(cfg_epochs), int(epoch_cap))
+        if as_int(cfg.get("epochs", new_epochs), default=new_epochs) != new_epochs:
+            print(f"[cfg] env clamp: epochs {cfg.get('epochs')} -> {new_epochs} (cap={epoch_cap})")
+        cfg["epochs"] = int(new_epochs)
+
+    # ---- seed clamp (both splits) ----
+    seed_cap = _env_int("SCAR_SEED_COUNT")
+    if seed_cap is not None and int(seed_cap) > 0:
+        sc = int(seed_cap)
+        if "seeds_calib" in cfg:
+            cfg["seeds_calib"] = list(cfg.get("seeds_calib") or [])[:sc]
+        if "seeds_eval" in cfg:
+            cfg["seeds_eval"] = list(cfg.get("seeds_eval") or [])[:sc]
+        print(f"[cfg] env clamp: seeds_calib<= {sc}, seeds_eval<= {sc} (SCAR_SEED_COUNT)")
+
+    # ---- seed clamp (eval only) ----
+    eval_cap = _env_int("SCAR_CANARY_SEEDS")
+    if eval_cap is not None and int(eval_cap) > 0:
+        se = int(eval_cap)
+        if "seeds_eval" in cfg:
+            cfg["seeds_eval"] = list(cfg.get("seeds_eval") or [])[:se]
+        print(f"[cfg] env clamp: seeds_eval<= {se} (SCAR_CANARY_SEEDS)")
+
 # ---------------------------
 # Sweep
 # ---------------------------
@@ -4062,8 +4125,14 @@ def run_sweep(tag: str):
             print(f"[WARN] external monitor unavailable ({e!r}); falling back to clean_val.")
             CFG["monitor_source"] = "clean_val"
 
+    # Optional canary clamps (epochs / seed lists) from env
+    try:
+        _apply_env_canary_clamps(CFG)
+    except Exception:
+        pass
+
     # factor mapping across ALL seeds
-    all_seeds = sorted(CFG["seeds_calib"] + CFG["seeds_eval"])
+    all_seeds = sorted(list(CFG["seeds_calib"]) + list(CFG["seeds_eval"]))
     mapping_all = assign_factors_evenly(all_seeds)
     split_map = {as_int(s, default=0): ("calib" if s in CFG["seeds_calib"] else "eval") for s in all_seeds}
     save_json(
