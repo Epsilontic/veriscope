@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import math
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, TYPE_CHECKING
 
 import numpy as np
 import pandas as pd
@@ -13,23 +13,36 @@ import pandas as pd
 # Imports from refactored legacy modules (no CLI imports)
 # ---------------------------
 
-# Runtime globals: single shared CFG / OUTDIR
-try:
-    from veriscope.runners.legacy import runtime as _runtime
+# ---------------------------
+# Lightweight defaults; runtime fetched lazily to avoid import-time stalls
+# ---------------------------
+CFG: Mapping[str, Any] = {}
+OUTDIR: Path = Path(".")
+SUCCESS_TARGET: Mapping[str, Any] = {"min_lead": 2}
 
-    # Shared mutable config / outdir; these are the same objects the CLI mutates.
-    CFG = _runtime.CFG
-    OUTDIR = _runtime.OUTDIR
-except Exception:  # pragma: no cover
-    CFG = {}
-    OUTDIR = Path(".")
 
-# SUCCESS_TARGET: soft-collapse lead-time requirements.
-# In the legacy CLI this may live in a config module; we provide a safe default.
-try:
-    from veriscope.runners.legacy.runtime import SUCCESS_TARGET  # type: ignore[attr-defined]
-except Exception:  # pragma: no cover
-    SUCCESS_TARGET = {"min_lead": 2}
+def _get_runtime():
+    try:
+        from veriscope.runners.legacy import runtime as r  # local import
+
+        return r
+    except Exception:
+        return None
+
+
+def _get_cfg() -> Mapping[str, Any]:
+    r = _get_runtime()
+    return getattr(r, "CFG", CFG) if r is not None else CFG
+
+
+def _get_outdir() -> Path:
+    r = _get_runtime()
+    return Path(getattr(r, "OUTDIR", OUTDIR)) if r is not None else Path(OUTDIR)
+
+
+def _get_success_target() -> Mapping[str, Any]:
+    r = _get_runtime()
+    return getattr(r, "SUCCESS_TARGET", SUCCESS_TARGET) if r is not None else SUCCESS_TARGET
 
 # Numeric / config / IO shims.
 # Prefer the shared helpers in legacy.utils; fall back to local definitions if missing.
@@ -75,34 +88,10 @@ except Exception:  # pragma: no cover
         return (float(np.quantile(arr, qlo)), float(np.quantile(arr, qhi)))
 
 
-# PH / baseline helpers
-try:
-    from veriscope.runners.legacy.detectors.baselines import (
-        _prep_series_for_ph,
-        ph_window_sparse,
-        SCHEDULED_METRICS,
-    )
-except Exception:  # pragma: no cover
-    _prep_series_for_ph = None  # type: ignore
-    ph_window_sparse = None  # type: ignore
-    SCHEDULED_METRICS: Sequence[str] = []
-
-
-# FR spine / IPM helpers (optional)
-try:
-    from veriscope.core.window import WindowDecl
-except Exception:  # pragma: no cover
-    WindowDecl = Any  # type: ignore
-
-try:
-    from veriscope.core.ipm import dPi_product_tv  # product-TV under Φ_W
-except Exception:  # pragma: no cover
-    dPi_product_tv = None  # type: ignore
-
-try:
-    from veriscope.core.calibration import aggregate_epsilon_stat as AGGREGATE_EPSILON
-except Exception:  # pragma: no cover
-    AGGREGATE_EPSILON = None  # type: ignore
+if TYPE_CHECKING:
+    from veriscope.core.window import WindowDecl  # pragma: no cover
+else:
+    WindowDecl = Any  # runtime type
 
 
 # Local tiny numeric helper
@@ -135,16 +124,23 @@ def compute_events(
     rows: List[Dict[str, Any]] = []
     dbg: List[Dict[str, Any]] = []
 
-    burn = as_int(CFG.get("warmup"), default=0) + as_int(CFG.get("ph_burn"), default=0)
-    win_default = as_int(CFG.get("ph_win"), default=0)
-    lam = as_float(CFG.get("ph_lambda"), default=0.0)
-    min_points = as_int(CFG.get("ph_min_points"), default=0)
+    cfg = _get_cfg()
+    burn = as_int(cfg.get("warmup"), default=0) + as_int(cfg.get("ph_burn"), default=0)
+    win_default = as_int(cfg.get("ph_win"), default=0)
+    lam = as_float(cfg.get("ph_lambda"), default=0.0)
+    min_points = as_int(cfg.get("ph_min_points"), default=0)
 
     if df is None or df.empty:
         return pd.DataFrame([]), pd.DataFrame([])
 
-    if _prep_series_for_ph is None or ph_window_sparse is None:
-        raise RuntimeError("PH helpers are unavailable; check baselines module imports.")
+    try:
+        from veriscope.runners.legacy.detectors.baselines import (
+            _prep_series_for_ph,
+            ph_window_sparse,
+            SCHEDULED_METRICS,
+        )
+    except Exception as e:
+        raise RuntimeError("PH helpers are unavailable; check baselines module imports.") from e
 
     from typing import cast
 
@@ -163,7 +159,7 @@ def compute_events(
         for m in metrics_for_ph:
             xs = _prep_series_for_ph(g0, m)
             win_m = (
-                as_int(CFG.get("ph_win_short"), default=win_default)
+                as_int(cfg.get("ph_win_short"), default=win_default)
                 if (m in SCHEDULED_METRICS)
                 else int(win_default)
             )
@@ -175,7 +171,7 @@ def compute_events(
                 direction=d,
                 burn_in=int(burn),
                 min_points=int(min_points),
-                two_sided=bool(CFG.get("ph_two_sided")),
+                two_sided=bool(cfg.get("ph_two_sided")),
             )
             thr = int(max(int(burn), int(win_m)))
             t_i = as_int(t, default=-1) if t is not None else -1
@@ -204,11 +200,11 @@ def compute_events(
                 t_collapse=t_collapse,
                 ph_win=win_default,
                 ph_lambda=lam,
-                ph_two_sided=int(bool(CFG.get("ph_two_sided"))),
-                heavy_every=CFG.get("heavy_every"),
-                metric_batches=CFG.get("metric_batches"),
-                var_k_energy=CFG.get("var_k_energy"),
-                var_k_max=CFG.get("var_k_max"),
+                ph_two_sided=int(bool(cfg.get("ph_two_sided"))),
+                heavy_every=cfg.get("heavy_every"),
+                metric_batches=cfg.get("metric_batches"),
+                var_k_energy=cfg.get("var_k_energy"),
+                var_k_max=cfg.get("var_k_max"),
                 **{f"t_{k}": v for k, v in t_map.items()},
             )
         )
@@ -255,7 +251,8 @@ def mark_events_epochwise(
     warn_key = "t_warn" if ("t_warn" in events.columns) else _first_t_column(events)
     ev = events.set_index(["seed", "factor"])
 
-    K = int(CFG.get("warn_consec", 3))
+    cfg = _get_cfg()
+    K = int(cfg.get("warn_consec", 3))
     from typing import cast
 
     for key, g in df.groupby(["seed", "factor"], sort=False):
@@ -349,7 +346,7 @@ def assert_overlay_consistency(
 
     if mismatches:
         cap = 50
-        path = Path(OUTDIR) / f"overlay_mismatches_{prefix}.json"
+        path = _get_outdir() / f"overlay_mismatches_{prefix}.json"
         save_json({"count": len(mismatches), "items": mismatches[:cap]}, path)
         print(f"[WARN] overlay mismatches: {len(mismatches)} (showing first {cap}; details in {path})")
 
@@ -367,7 +364,8 @@ def bootstrap_stratified(
     vals_fp: List[float] = []
     vals_med: List[float] = []
 
-    warm = as_int(CFG.get("warmup"), default=0) + as_int(CFG.get("ph_burn"), default=0)
+    cfg = _get_cfg()
+    warm = as_int(cfg.get("warmup"), default=0) + as_int(cfg.get("ph_burn"), default=0)
 
     for _ in range(B):
         boot_parts = []
@@ -387,7 +385,7 @@ def bootstrap_stratified(
         succ = int(
             (
                 (trig["t_warn"].notna())
-                & ((trig["t_collapse"] - trig["t_warn"]) >= SUCCESS_TARGET["min_lead"])
+                & ((trig["t_collapse"] - trig["t_warn"]) >= _get_success_target().get("min_lead", 2))
             ).sum()
         )
         vals_detect.append(float(succ / max(1, ncol)))
@@ -456,7 +454,7 @@ def summarize_detection(rows: pd.DataFrame, warm_idx: int) -> pd.DataFrame:
 
     _tw = to_numeric_series(trig["t_warn"], errors="coerce")
     _tc = to_numeric_series(trig["t_collapse"], errors="coerce")
-    lead_min = as_int(SUCCESS_TARGET.get("min_lead", 2), default=2)
+    lead_min = as_int(_get_success_target().get("min_lead", 2), default=2)
     mask = (_tw.notna()) & ((_tc - _tw) >= int(lead_min))
 
     successes = int(np.count_nonzero(mask.to_numpy(dtype=bool)))
@@ -637,10 +635,18 @@ def recompute_gate_series_under_decl(
     Returns a COPY of df_eval with:
       gate_worst_tv_calib, gate_eps_stat_calib, gate_gain_calib, gate_warn_calib
     """
-    if dPi_product_tv is None:
-        raise RuntimeError("dPi_product_tv unavailable; core.ipm import failed.")
+    try:
+        from veriscope.core.ipm import dPi_product_tv  # product-TV under Φ_W
+    except Exception as e:
+        raise RuntimeError("dPi_product_tv unavailable; core.ipm import failed.") from e
+
+    try:
+        from veriscope.core.calibration import aggregate_epsilon_stat as AGGREGATE_EPSILON
+    except Exception:
+        AGGREGATE_EPSILON = None  # type: ignore
 
     df = df_eval.copy()
+    cfg = _get_cfg()
 
     # Normalize key columns to numeric for sorting / slicing
     for c in ("epoch", "seed"):
@@ -653,10 +659,10 @@ def recompute_gate_series_under_decl(
     df["gate_gain_calib"] = np.nan
     df["gate_warn_calib"] = 0
 
-    max_frac = as_float(CFG.get("gate_eps_stat_max_frac", 0.25), default=0.25)
-    thr_gain = as_float(CFG.get("gate_gain_thresh", 0.1), default=0.1)
-    eps_sens = as_float(CFG.get("gate_epsilon_sens", 0.04), default=0.04)
-    alpha = as_float(CFG.get("gate_eps_stat_alpha", 0.05), default=0.05)
+    max_frac = as_float(cfg.get("gate_eps_stat_max_frac", 0.25), default=0.25)
+    thr_gain = as_float(cfg.get("gate_gain_thresh", 0.1), default=0.1)
+    eps_sens = as_float(cfg.get("gate_epsilon_sens", 0.04), default=0.04)
+    alpha = as_float(cfg.get("gate_eps_stat_alpha", 0.05), default=0.05)
     ln2 = math.log(2.0)
 
     mets = [m for m in getattr(window_decl, "metrics", []) if m in df.columns]
