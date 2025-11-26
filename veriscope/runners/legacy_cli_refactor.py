@@ -630,8 +630,15 @@ def write_window_provenance(outdir: Path, window: Window, cfg: dict, budget: Win
         }
         # Units breadcrumb for prequential gain used elsewhere
         capsule["gain_units"] = "bits/sample"
-        s = json.dumps(capsule, sort_keys=True)
-        capsule["sha256"] = hashlib.sha256(s.encode()).hexdigest()
+
+        # NOTE: this hash is for the *capsule payload*, not a checksum of any file on disk.
+        # Use a canonical JSON form so the hash is stable across whitespace/indentation.
+        s = json.dumps(capsule, sort_keys=True, separators=(",", ":"))
+        h = hashlib.sha256(s.encode("utf-8")).hexdigest()
+        capsule["capsule_sha256"] = h
+        # Back-compat for older readers that expected `sha256`.
+        capsule["sha256"] = h
+
         save_json(capsule, outdir / "window_provenance.json")
     except Exception:
         pass
@@ -4286,7 +4293,7 @@ def run_sweep(tag: str):
     # Compute checksum for whichever file actually exists (parquet or CSV fallback)
     target = out_path if out_path.exists() else out_path.with_suffix(".csv")
     md5 = file_md5(target)
-    Path(str(target) + ".md5").write_text(md5 + "\n")
+    Path(str(target) + ".md5").write_text(f"{md5}  {target.name}\n")
     print(f"[checksum] {target.name} md5={md5}")
 
     return df_all
