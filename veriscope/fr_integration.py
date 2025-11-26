@@ -322,15 +322,43 @@ def write_window_provenance_from_decl(outdir: Path, wd: WindowDecl) -> None:
             "gain_units": "bits/sample",
         }
 
-        s = json.dumps(capsule, sort_keys=True)
-        h = hashlib.sha256(s.encode("utf-8")).hexdigest()
+        # Hash the capsule in a stable, canonical form (object-level fingerprint)
+        capsule_canon = json.dumps(
+            capsule,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+        capsule_sha = hashlib.sha256(capsule_canon.encode("utf-8")).hexdigest()
 
         outdir.mkdir(parents=True, exist_ok=True)
-        (outdir / "window_provenance_decl.json").write_text(
-            json.dumps({"capsule": capsule, "sha256": h}, indent=2)
+
+        # Write provenance payload first
+        prov_path = outdir / "window_provenance_decl.json"
+        prov_text = (
+            json.dumps(
+                {"capsule": capsule, "capsule_sha256": capsule_sha},
+                indent=2,
+                sort_keys=True,
+                ensure_ascii=False,
+            )
+            + "\n"
         )
+        prov_path.write_text(prov_text, encoding="utf-8")
+
+        # Then hash the exact bytes written to disk and emit a sha256sum -c compatible manifest
+        file_sha = hashlib.sha256(prov_path.read_bytes()).hexdigest()
         try:
-            (outdir / "window_provenance_decl.json.sha256").write_text(h + "\n")
+            (outdir / "window_provenance_decl.json.sha256").write_text(
+                f"{file_sha}  {prov_path.name}\n",
+                encoding="utf-8",
+            )
+
+            # Back-compat: also emit a digest-only file (older tooling may expect just the hex digest).
+            (outdir / "window_provenance_decl.json.sha256.raw").write_text(
+                file_sha + "\n",
+                encoding="utf-8",
+            )
         except Exception:
             pass
     except Exception:
