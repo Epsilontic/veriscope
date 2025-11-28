@@ -17,8 +17,17 @@ class GateResult:
     ok: bool
     audit: Dict[str, Any]
 
+
 class GateEngine:
-    def __init__(self, frwin: "FRWindow", gain_thresh: float, eps_stat_alpha: float, eps_stat_max_frac: float, eps_sens: float, min_evidence: int = 0):
+    def __init__(
+        self,
+        frwin: "FRWindow",
+        gain_thresh: float,
+        eps_stat_alpha: float,
+        eps_stat_max_frac: float,
+        eps_sens: float,
+        min_evidence: int = 0,
+    ):
         self.win = frwin
         self.gain_thr = float(gain_thresh)
         self.alpha = float(eps_stat_alpha)
@@ -26,13 +35,15 @@ class GateEngine:
         self.eps_sens = float(eps_sens)
         self.min_evidence = int(max(0, min_evidence))
 
-    def check(self,
-              past: Dict[str, np.ndarray],
-              recent: Dict[str, np.ndarray],
-              counts_by_metric: Dict[str, int],
-              gain_bits: float,
-              kappa_sens: float,
-              eps_stat_value: float) -> GateResult:
+    def check(
+        self,
+        past: Dict[str, np.ndarray],
+        recent: Dict[str, np.ndarray],
+        counts_by_metric: Dict[str, int],
+        gain_bits: float,
+        kappa_sens: float,
+        eps_stat_value: float,
+    ) -> GateResult:
         wd = self.win.decl
         # worst_DW upper bound via fixed partition with the common adapter
         intervs: Sequence = tuple(getattr(wd, "interventions", ()) or (lambda x: x,))

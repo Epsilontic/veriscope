@@ -29,6 +29,7 @@ import torch.nn.functional as F
 
 from veriscope.runners.legacy.utils import save_json
 from veriscope.runners.legacy.determinism import seed_worker
+from veriscope.runners.legacy.types import DropCfg as _DropCfg
 
 try:
     from filelock import SoftFileLock as FileLock, Timeout as FileLockTimeout
@@ -46,6 +47,7 @@ except Exception:  # pragma: no cover
 
     class FileLockTimeout(Exception):
         """Fallback timeout exception when filelock is unavailable."""
+
         pass
 
 
@@ -59,6 +61,7 @@ C = 10
 # ---------------------------
 # Core datasets
 # ---------------------------
+
 
 def _cifar_datasets(data_root: Optional[str] = None):
     """
@@ -92,44 +95,25 @@ def _cifar_datasets(data_root: Optional[str] = None):
         timeout_s = float(os.environ.get("SCAR_DATA_LOCK_TIMEOUT", "120"))
         try:
             with FileLock(lock_path, timeout=timeout_s):
-                tr_aug = torchvision.datasets.CIFAR10(
-                    root=root, train=True, download=True, transform=tfm_tr
-                )
-                tr_eval = torchvision.datasets.CIFAR10(
-                    root=root, train=True, download=False, transform=tfm_eval
-                )
-                te_eval = torchvision.datasets.CIFAR10(
-                    root=root, train=False, download=True, transform=tfm_eval
-                )
+                tr_aug = torchvision.datasets.CIFAR10(root=root, train=True, download=True, transform=tfm_tr)
+                tr_eval = torchvision.datasets.CIFAR10(root=root, train=True, download=False, transform=tfm_eval)
+                te_eval = torchvision.datasets.CIFAR10(root=root, train=False, download=True, transform=tfm_eval)
         except FileLockTimeout:
             print(
-                f"[WARN] CIFAR lock timeout after {timeout_s:.0f}s at {lock_path}. "
-                "Assuming stale lock and proceeding.",
+                f"[WARN] CIFAR lock timeout after {timeout_s:.0f}s at {lock_path}. Assuming stale lock and proceeding.",
                 flush=True,
             )
             try:
                 Path(lock_path).unlink()
             except Exception:
                 pass
-            tr_aug = torchvision.datasets.CIFAR10(
-                root=root, train=True, download=True, transform=tfm_tr
-            )
-            tr_eval = torchvision.datasets.CIFAR10(
-                root=root, train=True, download=False, transform=tfm_eval
-            )
-            te_eval = torchvision.datasets.CIFAR10(
-                root=root, train=False, download=True, transform=tfm_eval
-            )
+            tr_aug = torchvision.datasets.CIFAR10(root=root, train=True, download=True, transform=tfm_tr)
+            tr_eval = torchvision.datasets.CIFAR10(root=root, train=True, download=False, transform=tfm_eval)
+            te_eval = torchvision.datasets.CIFAR10(root=root, train=False, download=True, transform=tfm_eval)
     else:
-        tr_aug = torchvision.datasets.CIFAR10(
-            root=root, train=True, download=True, transform=tfm_tr
-        )
-        tr_eval = torchvision.datasets.CIFAR10(
-            root=root, train=True, download=False, transform=tfm_eval
-        )
-        te_eval = torchvision.datasets.CIFAR10(
-            root=root, train=False, download=True, transform=tfm_eval
-        )
+        tr_aug = torchvision.datasets.CIFAR10(root=root, train=True, download=True, transform=tfm_tr)
+        tr_eval = torchvision.datasets.CIFAR10(root=root, train=True, download=False, transform=tfm_eval)
+        te_eval = torchvision.datasets.CIFAR10(root=root, train=False, download=True, transform=tfm_eval)
 
     return tr_aug, tr_eval, te_eval
 
@@ -165,8 +149,7 @@ def _stl10_monitor_dataset(cfg_ext: Dict[str, Any], data_root: Optional[str] = N
                 )
         except FileLockTimeout:
             print(
-                f"[WARN] STL10 lock timeout after {timeout_s:.0f}s at {lock_path}. "
-                "Assuming stale lock and proceeding.",
+                f"[WARN] STL10 lock timeout after {timeout_s:.0f}s at {lock_path}. Assuming stale lock and proceeding.",
                 flush=True,
             )
             try:
@@ -193,6 +176,7 @@ def _stl10_monitor_dataset(cfg_ext: Dict[str, Any], data_root: Optional[str] = N
 # ---------------------------
 # DataLoader helpers
 # ---------------------------
+
 
 def make_loader(
     ds,
@@ -224,7 +208,7 @@ def make_loader(
     # Default pinning behavior mirrors the legacy CLI:
     # - if pin_memory is None, prefer pinning on CUDA
     if pin_memory is None:
-        pin = (getattr(device, "type", "cpu") == "cuda")
+        pin = getattr(device, "type", "cpu") == "cuda"
     else:
         pin = bool(pin_memory)
 
@@ -278,14 +262,14 @@ def subset_loader_from_indices(
     gen = torch.Generator().manual_seed(100_000 + int(seed))
 
     if pin_memory is None:
-        pin = (getattr(device, "type", "cpu") == "cuda")
+        pin = getattr(device, "type", "cpu") == "cuda"
     else:
         pin = bool(pin_memory)
 
     extra: Dict[str, Any] = {}
     try:
         if "persistent_workers" in inspect.signature(DataLoader).parameters:
-            extra["persistent_workers"] = (num_workers > 0)
+            extra["persistent_workers"] = num_workers > 0
     except Exception:
         pass
 
@@ -313,6 +297,7 @@ def subset_loader_from_indices(
 # ---------------------------
 # Split helpers (balanced monitor/norm_ref)
 # ---------------------------
+
 
 def _balanced_indices_by_class(labels: np.ndarray, per_class: int, rng: np.random.Generator):
     """
@@ -403,10 +388,10 @@ def load_splits(
     )
     return tr_aug, tr_take, mon_val, norm_ref, splits_path
 
-
     # ---------------------------
     # Factor / corruption helpers
     # ---------------------------
+
 
 def _u01_from_hash(*xs: object) -> float:
     """Deterministic U(0,1) from a hash of the inputs."""
@@ -483,23 +468,17 @@ def maybe_corrupt_input(
     # Additive Gaussian noise
     std = float(factor.get("noise_std", 0.0))
     if std > 0.0:
-        g = torch.Generator(device=x.device).manual_seed(
-            int(1e6 * _u01_from_hash("noise", seed, epoch, idx))
-        )
+        g = torch.Generator(device=x.device).manual_seed(int(1e6 * _u01_from_hash("noise", seed, epoch, idx)))
         noise = torch.randn(x.shape, generator=g, device=x.device, dtype=x.dtype) * std
         x = (x + noise).clamp_(-3, 3)
 
     return x
 
 
-_DropCfg = Dict[str, Any]
-
 class FactorisedTrainDataset(Dataset):
     """CIFAR10 train indices with a single active factor per run. Provides epoch-aware dropout semantics."""
 
-    def __init__(
-    self, base: torchvision.datasets.CIFAR10, tr_indices: List[int], factor: Dict, seed: int
-    ):
+    def __init__(self, base: torchvision.datasets.CIFAR10, tr_indices: List[int], factor: Dict, seed: int):
         self.base = base
         self.indices = list(tr_indices)
         orig = np.array(base.targets, dtype=np.int64)[np.array(self.indices, dtype=np.int64)]

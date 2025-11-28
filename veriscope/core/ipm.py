@@ -7,7 +7,8 @@ import numpy as np
 
 from .window import FRWindow, WindowDecl
 
-__all__ = ["tv_hist_fixed"]
+__all__ = ["tv_hist_fixed", "d_hyb", "dPi_product_tv", "d_Pi", "D_W"]
+
 
 def tv_hist_fixed(z0: Any, z1: Any, bins: int) -> float:
     """Total variation distance between fixed-range [0,1] histograms built from z0,z1.
@@ -28,13 +29,16 @@ def tv_hist_fixed(z0: Any, z1: Any, bins: int) -> float:
     hb = hb / hb.sum()
     return 0.5 * float(np.abs(ha - hb).sum())
 
-def d_hyb(obs: Dict[str,np.ndarray], pred: Dict[str,np.ndarray], weights: Dict[str,float], bins: int) -> float:
+
+def d_hyb(obs: Dict[str, np.ndarray], pred: Dict[str, np.ndarray], weights: Dict[str, float], bins: int) -> float:
     mx, acc = 0.0, 0.0
     for m, w in weights.items():
         if (m in obs) and (m in pred):
             tv = tv_hist_fixed(obs[m], pred[m], bins)
-            mx = max(mx, tv); acc += float(w) * tv
+            mx = max(mx, tv)
+            acc += float(w) * tv
     return mx + acc
+
 
 def d_Pi(
     decl: WindowDecl,
@@ -46,17 +50,33 @@ def d_Pi(
     s = 0.0
     for m, w in decl.weights.items():
         if (m in P) and (m in Q):
-            p = apply(m, P[m]); q = apply(m, Q[m])
+            p = apply(m, P[m])
+            q = apply(m, Q[m])
             s += float(w) * tv_hist_fixed(p, q, decl.bins)
     return s
 
-def D_W(frwin: FRWindow, P: Dict[str,np.ndarray], Q: Dict[str,np.ndarray]) -> float:
-    # restricted operational distinguishability on Φ_W;
-    # in current fixed-partition regime this upper-bounds by max TV across metrics
+
+def dPi_product_tv(
+    decl: WindowDecl,
+    P: Dict[str, np.ndarray],
+    Q: Dict[str, np.ndarray],
+    apply: Callable[[str, np.ndarray], np.ndarray],
+) -> float:
+    """Canonical name for the fixed-partition product-TV distance.
+
+    This is an alias of `d_Pi` to keep a stable import surface across the repo.
+    """
+    return d_Pi(decl, P, Q, apply)
+
+
+def D_W(frwin: FRWindow, P: Dict[str, np.ndarray], Q: Dict[str, np.ndarray]) -> float:
+    # Restricted operational distinguishability on Φ_W.
+    # In the current fixed-partition regime, define D_W as max TV across declared metrics.
     mx = 0.0
     for m in frwin.decl.metrics:
         if (m in P) and (m in Q):
-            p = frwin.transport.apply(m, P[m]); q = frwin.transport.apply(m, Q[m])
+            p = frwin.transport.apply(m, P[m])
+            q = frwin.transport.apply(m, Q[m])
             tv = tv_hist_fixed(p, q, frwin.decl.bins)
             mx = max(mx, tv)
     return mx

@@ -10,6 +10,7 @@ This module owns:
 It reads CFG/BUDGET from the shared legacy runtime and keeps all heavy,
 finite-window metric logic out of the CLI to avoid cycles and runner bloat.
 """
+
 from __future__ import annotations
 from typing import Any, Dict, Tuple
 import time
@@ -19,17 +20,31 @@ import torch
 import torch.nn.functional as F
 import torch.multiprocessing as mp
 
-# Budget ledger (process-global); runner installs it via runtime/install_runtime
-try:
-    # Prefer a shared process-global BUDGET (installed by the runner)
-    from veriscope.runners.legacy.budget import BUDGET  # type: ignore
-except Exception:
-    BUDGET = None  # type: ignore
+# Budget ledger is installed by the runner via runtime.install_runtime().
+# IMPORTANT: do not import BUDGET at module import-time (it may not be installed yet).
+# Fetch lazily via runtime.get_budget() to avoid cycles and stale globals.
+
+
+def _get_budget():
+    try:
+        from veriscope.runners.legacy.runtime import get_budget  # local import
+
+        return get_budget()
+    except Exception:
+        # Fallback: attempt attribute access if older runtime versions exist.
+        try:
+            from veriscope.runners.legacy import runtime as _rt  # type: ignore
+
+            return getattr(_rt, "BUDGET", None)
+        except Exception:
+            return None
+
 
 # Lightweight numeric helpers
 try:
     from veriscope.runners.legacy.utils import as_int, as_float  # type: ignore
 except Exception:
+
     def as_int(x: Any, default: int = 0) -> int:
         try:
             return int(x)
@@ -42,26 +57,49 @@ except Exception:
         except Exception:
             return default
 
+
 # Stable per-feature std helper used by topo_h0_jl_agg
 try:
     from veriscope.runners.legacy.features import _std0  # type: ignore
 except Exception:
+
     def _std0(X: torch.Tensor, keepdim: bool = False) -> torch.Tensor:  # minimal fallback
         x = X.float()
         std = x.std(dim=0, keepdim=keepdim, unbiased=False)
         return std.clamp_min(1e-12)
 
-# Config access: prefer runtime-installed CFG, fall back to packaged defaults, else {}
-CFG: Dict[str, Any]
-try:
-    from veriscope.runners.legacy import runtime as _rt  # type: ignore
-    CFG = getattr(_rt, "CFG", {}) or {}
-except Exception:
+# Config access: prefer runtime-installed CFG, fall back to packaged defaults, else {}.
+# IMPORTANT: do not snapshot CFG at module import-time (runner may install it later).
+# Fetch lazily via runtime.get_cfg() to avoid cycles and stale globals.
+
+
+def _get_cfg() -> Dict[str, Any]:
+    try:
+        from veriscope.runners.legacy.runtime import get_cfg  # local import
+
+        c = get_cfg()
+        # get_cfg() returns a live Mapping; return a dict-like object with .get
+        return dict(c) if not isinstance(c, dict) else c
+    except Exception:
+        # Fallback: attribute access for older runtime versions.
+        try:
+            from veriscope.runners.legacy import runtime as _rt  # type: ignore
+
+            c = getattr(_rt, "CFG", None)
+            if isinstance(c, dict):
+                return c
+            if c is not None:
+                return dict(c)
+        except Exception:
+            pass
+
     try:
         from veriscope.config import CFG as _CFG_CENTER  # type: ignore
-        CFG = dict(_CFG_CENTER)
+
+        return dict(_CFG_CENTER)
     except Exception:
-        CFG = {}
+        return {}
+
 
 # --- Simple JL projection cache (local dedicated copy for heavy metrics) ---
 class _JLCache:
@@ -100,6 +138,7 @@ class _JLCache:
         self._cache[key] = A
         return A
 
+
 # Process-global JL cache within this module
 _JL = _JLCache()
 
@@ -123,17 +162,18 @@ except Exception as e:
 # Heavy metric functions
 # ======================
 
+
 @torch.no_grad()
-def sliced_w2_gpu(
-    Zt: torch.Tensor, Zt1: torch.Tensor, n_proj: int, seed: int, device
-) -> Tuple[float, float, int]:
+def sliced_w2_gpu(Zt: torch.Tensor, Zt1: torch.Tensor, n_proj: int, seed: int, device) -> Tuple[float, float, int]:
     """
     Compute sliced W2 with deterministic generators on CPU/CUDA.
     Respects CFG['sw2_budget_ms'] and charges BUDGET. Returns (w2, elapsed_ms, n_proj_used).
     """
+    budget = _get_budget()
+    cfg = _get_cfg()
     # --- finite-window budget guard (no-op if BUDGET is None or allow("sw2") passes) ---
     try:
-        if BUDGET is not None and not BUDGET.allow("sw2"):  # type: ignore[attr-defined]
+        if budget is not None and not budget.allow("sw2"):  # type: ignore[attr-defined]
             # Hard skip: budget exhausted for SW2; return a neutral "no-compute" capsule.
             return float("nan"), 0.0, 0
     except Exception:
@@ -151,7 +191,7 @@ def sliced_w2_gpu(
     n_proj = int(max(1, n_proj))
     used = 0
     acc = 0.0
-    budget_ms = int(CFG.get("sw2_budget_ms", 200))
+    budget_ms = int(cfg.get("sw2_budget_ms", 200))
     gen_dev = dev if getattr(dev, "type", "cpu") == "cuda" else torch.device("cpu")
     g = torch.Generator(device=gen_dev).manual_seed(17_4242 + int(seed))
     chunk = min(64, n_proj)
@@ -166,8 +206,8 @@ def sliced_w2_gpu(
         else:
             U = torch.randn(d, k, generator=g, device=gen_dev, dtype=Zt.dtype).to(dev)
         U = F.normalize(U, dim=0)
-        Xt = (Zt @ U)
-        Xt1 = (Zt1 @ U)
+        Xt = Zt @ U
+        Xt1 = Zt1 @ U
         Xt_sorted, _ = Xt.sort(dim=0)
         Xt1_sorted, _ = Xt1.sort(dim=0)
         acc += float(((Xt_sorted - Xt1_sorted) ** 2).mean().item()) * k
@@ -175,8 +215,8 @@ def sliced_w2_gpu(
 
     elapsed = float((time.time() - t0) * 1000.0)
     try:
-        if BUDGET is not None:
-            BUDGET.charge("sw2", elapsed)  # type: ignore[attr-defined]
+        if budget is not None:
+            budget.charge("sw2", elapsed)  # type: ignore[attr-defined]
     except Exception:
         pass
     if used == 0:
@@ -185,8 +225,9 @@ def sliced_w2_gpu(
 
 
 def sliced_w2_gpu_budget(Zt, Zt1, n_proj, seed, device, budget_ms):
+    budget = _get_budget()
     try:
-        if (BUDGET is not None) and (not BUDGET.allow("sw2")):  # type: ignore[attr-defined]
+        if (budget is not None) and (not budget.allow("sw2")):  # type: ignore[attr-defined]
             # Hard skip: budget exhausted for SW2; return a neutral "no-compute" capsule.
             return float("nan"), 0.0, 0, False
         val, ms, nproj_done = sliced_w2_gpu(Zt, Zt1, n_proj, seed, device)
@@ -227,9 +268,11 @@ def topo_h0_jl_agg(
     Returns: (value, n_successful_repeats, elapsed_ms, sampled_n_each_repeat)
     On any exception inside a repeat, that repeat is skipped. If none succeed, value=nan.
     """
+    budget = _get_budget()
+    cfg = _get_cfg()
     # --- finite-window budget guard (global ripser budget) ---
     try:
-        if BUDGET is not None and not BUDGET.allow("ripser"):  # type: ignore[attr-defined]
+        if budget is not None and not budget.allow("ripser"):  # type: ignore[attr-defined]
             # Budget already exhausted for ripser; hard skip.
             return float("nan"), 0, 0.0, 0
     except Exception:
@@ -241,9 +284,9 @@ def topo_h0_jl_agg(
     min_used_n = 10**9
     for r in range(repeats):
         # Enforce both per-call and global finite-window budgets
-        if (time.time() - t0) * 1000.0 > as_float(CFG.get("ripser_budget_ms", 250), default=250.0):
+        if (time.time() - t0) * 1000.0 > as_float(cfg.get("ripser_budget_ms", 250), default=250.0):
             break
-        if (BUDGET is not None) and (not BUDGET.allow("ripser")):  # type: ignore[attr-defined]
+        if (budget is not None) and (not budget.allow("ripser")):  # type: ignore[attr-defined]
             break
         try:
             t_rep = time.time()
@@ -252,7 +295,7 @@ def topo_h0_jl_agg(
                 min(q, Z.shape[1]),
                 run_key + 1009 * (r + 1),
                 epoch,
-                CFG.get("rp_fixed", True),
+                cfg.get("rp_fixed", True),
                 device=Z.device,
                 dtype=Z.dtype,
             )
@@ -277,8 +320,8 @@ def topo_h0_jl_agg(
             vals.append(h0_total_persistence_np(X.cpu().numpy()))
             ms_rep = (time.time() - t_rep) * 1000.0
             try:
-                if BUDGET is not None:
-                    BUDGET.charge("ripser", ms_rep)  # type: ignore[attr-defined]
+                if budget is not None:
+                    budget.charge("ripser", ms_rep)  # type: ignore[attr-defined]
             except Exception:
                 pass
         except Exception:

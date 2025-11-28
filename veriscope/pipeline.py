@@ -18,6 +18,7 @@ def _legacy_mod():
     """
     return importlib.import_module("veriscope.runners.legacy_cli_refactor")
 
+
 def run_one(seed: int, tag: str, monitor_ds: Any, factor: Dict[str, Any]) -> pd.DataFrame:
     legacy = _legacy_mod()
     return legacy.run_one(seed=seed, tag=tag, monitor_ds=monitor_ds, factor=factor)
@@ -31,5 +32,6 @@ def run_sweep(tag: str) -> Optional[pd.DataFrame]:
 def evaluate(df_all: pd.DataFrame, tag: str) -> None:
     legacy = _legacy_mod()
     legacy.evaluate(df_all, tag=tag)
+
 
 __all__ = ["run_one", "run_sweep", "evaluate"]

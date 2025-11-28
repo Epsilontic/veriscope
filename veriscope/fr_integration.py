@@ -80,6 +80,7 @@ def init_fr(
 
     # Light naturality probe (non-fatal; logs to naturality.log on failure)
     try:
+
         def _id(z):
             return z
 
@@ -93,9 +94,7 @@ def init_fr(
         try:
             outdir = Path(os.environ.get("SCAR_OUTDIR", "."))
             outdir.mkdir(parents=True, exist_ok=True)
-            (outdir / "naturality.log").write_text(
-                f"naturality probe failed: {type(_e).__name__}: {_e}\n"
-            )
+            (outdir / "naturality.log").write_text(f"naturality probe failed: {type(_e).__name__}: {_e}\n")
         except Exception:
             pass
 
@@ -163,8 +162,7 @@ def gate_step_fr(
 
     keys = set(tpast.keys()) & set(trecent.keys())
     counts_by_metric: Dict[str, int] = {
-        m: int(min(np.isfinite(tpast[m]).sum(), np.isfinite(trecent[m]).sum()))
-        for m in keys
+        m: int(min(np.isfinite(tpast[m]).sum(), np.isfinite(trecent[m]).sum())) for m in keys
     }
 
     # Window epsilon and eps_stat budget
@@ -276,8 +274,7 @@ def write_window_audit(
             "cal_ranges": cal_ranges_norm,
             "interventions": [f"predeclared_T_{i}" for i, _ in enumerate(intervs)],
             "controls_used": int(controls_used),
-            "notes": note
-            or "Fixed partitions and transport calibrated from factor=='none' after warm",
+            "notes": note or "Fixed partitions and transport calibrated from factor=='none' after warm",
         }
 
         outdir.mkdir(parents=True, exist_ok=True)

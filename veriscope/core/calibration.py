@@ -17,10 +17,12 @@ if TYPE_CHECKING:
 
 __all__ = ["epsilon_statistic_bhc", "aggregate_epsilon_stat"]
 
+
 def resolve_epsilon_from_controls(vals: Iterable[Any], q: float, fallback: float) -> Tuple[float, int]:
     a = np.asarray([float(x) for x in vals if isinstance(x, (int, float, np.floating))], dtype=float)
     a = a[np.isfinite(a)]
-    if a.size == 0: return float(fallback), 0
+    if a.size == 0:
+        return float(fallback), 0
     try:
         eps = float(np.quantile(a, q, method="linear"))
     except TypeError:
@@ -37,6 +39,7 @@ def epsilon_statistic_bhc(n: int, k: int, alpha: float = 0.05) -> float:
     t = max(0.0, math.log(max(2.0, float(k))) + math.log(1.0 / max(alpha, 1e-12)))
     eps = math.sqrt(max(0.0, t / max(2.0 * float(n), 1e-12)))
     return float(min(max(eps, 0.0), 1.0))
+
 
 def aggregate_epsilon_stat(window: "WindowDecl", counts_by_metric: Dict[str, int], alpha: float = 0.05) -> float:
     """Weighted aggregation across Φ_W using declared weights and bins."""

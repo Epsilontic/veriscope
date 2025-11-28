@@ -8,6 +8,7 @@
 
 
 from __future__ import annotations
+
 # --- debug faulthandler (early) ---
 import os
 import faulthandler
@@ -62,25 +63,22 @@ import matplotlib
 
 matplotlib.use("Agg")
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass  # noqa: F401
 from typing import List, Tuple, Iterable
-from typing import TypedDict
 from typing import cast
 
-class _DropCfg(TypedDict):
-    drop_classes: set[int]
-    drop_frac: float
-    start: int
-    end: int
 
 import matplotlib.pyplot as plt
 import numpy as np
 from typing import Any
 
+
 # --- scalar-safe int helper (NumPy → Python int) ---
 def safe_int_from_float(x: Union[float, np.floating]) -> int:
     """Round-trip through float to satisfy typing (NumPy scalars → Python int)."""
     return int(float(x))
+
+
 def _as_float_list(x: Any) -> List[float]:
     """Return a Python list of floats from x, tolerating scalar np.floating/None."""
     try:
@@ -88,12 +86,14 @@ def _as_float_list(x: Any) -> List[float]:
     except Exception:
         arr = np.array([], dtype=float)
     return arr.tolist()
-    
+
+
 import numpy.typing as npt
 from typing import Iterable
 
 # --- pandas imports ---
 import pandas as pd
+
 
 # --- typed scalar extractors for pandas/NumPy ---
 def series_head_int(s: object, default: int = 0) -> int:
@@ -111,6 +111,7 @@ def series_head_int(s: object, default: int = 0) -> int:
             pass
     return default
 
+
 def series_head_float(s: object, default: float = 0.0) -> float:
     if isinstance(s, pd.Series) and not s.empty:
         v = s.iloc[0]
@@ -124,7 +125,9 @@ def series_head_float(s: object, default: float = 0.0) -> float:
             pass
     return default
 
+
 from typing import SupportsFloat  # safe even if similar imports exist
+
 
 def iter_float(a: npt.ArrayLike | SupportsFloat) -> Iterable[float]:
     """Yield floats from arraylike; treat scalars as length-1 iterable via ndarray coercion."""
@@ -135,9 +138,11 @@ def iter_float(a: npt.ArrayLike | SupportsFloat) -> Iterable[float]:
     for x in arr.ravel():
         yield float(x)
 
+
 FloatArr: TypeAlias = np.ndarray
 
 from typing import cast as _cast
+
 
 def qlin_vec(a: Iterable[float] | npt.ArrayLike, qs: npt.ArrayLike) -> np.ndarray:
     """Vector quantiles with linear method; returns float ndarray."""
@@ -148,10 +153,13 @@ def qlin_vec(a: Iterable[float] | npt.ArrayLike, qs: npt.ArrayLike) -> np.ndarra
     except TypeError:
         return np.asarray(quan(arr, qs, interpolation="linear"), dtype=float)
 
+
 # --- Helper: Typed DataFrame.get with Series default to please mypy ---
 def df_get_series(df: pd.DataFrame, key: str) -> pd.Series:
     """Typed DataFrame.get with a Series default to please mypy."""
     return cast(pd.Series, df.get(key, pd.Series(dtype=float)))
+
+
 import torch
 import torch.multiprocessing as mp
 import torch.nn as nn
@@ -163,13 +171,16 @@ from torch.utils.data import DataLoader
 if TYPE_CHECKING:
     import torchvision  # type: ignore[import-untyped]
 
+
 # Safe percentile wrapper that matches NumPy's current typing
 def pct_linear(a: Iterable[float] | npt.ArrayLike, q: float) -> float:
     return qlin(a, float(q) / 100.0)
 
+
 # --- central config seed (non-fatal if module is absent) ---
 try:
     from veriscope.config import CFG as _CFG_CENTER
+
     # create CFG if not defined yet
     if "CFG" not in globals():
         CFG = dict(_CFG_CENTER)
@@ -186,14 +197,12 @@ try:
     from veriscope.core.transport import DeclTransport
     from veriscope.core.window import FRWindow, WindowDecl
     from veriscope.core.calibration import aggregate_epsilon_stat as agg_eps
-    from veriscope.core.ipm import tv_hist_fixed
 except Exception:
-    GateEngine = None          # type: ignore[assignment]
-    DeclTransport = None       # type: ignore[assignment]
-    FRWindow = None            # type: ignore[assignment]
-    WindowDecl = None          # type: ignore[assignment]
-    agg_eps = None             # type: ignore[assignment]
-    tv_hist_fixed = None       # type: ignore[assignment]
+    GateEngine = None  # type: ignore[assignment]
+    DeclTransport = None  # type: ignore[assignment]
+    FRWindow = None  # type: ignore[assignment]
+    WindowDecl = None  # type: ignore[assignment]
+    agg_eps = None  # type: ignore[assignment]
 
 FRW_CLS: Optional[type] = FRWindow
 TRANS_CLS: Optional[type] = DeclTransport
@@ -248,6 +257,9 @@ from veriscope.runners.legacy.model import (
 from veriscope.runners.legacy.features import (
     _features_for_loader,
     _std0,
+    variance_outside_k,
+    spectral_r2,
+    cosine_dispersion,
 )
 
 from veriscope.runners.legacy.monitors import (
@@ -262,6 +274,7 @@ from veriscope.runners.legacy.probes import (
     kappa_sens_probe,
 )
 
+
 # baseline detectors (moved out of CLI)
 from veriscope.runners.legacy.detectors.baselines import (
     SCHEDULED_METRICS,
@@ -274,7 +287,12 @@ from veriscope.runners.legacy.detectors.baselines import (
     calibrate_ph_directions,
 )
 
-from veriscope.runners.legacy.gate_legacy import dPi_product_tv
+# learned detector utilities (moved out of CLI)
+from veriscope.runners.legacy.detectors.learned import (
+    _first_run_end,
+)
+
+from veriscope.core.ipm import dPi_product_tv
 
 # ---- Legacy eval core (moved out of CLI) ----
 from veriscope.runners.legacy.eval.core import (
@@ -288,12 +306,15 @@ from veriscope.runners.legacy.eval.core import (
     _first_t_column,
 )
 
+
 def _assert_runner_wired() -> None:
     if FRW_CLS is None or TRANS_CLS is None or GATE_CLS is None or DECL_CLS is None:
         raise RuntimeError("runner not wired: missing class bindings")
 
+
 # ---- typing shims for dynamic inputs (JSON/env/argparse) ----
 NumberLike = Union[int, float, np.integer, np.floating, str]
+
 
 @overload
 def to_float(x: int | float | np.integer | np.floating) -> float: ...
@@ -305,6 +326,7 @@ def to_float(x: Any) -> float:
     if isinstance(x, str):
         return float(x.strip())
     raise TypeError(f"to_float: expected number-like, got {type(x).__name__}")
+
 
 @overload
 def to_int(x: int) -> int: ...
@@ -336,6 +358,7 @@ def as_int_cfg(x: Any, default: int = 0) -> int:
     """Alias used inside summary/emitters to avoid local shadowing of `as_int`."""
     return as_int(x, default=default)
 
+
 # ---- percentile helper with stable semantics across NumPy versions ----
 def percentile_linear(a: Iterable[float] | npt.ArrayLike, q: Any) -> float:
     """Return the q-th percentile (q in [0,100]) with linear interpolation semantics."""
@@ -349,12 +372,13 @@ def _to_num(s: pd.Series | None) -> pd.Series:
     return pd.to_numeric(s, errors="coerce")
 
 
-def to_numeric_opt(s: Optional[pd.Series], *, errors: _Literal["raise","coerce","ignore"] = "coerce") -> pd.Series:
+def to_numeric_opt(s: Optional[pd.Series], *, errors: _Literal["raise", "coerce", "ignore"] = "coerce") -> pd.Series:
     """Like pd.to_numeric but accepts Optional[Series] and always returns Series[float]."""
     if s is None:
         return pd.Series(dtype=float)
-    eno: _Literal["raise","coerce"] = "coerce" if errors == "ignore" else errors
+    eno: _Literal["raise", "coerce"] = "coerce" if errors == "ignore" else errors
     return pd.to_numeric(s, errors=eno).astype(float, copy=False)
+
 
 def _float_pair(x: object) -> tuple[float, float]:
     if isinstance(x, (list, tuple)) and len(x) == 2:
@@ -364,20 +388,25 @@ def _float_pair(x: object) -> tuple[float, float]:
         )
     return (float("nan"), float("nan"))
 
+
 if TYPE_CHECKING:
     from filelock import SoftFileLock as FileLock
 else:
     try:
         from filelock import SoftFileLock as _RuntimeFileLock
     except Exception:  # pragma: no cover
+
         class _RuntimeFileLock:
             def __init__(self, *args: Any, **kwargs: Any) -> None: ...
+
     FileLock = _RuntimeFileLock  # runtime alias only
+
 
 # --- env truthy and centralized run tag ---
 def env_truthy(name: str, default: str = "0") -> bool:
     v = str(os.environ.get(name, default)).strip().lower()
     return v in ("1", "true", "yes", "on")
+
 
 CAL = env_truthy("SCAR_CALIB")
 SMOKE = env_truthy("SCAR_SMOKE")
@@ -414,51 +443,80 @@ try:
 except Exception:  # pragma: no cover
     _t_avg_pool2d = None  # type: ignore[assignment]
 
+
 def t_avg_pool2d(*args: Any, **kwargs: Any):
     """Compat wrapper so static checkers see a callable; raises if F.avg_pool2d is missing."""
     if _t_avg_pool2d is None:
         raise RuntimeError("torch.nn.functional.avg_pool2d unavailable")
     return _t_avg_pool2d(*args, **kwargs)
 
+
 if t_eigvalsh is None:
+
     def t_eigvalsh(*args, **kwargs):
         raise RuntimeError("torch.linalg.eigvalsh unavailable")
 
+
 if t_eigvals is None:
+
     def t_eigvals(*args, **kwargs):
         raise RuntimeError("torch.linalg.eigvals unavailable")
 
+
 if t_vector_norm is None:
+
     def t_vector_norm(*args, **kwargs):
         raise RuntimeError("torch.linalg.vector_norm unavailable")
+
 
 amp_mode: Any = None
 # AMP compatibility shim: prefer torch.amp, fall back to torch.cuda.amp, otherwise no-op
 try:
     from torch import amp as _amp_mod
+
     _AMP_SRC = "torch.amp"
 except Exception:
     try:
         from torch.cuda import amp as _amp_mod  # type: ignore
+
         _AMP_SRC = "torch.cuda.amp"
     except Exception:
         _AMP_SRC = "none"
+
         class _NoAutocast:
-            def __init__(self, *args, **kwargs): pass
-            def __enter__(self): return None
-            def __exit__(self, exc_type, exc, tb): return False
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def __enter__(self):
+                return None
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
         class _NoGradScaler:
-            def __init__(self, enabled=False): self.enabled = bool(enabled)
-            def scale(self, loss): return loss
-            def unscale_(self, opt): pass
-            def step(self, opt): opt.step()
-            def update(self): pass
+            def __init__(self, enabled=False):
+                self.enabled = bool(enabled)
+
+            def scale(self, loss):
+                return loss
+
+            def unscale_(self, opt):
+                pass
+
+            def step(self, opt):
+                opt.step()
+
+            def update(self):
+                pass
+
         class _NoAmp:
             autocast = _NoAutocast
             GradScaler = _NoGradScaler
+
         amp_mode = _NoAmp()
     else:
         import inspect as _inspect
+
         _sig = _inspect.signature(_amp_mod.autocast)
         if "device_type" in _sig.parameters:
             amp_mode = _amp_mod
@@ -467,16 +525,22 @@ except Exception:
             class _AutocastWrapper:
                 def __init__(self, device_type=None, enabled=True):
                     self._ctx = _amp_mod.autocast(enabled=enabled)
-                def __enter__(self): return self._ctx.__enter__()
-                def __exit__(self, exc_type, exc, tb): return self._ctx.__exit__(exc_type, exc, tb)
+
+                def __enter__(self):
+                    return self._ctx.__enter__()
+
+                def __exit__(self, exc_type, exc, tb):
+                    return self._ctx.__exit__(exc_type, exc, tb)
+
             class _AmpShim:
                 autocast = _AutocastWrapper
                 GradScaler = _amp_mod.GradScaler
+
             amp_mode = _AmpShim()
 else:
     amp_mode = _amp_mod
 
- # Backward-compat for legacy references; keep a stable alias for older call sites.
+# Backward-compat for legacy references; keep a stable alias for older call sites.
 amp: Any = amp_mode
 try:
     mp.set_start_method("spawn", force=True)
@@ -494,158 +558,28 @@ try:
             print("GPU:", torch.cuda.get_device_name(0))
 except Exception:
     pass
-    
+
 # Numerically-stable sigmoid used across train/OOF/eval
+
 
 def _sigmoid_stable(z, cap: float = 60.0):
     """Return sigmoid(z) with clipping to avoid overflow in exp()."""
     zc = np.clip(z, -float(cap), float(cap))
     return 1.0 / (1.0 + np.exp(-zc))
 
-# === Finite‑window guard primitives (product–TV + prequential gain) ===
-
-
-@dataclass
-class Window:
-    epsilon: float                  # resolution threshold in product–TV
-    weights: Dict[str, float]       # per‑context weights, e.g. {"raw":0.4,"detrend":0.3,"zscore":0.3}
-    bins: int = 16                  # histogram bins for product–TV
-    interventions: tuple[Callable[[np.ndarray], np.ndarray], ...] = ()       # tuple of callables T(x) taking and returning arrays
-
-def product_tv(obs_by_ctx: Dict[str, np.ndarray], pred_by_ctx: Dict[str, np.ndarray], weights: Dict[str, float], bins: int) -> float:
-    tv = 0.0
-    for c, w in weights.items():
-        if c in obs_by_ctx and c in pred_by_ctx:
-            a = np.asarray(obs_by_ctx[c], dtype=float)
-            b = np.asarray(pred_by_ctx[c], dtype=float)
-            tv += float(w) * tv_hist_fixed(a, b, bins)
-    return float(tv)
-
-def prequential_gain(logp_model: np.ndarray, logp_baseline: np.ndarray) -> float:
-    # positive means the model compresses better than the baseline
-    # both arrays should be aligned to the same observation order
-    return float((np.asarray(logp_baseline) - np.asarray(logp_model)).sum())
-
-def earned_warning(
-    obs_ctx: Dict[str, np.ndarray],
-    pred_ctx: Dict[str, np.ndarray],
-    base_ctx: Dict[str, np.ndarray],
-    window: Window,
-    gain_thresh: float,
-    transport: Callable[[np.ndarray], np.ndarray] = lambda x: x,
-):
-    """Return (ok, audit) where ok==True means the window passes stability + gain."""
-    # Normalize gain over aligned, finite entries
-    lm = np.asarray(pred_ctx.get("logp", []), dtype=float)
-    lb = np.asarray(base_ctx.get("logp", []), dtype=float)
-    L = min(lm.size, lb.size)
-    if L > 0:
-        lm = lm[:L]
-        lb = lb[:L]
-    mask = np.isfinite(lm) & np.isfinite(lb)
-    n_eff = int(mask.sum())
-    gain = float(((lb[mask] - lm[mask]).sum() / max(1, n_eff)) / math.log(2.0))  # bits/sample
-    if not np.isfinite(gain) or gain < gain_thresh:
-        return False, {"why": "no_prequential_gain", "gain": float(gain), "n_eff": n_eff}
-
-    # strip logp channel for TV computation
-    pred_no_log = {k: v for k, v in pred_ctx.items() if k != "logp"}
-    obs_no_log  = {k: v for k, v in obs_ctx.items() if k != "logp"}
-
-    worst = 0.0
-    intervs = window.interventions or (lambda x: x,)
-    for T in intervs:
-        tv = product_tv(
-            {k: transport(T(v)) for k, v in pred_no_log.items()},
-            {k: transport(T(v)) for k, v in obs_no_log.items()},
-            window.weights,
-            window.bins,
-        )
-        if tv > worst:
-            worst = tv
-
-    ok = worst <= window.epsilon
-    return ok, {"gain": float(gain), "worst_tv": float(worst)}
-
-# Default window (non-invasive; unused unless you call earned_warning)
-DEFAULT_WINDOW = Window(
-    epsilon=0.08,
-    weights={"raw": 0.4, "detrend": 0.3, "zscore": 0.3},
-    bins=16,
-    interventions=(
-        lambda x: x,                           # identity
-        lambda x: x * 1.05,                    # scale up
-        lambda x: x * 0.95,                    # scale down
-        lambda x: np.clip(x + 0.05, 0, 1),     # shift up
-    ),
-)
 
 # Global ledger is instantiated after CFG is defined.
 BUDGET: Optional[BudgetLedger] = None
 
 
-def _window_hash(window: Window) -> str:
-    """Deterministic id for the admissible window; used in provenance."""
-    try:
-        payload = {
-            "epsilon": float(window.epsilon),
-            "weights": {str(k): float(v) for k, v in (window.weights or {}).items()},
-            "bins": int(window.bins),
-            "interventions": len(tuple(window.interventions or ())),
-        }
-        s = json.dumps(payload, sort_keys=True)
-        return hashlib.sha256(s.encode()).hexdigest()
-    except Exception:
-        return ""
-
-
-
-def write_window_provenance(outdir: Path, window: Window, cfg: dict, budget: WindowBudget):
-    """Persist a tamper-evident window provenance capsule."""
-    try:
-        from typing import Mapping, cast
-        wmap = cast(Mapping[str, float], window.weights or {})
-        cp = cast(Mapping[str, object], cfg)
-        capsule = {
-            "window_hash": _window_hash(window),
-            "window": {
-                "epsilon": float(window.epsilon),
-                "weights": {str(k): float(v) for k, v in wmap.items()},
-                "bins": int(window.bins),
-                "n_interventions": len(tuple(window.interventions or ())),
-            },
-            "budgets": {
-                "sw2_ms": int(budget.sw2_ms),
-                "ripser_ms": int(budget.ripser_ms),
-                "total_heavy_ms": int(budget.total_heavy_ms),
-                "sw2_calls": int(budget.sw2_calls),
-                "ripser_calls": int(budget.ripser_calls),
-            },
-            "cfg_pointers": {
-                "heavy_every": int(as_int(cp.get("heavy_every", 0), default=0)),
-                "sw2_n_proj": int(as_int(cp.get("sw2_n_proj", 0), default=0)),
-                "rp_repeats": int(as_int(cp.get("rp_repeats", 0), default=0)),
-                "rp_dim_topo": int(as_int(cp.get("rp_dim_topo", 0), default=0)),
-            },
-        }
-        # Units breadcrumb for prequential gain used elsewhere
-        capsule["gain_units"] = "bits/sample"
-
-        # NOTE: this hash is for the *capsule payload*, not a checksum of any file on disk.
-        # Use a canonical JSON form so the hash is stable across whitespace/indentation.
-        s = json.dumps(capsule, sort_keys=True, separators=(",", ":"))
-        h = hashlib.sha256(s.encode("utf-8")).hexdigest()
-        capsule["capsule_sha256"] = h
-        # Back-compat for older readers that expected `sha256`.
-        capsule["sha256"] = h
-
-        save_json(capsule, outdir / "window_provenance.json")
-    except Exception:
-        pass
-
-
-def calibrate_window_from_controls(df_control: pd.DataFrame, metrics: List[str], weights: Dict[str, float],
-                                   bins: int, epsilon: float, interventions: tuple) -> WindowDecl:
+def calibrate_window_from_controls(
+    df_control: pd.DataFrame,
+    metrics: List[str],
+    weights: Dict[str, float],
+    bins: int,
+    epsilon: float,
+    interventions: tuple,
+) -> WindowDecl:
     # Normalize factor column and guard empty
     try:
         if "factor" in df_control.columns:
@@ -659,8 +593,14 @@ def calibrate_window_from_controls(df_control: pd.DataFrame, metrics: List[str],
         except Exception:
             pass
         cal_ranges = {m: (0.0, 1.0) for m in metrics}
-        return WindowDecl(epsilon=epsilon, metrics=metrics, weights=weights, bins=bins,
-                          interventions=interventions, cal_ranges=cal_ranges)
+        return WindowDecl(
+            epsilon=epsilon,
+            metrics=metrics,
+            weights=weights,
+            bins=bins,
+            interventions=interventions,
+            cal_ranges=cal_ranges,
+        )
     """Predeclare Φ_W from factor=='none' controls after warm; freeze transport ranges per metric."""
     cal_ranges = {}
     for m in metrics:
@@ -677,15 +617,29 @@ def calibrate_window_from_controls(df_control: pd.DataFrame, metrics: List[str],
         if not (np.isfinite(lo) and np.isfinite(hi) and hi > lo):
             lo, hi = (0.0, 1.0)
         cal_ranges[m] = (lo, hi)
-    return WindowDecl(epsilon=epsilon, metrics=metrics, weights=weights, bins=bins,
-                      interventions=interventions, cal_ranges=cal_ranges)
+    return WindowDecl(
+        epsilon=epsilon, metrics=metrics, weights=weights, bins=bins, interventions=interventions, cal_ranges=cal_ranges
+    )
+
+
+def _apply_for_window_decl(window_decl: Any):
+    """Return DeclTransport.apply if installed on the decl; else identity-as-float."""
+    try:
+        dt = getattr(window_decl, "_DECL_TRANSPORT", None)
+        if dt is not None and hasattr(dt, "apply"):
+            return dt.apply  # type: ignore[return-value]
+    except Exception:
+        pass
+    return lambda _name, arr: np.asarray(arr, dtype=float)
+
 
 # --- Calibrate epsilon from controls ---
-def calibrate_epsilon_from_controls(df_control: pd.DataFrame, window_decl: WindowDecl, W: int, q: float = 0.995) -> Tuple[float, int]:
+def calibrate_epsilon_from_controls(
+    df_control: pd.DataFrame, window_decl: WindowDecl, W: int, q: float = 0.995
+) -> Tuple[float, int]:
     """
     Returns (epsilon, n_vals). Falls back to CFG['gate_epsilon'] on empty or invalid input.
     """
-    import numpy as _np
     vals: List[float] = []
     try:
         if "factor" in df_control.columns:
@@ -696,6 +650,7 @@ def calibrate_epsilon_from_controls(df_control: pd.DataFrame, window_decl: Windo
         if "epoch" in df_control.columns:
             df_control["epoch"] = to_numeric_series(df_control.get("epoch"), errors="coerce")
         mets = [m for m in getattr(window_decl, "metrics", []) if m in df_control.columns]
+        apply = _apply_for_window_decl(window_decl)
         if not mets:
             raise ValueError("no_metric_columns")
         for _, g in df_control.groupby(["seed", "factor"], sort=False):
@@ -703,8 +658,8 @@ def calibrate_epsilon_from_controls(df_control: pd.DataFrame, window_decl: Windo
             if len(g) < 2 * max(1, int(W)):
                 continue
             for i in range(0, max(0, len(g) - 2 * int(W) + 1)):
-                past = {m: _as_float_array(to_numeric_opt(g.get(m)).iloc[i:i+W].to_numpy()) for m in mets}
-                recent = {m: _as_float_array(to_numeric_opt(g.get(m)).iloc[i+W:i+2*W].to_numpy()) for m in mets}
+                past = {m: _as_float_array(to_numeric_opt(g.get(m)).iloc[i : i + W].to_numpy()) for m in mets}
+                recent = {m: _as_float_array(to_numeric_opt(g.get(m)).iloc[i + W : i + 2 * W].to_numpy()) for m in mets}
                 ok = True
                 for m in mets:
                     pa = past[m]
@@ -715,35 +670,41 @@ def calibrate_epsilon_from_controls(df_control: pd.DataFrame, window_decl: Windo
                 if not ok:
                     continue
                 try:
-                    tv = dPi_product_tv(window_decl, past, recent)
-                    if _np.isfinite(tv):
+                    tv = dPi_product_tv(window_decl, past, recent, apply=apply)
+                    if np.isfinite(tv):
                         vals.append(float(tv))
                 except Exception:
                     continue
     except Exception as _e:
         try:
-            print(f"[WARN] calibrate_epsilon_from_controls failed early: {_e}; fallback to CFG gate_epsilon={CFG.get('gate_epsilon', 0.08)}")
+            print(
+                f"[WARN] calibrate_epsilon_from_controls failed early: {_e}; fallback to CFG gate_epsilon={CFG.get('gate_epsilon', 0.08)}"
+            )
         except Exception:
             pass
         return float(_effective_gate_epsilon(CFG, OUTDIR)), 0
     if not vals:
         try:
-            print(f"[WARN] calibrate_epsilon_from_controls: no valid TV samples; returning CFG gate_epsilon={CFG.get('gate_epsilon', 0.08)}")
+            print(
+                f"[WARN] calibrate_epsilon_from_controls: no valid TV samples; returning CFG gate_epsilon={CFG.get('gate_epsilon', 0.08)}"
+            )
         except Exception:
             pass
         return float(_effective_gate_epsilon(CFG, OUTDIR)), 0
     eps_new, n_vals = _robust_eps(vals, q=float(q), CFG=CFG, out_dir=OUTDIR)
     return float(eps_new), int(n_vals)
 
-        
-def gate_check(window: WindowDecl,
-               past: Dict[str, np.ndarray],
-               recent: Dict[str, np.ndarray],
-               counts: Dict[str, int],
-               gain: float,
-               gain_thresh: float,
-               kappa_sens: float,
-               eps_stat_alpha: float = 0.05) -> Tuple[int, Dict[str, Any]]:
+
+def gate_check(
+    window: WindowDecl,
+    past: Dict[str, np.ndarray],
+    recent: Dict[str, np.ndarray],
+    counts: Dict[str, int],
+    gain: float,
+    gain_thresh: float,
+    kappa_sens: float,
+    eps_stat_alpha: float = 0.05,
+) -> Tuple[int, Dict[str, Any]]:
     """Joint gate: prequential gain + fixed-partition product–TV with ε_stat and κ_sens."""
     thr = float(gain_thresh)
     # --- FR branch: license via D_W with common transport; preserves legacy audit keys ---
@@ -816,18 +777,20 @@ def gate_check(window: WindowDecl,
         _apply = _DECL_TRANSPORT.apply  # type: ignore
     else:
         _apply = lambda name, arr: np.asarray(arr, float)
-    from typing import Mapping, Union, cast
-    weights = cast(Mapping[str, float], getattr(window, "weights", {}) or {})
-    bins = as_int(getattr(window, "bins", 16), default=16)
     for T in intervs:
-        tv_sum = 0.0
-        for m, w in weights.items():
-            a_raw = T(_apply(m, past.get(m, np.array([], dtype=float))))
-            b_raw = T(_apply(m, recent.get(m, np.array([], dtype=float))))
-            a = np.asarray(a_raw, dtype=float)
-            b = np.asarray(b_raw, dtype=float)
-            tv_sum += float(cast(Union[int, float], w)) * tv_hist_fixed(a, b, bins)
-        worst = max(worst, tv_sum)
+
+        def _apply_T(name: str, arr: np.ndarray, _T: Any = T) -> np.ndarray:
+            return np.asarray(_T(_apply(name, arr)), dtype=float)
+
+        try:
+            tv_sum = float(dPi_product_tv(window, past, recent, apply=_apply_T))
+        except Exception:
+            tv_sum = float("nan")
+
+        if np.isfinite(tv_sum):
+            worst = max(worst, tv_sum)
+        else:
+            worst = max(worst, float("inf"))
 
     # Sampling-slack ε_stat: aggregate, guard, and cap to a fraction of ε
     eps_stat = AGGREGATE_EPSILON(window, counts_by_metric=counts, alpha=eps_stat_alpha)
@@ -843,12 +806,12 @@ def gate_check(window: WindowDecl,
     # Stability: worst TV must be ≤ (ε − ε_stat), never negative
     worst = float(worst if np.isfinite(worst) else np.inf)
     eps_eff = max(0.0, float(window.epsilon) - eps_stat)
-    ok_stability = (worst <= eps_eff)
+    ok_stability = worst <= eps_eff
 
     # Sensitivity budget κ_sens ≤ ε_sens
     eps_sens = float(max(0.0, CFG.get("gate_epsilon_sens", 0.04)))
     kappa_sens = float(kappa_sens if np.isfinite(kappa_sens) else np.inf)
-    ok_kappa = (kappa_sens <= eps_sens)
+    ok_kappa = kappa_sens <= eps_sens
 
     return int(bool(ok_gain and ok_stability and ok_kappa)), {
         "gain_bits": float(gain),
@@ -861,6 +824,7 @@ def gate_check(window: WindowDecl,
         "eps_stat_cap_fraction": float(CFG.get("gate_eps_stat_max_frac", 0.25)),
         "gain_thresh_used": float(thr),
     }
+
 
 # --- resolved ε fallback from precedence_summary + robust ε estimator ---
 def _effective_gate_epsilon(CFG: dict, out_dir: Path) -> float:
@@ -884,6 +848,7 @@ def _effective_gate_epsilon(CFG: dict, out_dir: Path) -> float:
         return float(x)
     return 0.08  # last resort only
 
+
 def _robust_eps(vals, q: float, CFG: dict, out_dir: Path) -> Tuple[float, int]:
     q = 0.0 if q < 0.0 else (1.0 if q > 1.0 else float(q))
     try:
@@ -903,6 +868,7 @@ def _robust_eps(vals, q: float, CFG: dict, out_dir: Path) -> Tuple[float, int]:
     except Exception:
         _torch = None
     from collections.abc import Iterable as _CollIterable
+
     _it = vals if isinstance(vals, _CollIterable) and not isinstance(vals, (str, bytes, bytearray)) else [vals]
     for x in _it:
         if isinstance(x, (bool, np.bool_)):
@@ -919,6 +885,7 @@ def _robust_eps(vals, q: float, CFG: dict, out_dir: Path) -> Tuple[float, int]:
         return _effective_gate_epsilon(CFG, out_dir), 0
     eps = float(qlin(a, q))
     return eps, int(a.size)
+
 
 # ---------------------------
 # Output & config
@@ -964,7 +931,11 @@ try:
                 pass
             try:
                 with open(OUTDIR / "sweep.log", "a") as _lg:
-                    print("[calib] hard override active; locked calibration mode declared at launch.", file=_lg, flush=True)
+                    print(
+                        "[calib] hard override active; locked calibration mode declared at launch.",
+                        file=_lg,
+                        flush=True,
+                    )
             except Exception:
                 pass
 except Exception:
@@ -976,129 +947,132 @@ C = 10  # CIFAR-10 classes
 
 if "CFG" not in globals():
     CFG: Dict[str, Any] = {}
-CFG.update(dict(
-# device & determinism
-device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
-deterministic=True,  # strict determinism ON by default
-amp=True,  # ignored when deterministic=True
-# optimizer / schedule
-base_lr=0.3,
-momentum=0.9,
-weight_decay=5e-4,
-warmup=2,
-cosine=True,
-# grad safety
-grad_clip_norm=5.0,  # default clip to stabilize early steps
-# sweep budget
-epochs=72,
-batch=256,
-# seeds
-seeds_calib=list(range(401, 411)),  # 10 seeds for calibration
-seeds_eval=list(range(511, 541)),  # 30 seeds for evaluation
-# factorial pathologies (exactly one active per run)
-factors=[
-{"name": "none"},
-{
-"name": "none_safe",
-"base_lr_scale": 0.33,
-"override_grad_clip": 6.0,
-},  # healthier run for FP denom
-{"name": "uniform_label_noise", "p": 0.6},
-{"name": "class_skew", "base_p": 0.4, "hot_scale": 1.7, "hot_k": 4},
-{"name": "long_tail", "base_p": 0.4, "pareto_a": 3.0},
-{"name": "input_corruption", "blur_p": 0.3, "noise_std": 0.03},
-{
-"name": "class_dropout_window",
-"drop_classes": 1,
-"drop_frac": 0.8,
-"start": 10,
-"end": 30,
-},
-{"name": "lr_spike", "epoch": 5, "factor": 6.0},
-{"name": "mom_pulse", "start": 12, "duration": 3, "momentum": 0.0},
-],
-# monitor stream
-monitor_source="external",  # {"external","clean_val","noisy_train"}
-monitor_labels=False,  # optional: compute monitor_acc if True
-metric_batches=3,  # per-epoch monitor mini-batches for mean/std estimates
-metric_total_cap=512,  # per-epoch cap per metric (mean over <= cap samples)
-# external monitor config (STL-10 resized, CIFAR-normalised)
-external_monitor=dict(
-dataset="STL10",
-split="test",
-resize_to=32,
-pool_size=4000,  # per-run pool
-ent_subset=1200,  # for entropy/confidence (independent stream)
-ent_every=2,
-),
-# splits / normalisation frame
-monitor_val_per_class=80,  # used only if monitor_source=="clean_val"
-norm_ref_per_class=100,  # μ_ref, σ_ref frozen once at init per run (from CIFAR train)
-# feature geometry
-geom_std="ref",  # freeze σ to reference across epochs
-geom_rp_dim=48,  # JL for covariance space in metrics
-# variance-outside-k
-var_k_energy=0.90,
-var_k_max=32,
-# heavy metrics cadence & budgets
-heavy_every=6,
-rp_dim_topo=16,
-rp_repeats=8,
-rp_agg="median",
-rp_fixed=True,
-ripser_budget_ms=250,
-topo_sample_n=192,
-sw2_budget_ms=200,
-sw2_n_proj=96,  # lower to 64 for 8GB GPUs
-# PH calibration (directions learned on SOFT collapses only)
-ph_win=20,
-ph_burn=6,
-ph_two_sided=False,
-ph_lambda=3.0,
-ph_min_points=10,
-# coherence/slope early-warning (observability only)
-slope_w=7,
-slope_tol=5e-4,
-slope_persist_min=13,
-corr_w=13,
-coh_thresh=0.80,
-coh_minlen=3,
-# sequential PH / rank baseline params
-ph_win_short=8,
-seq_cusum_lambda=3.0,
-rank_win=8,
-# learned detector
-detector_horizon=5,  # epochs before soft collapse considered positive
-detector_L2_grid=[1e-3, 1e-2, 1e-1],
-detector_steps_grid=[200, 400, 800],
-detector_lr=1e-2,
-detector_cv_folds=5,  # grouped CV over seeds
-warn_vote=2,  # quorum k for vote baseline
-warn_consec=3,  # consecutive-epoch hits required for a warn (env SCAR_WARN_CONSEC overrides)
-det_use_missing=False,  # do NOT feed missingness indicators to learner
-# baselines over train loss (reported; not used by learner)
-ewma_alpha=0.2,
-sma_k=5,
-# NEWMA baseline (fast/slow rates)
-newma_fast=0.3,
-newma_slow=0.03,
-# unified ground truth calibration (unsupervised)
-gt_rank_min=8.0,  # effective rank threshold (native eff_dim)
-gt_rank_q=0.075,  # quantile for eff_dim(_gt) when calibrating gt_rank_min
-gt_patience=2,  # soft patience
-# workers & I/O
-num_workers=int(os.environ.get("SCAR_NUM_WORKERS", "0")),
-# ops controls
-max_failures=6,  # abort sweep if this many runs fail
-skip_cos_disp_in_smoke=True,  # short-circuit cosine_dispersion when SCAR_SMOKE=1
-skip_gns_in_smoke=True,       # short-circuit gradient_noise_scale when SCAR_SMOKE=1
-# compatibility / backend flags
-compat_mode=True,  # keep PH baselines on ripser during this calibration cycle
-lock_sw2_backend=True,  # reserved: keep a stable SW2 backend per run
-))
+CFG.update(
+    dict(
+        # device & determinism
+        device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+        deterministic=True,  # strict determinism ON by default
+        amp=True,  # ignored when deterministic=True
+        # optimizer / schedule
+        base_lr=0.3,
+        momentum=0.9,
+        weight_decay=5e-4,
+        warmup=2,
+        cosine=True,
+        # grad safety
+        grad_clip_norm=5.0,  # default clip to stabilize early steps
+        # sweep budget
+        epochs=72,
+        batch=256,
+        # seeds
+        seeds_calib=list(range(401, 411)),  # 10 seeds for calibration
+        seeds_eval=list(range(511, 541)),  # 30 seeds for evaluation
+        # factorial pathologies (exactly one active per run)
+        factors=[
+            {"name": "none"},
+            {
+                "name": "none_safe",
+                "base_lr_scale": 0.33,
+                "override_grad_clip": 6.0,
+            },  # healthier run for FP denom
+            {"name": "uniform_label_noise", "p": 0.6},
+            {"name": "class_skew", "base_p": 0.4, "hot_scale": 1.7, "hot_k": 4},
+            {"name": "long_tail", "base_p": 0.4, "pareto_a": 3.0},
+            {"name": "input_corruption", "blur_p": 0.3, "noise_std": 0.03},
+            {
+                "name": "class_dropout_window",
+                "drop_classes": 1,
+                "drop_frac": 0.8,
+                "start": 10,
+                "end": 30,
+            },
+            {"name": "lr_spike", "epoch": 5, "factor": 6.0},
+            {"name": "mom_pulse", "start": 12, "duration": 3, "momentum": 0.0},
+        ],
+        # monitor stream
+        monitor_source="external",  # {"external","clean_val","noisy_train"}
+        monitor_labels=False,  # optional: compute monitor_acc if True
+        metric_batches=3,  # per-epoch monitor mini-batches for mean/std estimates
+        metric_total_cap=512,  # per-epoch cap per metric (mean over <= cap samples)
+        # external monitor config (STL-10 resized, CIFAR-normalised)
+        external_monitor=dict(
+            dataset="STL10",
+            split="test",
+            resize_to=32,
+            pool_size=4000,  # per-run pool
+            ent_subset=1200,  # for entropy/confidence (independent stream)
+            ent_every=2,
+        ),
+        # splits / normalisation frame
+        monitor_val_per_class=80,  # used only if monitor_source=="clean_val"
+        norm_ref_per_class=100,  # μ_ref, σ_ref frozen once at init per run (from CIFAR train)
+        # feature geometry
+        geom_std="ref",  # freeze σ to reference across epochs
+        geom_rp_dim=48,  # JL for covariance space in metrics
+        # variance-outside-k
+        var_k_energy=0.90,
+        var_k_max=32,
+        # heavy metrics cadence & budgets
+        heavy_every=6,
+        rp_dim_topo=16,
+        rp_repeats=8,
+        rp_agg="median",
+        rp_fixed=True,
+        ripser_budget_ms=250,
+        topo_sample_n=192,
+        sw2_budget_ms=200,
+        sw2_n_proj=96,  # lower to 64 for 8GB GPUs
+        # PH calibration (directions learned on SOFT collapses only)
+        ph_win=20,
+        ph_burn=6,
+        ph_two_sided=False,
+        ph_lambda=3.0,
+        ph_min_points=10,
+        # coherence/slope early-warning (observability only)
+        slope_w=7,
+        slope_tol=5e-4,
+        slope_persist_min=13,
+        corr_w=13,
+        coh_thresh=0.80,
+        coh_minlen=3,
+        # sequential PH / rank baseline params
+        ph_win_short=8,
+        seq_cusum_lambda=3.0,
+        rank_win=8,
+        # learned detector
+        detector_horizon=5,  # epochs before soft collapse considered positive
+        detector_L2_grid=[1e-3, 1e-2, 1e-1],
+        detector_steps_grid=[200, 400, 800],
+        detector_lr=1e-2,
+        detector_cv_folds=5,  # grouped CV over seeds
+        warn_vote=2,  # quorum k for vote baseline
+        warn_consec=3,  # consecutive-epoch hits required for a warn (env SCAR_WARN_CONSEC overrides)
+        det_use_missing=False,  # do NOT feed missingness indicators to learner
+        # baselines over train loss (reported; not used by learner)
+        ewma_alpha=0.2,
+        sma_k=5,
+        # NEWMA baseline (fast/slow rates)
+        newma_fast=0.3,
+        newma_slow=0.03,
+        # unified ground truth calibration (unsupervised)
+        gt_rank_min=8.0,  # effective rank threshold (native eff_dim)
+        gt_rank_q=0.075,  # quantile for eff_dim(_gt) when calibrating gt_rank_min
+        gt_patience=2,  # soft patience
+        # workers & I/O
+        num_workers=int(os.environ.get("SCAR_NUM_WORKERS", "0")),
+        # ops controls
+        max_failures=6,  # abort sweep if this many runs fail
+        skip_cos_disp_in_smoke=True,  # short-circuit cosine_dispersion when SCAR_SMOKE=1
+        skip_gns_in_smoke=True,  # short-circuit gradient_noise_scale when SCAR_SMOKE=1
+        # compatibility / backend flags
+        compat_mode=True,  # keep PH baselines on ripser during this calibration cycle
+        lock_sw2_backend=True,  # reserved: keep a stable SW2 backend per run
+    )
+)
 
 # Default family z-gate; overridden by SCAR_FAMILY_Z_THR if set
 CFG.setdefault("family_z_thr", 2.903)
+
 
 def _env_float_in_range(name: str, default: float, lo: float, hi: float) -> float:
     s = os.environ.get(name)
@@ -1116,6 +1090,7 @@ def _env_float_in_range(name: str, default: float, lo: float, hi: float) -> floa
         pass
     return default
 
+
 # --- env override for family z-gate (used by deployed detector gate) ---
 CFG["family_z_thr"] = _env_float_in_range("SCAR_FAMILY_Z_THR", CFG.get("family_z_thr", 2.903), 0.25, 20.0)
 try:
@@ -1130,7 +1105,7 @@ try:
         val = os.environ.get("CUBLAS_WORKSPACE_CONFIG", "")
         if val not in (":4096:8", ":16:8"):
             print(
-            "[WARN] Deterministic=True but CUBLAS_WORKSPACE_CONFIG is not a standard deterministic value; using ':4096:8'."
+                "[WARN] Deterministic=True but CUBLAS_WORKSPACE_CONFIG is not a standard deterministic value; using ':4096:8'."
             )
             os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 except Exception:
@@ -1183,7 +1158,7 @@ CFG.setdefault("gate_window", 16)
 CFG.setdefault("gate_bins", 16)
 CFG.setdefault("gate_epsilon", 0.08)
 CFG.setdefault("gate_eps_stat_max_frac", 0.25)
-CFG.setdefault("gate_gain_thresh", 0.05)   # bits per sample (calibrated against controls)
+CFG.setdefault("gate_gain_thresh", 0.05)  # bits per sample (calibrated against controls)
 CFG.setdefault("gate_epsilon_sens", 0.04)  # dedicated κ_sens budget
 CFG.setdefault("gate_min_evidence", 16)
 CFG.setdefault("gate_gain_units", "bits/sample")
@@ -1201,7 +1176,7 @@ try:
     BUDGET = BudgetLedger(_wb)
 except Exception:
     BUDGET = BudgetLedger(WindowBudget())
-    
+
 # Install shared runtime state so other legacy modules can see CFG/OUTDIR/BUDGET.
 try:
     runtime.install_runtime(cfg=CFG, outdir=OUTDIR, budget=BUDGET)
@@ -1214,18 +1189,17 @@ CFG_SMOKE = dict(
     seeds_calib=[401, 402],
     seeds_eval=[511, 512],
     epochs=16,
-    heavy_every=16,      # will be overwritten by the update below
+    heavy_every=16,  # will be overwritten by the update below
     rp_repeats=1,
     sw2_n_proj=64,
-    gate_window=6,       # 2*W=12 <= 16 so the gate runs
-    warmup=4,            # NEW
-    ph_burn=0,           # NEW
+    gate_window=6,  # 2*W=12 <= 16 so the gate runs
+    warmup=4,  # NEW
+    ph_burn=0,  # NEW
 )
 
 # Ensure smoke mode executes at least one heavy pass
-CFG_SMOKE.update({
-"heavy_every": max(1, as_int(CFG_SMOKE.get("epochs", 16), default=16) // 4)
-})
+CFG_SMOKE.update({"heavy_every": max(1, as_int(CFG_SMOKE.get("epochs", 16), default=16) // 4)})
+
 
 def seeds_for_eval_from_env(CFG_dict):
     """Return seeds for evaluation based on SCAR_EVAL_SPLIT.
@@ -1255,12 +1229,13 @@ def _cuda_hash():
 
 def _pip_freeze_md5():
     try:
-        s = subprocess.check_output(
-        [sys.executable, "-m", "pip", "freeze"], stderr=subprocess.DEVNULL, text=True
-        )[:50000]
+        s = subprocess.check_output([sys.executable, "-m", "pip", "freeze"], stderr=subprocess.DEVNULL, text=True)[
+            :50000
+        ]
         return hashlib.md5(s.encode()).hexdigest()
     except Exception:
         return ""
+
 
 # --- Calibration loader (file → env overrides) + provenance capsule ---
 def _read_text_safe(p: Path) -> str:
@@ -1269,12 +1244,13 @@ def _read_text_safe(p: Path) -> str:
     except Exception:
         return ""
 
+
 def load_calibration(cfg_path: Optional[str]) -> tuple[dict, Optional[str], Optional[str]]:
     """
     Returns: (cal, sha16, cfg_path_str)
     Priority: packaged default file -> user file (if provided) -> env overrides.
     """
-    pkg_default = (Path(__file__).resolve().parent / "configs" / "phase4_cifar10_v0.1.0.json")
+    pkg_default = Path(__file__).resolve().parent / "configs" / "phase4_cifar10_v0.1.0.json"
     cal = {
         "gate_min_evidence": 16,
         "gate_gain_thresh": 0.05,
@@ -1292,8 +1268,12 @@ def load_calibration(cfg_path: Optional[str]) -> tuple[dict, Optional[str], Opti
                 if k in obj:
                     cal[k] = obj[k]
             for k in [
-                "gate_window", "gate_bins", "gate_epsilon",
-                "gate_eps_stat_max_frac", "gate_epsilon_sens", "gate_eps_stat_alpha"
+                "gate_window",
+                "gate_bins",
+                "gate_epsilon",
+                "gate_eps_stat_max_frac",
+                "gate_epsilon_sens",
+                "gate_eps_stat_alpha",
             ]:
                 if k in obj:
                     CFG[k] = obj[k]
@@ -1314,8 +1294,12 @@ def load_calibration(cfg_path: Optional[str]) -> tuple[dict, Optional[str], Opti
                         cal[k] = obj[k]
                 # Allow user JSON to set the same CFG pointers as the packaged default
                 for k in [
-                    "gate_window", "gate_bins", "gate_epsilon",
-                    "gate_eps_stat_max_frac", "gate_epsilon_sens", "gate_eps_stat_alpha"
+                    "gate_window",
+                    "gate_bins",
+                    "gate_epsilon",
+                    "gate_eps_stat_max_frac",
+                    "gate_epsilon_sens",
+                    "gate_eps_stat_alpha",
                 ]:
                     if k in obj:
                         CFG[k] = obj[k]
@@ -1354,6 +1338,7 @@ def load_calibration(cfg_path: Optional[str]) -> tuple[dict, Optional[str], Opti
 
     return cal, sha16, (str(used_path) if used_path is not None else None)
 
+
 def write_calibration_capsule(outdir: Path, cal: dict, src_path: Optional[str], sha16: Optional[str]) -> None:
     """Persist calibration details alongside other provenance files."""
     try:
@@ -1374,18 +1359,21 @@ def write_calibration_capsule(outdir: Path, cal: dict, src_path: Optional[str], 
     except Exception:
         pass
 
+
 # Load packaged/user/env calibration and stamp provenance
 try:
     _cal, _cal_sha16, _cal_path = load_calibration(os.environ.get("SCAR_CALIBRATION"))
     CFG["gate_min_evidence"] = as_int(_cal.get("gate_min_evidence", 16), default=16)
-    CFG["gate_gain_thresh"]  = as_float(_cal.get("gate_gain_thresh", 0.05), default=0.05)
-    CFG["gate_gain_units"]   = str(_cal.get("gate_gain_units", "bits/sample"))
+    CFG["gate_gain_thresh"] = as_float(_cal.get("gate_gain_thresh", 0.05), default=0.05)
+    CFG["gate_gain_units"] = str(_cal.get("gate_gain_units", "bits/sample"))
     try:
         write_calibration_capsule(OUTDIR, _cal, _cal_path, _cal_sha16)
     except Exception:
         pass
     if mp.current_process().name == "MainProcess":
-        print(f"[cal] min_evidence={CFG['gate_min_evidence']} gain_thresh={CFG['gate_gain_thresh']:.3f} ({CFG['gate_gain_units']})")
+        print(
+            f"[cal] min_evidence={CFG['gate_min_evidence']} gain_thresh={CFG['gate_gain_thresh']:.3f} ({CFG['gate_gain_units']})"
+        )
     # Reapply environment overrides LAST so they win over any preloads
     try:
         v = os.environ.get("SCAR_GATE_MIN_EVIDENCE")
@@ -1469,33 +1457,32 @@ try:
     repro_path = OUTDIR / "repro.json"
     if mp.current_process().name == "MainProcess":
         if not repro_path.exists():
-            save_json({
-            "cuda_hash_md5": _cuda_hash(),
-            "pip_freeze_md5": _pip_freeze_md5(),
-            "torch": torch.__version__,
-            "torchvision": torchvision.__version__,
-            "cuda": torch.version.cuda,
-            "cublas_workspace": os.environ.get("CUBLAS_WORKSPACE_CONFIG", ""),
-            "deterministic": bool(CFG.get("deterministic", True)),
-            }, repro_path)
+            save_json(
+                {
+                    "cuda_hash_md5": _cuda_hash(),
+                    "pip_freeze_md5": _pip_freeze_md5(),
+                    "torch": torch.__version__,
+                    "torchvision": torchvision.__version__,
+                    "cuda": torch.version.cuda,
+                    "cublas_workspace": os.environ.get("CUBLAS_WORKSPACE_CONFIG", ""),
+                    "deterministic": bool(CFG.get("deterministic", True)),
+                },
+                repro_path,
+            )
 except Exception:
     pass
 
 
-# Persist the finite-window provenance alongside repro info
-try:
-    if (mp.current_process().name == "MainProcess") and (BUDGET is not None):
-        write_window_provenance(OUTDIR, DEFAULT_WINDOW, CFG, BUDGET.lim)
-except Exception:
-    pass
 # Echo calibration state to stdout once
 try:
     if mp.current_process().name == "MainProcess":
         if str(os.environ.get("SCAR_CALIB", "0")).strip() in ("1", "true", "TRUE", "yes", "on"):
-            print("[calib] launch declared in calibration mode (SCAR_CALIB=1). Locked keys should be respected by drivers.")
+            print(
+                "[calib] launch declared in calibration mode (SCAR_CALIB=1). Locked keys should be respected by drivers."
+            )
 except Exception:
     pass
-    
+
 
 def safe_write_parquet(df: pd.DataFrame, path: Path):
     # Pin the Parquet engine and fall back loudly to CSV if Arrow is unavailable
@@ -1547,6 +1534,7 @@ def _write_both_overlays(ov_all: pd.DataFrame, outdir: Path):
     safe_write_parquet(soft, soft_path)
     safe_write_parquet(hard, hard_path)
 
+
 # --- Warn persistence (k-consecutive) applied per (seed, factor) group ---
 def _apply_warn_persistence(df: pd.DataFrame, k: int):
     if not isinstance(k, int) or k <= 1:
@@ -1556,9 +1544,7 @@ def _apply_warn_persistence(df: pd.DataFrame, k: int):
         return df
     keys = ["seed", "factor"]
     for col in warn_cols:
-        df[col] = df.groupby(keys)[col].transform(
-        lambda s: s.rolling(k, min_periods=k).sum().ge(k)
-        )
+        df[col] = df.groupby(keys)[col].transform(lambda s: s.rolling(k, min_periods=k).sum().ge(k))
     return df
 
 
@@ -1567,6 +1553,7 @@ def _as_text(x: Any) -> str:
     if isinstance(x, (bytes, bytearray)):
         return x.decode("utf-8", errors="replace")
     return str(x)
+
 
 def safe_int(x: Any) -> int:
     if isinstance(x, (int, np.integer)):
@@ -1580,6 +1567,7 @@ def safe_int(x: Any) -> int:
         return int(float(x))
     except Exception:
         return 0
+
 
 def safe_float(x: Any) -> float:
     if isinstance(x, (int, float, np.integer, np.floating)):
@@ -1613,10 +1601,10 @@ try:
     )
 except Exception:
     # Keep core/legacy types intact; only null out optional FR wiring hooks
-    init_fr = None                      # type: ignore[assignment]
-    _FR_RESOLVE_EPS = None              # type: ignore[assignment]
-    install_window_decl = None          # type: ignore[assignment]
-    write_window_audit = None           # type: ignore[assignment]
+    init_fr = None  # type: ignore[assignment]
+    _FR_RESOLVE_EPS = None  # type: ignore[assignment]
+    install_window_decl = None  # type: ignore[assignment]
+    write_window_audit = None  # type: ignore[assignment]
     write_window_provenance_from_decl = None  # type: ignore[assignment]
 
 # If fr_integration exposes a resolver, hook it into AGGREGATE_EPSILON
@@ -1625,22 +1613,17 @@ if _FR_RESOLVE_EPS is not None:
 
 # --- FR runtime holders (do not shadow types) ---
 from typing import Callable, Iterable
-import numpy as _np
 
-USE_FR: bool = False
-FR_WIN: Optional["FRWindow"] = None
-GE: Optional["GateEngine"] = None
-WINDOW_DECL: Optional["WindowDecl"] = None
-_DECL_TRANSPORT: Optional["DeclTransport"] = None
-ASSERT_NATURALITY: Optional[Callable[[ "Transport", Iterable[Callable[..., _np.ndarray]], str], None]] = None  # type: ignore[name-defined]
 
 # ---- tiny shims that mypy loves ----
 from typing import Any, Iterable, overload, Union
+
 
 def as_opt_int(x: Any) -> Optional[int]:
     """Int or None; use when the target really is optional."""
     v = as_int(x, default=-1)
     return v if v >= 0 else None
+
 
 def s2f(s: Any) -> np.ndarray:
     """Series[Any] | None -> np.ndarray[float], tolerant of junk."""
@@ -1650,6 +1633,7 @@ def s2f(s: Any) -> np.ndarray:
         except Exception:
             pass
     return np.array([], dtype=float)
+
 
 def _as_float_guard_dup(x: Any, default: float = 0.0) -> float:
     try:
@@ -1665,7 +1649,9 @@ def _as_float_guard_dup(x: Any, default: float = 0.0) -> float:
         pass
     return default
 
+
 # ---- typed guards useful for mypy-clean comparisons/membership ----
+
 
 def safe_in(item: Any, container: Any) -> bool:
     """Like `item in container` but returns False for non-iterables."""
@@ -1701,6 +1687,7 @@ def as_json_dict(x: Any) -> dict[str, Any]:
 # Model & schedule
 # ---------------------------
 
+
 def make_opt(model):
     """Compatibility wrapper: delegate to legacy.model.make_opt using global CFG."""
     return _make_opt_model(model, CFG)
@@ -1712,91 +1699,8 @@ def make_opt(model):
 # ---------------------------
 
 
-def cov_eigs(Z: torch.Tensor, eps: float = 1e-6) -> Tuple[torch.Tensor, int]:
-    n = Z.shape[0]
-    COV = (Z.T @ Z) / max(1, (n - 1))
-    COV = COV + eps * torch.eye(COV.shape[0], device=Z.device, dtype=Z.dtype)
-    try:
-        w = t_eigvalsh(COV)
-    except Exception:
-        w = t_eigvals(COV).real
-    neg = int((w < -1e-8).sum().item())
-    return w.clamp_min(0), neg
-
-
-def choose_k_by_energy(eigs: torch.Tensor, energy: float, kmax: int) -> Tuple[int, float, bool]:
-    if not (0.0 < energy <= 0.999999):
-        raise AssertionError("var_k_energy must be in (0,1).")
-    s = eigs.sum()
-    if s <= 0 or eigs.numel() == 0:
-        return 1, float("nan"), False
-    w_desc = torch.flip(eigs, dims=[0])
-    cum_top = torch.cumsum(w_desc, dim=0)
-    idxs = (cum_top >= energy * s).nonzero(as_tuple=False)
-    if idxs.numel() == 0:
-        return 1, float("nan"), False
-    k = int(idxs[0].item()) + 1
-    k = max(1, min(k, int(min(eigs.shape[0], kmax))))
-    tail_frac = float(((s - cum_top[k - 1]) / (s + 1e-12)).cpu().item())
-    return k, tail_frac, True
-
-
-def variance_outside_k(Z: torch.Tensor) -> Tuple[float, float, int, float, int, int]:
-    w, neg = cov_eigs(Z)
-    ok = 1
-    k, tail_mass, good = choose_k_by_energy(w, CFG["var_k_energy"], CFG["var_k_max"])
-    if not good:
-        ok = 0
-        k = 1
-        tail_mass = float("nan")
-    s = w.sum().clamp_min(1e-12)
-    topk = w[-k:].sum()
-    var_out_k = float(1.0 - (topk / s))
-    eff_dim = float((s**2 / (w.pow(2).sum().clamp_min(1e-12))).cpu())
-    return var_out_k, eff_dim, int(k), float(tail_mass), ok, neg
-
-
-# --- spectral_r2: top-2 energy ratio from covariance eigenvalues
-def spectral_r2(Z: torch.Tensor) -> float:
-    """Top-2 energy ratio (λ1+λ2)/Σλ using covariance eigenvalues; nan if d<2 or degenerate."""
-    try:
-        w, _ = cov_eigs(Z)
-        if w.numel() < 2:
-            return float("nan")
-        s = float(w.sum().cpu().item())
-        if not np.isfinite(s) or s <= 0:
-            return float("nan")
-        r2 = float(((w[-1] + w[-2]) / w.sum()).cpu().item())
-        return r2
-    except Exception:
-        return float("nan")
-
-
-@torch.no_grad()
-def cosine_dispersion(Z: torch.Tensor, seed: int, epoch: int, sample: int = 800) -> float:
-    """Cosine‑similarity dispersion of JL/geom features (observability only)."""
-    if os.environ.get("SCAR_SMOKE", "0") == "1" and CFG.get("skip_cos_disp_in_smoke", False):
-        return float("nan")
-    n = Z.shape[0]
-    if n <= 2:
-        return float("nan")
-    sample_n = int(min(max(2, sample), n))
-    _seed = int(1e6 * _u01_from_hash("cos", seed, epoch))
-    # Device-safe generator
-    if Z.device.type == "cuda":
-        g = torch.Generator(device=Z.device).manual_seed(_seed)
-        idx = torch.randperm(n, generator=g, device=Z.device)[:sample_n]
-    else:
-        g = torch.Generator().manual_seed(_seed)
-        idx = torch.randperm(n, generator=g)[:sample_n]
-    X = F.normalize(Z[idx], dim=1)
-    G = X @ X.T
-    off = G - torch.eye(G.shape[0], device=G.device, dtype=G.dtype)
-    var = off.pow(2).sum() / max(1, off.numel() - G.shape[0])
-    return float(var.sqrt().item())
-
-
 # --- monitor_margin_median: median logit margin (top-1 minus top-2) over loader (label-free)
+
 
 def ftle_entropy_grad(model, xb_small: torch.Tensor) -> float:
     """Median log-norm of entropy gradient (AMP-safe)."""
@@ -1861,8 +1765,8 @@ def calibrate_gate_gain_thresh_from_controls(df: pd.DataFrame, W: int, warm: int
             if len(x) < W or len(b) < W:
                 continue
             for i in range(len(x) - W + 1):
-                xs = x[i:i+W]
-                bs = b[i:i+W]
+                xs = x[i : i + W]
+                bs = b[i : i + W]
                 m = np.isfinite(xs) & np.isfinite(bs)
                 n = int(m.sum())
                 if n == 0:
@@ -1875,11 +1779,14 @@ def calibrate_gate_gain_thresh_from_controls(df: pd.DataFrame, W: int, warm: int
         return float(CFG.get("gate_gain_thresh", 0.05))
     thr = float(np.quantile(np.array(vals, dtype=float), q))
     try:
-        save_json({"gate_gain_thresh": thr, "q": q, "warm": int(warm), "W": int(W)},
-                  OUTDIR / "gate_gain_thresh_calibration.json")
+        save_json(
+            {"gate_gain_thresh": thr, "q": q, "warm": int(warm), "W": int(W)},
+            OUTDIR / "gate_gain_thresh_calibration.json",
+        )
     except Exception:
         pass
     return thr
+
 
 #
 # ---------------------------
@@ -1966,9 +1873,7 @@ def _rolling_corr(x_arr: np.ndarray, y_arr: np.ndarray, w: int = 21) -> np.ndarr
     return out
 
 
-def _coh_persist_below(
-corr_series: np.ndarray, thresh: float = 0.85, min_len: int = 5
-) -> np.ndarray:
+def _coh_persist_below(corr_series: np.ndarray, thresh: float = 0.85, min_len: int = 5) -> np.ndarray:
     """Boolean array: True where rolling corr < thresh for >= min_len consecutive epochs."""
     c = np.asarray(corr_series, dtype=float)
     n = len(c)
@@ -1983,6 +1888,7 @@ corr_series: np.ndarray, thresh: float = 0.85, min_len: int = 5
             cnt = 0
     return flags
 
+
 # --- flatten model parameters and compute L2 norm (for weight drift)
 def _flatten_params_l2(model: nn.Module) -> Tuple[float, torch.Tensor]:
     vec = []
@@ -1996,9 +1902,7 @@ def _flatten_params_l2(model: nn.Module) -> Tuple[float, torch.Tensor]:
 
 
 # --- gradient noise scale (per-batch, microbatch split)
-def gradient_noise_scale(
-    model: nn.Module, xb: torch.Tensor, yb: torch.Tensor, micro: int = 4
-) -> Tuple[float, int]:
+def gradient_noise_scale(model: nn.Module, xb: torch.Tensor, yb: torch.Tensor, micro: int = 4) -> Tuple[float, int]:
     """Compute a cheap GNS proxy on a single batch by comparing microbatch gradients.
     BN‑safe: does not mutate running_mean/var or num_batches_tracked. Restores modes.
     Returns (gns, n_micro) with gns=nan on failure.
@@ -2015,29 +1919,32 @@ def gradient_noise_scale(
 
             # --- BN anchor / device-dtype guard (mypy-safe) ---
             anchor = (
-                m.running_mean if getattr(m, "running_mean", None) is not None else
-                (m.weight if getattr(m, "weight", None) is not None else None)
+                m.running_mean
+                if getattr(m, "running_mean", None) is not None
+                else (m.weight if getattr(m, "weight", None) is not None else None)
             )
             if isinstance(anchor, torch.Tensor):
                 dev = anchor.device
-                dt  = anchor.dtype
+                dt = anchor.dtype
             else:
                 dev = torch.device("cpu")
-                dt  = torch.float32
+                dt = torch.float32
 
             # snapshot BN buffers with Tensor-aware clone guards
             rm = getattr(m, "running_mean", None)
-            rv = getattr(m, "running_var",  None)
-            mu_snap  = rm.clone() if isinstance(rm, torch.Tensor) else torch.zeros(m.num_features, device=dev, dtype=dt)
-            var_snap = rv.clone() if isinstance(rv, torch.Tensor) else torch.ones(m.num_features,  device=dev, dtype=dt)
+            rv = getattr(m, "running_var", None)
+            mu_snap = rm.clone() if isinstance(rm, torch.Tensor) else torch.zeros(m.num_features, device=dev, dtype=dt)
+            var_snap = rv.clone() if isinstance(rv, torch.Tensor) else torch.ones(m.num_features, device=dev, dtype=dt)
 
-            bn_state.append((
-                m,
-                mu_snap,
-                var_snap,
-                (nbt.clone() if isinstance(nbt, torch.Tensor) else nbt),
-                m.training,
-            ))
+            bn_state.append(
+                (
+                    m,
+                    mu_snap,
+                    var_snap,
+                    (nbt.clone() if isinstance(nbt, torch.Tensor) else nbt),
+                    m.training,
+                )
+            )
             m.eval()
 
     try:
@@ -2100,6 +2007,7 @@ def gradient_noise_scale(
         # Restore overall model mode
         model.train() if was_training else model.eval()
 
+
 # ---------------------------
 # GT (unsupervised): robust hard + rank-only soft
 # ---------------------------
@@ -2154,451 +2062,17 @@ def gt_collapse_time(run_df: pd.DataFrame, grad_cutoff: float) -> Tuple[Optional
 
 
 # ---------------------------
-# Learned detector utilities
+# Learned detector utilities (moved out of CLI)
 # ---------------------------
-def _metrics_matrix_with_missing(
-g: pd.DataFrame, metric_cols: List[str]
-) -> Tuple[np.ndarray, np.ndarray]:
-    X = g[metric_cols].to_numpy(dtype=np.float32)
-    M = np.isnan(X).astype(np.float32)
-    return X, M
-
-
-def _fit_global_robust_norm_precollapse(
-df_cal: pd.DataFrame, cols: List[str]
-) -> Dict[str, Tuple[float, float]]:
-    """Robust med/MAD estimated only on pre-collapse epochs (or all epochs for none-runs)."""
-    stats: Dict[str, Tuple[float, float]] = {}
-    if df_cal.empty:
-        return {m: (0.0, 1.0) for m in cols}
-
-    for m in cols:
-        sub = df_cal.copy()
-        if {"collapse_tag_gt", "t_collapse_gt"}.issubset(sub.columns):
-            pre_parts: List[pd.DataFrame] = []
-            for _, g in sub.groupby(["seed", "factor"]):
-                tag = str(g["collapse_tag_gt"].iloc[0])
-                tc = g["t_collapse_gt"].iloc[0]
-                if (tag == "soft") and pd.notna(tc):
-                    pre_parts.append(g[g["epoch"] < int(tc)])
-                elif tag == "hard":
-                    # exclude hard-collapse runs from normalization
-                    continue
-                else:
-                    pre_parts.append(g)
-            sub = pd.concat(pre_parts, ignore_index=True) if pre_parts else sub.iloc[0:0]
-
-        arr = (
-        sub[m].to_numpy(dtype=np.float32)
-        if m in sub.columns
-        else np.array([], dtype=np.float32)
-        )
-        fin = np.isfinite(arr)
-        if fin.sum() >= 16:
-            med = float(np.median(arr[fin]))
-            mad = float(np.median(np.abs(arr[fin] - med))) + 1e-8
-        else:
-            med, mad = 0.0, 1.0
-        stats[m] = (med, 1.4826 * mad)
-    return stats
-
-
-def _fit_global_robust_norm(
-df_cal: pd.DataFrame, cols: List[str]
-) -> Dict[str, Tuple[float, float]]:
-    stats = {}
-    X = df_cal[cols].to_numpy(dtype=np.float32)
-    for j, m in enumerate(cols):
-        col = X[:, j]
-        finite = np.isfinite(col)
-        if finite.sum() >= 16:
-            med = float(np.median(col[finite]))
-            mad = float(np.median(np.abs(col[finite] - med))) + 1e-8
-        else:
-            med, mad = 0.0, 1.0
-        stats[m] = (med, 1.4826 * mad)
-    return stats
-
-
-def _apply_global_norm_impute(
-X: np.ndarray, stats: Dict[str, Tuple[float, float]], cols: List[str]
-) -> np.ndarray:
-    Xn = X.copy()
-    for j, m in enumerate(cols):
-        med, scale = stats[m]
-        if scale <= 0:
-            scale = 1.0
-        col = Xn[:, j]
-        mask = ~np.isfinite(col)
-        col[mask] = med
-        Xn[:, j] = (col - med) / scale
-    Xn[np.isinf(Xn)] = 0.0
-    return Xn
-
-
-def _train_logistic_ridge_balanced(
-X: np.ndarray, y: np.ndarray, groups: np.ndarray, steps: int, lr: float, l2: float
-) -> Tuple[np.ndarray, float]:
-    # Guard: degenerate labels (all negatives or all positives) -> deterministic "disabled" classifier
-    if (y.sum() == 0) or (y.sum() == len(y)):
-        w = np.zeros(X.shape[1], dtype=np.float32)
-        b = -10.0 if y.sum() == 0 else 10.0
-        return w, float(b)
-
-    pos = max(1e-6, y.mean())
-    w_pos = 0.5 / pos
-    w_neg = 0.5 / (1 - pos)
-    w = np.zeros(X.shape[1], dtype=np.float32)
-    b = 0.0
-    for _ in range(steps):
-        # Clip logits for numerical stability
-        z = np.clip(X @ w + b, -20.0, 20.0)
-        p = _sigmoid_stable(z)
-        w_i = np.where(y > 0.5, w_pos, w_neg)
-        grad_w = (X.T @ ((p - y) * w_i)) / len(y) + l2 * w
-        grad_b = float(np.mean((p - y) * w_i))
-        w -= lr * grad_w
-        b -= lr * grad_b
-    return w, b
-
-
-def _cv_grouped_fit(
-    X: np.ndarray,
-    y: np.ndarray,
-    groups: np.ndarray,
-    fp_mask: np.ndarray,
-    steps_grid,
-    l2_grid,
-    lr: float,
-    folds: int,
-    fp_cap: float,
-    epochs: np.ndarray,
-    tc_soft: np.ndarray,
-    warm_idx: int,
-) -> Optional[Tuple[int, float, float]]:
-    """Pick (steps, l2, threshold) by maximizing expected OOF lead time under an FP cap (tie-break: sensitivity)."""
-
-    # --- safety short-circuit: no positives at all ---
-    if y.sum() == 0:
-        return None
-
-    uniq = np.unique(groups)
-    if len(uniq) < max(2, folds):
-        folds = max(2, min(len(uniq), folds))
-    folds_idx = _partition_groups_with_positives(uniq.copy(), y, groups, folds)
-
-    best_lead = -np.inf
-    best_sens = -np.inf
-    best_info: Optional[Tuple[int, float, float]] = None
-
-    for l2 in l2_grid:
-        for steps in steps_grid:
-            # Out-of-fold predictions
-            oof_p = np.full_like(y, np.nan, dtype=np.float32)
-            for va_seeds in folds_idx:
-                tr = ~np.isin(groups, va_seeds)
-                va = ~tr
-                if va.sum() == 0 or tr.sum() == 0:
-                    continue
-                w, b = _train_logistic_ridge_balanced(
-                    X[tr], y[tr], groups[tr], steps=steps, lr=lr, l2=l2
-                )
-                z_va = (X[va] @ w + b)
-                oof_p[va] = _sigmoid_stable(z_va)
-
-            mask = np.isfinite(oof_p)
-            if mask.sum() == 0:
-                continue
-            elig = (fp_mask == 1) & (y == 0) & mask
-
-            # candidate thresholds from quantiles over relevant scores
-            rel = mask & (elig | (y == 1))
-            scores = oof_p[rel]
-            if scores.size > 0:
-                ts = np.unique(qlin_vec(scores, np.linspace(0.05, 0.95, 61)))
-            else:
-                ts = np.linspace(0.05, 0.95, 91)
-
-            for t in ts:
-                pred = oof_p >= t
-
-                # FP rate on eligible negatives (>=warm)
-                fp_rate = pred[elig].mean() if elig.any() else 0.0
-                if not np.isfinite(fp_rate) or fp_rate > fp_cap:
-                    continue
-
-                # lead time and sensitivity at the run level (soft collapses only)
-                leads: List[float] = []
-                hits = 0
-                total_pos = 0
-                for seed in uniq.astype(np.int64):
-                    gmask = (groups == seed) & mask
-                    if not gmask.any():
-                        continue
-                    tc = np.nanmean(tc_soft[groups == seed])  # soft only; NaN otherwise
-                    if np.isfinite(tc):
-                        total_pos += 1
-                        idx = np.where(gmask & (epochs >= warm_idx) & pred)[0]
-                        if idx.size > 0:
-                            t_warn = int(epochs[idx.min()])
-                            if t_warn < tc:
-                                leads.append(float(tc - t_warn))
-                                hits += 1
-
-                sens = (hits / max(1, total_pos)) if total_pos > 0 else 0.0
-                mean_lead = float(np.mean(leads)) if len(leads) > 0 else -np.inf
-
-                if (mean_lead > best_lead + 1e-9) or (
-                    abs(mean_lead - best_lead) <= 1e-9 and sens > best_sens
-                ):
-                    best_lead, best_sens, best_info = mean_lead, sens, (steps, l2, float(t))
-
-    return best_info
-
-
-# --- τ→τ′ mapping helpers (deterministic, uses deployed gate logic) ---
-def _partition_groups_with_positives(
-uniq_groups: np.ndarray,
-y: np.ndarray,
-groups: np.ndarray,
-folds: int = 5,
-) -> List[np.ndarray]:
-    """
-    Deterministic stratified partition of group ids into folds.
-    Strategy: put all positive groups into k buckets round‑robin, then
-    fill remaining buckets with negatives round‑robin. Falls back to
-    even split if there are no positive groups.
-    """
-    uniq = np.array(sorted(uniq_groups.astype(np.int64)))
-    k = int(max(2, min(len(uniq), as_int(folds, default=2))))
-    # identify groups with at least one positive label
-    pos_groups = []
-    neg_groups = []
-    for g_id in uniq:
-        mask = (groups.astype(np.int64) == g_id)
-        if mask.any() and (y[mask].sum() > 0):
-            pos_groups.append(int(g_id))
-        else:
-            neg_groups.append(int(g_id))
-    # initialize empty buckets
-    buckets = [list() for _ in range(k)]
-    # round‑robin assign positives first
-    for i, g_id in enumerate(pos_groups):
-        buckets[i % k].append(g_id)
-    # then distribute negatives
-    for i, g_id in enumerate(neg_groups):
-        buckets[i % k].append(g_id)
-    # convert to numpy arrays
-    return [np.array(sorted(b), dtype=np.int64) for b in buckets]
-
-
-def _oof_probs_for_params(
-Xn: np.ndarray, y: np.ndarray, groups: np.ndarray, steps: int, l2: float, lr: float, folds: int
-) -> np.ndarray:
-    """
-    Deterministic grouped OOF probabilities for a fixed (steps, l2) setting.
-    - Groups are seeds; we partition them deterministically so every train split
-    contains positives (when available).
-    - Returns a float32 vector of OOF probabilities aligned with `y`.
-    """
-    # Ensure a sensible number of folds
-    uniq = np.unique(groups.astype(np.int64))
-    k = int(max(2, min(len(uniq), as_int(folds, default=2))))
-    folds_idx = _partition_groups_with_positives(uniq.copy(), y, groups, folds=k)
-
-    p = np.full(y.shape, np.nan, dtype=np.float32)
-    for va_seeds in folds_idx:
-        # boolean masks for this fold
-        va_mask = np.isin(groups, va_seeds)
-        tr_mask = ~va_mask
-        if tr_mask.sum() == 0 or va_mask.sum() == 0:
-            continue
-
-        # train on train groups only
-        w, b = _train_logistic_ridge_balanced(
-        Xn[tr_mask], y[tr_mask], groups[tr_mask], steps=steps, lr=lr, l2=l2
-        )
-        # score validation groups
-        z = Xn[va_mask] @ w + b
-        p[va_mask] = _sigmoid_stable(z)
-    return p
-
-
-
-def _first_run_end(hit_idx: np.ndarray, L: int) -> int:
-    """Return index into hit_idx for the end of the first run of length >= L, or -1."""
-    if len(hit_idx) < L:
-        return -1
-    r = 1
-    for j in range(1, len(hit_idx)):
-        if hit_idx[j] == hit_idx[j - 1] + 1:
-            r += 1
-            if r >= L:
-                return j
-        else:
-            r = 1
-    return -1
-
-
-# --- Gate-only baseline t_warn using K-consecutive policy ---
-def _baseline_gate_t_warn(df_gate: pd.DataFrame, warm_idx: int) -> Optional[int]:
-    """
-    Gate-only baseline t_warn using the same K-consecutive policy as training early-exit.
-    Returns the last epoch (int) of the first run of length ≥ K, or None if no such run exists.
-    """
-    gate_hits = df_gate.loc[
-        (df_gate["epoch"] >= int(warm_idx)) & (df_gate["gate_warn"] == 1),
-        "epoch",
-    ].to_numpy(dtype=int)
-
-    if gate_hits.size == 0:
-        return None
-
-    k_req = as_int(CFG.get("gate_consec", CFG.get("warn_consec", 2)), default=2)
-    j_end = _first_run_end(gate_hits, k_req)  # index into gate_hits
-    if j_end == -1:
-        return None
-    return as_int(gate_hits[j_end], default=0)  # epoch value
-
-
-def _fam_alarm_at(
-i: int,
-Z: np.ndarray,
-det_features: List[str],
-dir_map: Dict[str, str],
-cols: List[str],
-z_thr: float,
-K: int,
-) -> bool:
-    if not cols:
-        return False
-    lo, hi = max(0, i - K), min(Z.shape[0] - 1, i + K)
-    for m in cols:
-        if m not in det_features:
-            continue
-        j = det_features.index(m)
-        zwin = Z[lo : hi + 1, j]
-        d = dir_map.get(m)
-        if d is None:
-            continue  # skip metrics without calibrated direction
-        if d == "up" and np.nanmax(zwin) >= z_thr:
-            return True
-        if d == "down" and np.nanmin(zwin) <= -z_thr:
-            return True
-    return False
-
-
-def _gated_runlevel_fp_for_threshold(
-    meta_rows: pd.DataFrame,
-    X_raw: np.ndarray,
-    p: np.ndarray,
-    det_features: List[str],
-    stats: Dict[str, Tuple[float, float]],
-    dir_map: Dict[str, str],
-    rp_flags: Dict[Tuple[int, str], int],
-    warm: int,
-    z_thr: float,
-    K: int,
-    warn_consec: int,
-) -> float:
-    """Run-level FP on factor=='none' after warm, under deployed gate at fixed τ.
-    Threshold is applied by masking p to -inf *before* this is called.
-    """
-    from typing import Optional as _Optional  # local import keeps file-wide imports unchanged
-
-    Xz = _apply_global_norm_impute(X_raw, stats, det_features)
-    geom_cols = [c for c in ("cos_disp", "var_out_k") if c in det_features]
-    dyn_cols = [c for c in ("ftle", "ftle_lowent") if c in det_features]
-
-    run_warn: Dict[Tuple[int, str], _Optional[int]] = {}
-    from typing import cast, Any
-    for key, indices in meta_rows.groupby(["seed", "factor"]).groups.items():
-        sd, fc = cast(tuple[Any, Any], key)
-        idx = np.asarray(sorted(indices), dtype=np.int64)
-        sub = meta_rows.iloc[idx].sort_values("epoch")
-        order = np.argsort(sub["epoch"].to_numpy())
-        idx = idx[order]
-        epochs = meta_rows.iloc[idx]["epoch"].to_numpy().astype(np.int64)
-        Zg = Xz[idx]
-        pg = p[idx]
-        elig = (epochs >= warm) & np.isfinite(pg) & (pg > -np.inf)
-        hit_idx = np.where(elig)[0]
-
-        j_end = _first_run_end(hit_idx, warn_consec)
-        t_warn: _Optional[int] = None
-        if j_end >= 0:
-            i = hit_idx[j_end]
-            geom_ok = _fam_alarm_at(i, Zg, det_features, dir_map, geom_cols, z_thr, K)
-            dyn_ok = _fam_alarm_at(i, Zg, det_features, dir_map, dyn_cols, z_thr, K)
-            rp_under = bool(rp_flags.get((int(sd), str(fc)), 0))
-            gate_ok = dyn_ok if rp_under else (geom_ok or dyn_ok)
-            if gate_ok:
-                t_warn = int(epochs[i])
-        run_warn[(int(sd), str(fc))] = t_warn
-
-    none_runs = [
-        (int(sd), str(fc))
-        for (sd, fc), _ in meta_rows.groupby(["seed", "factor"])
-        if str(fc) == "none"
-    ]
-    flags = []
-    for k in none_runs:
-        tw = run_warn.get(k)
-        flags.append(bool(tw is not None and tw >= warm))
-    return float(np.mean(flags)) if flags else float("nan")
-
-
-def map_threshold_to_gated_fp(
-meta_rows: pd.DataFrame,
-X_raw: np.ndarray,
-p: np.ndarray,
-det_features: List[str],
-stats: Dict[str, Tuple[float, float]],
-dir_map: Dict[str, str],
-rp_flags: Dict[Tuple[int, str], int],
-warm: int,
-z_thr: float,
-K: int,
-warn_consec: int,
-fp_cap: float,
-) -> Tuple[float, float]:
-    """Deterministically map τ→τ′ so gated run-level FP on factor=='none' ≤ fp_cap.
-    Returns (tau_prime, measured_fp).
-    """
-    ep = meta_rows["epoch"].to_numpy().astype(np.int64)
-    fac = meta_rows["factor"].astype(str).to_numpy()
-    elig = (ep >= warm) & np.isfinite(p) & (fac == "none")
-    scores = np.asarray(p[elig], dtype=np.float32)
-    if scores.size == 0:
-        print("[WARN] τ′ calibration skipped: no factor=='none' rows after warm; failing closed with τ′=1.0")
-        return 1.0, float("nan")
-
-    qs = np.linspace(0.05, 0.995, 191, dtype=np.float64)
-    ts = list(map(float, np.unique(qlin_vec(scores, qs)).tolist()))
-
-    best_tau, best_fp = ts[-1], float("inf")
-    for t in ts:
-        p_masked = np.where(p >= t, p, -np.inf).astype(np.float32)
-        fp = _gated_runlevel_fp_for_threshold(
-        meta_rows,
-        X_raw,
-        p_masked,
-        det_features,
-        stats,
-        dir_map,
-        rp_flags,
-        warm,
-        z_thr,
-        K,
-        warn_consec,
-        )
-        if np.isnan(fp):
-            continue
-        if fp <= fp_cap:
-            best_tau, best_fp = float(t), float(fp)
-            break
-        best_fp = float(fp)
-    return best_tau, best_fp
+from veriscope.runners.legacy.detectors.learned import (
+    _metrics_matrix_with_missing,
+    _fit_global_robust_norm_precollapse,
+    _apply_global_norm_impute,
+    _train_logistic_ridge_balanced,
+    _cv_grouped_fit,
+    _oof_probs_for_params,
+    map_threshold_to_gated_fp,
+)
 
 
 # ---------------------------
@@ -2654,27 +2128,30 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
     if not _DET_LOGGED:
         try:
             print(
-            "[det] status | deterministic=%s | CUBLAS_WORKSPACE_CONFIG=%s | TF32(matmul=%s, cudnn=%s)"
-            % (
-            str(bool(CFG.get("deterministic", True))),
-            os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
-            str(torch.backends.cuda.matmul.allow_tf32),
-            str(torch.backends.cudnn.allow_tf32),
-            )
+                "[det] status | deterministic=%s | CUBLAS_WORKSPACE_CONFIG=%s | TF32(matmul=%s, cudnn=%s)"
+                % (
+                    str(bool(CFG.get("deterministic", True))),
+                    os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
+                    str(torch.backends.cuda.matmul.allow_tf32),
+                    str(torch.backends.cudnn.allow_tf32),
+                )
             )
         except Exception:
             pass
         # Emit a determinism probe file once per process
         try:
             if mp.current_process().name == "MainProcess":
-                update_json(OUTDIR / "env_probe.json", {
-                "cuda_hash": _cuda_hash(),
-                "pip_freeze_md5": _pip_freeze_md5(),
-                "torch": torch.__version__,
-                "torchvision": torchvision.__version__,
-                "cuda": torch.version.cuda,
-                "deterministic_flag": bool(CFG.get("deterministic", True)),
-                })
+                update_json(
+                    OUTDIR / "env_probe.json",
+                    {
+                        "cuda_hash": _cuda_hash(),
+                        "pip_freeze_md5": _pip_freeze_md5(),
+                        "torch": torch.__version__,
+                        "torchvision": torchvision.__version__,
+                        "cuda": torch.version.cuda,
+                        "deterministic_flag": bool(CFG.get("deterministic", True)),
+                    },
+                )
         except Exception:
             pass
         _DET_LOGGED = True
@@ -2688,11 +2165,7 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
     )
     run_id = f"s{seed}-{factor['name']}"
     tr_ds = FactorisedTrainDataset(tr_aug, tr_take, factor=factor, seed=seed)
-    sampler = (
-        DropoutAwareSampler(tr_ds, CFG["batch"], seed=seed)
-        if factor["name"] == "class_dropout_window"
-        else None
-    )
+    sampler = DropoutAwareSampler(tr_ds, CFG["batch"], seed=seed) if factor["name"] == "class_dropout_window" else None
 
     # monitor loaders
     ent_every = as_int(CFG.get("external_monitor", {}).get("ent_every"), default=2)
@@ -2744,12 +2217,12 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
 
             # Ensure Python ints and give mypy a precise type
             pool_list = cast(List[int], pool_idxs.astype(int).tolist())
-            ent_list  = cast(List[int],  ent_idxs.astype(int).tolist())
+            ent_list = cast(List[int], ent_idxs.astype(int).tolist())
             update_json(
                 splits_path,
                 {
                     "STL10_POOL": pool_list,
-                    "STL10_ENT":  ent_list,
+                    "STL10_ENT": ent_list,
                 },
             )
         except Exception as e:
@@ -2795,9 +2268,14 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
     def probe_aug_loader_factory():
         base_loader = pool_loader
         try:
+
             class _ProbeDS(torch.utils.data.Dataset):
-                def __init__(self, base): self.base = base
-                def __len__(self): return len(self.base)
+                def __init__(self, base):
+                    self.base = base
+
+                def __len__(self):
+                    return len(self.base)
+
                 def __getitem__(self, i):
                     x, y = self.base[i]
                     try:
@@ -2808,11 +2286,16 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
                     if isinstance(x, torch.Tensor):
                         noise = torch.randn(x.shape, dtype=x.dtype, device=dev, generator=g) * 0.02
                         x2 = (x + noise).clamp(-3, 3)
-                        if int(_u01_from_hash("flip_probe", seed, int(i)) * 2) == 1 and x2.ndim == 3 and x2.shape[-1] >= 2:
+                        if (
+                            int(_u01_from_hash("flip_probe", seed, int(i)) * 2) == 1
+                            and x2.ndim == 3
+                            and x2.shape[-1] >= 2
+                        ):
                             x2 = torch.flip(x2, dims=[2])
                     else:
                         x2 = x
                     return x2, y
+
             return DataLoader(
                 _ProbeDS(base_loader.dataset),
                 batch_size=base_loader.batch_size,
@@ -2838,9 +2321,7 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
             try:
                 xb_chk, _ = next(iter(norm_ref_loader))
             except Exception as e2:
-                print(
-                f"[WARN] norm_ref fetch failed for dim check: {e2}; defaulting penult_dim=512"
-                )
+                print(f"[WARN] norm_ref fetch failed for dim check: {e2}; defaulting penult_dim=512")
                 d_pen = 512
             else:
                 d_pen = as_int(penult(model, xb_chk.to(device)).shape[1], default=512)
@@ -2876,9 +2357,9 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
 
         try:
             H = (
-            torch.cat(feats, 0)
-            if feats
-            else penult(model, next(iter(norm_ref_loader))[0].to(device)).detach().cpu().float()
+                torch.cat(feats, 0)
+                if feats
+                else penult(model, next(iter(norm_ref_loader))[0].to(device)).detach().cpu().float()
             )
         except Exception as e:
             print(f"[WARN] norm_ref fallback failed: {e}; using empty feature frame")
@@ -2930,8 +2411,9 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
     last_Z_geom = None
     last_Z_geom_native = None
     from typing import Optional as _Optional
+
     ewma_loss: _Optional[float] = None
-    
+
     # --- gate early-exit state (k-consecutive gate_warn after warm) ---
     gate_hits_consec = 0
     gate_halt_epoch = None
@@ -2958,34 +2440,31 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
         if sampler is None:
             # ---- P0: disable persistent workers for per-epoch recreated loader ----
             tr_loader = make_loader(
-            tr_ds,
-            CFG["batch"],
-            shuffle=True,
-            workers=CFG["num_workers"],
-            gen=new_gen(seed, 1 + epoch),
-            device=device,
-            sampler=None,
-            persistent=False,
+                tr_ds,
+                CFG["batch"],
+                shuffle=True,
+                workers=CFG["num_workers"],
+                gen=new_gen(seed, 1 + epoch),
+                device=device,
+                sampler=None,
+                persistent=False,
             )
         else:
             tr_loader = make_loader(
-            tr_ds,
-            CFG["batch"],
-            shuffle=False,
-            workers=CFG["num_workers"],
-            gen=new_gen(seed, 1),
-            device=device,
-            sampler=sampler,
-            persistent=True,
+                tr_ds,
+                CFG["batch"],
+                shuffle=False,
+                workers=CFG["num_workers"],
+                gen=new_gen(seed, 1),
+                device=device,
+                sampler=sampler,
+                persistent=True,
             )
             sampler.set_epoch(epoch)
         tr_ds.set_epoch(epoch)
 
         # LR & optimizer pathology tweaks
-        lr = (
-        lr_at(epoch, CFG["epochs"], CFG["base_lr"], CFG["warmup"], CFG["cosine"])
-        * base_lr_scale
-        )
+        lr = lr_at(epoch, CFG["epochs"], CFG["base_lr"], CFG["warmup"], CFG["cosine"]) * base_lr_scale
         mom = CFG["momentum"]
         if factor["name"] == "lr_spike" and epoch == int(factor.get("epoch", 5)):
             lr *= float(factor.get("factor", 6.0))
@@ -3001,7 +2480,8 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
 
         # effective grad clip
         clip_eff: Optional[float] = (
-            as_float(override_clip, default=float("nan")) if (override_clip is not None)
+            as_float(override_clip, default=float("nan"))
+            if (override_clip is not None)
             else as_float(CFG.get("grad_clip_norm", 0.0), default=0.0)
         )
         if clip_eff is not None and clip_eff <= 0:
@@ -3010,14 +2490,14 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
         # lightweight feature stats for this epoch (on monitor pool)
         with torch.no_grad():
             Z_geom, Z_geom_native = _features_for_loader(
-            model,
-            pool_loader,
-            device,
-            n_batches=max(1, CFG["metric_batches"]),
-            cap=CFG["metric_total_cap"],
-            ref_mu_sig=ref_mu_sig,
-            run_key=run_key,
-            epoch=epoch,
+                model,
+                pool_loader,
+                device,
+                n_batches=max(1, CFG["metric_batches"]),
+                cap=CFG["metric_total_cap"],
+                ref_mu_sig=ref_mu_sig,
+                run_key=run_key,
+                epoch=epoch,
             )
         n_feats = int(Z_geom.shape[0])
         vout_k, effd, k_used, tail_mass, v_ok, neg_eigs = variance_outside_k(Z_geom)
@@ -3046,24 +2526,16 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
         c_w = as_int(CFG.get("corr_w"), default=21)
         c_th = as_float(CFG.get("coh_thresh"), default=0.85)
         c_min = as_int(CFG.get("coh_minlen"), default=5)
-        corr_ev = _rolling_corr(
-        np.array(_eff_dim_series, dtype=float), np.array(_var_out_k_series, dtype=float), w=c_w
-        )
+        corr_ev = _rolling_corr(np.array(_eff_dim_series, dtype=float), np.array(_var_out_k_series, dtype=float), w=c_w)
         coh_flags = _coh_persist_below(corr_ev, thresh=c_th, min_len=c_min)
 
         slope_eff_dim = float(s_eff[-1]) if s_eff.size and np.isfinite(s_eff[-1]) else float("nan")
-        slope_var_out_k = (
-        float(s_var[-1]) if s_var.size and np.isfinite(s_var[-1]) else float("nan")
-        )
-        reg_eff_dim = (
-        float(r_eff[-1]) if r_eff.size and np.isfinite(r_eff[-1]) else float("nan")
-        )  # -1/0/+1
+        slope_var_out_k = float(s_var[-1]) if s_var.size and np.isfinite(s_var[-1]) else float("nan")
+        reg_eff_dim = float(r_eff[-1]) if r_eff.size and np.isfinite(r_eff[-1]) else float("nan")  # -1/0/+1
         reg_var_out_k = float(r_var[-1]) if r_var.size and np.isfinite(r_var[-1]) else float("nan")
         reg_eff_neg_persist = bool(rf_eff["neg"][-1]) if rf_eff["neg"].size else False
         reg_var_pos_persist = bool(rf_var["pos"][-1]) if rf_var["pos"].size else False
-        corr_effdim_varoutk = (
-        float(corr_ev[-1]) if corr_ev.size and np.isfinite(corr_ev[-1]) else float("nan")
-        )
+        corr_effdim_varoutk = float(corr_ev[-1]) if corr_ev.size and np.isfinite(corr_ev[-1]) else float("nan")
         coh_break_persist = bool(coh_flags[-1]) if coh_flags.size else False
 
         # heavy metrics
@@ -3072,27 +2544,27 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
         sw_nat, sw_nat_ms, sw_nat_proj_done, sw_nat_valid = float("nan"), 0.0, 0, 0
         if (epoch % as_int(CFG.get("heavy_every"), default=1)) == 0:
             pers_h0, topo_done, topo_ms, topo_n_used = topo_h0_jl_agg(
-            Z_geom,
-            q=CFG["rp_dim_topo"],
-            repeats=CFG["rp_repeats"],
-            run_key=run_key,
-            epoch=epoch,
-            agg=CFG.get("rp_agg", "median"),
-            sample_n=CFG.get("topo_sample_n", 192),
+                Z_geom,
+                q=CFG["rp_dim_topo"],
+                repeats=CFG["rp_repeats"],
+                run_key=run_key,
+                epoch=epoch,
+                agg=CFG.get("rp_agg", "median"),
+                sample_n=CFG.get("topo_sample_n", 192),
             )
             if last_Z_geom is not None:
                 sw, sw_ms, sw_proj_done, ok = sliced_w2_gpu_budget(
-                last_Z_geom, Z_geom, CFG["sw2_n_proj"], seed, device, CFG["sw2_budget_ms"]
+                    last_Z_geom, Z_geom, CFG["sw2_n_proj"], seed, device, CFG["sw2_budget_ms"]
                 )
                 sw_valid = int(ok)
             if last_Z_geom_native is not None:
                 sw_nat, sw_nat_ms, sw_nat_proj_done, okn = sliced_w2_gpu_budget(
-                last_Z_geom_native,
-                Z_geom_native,
-                CFG["sw2_n_proj"],
-                seed + 7,
-                device,
-                CFG["sw2_budget_ms"],
+                    last_Z_geom_native,
+                    Z_geom_native,
+                    CFG["sw2_n_proj"],
+                    seed + 7,
+                    device,
+                    CFG["sw2_budget_ms"],
                 )
                 sw_nat_valid = int(okn)
             _sw2_series.append(sw if np.isfinite(sw) else np.nan)
@@ -3111,9 +2583,7 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
 
         sw2_recent = _last_k_finite(_sw2_series, 3)
         sw2_med3 = float(np.median(sw2_recent)) if sw2_recent else float("nan")
-        s_sw2 = _rolling_slope(
-        np.array([v for v in _sw2_series], dtype=float), w=max(3, CFG["heavy_every"])
-        )
+        s_sw2 = _rolling_slope(np.array([v for v in _sw2_series], dtype=float), w=max(3, CFG["heavy_every"]))
         sw2_slope = float(s_sw2[-1]) if s_sw2.size and np.isfinite(s_sw2[-1]) else float("nan")
 
         # Update buffers after metric computation
@@ -3132,9 +2602,7 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
             margin_med = monitor_margin_median(model, ent_loader, device)
             _margin_series.append(margin_med)
             s_mar = _rolling_slope(np.array(_margin_series, dtype=float), w=s_w)
-            slope_margin = (
-            float(s_mar[-1]) if s_mar.size and np.isfinite(s_mar[-1]) else float("nan")
-            )
+            slope_margin = float(s_mar[-1]) if s_mar.size and np.isfinite(s_mar[-1]) else float("nan")
             if CFG["monitor_labels"]:
                 try:
                     mon_acc = monitor_accuracy(model, ent_loader, device)
@@ -3234,19 +2702,15 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
             grad_valid = 1
         train_loss = train_loss_sum / max(1, train_cnt)
         ewma_loss = (
-        train_loss
-        if epoch == 0 or np.isnan(train_loss)
-        else (
-        CFG["ewma_alpha"] * train_loss
-        + (1 - CFG["ewma_alpha"]) * (ewma_loss if np.isfinite(ewma_loss) else train_loss)
-        )
+            train_loss
+            if epoch == 0 or np.isnan(train_loss)
+            else (
+                CFG["ewma_alpha"] * train_loss
+                + (1 - CFG["ewma_alpha"]) * (ewma_loss if np.isfinite(ewma_loss) else train_loss)
+            )
         )
         loss_hist.append(train_loss)
-        sma_loss = (
-        float(np.mean(loss_hist[-CFG["sma_k"] :]))
-        if len(loss_hist) >= CFG["sma_k"]
-        else float("nan")
-        )
+        sma_loss = float(np.mean(loss_hist[-CFG["sma_k"] :])) if len(loss_hist) >= CFG["sma_k"] else float("nan")
 
         sw_ratio = float("nan")
         if sw_valid and sw_nat_valid and np.isfinite(sw) and np.isfinite(sw_nat):
@@ -3273,7 +2737,7 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
             xb_g, yb_g = next(it_g)
             xb_g, yb_g = xb_g.to(device), yb_g.to(device)
             gns, gns_n = gradient_noise_scale(
-            model, xb_g[: min(128, xb_g.shape[0])], yb_g[: min(128, yb_g.shape[0])], micro=4
+                model, xb_g[: min(128, xb_g.shape[0])], yb_g[: min(128, yb_g.shape[0])], micro=4
             )
         except Exception:
             gns, gns_n = float("nan"), 0
@@ -3294,7 +2758,7 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
         try:
             W_gate = as_int(CFG.get("gate_window", 16), default=16)
             if (WINDOW_DECL is not None) and (len(logs) >= 2 * W_gate):
-                recent = logs[-(2 * W_gate):]
+                recent = logs[-(2 * W_gate) :]
 
                 def _series(seg, key):
                     v = np.array([float(r.get(key, np.nan)) for r in seg], dtype=float)
@@ -3331,7 +2795,12 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
                 try:
                     if (epoch % max(1, as_int(CFG.get("heavy_every", 6), default=6))) == 0:
                         gate_kappa = kappa_sens_probe(
-                            model, opt, pool_loader, device, WINDOW_DECL, ref_mu_sig,
+                            model,
+                            opt,
+                            pool_loader,
+                            device,
+                            WINDOW_DECL,
+                            ref_mu_sig,
                             probe_cfg={
                                 "aug_probe": True,
                                 "aug_loader_factory": probe_aug_loader_factory,
@@ -3356,11 +2825,11 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
                     getattr(WINDOW_DECL, "epsilon", CFG.get("gate_epsilon", 0.08)),
                     default=as_float(CFG.get("gate_epsilon", 0.08), default=0.08),
                 )
-                gate_worst_tv    = as_float((audit or {}).get("worst_tv",  np.nan), default=float("nan"))
-                gate_eps_stat    = as_float((audit or {}).get("eps_stat",  np.nan), default=float("nan"))
-                gate_gain        = as_float((audit or {}).get("gain_bits", np.nan), default=float("nan"))
-                gate_kappa       = as_float((audit or {}).get("kappa_sens", np.nan), default=float("nan"))
-                gate_warn        = int(flag)
+                gate_worst_tv = as_float((audit or {}).get("worst_tv", np.nan), default=float("nan"))
+                gate_eps_stat = as_float((audit or {}).get("eps_stat", np.nan), default=float("nan"))
+                gate_gain = as_float((audit or {}).get("gain_bits", np.nan), default=float("nan"))
+                gate_kappa = as_float((audit or {}).get("kappa_sens", np.nan), default=float("nan"))
+                gate_warn = int(flag)
                 # effective parameters actually used for this check
                 gate_gain_thresh_eff = as_float(CFG.get("gate_gain_thresh", 0.1), default=0.1)
         except Exception:
@@ -3468,25 +2937,27 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
                     # persist a terminal marker compatible with resume logic
                     try:
                         (OUTDIR / f"runs_seed{seed}_{tag}.done.json").write_text(
-                            json.dumps({
-                                "terminal": True,
-                                "reason": "gate_halt",
-                                "epoch": int(epoch),
-                                "gate_hits_consec": int(gate_hits_consec)
-                            })
+                            json.dumps(
+                                {
+                                    "terminal": True,
+                                    "reason": "gate_halt",
+                                    "epoch": int(epoch),
+                                    "gate_hits_consec": int(gate_hits_consec),
+                                }
+                            )
                         )
                     except Exception:
                         pass
                     break
-#         if nan_seen:
-#             # ensure we persist a terminal marker even if the failure was detected without an exception break
-#             try:
-#                 (OUTDIR / f"runs_seed{seed}_{tag}.done.json").write_text(
-#                     json.dumps({"terminal": True, "reason": "nan_flag", "epoch": int(epoch)})
-#                 )
-#             except Exception:
-#                 pass
-#             break
+        #         if nan_seen:
+        #             # ensure we persist a terminal marker even if the failure was detected without an exception break
+        #             try:
+        #                 (OUTDIR / f"runs_seed{seed}_{tag}.done.json").write_text(
+        #                     json.dumps({"terminal": True, "reason": "nan_flag", "epoch": int(epoch)})
+        #                 )
+        #             except Exception:
+        #                 pass
+        #             break
         if nan_seen:
             # ensure we persist a terminal marker even if the failure was detected without an exception break
             try:
@@ -3499,6 +2970,8 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
 
     df = pd.DataFrame(logs)
     return df
+
+
 # ---------------------------
 # Direction calibration for PH & grad cutoff
 # ---------------------------
@@ -3533,9 +3006,11 @@ def calibrate_grad_cutoff_per_factor(df_cal: pd.DataFrame) -> Dict[str, float]:
             out[str(factor)] = np.inf
     return out
 
+
 # ---------------------------------
 # Efficacy tightening: AUC & CIs
 # ---------------------------------
+
 
 def _wilcoxon_auc(pos: np.ndarray, neg: np.ndarray) -> float:
     """Tie-aware rank AUC (equiv. to Mann–Whitney U / (m*n))."""
@@ -3565,8 +3040,14 @@ def _bootstrap_ci(values: np.ndarray, B: int = 1000, alpha: float = 0.05, seed: 
     return (float(lo), float(hi))
 
 
-def safe_auc_by_factor(df: pd.DataFrame, score_col: str, label_col: str, min_per_side: int = 2,
-family_map: Optional[Dict[str, str]] = None, B: int = 1000) -> pd.DataFrame:
+def safe_auc_by_factor(
+    df: pd.DataFrame,
+    score_col: str,
+    label_col: str,
+    min_per_side: int = 2,
+    family_map: Optional[Dict[str, str]] = None,
+    B: int = 1000,
+) -> pd.DataFrame:
     """
     Compute per-factor Δ and AUC with bootstrap CIs. Ensures each factor has at least
     `min_per_side` seeds on both sides of label_col. Optionally pool factors via `family_map`.
@@ -3575,7 +3056,9 @@ family_map: Optional[Dict[str, str]] = None, B: int = 1000) -> pd.DataFrame:
     auc, auc_lo, auc_hi.
     """
     if df is None or df.empty:
-        return pd.DataFrame(columns=["group","n_pos","n_neg","delta_med","delta_lo","delta_hi","auc","auc_lo","auc_hi"])
+        return pd.DataFrame(
+            columns=["group", "n_pos", "n_neg", "delta_med", "delta_lo", "delta_hi", "auc", "auc_lo", "auc_hi"]
+        )
 
     fam = df.copy()
     if family_map:
@@ -3605,9 +3088,19 @@ family_map: Optional[Dict[str, str]] = None, B: int = 1000) -> pd.DataFrame:
                 dlo, dhi = quantile2(deltas, 0.025, 0.975)
             else:
                 dlo, dhi = (np.nan, np.nan)
-            out_rows.append(dict(group=str(grp), n_pos=len(pos), n_neg=len(neg),
-            delta_med=float(d), delta_lo=float(dlo), delta_hi=float(dhi),
-            auc=np.nan, auc_lo=np.nan, auc_hi=np.nan))
+            out_rows.append(
+                dict(
+                    group=str(grp),
+                    n_pos=len(pos),
+                    n_neg=len(neg),
+                    delta_med=float(d),
+                    delta_lo=float(dlo),
+                    delta_hi=float(dhi),
+                    auc=np.nan,
+                    auc_lo=np.nan,
+                    auc_hi=np.nan,
+                )
+            )
             continue
         # Δ bootstrap
         base = g_seed[[score_col, label_col]].to_numpy()
@@ -3624,12 +3117,22 @@ family_map: Optional[Dict[str, str]] = None, B: int = 1000) -> pd.DataFrame:
             deltas.append(float(np.median(pos_s) - np.median(neg_s)))
             aucs.append(_wilcoxon_auc(pos_s, neg_s))
         d_med = float(np.median(deltas)) if deltas else np.nan
-        d_lo, d_hi = (quantile2(deltas, 0.025, 0.975) if deltas else (np.nan, np.nan))
+        d_lo, d_hi = quantile2(deltas, 0.025, 0.975) if deltas else (np.nan, np.nan)
         auc = _wilcoxon_auc(pos, neg)
-        a_lo, a_hi = (quantile2(aucs, 0.025, 0.975) if aucs else (np.nan, np.nan))
-        out_rows.append(dict(group=str(grp), n_pos=len(pos), n_neg=len(neg),
-        delta_med=d_med, delta_lo=float(d_lo), delta_hi=float(d_hi),
-        auc=float(auc), auc_lo=float(a_lo), auc_hi=float(a_hi)))
+        a_lo, a_hi = quantile2(aucs, 0.025, 0.975) if aucs else (np.nan, np.nan)
+        out_rows.append(
+            dict(
+                group=str(grp),
+                n_pos=len(pos),
+                n_neg=len(neg),
+                delta_med=d_med,
+                delta_lo=float(d_lo),
+                delta_hi=float(d_hi),
+                auc=float(auc),
+                auc_lo=float(a_lo),
+                auc_hi=float(a_hi),
+            )
+        )
     return pd.DataFrame(out_rows)
 
 
@@ -3637,12 +3140,13 @@ from typing import Iterable, Callable
 
 # --- FR integration holders (process-global; typed for mypy) ---
 USE_FR: bool = False
-FR_WIN: Optional["FRWindow"] = None              # current FRWindow instance (or None)
+FR_WIN: Optional["FRWindow"] = None  # current FRWindow instance (or None)
 _DECL_TRANSPORT: Optional["DeclTransport"] = None  # kept for backward compatibility
-GE: Optional["GateEngine"] = None                # GateEngine instance/factory
-WINDOW_DECL: Optional["WindowDecl"] = None       # WindowDecl from calibration
+GE: Optional["GateEngine"] = None  # GateEngine instance/factory
+WINDOW_DECL: Optional["WindowDecl"] = None  # WindowDecl from calibration
 DECL_INSTALL: Optional[Callable[..., None]] = None
 FR_ASSERT_NATURALITY = None  # kept for backward compatibility
+
 
 def _wire_fr_from_decl(win: "WindowDecl") -> None:
     """
@@ -3666,9 +3170,11 @@ def _wire_fr_from_decl(win: "WindowDecl") -> None:
     FR_WIN = fr_win
     GE = ge
 
+
 # ---------------------------------
 # Dynamics checks for outliers
 # ---------------------------------
+
 
 def _theil_sen_slope(y: np.ndarray, x: Optional[np.ndarray] = None) -> float:
     """Robust slope (median of pairwise slopes). Works on small n (e.g., last 8 epochs)."""
@@ -3695,6 +3201,7 @@ def monotonicity_checks_for_outliers(df_runs: pd.DataFrame, warm_idx: int, tail:
     """
     rows = []
     from typing import cast, Any
+
     for key, g in df_runs.groupby(["seed", "factor"]):
         sd, fc = cast(tuple[Any, Any], key)
         gg = g.sort_values("epoch")
@@ -3710,17 +3217,24 @@ def monotonicity_checks_for_outliers(df_runs: pd.DataFrame, warm_idx: int, tail:
         if isinstance(ft_ser, pd.Series):
             ft_arr = pd.to_numeric(ft_ser, errors="coerce").to_numpy(dtype=float)
         ft_ok = bool(np.all(np.nan_to_num(ft_arr) <= 0.0)) if len(post) else False
-        rows.append(dict(seed=as_int(sd, default=0), factor=str(fc),
-        slope_ftle=s_ft, slope_drift_abs=s_dr,
-        slope_ftle_pos=bool(np.isfinite(s_ft) and s_ft > 0),
-        slope_drift_pos=bool(np.isfinite(s_dr) and s_dr > 0),
-        ftle_nonpos_after_warm=ft_ok))
+        rows.append(
+            dict(
+                seed=as_int(sd, default=0),
+                factor=str(fc),
+                slope_ftle=s_ft,
+                slope_drift_abs=s_dr,
+                slope_ftle_pos=bool(np.isfinite(s_ft) and s_ft > 0),
+                slope_drift_pos=bool(np.isfinite(s_dr) and s_dr > 0),
+                ftle_nonpos_after_warm=ft_ok,
+            )
+        )
     return pd.DataFrame(rows)
 
 
 # ---------------------------------
 # Artifact invariants & provenance
 # ---------------------------------
+
 
 def compute_invariants_and_provenance(df_runs: pd.DataFrame, artifact_csv: Optional[Path] = None) -> Dict[str, Any]:
     """Persist invariants and provenance. FTLE invariant uses a control-derived bound (q99 * margin)."""
@@ -3759,6 +3273,7 @@ def compute_invariants_and_provenance(df_runs: pd.DataFrame, artifact_csv: Optio
 
     inv = []
     from typing import cast, Any
+
     for key, g in df_runs.groupby(["seed", "factor"]):
         sd, fc = cast(tuple[Any, Any], key)
         gg = g.sort_values("epoch")
@@ -3778,6 +3293,7 @@ def compute_invariants_and_provenance(df_runs: pd.DataFrame, artifact_csv: Optio
             try:
                 import glob
                 import json as _json
+
                 paths = sorted(glob.glob(str(OUTDIR / "gt_rank_calibration_*.json")))
                 if paths:
                     _obj = _json.loads(Path(paths[-1]).read_text())
@@ -3816,10 +3332,32 @@ def compute_invariants_and_provenance(df_runs: pd.DataFrame, artifact_csv: Optio
     out = {
         "invariants": invariants.to_dict(orient="records"),
         "summary": {
-            "ftle_bounded_pass_rate": float(np.mean(invariants.get("ftle_bounded", pd.Series([], dtype=float)).astype(bool))) if not invariants.empty and ("ftle_bounded" in invariants.columns) else np.nan,
-            "neg_eigs_zero_pass_rate": float(np.mean(invariants.get("neg_eigs_zero", pd.Series([], dtype=float)).astype(bool))) if not invariants.empty and ("neg_eigs_zero" in invariants.columns) else np.nan,
-            "k_used_in_range_pass_rate": float(np.mean(invariants.get("k_used_in_range", pd.Series([], dtype=float)).astype(bool))) if not invariants.empty and ("k_used_in_range" in invariants.columns) else np.nan,
-            "ftle_bounded_skipped_count": (int(float(to_numeric_series(invariants.get("ftle_bounded_skipped", pd.Series([], dtype=float))).fillna(0).sum())) if ("ftle_bounded_skipped" in invariants.columns) else 0),
+            "ftle_bounded_pass_rate": float(
+                np.mean(invariants.get("ftle_bounded", pd.Series([], dtype=float)).astype(bool))
+            )
+            if not invariants.empty and ("ftle_bounded" in invariants.columns)
+            else np.nan,
+            "neg_eigs_zero_pass_rate": float(
+                np.mean(invariants.get("neg_eigs_zero", pd.Series([], dtype=float)).astype(bool))
+            )
+            if not invariants.empty and ("neg_eigs_zero" in invariants.columns)
+            else np.nan,
+            "k_used_in_range_pass_rate": float(
+                np.mean(invariants.get("k_used_in_range", pd.Series([], dtype=float)).astype(bool))
+            )
+            if not invariants.empty and ("k_used_in_range" in invariants.columns)
+            else np.nan,
+            "ftle_bounded_skipped_count": (
+                int(
+                    float(
+                        to_numeric_series(invariants.get("ftle_bounded_skipped", pd.Series([], dtype=float)))
+                        .fillna(0)
+                        .sum()
+                    )
+                )
+                if ("ftle_bounded_skipped" in invariants.columns)
+                else 0
+            ),
         },
         "provenance": {},
     }
@@ -3832,21 +3370,25 @@ def compute_invariants_and_provenance(df_runs: pd.DataFrame, artifact_csv: Optio
         pass
     try:
         import numpy as _np
+
         prov["numpy"] = _np.__version__
     except Exception:
         pass
     try:
         import pandas as _pd
+
         prov["pandas"] = _pd.__version__
     except Exception:
         pass
     try:
         import torch as _t
+
         prov["torch"] = getattr(_t, "__version__", None)
     except Exception:
         pass
     try:
         import torch as _t
+
         prov["cuda"] = getattr(getattr(_t, "version", None), "cuda", None)
     except Exception:
         pass
@@ -3856,7 +3398,7 @@ def compute_invariants_and_provenance(df_runs: pd.DataFrame, artifact_csv: Optio
         except Exception:
             pass
 
-    prov["ftle_cap_source"] = ("abs_cap" if abs_cap is not None else "control_q99_margin")
+    prov["ftle_cap_source"] = "abs_cap" if abs_cap is not None else "control_q99_margin"
     prov["ftle_control_q99"] = float(ctl_q99) if np.isfinite(ctl_q99) else None
     prov["ftle_control_q99_n"] = int(ctl_n)
     prov["ftle_margin"] = float(margin)
@@ -3869,6 +3411,7 @@ def compute_invariants_and_provenance(df_runs: pd.DataFrame, artifact_csv: Optio
     except Exception:
         pass
     return out
+
 
 # ---------------------------
 # Plotting (reads unified epoch overlays)
@@ -3927,6 +3470,7 @@ def make_plots(df, tr_like, tag, overlay_prefix="learned"):
     rng = np.random.default_rng(123)
     y = 0
     from typing import cast, Any
+
     for key, sub in df.groupby(["seed", "factor"]):
         seed, factor = cast(tuple[Any, Any], key)
         sub = sub.sort_values("epoch")
@@ -3972,6 +3516,7 @@ def make_plots(df, tr_like, tag, overlay_prefix="learned"):
 def _ffill_scheduled(df_in: pd.DataFrame) -> pd.DataFrame:
     df = df_in.copy()
     from typing import cast, Any
+
     for key, g in df.groupby(["seed", "factor"]):
         seed, factor = cast(tuple[Any, Any], key)
         idx = g.index
@@ -3984,6 +3529,7 @@ def _ffill_scheduled(df_in: pd.DataFrame) -> pd.DataFrame:
 def _stationaryize_scheduled(df_in: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
     df = df_in.copy()
     from typing import cast, Any
+
     for key, g in df.groupby(["seed", "factor"]):
         seed, factor = cast(tuple[Any, Any], key)
         idx = g.index
@@ -4060,6 +3606,7 @@ def _apply_env_canary_clamps(cfg: Dict[str, Any]) -> None:
         if "seeds_eval" in cfg:
             cfg["seeds_eval"] = list(cfg.get("seeds_eval") or [])[:se]
         print(f"[cfg] env clamp: seeds_eval<= {se} (SCAR_CANARY_SEEDS)")
+
 
 # ---------------------------
 # Sweep
@@ -4143,11 +3690,11 @@ def run_sweep(tag: str):
     mapping_all = assign_factors_evenly(all_seeds)
     split_map = {as_int(s, default=0): ("calib" if s in CFG["seeds_calib"] else "eval") for s in all_seeds}
     save_json(
-    {
-    "mapping": {str(k): mapping_all[k]["name"] for k in mapping_all},
-    "split": {str(k): split_map[k] for k in split_map},
-    },
-    OUTDIR / "seed_factor_map.json",
+        {
+            "mapping": {str(k): mapping_all[k]["name"] for k in mapping_all},
+            "split": {str(k): split_map[k] for k in split_map},
+        },
+        OUTDIR / "seed_factor_map.json",
     )
 
     paths = []
@@ -4158,9 +3705,7 @@ def run_sweep(tag: str):
         csvp = parq.with_suffix(".csv")
 
         # Resume only if shard appears complete; otherwise redo the seed
-        if (parq.exists() and parq.stat().st_size > 0) or (
-        csvp.exists() and csvp.stat().st_size > 0
-        ):
+        if (parq.exists() and parq.stat().st_size > 0) or (csvp.exists() and csvp.stat().st_size > 0):
             probe = parq if parq.exists() else csvp
             emin = emax = nrows = None
             if probe.suffix == ".parquet":
@@ -4173,25 +3718,23 @@ def run_sweep(tag: str):
 
             # complete iff at least 2 rows and max epoch reached (epochs-1)
             complete = (
-            (emax is not None)
-            and (nrows is not None)
-            and (nrows >= 2)
-            and (emax == as_int(CFG.get("epochs", 1), default=1) - 1)
+                (emax is not None)
+                and (nrows is not None)
+                and (nrows >= 2)
+                and (emax == as_int(CFG.get("epochs", 1), default=1) - 1)
             )
 
             # CSV fallback completeness: if parquet probe incomplete but CSV exists and is complete, resume from CSV
             if (not complete) and (probe.suffix != ".csv") and csvp.exists():
                 emin_csv, emax_csv, nrows_csv = _epoch_bounds_csv(csvp)
                 complete_csv = (
-                (emax_csv is not None)
-                and (nrows_csv is not None)
-                and (nrows_csv >= 2)
-                and (emax_csv == as_int(CFG.get("epochs", 1), default=1) - 1)
+                    (emax_csv is not None)
+                    and (nrows_csv is not None)
+                    and (nrows_csv >= 2)
+                    and (emax_csv == as_int(CFG.get("epochs", 1), default=1) - 1)
                 )
                 if complete_csv:
-                    print(
-                    f"[resume] skipping seed={seed} (csv complete: emax={emax_csv}, rows={nrows_csv})"
-                    )
+                    print(f"[resume] skipping seed={seed} (csv complete: emax={emax_csv}, rows={nrows_csv})")
                     paths.append(csvp)  # aggregator now handles CSV directly
                     continue
 
@@ -4206,14 +3749,12 @@ def run_sweep(tag: str):
                 continue
 
             if complete:
-                print(
-                f"[resume] skipping seed={seed} ({probe.suffix[1:]} complete: emax={emax}, rows={nrows})"
-                )
+                print(f"[resume] skipping seed={seed} ({probe.suffix[1:]} complete: emax={emax}, rows={nrows})")
                 paths.append(parq)  # always append the parquet basename for parquet case
                 continue
             else:
                 print(
-                f"[resume] redoing seed={seed} ({probe.suffix[1:]} incomplete: emin={emin}, emax={emax}, rows={nrows})"
+                    f"[resume] redoing seed={seed} ({probe.suffix[1:]} incomplete: emin={emin}, emax={emax}, rows={nrows})"
                 )
                 # fall through to run_one
 
@@ -4227,10 +3768,7 @@ def run_sweep(tag: str):
         except Exception as e:
             fail_count += 1
             errlog = OUTDIR / f"errors_{tag}.log"
-            msg = (
-            f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
-            f"seed={seed} factor={f['name']} tag={tag} -> {repr(e)}\n"
-            )
+            msg = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] seed={seed} factor={f['name']} tag={tag} -> {repr(e)}\n"
             try:
                 with open(errlog, "a", encoding="utf-8") as fh:
                     fh.write(msg)
@@ -4321,7 +3859,7 @@ def evaluate(df_all: pd.DataFrame, tag: str):
     no_eval = (df_eval_raw is None) or getattr(df_eval_raw, "empty", True)
     if no_eval:
         print(
-        "[eval] no evaluation seeds present; will skip learned/baseline evaluation but still write calibration aggregates."
+            "[eval] no evaluation seeds present; will skip learned/baseline evaluation but still write calibration aggregates."
         )
 
     # --- calibrate gate gain threshold (bits/sample) from controls ---
@@ -4343,7 +3881,9 @@ def evaluate(df_all: pd.DataFrame, tag: str):
         )
         print(f"[calib] gate_gain_thresh (bits/sample) = {CFG['gate_gain_thresh']:.4f}")
     except Exception as e:
-        print(f"[WARN] gate gain calibration failed; keeping CFG['gate_gain_thresh']={CFG.get('gate_gain_thresh')}: {e}")
+        print(
+            f"[WARN] gate gain calibration failed; keeping CFG['gate_gain_thresh']={CFG.get('gate_gain_thresh')}: {e}"
+        )
 
     # --- Calibrate and persist a fixed-partition WindowDecl from controls (factor=='none' post-warm) ---
     try:
@@ -4373,6 +3913,7 @@ def evaluate(df_all: pd.DataFrame, tag: str):
         # Persist for future sweeps and install for any downstream checks in this process
         crng = getattr(window_decl, "cal_ranges", {})
         from typing import Mapping, cast
+
         wmap = cast(Mapping[str, float], getattr(window_decl, "weights", {}) or {})
         mets = list(getattr(window_decl, "metrics", []))
         bins = as_int(getattr(window_decl, "bins", 0), default=0)
@@ -4383,11 +3924,7 @@ def evaluate(df_all: pd.DataFrame, tag: str):
                 "metrics": list(mets),
                 "weights": {str(k): float(v) for k, v in wmap.items()},
                 "bins": int(bins),
-                "cal_ranges": {
-                    str(k): [a, b]
-                    for k, v in crng.items()
-                    for (a, b) in [_float_pair(v)]
-                },
+                "cal_ranges": {str(k): [a, b] for k, v in crng.items() for (a, b) in [_float_pair(v)]},
                 "kappa_transport_mismatch": True,
                 "eps_stat_max_frac": as_float(CFG.get("gate_eps_stat_max_frac", 0.25), default=0.25),
             },
@@ -4396,14 +3933,19 @@ def evaluate(df_all: pd.DataFrame, tag: str):
         install_window_decl(window_decl)
         _wire_fr_from_decl(window_decl)
         try:
-            write_window_audit(OUTDIR, window_decl, note="Calibrated WindowDecl from controls (post-warm)", controls_used=len(df_control))
+            write_window_audit(
+                OUTDIR,
+                window_decl,
+                note="Calibrated WindowDecl from controls (post-warm)",
+                controls_used=len(df_control),
+            )
             write_window_provenance_from_decl(OUTDIR, window_decl)
         except Exception:
             pass
         # --- Recompute per-epoch gate flag under calibrated settings (transport-consistent, offline) ---
         try:
             _W = as_int(CFG.get("gate_window", 16), default=16)
-            df_eval_raw = df_eval_raw.sort_values(["seed","factor","epoch"]).reset_index(drop=True)
+            df_eval_raw = df_eval_raw.sort_values(["seed", "factor", "epoch"]).reset_index(drop=True)
             df_eval_raw = recompute_gate_series_under_decl(df_eval_raw, window_decl, W=_W)
         except Exception as e:
             print(f"[WARN] offline calibrated gate recompute failed: {e}")
@@ -4416,6 +3958,7 @@ def evaluate(df_all: pd.DataFrame, tag: str):
     def add_gt(df_in):
         rows = []
         from typing import cast, Any
+
         for key, g in df_in.groupby(["seed", "factor"]):
             seed, factor = cast(tuple[Any, Any], key)
             g = g.sort_values("epoch").copy()
@@ -4443,6 +3986,7 @@ def evaluate(df_all: pd.DataFrame, tag: str):
             return df_empty
         rows = []
         from typing import cast, Any
+
         for key, g in df_in.groupby(["seed", "factor"]):
             seed, factor = cast(tuple[Any, Any], key)
             g = g.sort_values("epoch").copy()
@@ -4501,13 +4045,13 @@ def evaluate(df_all: pd.DataFrame, tag: str):
         try:
             CFG["gt_rank_min"] = float(fixed_thr_env)
             save_json(
-            {
-            "gt_rank_min": CFG["gt_rank_min"],
-            "gt_rank_q": None,
-            "warm": int(warm_idx),
-            "source": "env_fixed",
-            },
-            OUTDIR / f"gt_rank_calibration_{tag}.json",
+                {
+                    "gt_rank_min": CFG["gt_rank_min"],
+                    "gt_rank_q": None,
+                    "warm": int(warm_idx),
+                    "source": "env_fixed",
+                },
+                OUTDIR / f"gt_rank_calibration_{tag}.json",
             )
             print(f"[calib] gt_rank_min fixed from env: {CFG['gt_rank_min']:.3f}")
         except Exception as e:
@@ -4522,13 +4066,13 @@ def evaluate(df_all: pd.DataFrame, tag: str):
             if qv is not None and np.isfinite(qv):
                 CFG["gt_rank_min"] = float(qv)
                 save_json(
-                {
-                "gt_rank_min": CFG["gt_rank_min"],
-                "gt_rank_q": q_env,
-                "warm": int(warm_idx),
-                "source": "env_quantile",
-                },
-                OUTDIR / f"gt_rank_calibration_{tag}.json",
+                    {
+                        "gt_rank_min": CFG["gt_rank_min"],
+                        "gt_rank_q": q_env,
+                        "warm": int(warm_idx),
+                        "source": "env_quantile",
+                    },
+                    OUTDIR / f"gt_rank_calibration_{tag}.json",
                 )
                 print(f"[calib] gt_rank_min from env quantile q={q_env:.2f}: {CFG['gt_rank_min']:.3f}")
             else:
@@ -4546,15 +4090,17 @@ def evaluate(df_all: pd.DataFrame, tag: str):
             qv = float(CFG.get("gt_rank_min", 8.0))
         CFG["gt_rank_min"] = float(qv)
         save_json(
-        {
-        "gt_rank_min": CFG["gt_rank_min"],
-        "gt_rank_q": gtq,
-        "warm": int(warm_idx),
-        "source": "quantile",
-        },
-        OUTDIR / f"gt_rank_calibration_{tag}.json",
+            {
+                "gt_rank_min": CFG["gt_rank_min"],
+                "gt_rank_q": gtq,
+                "warm": int(warm_idx),
+                "source": "quantile",
+            },
+            OUTDIR / f"gt_rank_calibration_{tag}.json",
         )
-        print(f"[calib] gt_rank_min set from factor=='none' @q={gtq:.3f} after warm={warm_idx}: {CFG['gt_rank_min']:.3f}")
+        print(
+            f"[calib] gt_rank_min set from factor=='none' @q={gtq:.3f} after warm={warm_idx}: {CFG['gt_rank_min']:.3f}"
+        )
 
     # Compute GT exactly once using this finalized threshold
     df_cal_raw = add_gt_final(df_cal_raw)
@@ -4563,9 +4109,7 @@ def evaluate(df_all: pd.DataFrame, tag: str):
     # sanity: fail fast if GT didn't stick
     assert "collapse_tag_gt" in df_cal_raw.columns, "add_gt_final failed to stamp GT on df_cal_raw"
     if "collapse_tag_gt" not in df_eval_raw.columns:
-        print(
-        "[eval] WARN: add_gt_final did not stamp GT on df_eval_raw; continuing with empty eval."
-        )
+        print("[eval] WARN: add_gt_final did not stamp GT on df_eval_raw; continuing with empty eval.")
 
     # ---- PH direction calibration on SOFT collapses only (pre-onset only) ----
     soft_cal = df_cal_raw[df_cal_raw["collapse_tag_gt"] == "soft"]
@@ -4593,6 +4137,7 @@ def evaluate(df_all: pd.DataFrame, tag: str):
     # ---- Run-level collapse tag map for evaluation (needed by summarize_detection) ----
     collapse_tag_map = {}
     from typing import cast, Any
+
     for key, g in df_eval_raw.groupby(["seed", "factor"]):
         sd, fc = cast(tuple[Any, Any], key)
         ctag_this = "none"
@@ -4615,12 +4160,12 @@ def evaluate(df_all: pd.DataFrame, tag: str):
         min_pts=as_int(CFG.get("rp_min_pts", 8), default=8),
     )
     save_json(
-    {
-    "corr_min": as_float(CFG.get("rp_corr_min", 0.9), default=0.9),
-    "min_pts": as_int(CFG.get("rp_min_pts", 8), default=8),
-    "flags": {f"s{seed}-{factor}": as_int(flag, default=0) for (seed, factor), flag in rp_flags.items()},
-    },
-    OUTDIR / f"rp_adequacy_{tag}.json",
+        {
+            "corr_min": as_float(CFG.get("rp_corr_min", 0.9), default=0.9),
+            "min_pts": as_int(CFG.get("rp_min_pts", 8), default=8),
+            "flags": {f"s{seed}-{factor}": as_int(flag, default=0) for (seed, factor), flag in rp_flags.items()},
+        },
+        OUTDIR / f"rp_adequacy_{tag}.json",
     )
 
     # ---- Baselines (PH on various pools) using unified GT ----
@@ -4633,16 +4178,16 @@ def evaluate(df_all: pd.DataFrame, tag: str):
 
     # ---- Prepare learned detector data (schedule-independent features only) ----
     det_features = [
-    "cos_disp",
-    "var_out_k",
-    "ftle",
-    "ftle_lowent",
-    # slope/coherence channels
-    "slope_eff_dim",
-    "slope_var_out_k",
-    "reg_eff_dim",
-    "reg_var_out_k",
-    "corr_effdim_varoutk",
+        "cos_disp",
+        "var_out_k",
+        "ftle",
+        "ftle_lowent",
+        # slope/coherence channels
+        "slope_eff_dim",
+        "slope_var_out_k",
+        "reg_eff_dim",
+        "reg_var_out_k",
+        "corr_effdim_varoutk",
     ]
 
     df_cal_det = df_cal_raw.copy()
@@ -4657,6 +4202,7 @@ def evaluate(df_all: pd.DataFrame, tag: str):
     ep_list = []
     tc_soft_list = []
     from typing import cast, Any
+
     for key, g in df_cal_det.groupby(["seed", "factor"]):
         seed, factor = cast(tuple[Any, Any], key)
         g = g.sort_values("epoch").copy()
@@ -4672,7 +4218,7 @@ def evaluate(df_all: pd.DataFrame, tag: str):
             tci = as_int(t_c, default=-1)
             horizon = as_int(CFG.get("detector_horizon"), default=10)
             for t in range(len(g)):
-                ep = as_int(g.iloc[t]["epoch"], default=-10**9)
+                ep = as_int(g.iloc[t]["epoch"], default=-(10**9))
                 if ep >= warm_idx and ((tci - ep) <= horizon):
                     y[t] = 1.0
         grp = np.full(len(g), as_int(seed, default=0), dtype=np.int64)
@@ -4691,14 +4237,10 @@ def evaluate(df_all: pd.DataFrame, tag: str):
             )
         )
 
-    X_raw = (
-    np.concatenate(X_list, 0) if X_list else np.zeros((0, len(det_features)), dtype=np.float32)
-    )
+    X_raw = np.concatenate(X_list, 0) if X_list else np.zeros((0, len(det_features)), dtype=np.float32)
     y = np.concatenate(y_list, 0) if y_list else np.zeros((0,), dtype=np.float32)
     groups = np.concatenate(g_list, 0) if g_list else np.zeros((0,), dtype=np.int64)
-    fp_mask = (
-    np.concatenate(fp_mask_list, 0) if fp_mask_list else np.zeros_like(y, dtype=np.float32)
-    )
+    fp_mask = np.concatenate(fp_mask_list, 0) if fp_mask_list else np.zeros_like(y, dtype=np.float32)
     ep_arr = np.concatenate(ep_list, 0) if ep_list else np.zeros((0,), dtype=np.int64)
     tc_arr = np.concatenate(tc_soft_list, 0) if tc_soft_list else np.zeros((0,), dtype=float)
 
@@ -4762,23 +4304,21 @@ def evaluate(df_all: pd.DataFrame, tag: str):
     else:
         steps, l2, thresh = best
 
-    w, b = _train_logistic_ridge_balanced(
-    X_det, y, groups, steps=steps, lr=CFG["detector_lr"], l2=l2
-    )
+    w, b = _train_logistic_ridge_balanced(X_det, y, groups, steps=steps, lr=CFG["detector_lr"], l2=l2)
     model_info = dict(
-    weights=w.tolist(),
-    bias=float(b),
-    thresh=float(thresh),
-    features=det_features,
-    horizon=as_int(CFG.get("detector_horizon", 10), default=10),
-    norm_stats=stats,
-    steps=steps,
-    l2=l2,
-    scheduled_metrics=[],
-    det_use_missing=False,
-    ph_win=as_int(CFG.get("ph_win", 8), default=8),
-    ph_lambda=as_float(CFG.get("ph_lambda", 0.0), default=0.0),
-    ph_two_sided=as_int(CFG.get("ph_two_sided", 0), default=0),
+        weights=w.tolist(),
+        bias=float(b),
+        thresh=float(thresh),
+        features=det_features,
+        horizon=as_int(CFG.get("detector_horizon", 10), default=10),
+        norm_stats=stats,
+        steps=steps,
+        l2=l2,
+        scheduled_metrics=[],
+        det_use_missing=False,
+        ph_win=as_int(CFG.get("ph_win", 8), default=8),
+        ph_lambda=as_float(CFG.get("ph_lambda", 0.0), default=0.0),
+        ph_two_sided=as_int(CFG.get("ph_two_sided", 0), default=0),
     )
     save_json(model_info, OUTDIR / f"learned_detector_{tag}.json")
 
@@ -4787,6 +4327,7 @@ def evaluate(df_all: pd.DataFrame, tag: str):
     meta_rows = []
     X_parts = []
     from typing import cast, Any
+
     for key, g in df_cal_det.groupby(["seed", "factor"]):
         sd, fc = cast(tuple[Any, Any], key)
         gg = g.sort_values("epoch").reset_index(drop=True)
@@ -4794,7 +4335,11 @@ def evaluate(df_all: pd.DataFrame, tag: str):
         X_parts.append(X_raw_g)
         for _, r in gg.iterrows():
             meta_rows.append(
-                {"seed": as_int(r["seed"], default=0), "factor": str(r["factor"]), "epoch": as_int(r["epoch"], default=-10**9)}
+                {
+                    "seed": as_int(r["seed"], default=0),
+                    "factor": str(r["factor"]),
+                    "epoch": as_int(r["epoch"], default=-(10**9)),
+                }
             )
     X_cal_raw = (
         np.concatenate(X_parts, axis=0).astype(np.float32)
@@ -4814,6 +4359,7 @@ def evaluate(df_all: pd.DataFrame, tag: str):
     # Precompute per-(seed,factor) collapse target for labeling positives
     gt_by_sf = {}
     from typing import cast, Any
+
     for key, g in df_cal_det.groupby(["seed", "factor"]):
         sd, fc = cast(tuple[Any, Any], key)
         try:
@@ -4830,20 +4376,20 @@ def evaluate(df_all: pd.DataFrame, tag: str):
     for i, r in meta_df.iterrows():
         sd = as_int(r["seed"], default=0)
         fc = str(r["factor"])
-        ep = as_int(r["epoch"], default=-10**9)
+        ep = as_int(r["epoch"], default=-(10**9))
         t_c, ctag = gt_by_sf.get((sd, fc), (np.nan, "none"))
         tci = as_int(t_c, default=-1)
         if (tci >= 0) and ctag == "soft" and ep >= warm_idx and ((tci - ep) <= horiz):
             y_cal[i] = 1.0
 
     p_oof = _oof_probs_for_params(
-    Xn_cal,
-    y_cal,
-    groups_cal,
-    steps=steps,
-    l2=l2,
-    lr=CFG["detector_lr"],
-    folds=CFG["detector_cv_folds"],
+        Xn_cal,
+        y_cal,
+        groups_cal,
+        steps=steps,
+        l2=l2,
+        lr=CFG["detector_lr"],
+        folds=CFG["detector_cv_folds"],
     )
 
     # RP adequacy flags on calibration
@@ -4904,12 +4450,13 @@ def evaluate(df_all: pd.DataFrame, tag: str):
     # ---- Apply learned detector to evaluation runs ----
     rows = []
     from typing import cast, Any
+
     for key, g in df_eval_det.groupby(["seed", "factor"]):
         seed, factor = cast(tuple[Any, Any], key)
         gg = g.sort_values("epoch").reset_index(drop=True)
         X_raw, M_ind = _metrics_matrix_with_missing(gg, det_features)
         Xn = _apply_global_norm_impute(X_raw, stats, det_features)
-        z = (Xn @ w + b)
+        z = Xn @ w + b
         p = _sigmoid_stable(z)
         mask = (gg["epoch"] >= warm_idx) & (p >= thresh)
         hit_idx = np.where(mask.values)[0]
@@ -4957,42 +4504,42 @@ def evaluate(df_all: pd.DataFrame, tag: str):
             i = hit_idx[j_end]
             geom_ok = _fam_alarm(i, geom_cols)
             dyn_ok = _fam_alarm(i, dyn_cols)
-            gate_ok = (dyn_ok if rp_under else (geom_ok or dyn_ok))
+            gate_ok = dyn_ok if rp_under else (geom_ok or dyn_ok)
             if gate_ok:
                 t_warn = int(gg.iloc[i]["epoch"])
 
         t_c_raw = gg["t_collapse_gt"].iloc[0]
         t_c = as_int(t_c_raw, default=-1)
-        t_c = (t_c if t_c >= 0 else None)
+        t_c = t_c if t_c >= 0 else None
         ctag = str(gg["collapse_tag_gt"].iloc[0])
 
         if t_warn is not None and t_c is not None and not (t_warn < t_c):
             t_warn = None
 
         lead = (
-        float(t_c - t_warn)
-        if (ctag in ["soft", "hard"] and t_warn is not None and t_c is not None)
-        else float("nan")
+            float(t_c - t_warn)
+            if (ctag in ["soft", "hard"] and t_warn is not None and t_c is not None)
+            else float("nan")
         )
         rows.append(
-        dict(
-        run_id=f"s{as_int(seed, default=0)}-{str(factor)}",
-        seed=as_int(seed, default=0),
-        factor=str(factor),
-        t_warn=t_warn,
-        t_collapse=t_c,
-        collapse_tag=ctag,
-        ph_win=as_int(CFG.get("ph_win", 8), default=8),
-        ph_lambda=as_float(CFG.get("ph_lambda", 0.0), default=0.0),
-        ph_two_sided=as_int(CFG.get("ph_two_sided", 0), default=0),
-        warn_vote=CFG["warn_vote"],
-        heavy_every=CFG["heavy_every"],
-        metric_batches=CFG["metric_batches"],
-        var_k_energy=CFG["var_k_energy"],
-        var_k_max=CFG["var_k_max"],
-        lead_time=lead,
-        rp_under_resolved=int(rp_under),
-        )
+            dict(
+                run_id=f"s{as_int(seed, default=0)}-{str(factor)}",
+                seed=as_int(seed, default=0),
+                factor=str(factor),
+                t_warn=t_warn,
+                t_collapse=t_c,
+                collapse_tag=ctag,
+                ph_win=as_int(CFG.get("ph_win", 8), default=8),
+                ph_lambda=as_float(CFG.get("ph_lambda", 0.0), default=0.0),
+                ph_two_sided=as_int(CFG.get("ph_two_sided", 0), default=0),
+                warn_vote=CFG["warn_vote"],
+                heavy_every=CFG["heavy_every"],
+                metric_batches=CFG["metric_batches"],
+                var_k_energy=CFG["var_k_energy"],
+                var_k_max=CFG["var_k_max"],
+                lead_time=lead,
+                rp_under_resolved=int(rp_under),
+            )
         )
     det_rows = pd.DataFrame(rows)
     det_rows.to_csv(OUTDIR / f"detector_events_{tag}.csv", index=False)
@@ -5047,11 +4594,7 @@ def evaluate(df_all: pd.DataFrame, tag: str):
                     metric_batches=CFG["metric_batches"],
                     var_k_energy=CFG["var_k_energy"],
                     var_k_max=CFG["var_k_max"],
-                    lead_time=(
-                        float(t_c - t_warn)
-                        if (t_warn is not None and t_c is not None)
-                        else float("nan")
-                    ),
+                    lead_time=(float(t_c - t_warn) if (t_warn is not None and t_c is not None) else float("nan")),
                 )
             )
         out = pd.DataFrame(rows)
@@ -5070,6 +4613,7 @@ def evaluate(df_all: pd.DataFrame, tag: str):
 
     seq_rows = []
     from typing import cast, Any
+
     for key, g in df_eval_raw.groupby(["seed", "factor"]):
         seed, factor = cast(tuple[Any, Any], key)
         gg = g.sort_values("epoch").reset_index(drop=True)
@@ -5135,7 +4679,7 @@ def evaluate(df_all: pd.DataFrame, tag: str):
 
         t_c_raw = gg["t_collapse_gt"].iloc[0]
         t_c = as_int(t_c_raw, default=-1)
-        t_c = (t_c if t_c >= 0 else None)
+        t_c = t_c if t_c >= 0 else None
         ctag = str(gg["collapse_tag_gt"].iloc[0])
 
         if t_warn is not None and t_c is not None and not (t_warn < t_c):
@@ -5170,6 +4714,7 @@ def evaluate(df_all: pd.DataFrame, tag: str):
     # ---- NEWMA baseline on PH + non-scheduled spectral/FTLE channels ----
     newma_rows = []
     from typing import cast, Any
+
     for key, g in df_eval_raw.groupby(["seed", "factor"]):
         seed, factor = cast(tuple[Any, Any], key)
         gg = g.sort_values("epoch").reset_index(drop=True)
@@ -5184,16 +4729,9 @@ def evaluate(df_all: pd.DataFrame, tag: str):
             return out
 
         xs_ph = _prep_series_for_ph(gg, "pers_H0")
-        xs_eff = (
-            (gg["eff_dim_gt"] if "eff_dim_gt" in gg.columns else gg["eff_dim"])
-            .to_numpy()
-            .astype(float)
-            .tolist()
-        )
+        xs_eff = (gg["eff_dim_gt"] if "eff_dim_gt" in gg.columns else gg["eff_dim"]).to_numpy().astype(float).tolist()
         xs_var = gg["var_out_k"].to_numpy().astype(float).tolist()
-        xs_ftle = _mask_with_valid(
-            gg["ftle"], gg["ftle_valid"] if "ftle_valid" in gg.columns else None
-        ).tolist()
+        xs_ftle = _mask_with_valid(gg["ftle"], gg["ftle_valid"] if "ftle_valid" in gg.columns else None).tolist()
 
         lam_newma = as_float(CFG.get("ph_lambda"), default=0.0)
 
@@ -5226,13 +4764,13 @@ def evaluate(df_all: pd.DataFrame, tag: str):
             burn_in=warm_idx,
         )
         cand = [t for t in [t1, t2, t3, t4] if t is not None]
-        tmin = (min(cand) if cand else None)
+        tmin = min(cand) if cand else None
         tw_tmp = as_int(tmin, default=-1) if tmin is not None else -1
         t_warn = tw_tmp if tw_tmp >= 0 else None
 
         t_c_raw = gg["t_collapse_gt"].iloc[0]
         t_c = as_int(t_c_raw, default=-1)
-        t_c = (t_c if t_c >= 0 else None)
+        t_c = t_c if t_c >= 0 else None
         ctag = str(gg["collapse_tag_gt"].iloc[0])
 
         if t_warn is not None and t_c is not None and not (t_warn < t_c):
@@ -5265,6 +4803,7 @@ def evaluate(df_all: pd.DataFrame, tag: str):
     # ---- Gate-only baseline (uses per-epoch gate_warn) ----
     gate_rows = []
     from typing import cast, Any
+
     for key, g in df_eval_raw.groupby(["seed", "factor"]):
         seed, factor = cast(tuple[Any, Any], key)
         gg = g.sort_values("epoch").reset_index(drop=True)
@@ -5283,7 +4822,7 @@ def evaluate(df_all: pd.DataFrame, tag: str):
         t_warn = gw if gw is not None else None
         t_c_raw = gg["t_collapse_gt"].iloc[0]
         t_c = as_int(t_c_raw, default=-1)
-        t_c = (t_c if t_c >= 0 else None)
+        t_c = t_c if t_c >= 0 else None
 
         ctag = str(gg["collapse_tag_gt"].iloc[0])
 
@@ -5387,7 +4926,9 @@ def evaluate(df_all: pd.DataFrame, tag: str):
     _write_both_overlays(df_eval_overlay, OUTDIR)
 
     try:
-        compute_invariants_and_provenance(df_eval_overlay, artifact_csv=OUTDIR / f"bundle_runs_eval_with_overlays_{tag}.parquet")
+        compute_invariants_and_provenance(
+            df_eval_overlay, artifact_csv=OUTDIR / f"bundle_runs_eval_with_overlays_{tag}.parquet"
+        )
     except Exception as e:
         print(f"[WARN] invariants/provenance generation failed: {e}")
 
@@ -5406,9 +4947,11 @@ def main():
     # If user only asked for help/version, print and exit quickly.
     if any(a in ("-h", "--help") for a in _argv):
         # Minimal usage to avoid importing argparse or any heavy deps.
-        print("veriscope: early warning of soft collapse (Phase-4)\n"
-              "Usage: veriscope [options]\n"
-              "Common: --help, --version, (env) SCAR_SMOKE=1")
+        print(
+            "veriscope: early warning of soft collapse (Phase-4)\n"
+            "Usage: veriscope [options]\n"
+            "Common: --help, --version, (env) SCAR_SMOKE=1"
+        )
         return 0
 
     if any(a in ("-V", "--version") for a in _argv):
@@ -5493,7 +5036,11 @@ def main():
             torch=(getattr(_torch, "__version__", None) or "missing"),
             tv=(getattr(_tv, "__version__", None) or "missing"),
             cuda=(getattr(getattr(_torch, "version", None), "cuda", None) if _torch else None),
-            cudnn=(getattr(getattr(getattr(_torch, "backends", None), "cudnn", None), "version", lambda: None)() if _torch else None),
+            cudnn=(
+                getattr(getattr(getattr(_torch, "backends", None), "cudnn", None), "version", lambda: None)()
+                if _torch
+                else None
+            ),
             device=str(CFG.get("device", "cpu")),
             deterministic=bool(CFG.get("deterministic", False)),
             cuda_hash=_cuda_hash(),
@@ -5515,14 +5062,16 @@ def main():
             print(f"[WARN] bad SCAR_GATE_MIN_EVIDENCE={os.environ.get('SCAR_GATE_MIN_EVIDENCE')!r}: {e}")
         # Clarify units for gate gain everywhere we log/save config
         CFG.setdefault("gate_gain_units", "bits/sample")
-        
+
         # Clamp var_k_max to avoid degenerate k (NEW)
         CFG["var_k_max"] = max(1, int(CFG.get("var_k_max", 32)))
-        
+
         save_json(CFG, OUTDIR / "cfg_phase4.json")
         try:
             print("[cfg] note: 'gate_gain' is measured in bits/sample.")
-            print("[cfg] note: eps_stat aggregation uses weighted sum of per-metric BH–C bounds; see audit 'eps_aggregation' and 'counts_by_metric'.")
+            print(
+                "[cfg] note: eps_stat aggregation uses weighted sum of per-metric BH–C bounds; see audit 'eps_aggregation' and 'counts_by_metric'."
+            )
         except Exception:
             pass
         # one-time reproducibility capsule (non-fatal)
@@ -5533,7 +5082,11 @@ def main():
                     "torch": getattr(_torch, "__version__", None),
                     "torchvision": getattr(_tv, "__version__", None),
                     "cuda": getattr(getattr(_torch, "version", None), "cuda", None) if _torch else None,
-                    "cudnn": (getattr(getattr(getattr(_torch, "backends", None), "cudnn", None), "version", lambda: None)() if _torch else None),
+                    "cudnn": (
+                        getattr(getattr(getattr(_torch, "backends", None), "cudnn", None), "version", lambda: None)()
+                        if _torch
+                        else None
+                    ),
                     "device": str(CFG.get("device", "cpu")),
                     "deterministic": bool(CFG.get("deterministic", False)),
                     "cuda_hash": _cuda_hash(),
@@ -5590,7 +5143,7 @@ def main():
         print(f"[preload] gate_gain_thresh={CFG['gate_gain_thresh']:.4f}")
     except Exception:
         pass
-    
+
     # --- hand off to pipeline (import late to avoid cycles / stale runtime) ---
     from veriscope.pipeline import run_sweep as pipeline_run_sweep
     from veriscope.pipeline import evaluate as pipeline_evaluate

@@ -20,6 +20,7 @@ FloatArray = npt.NDArray[np.floating]
 
 # --- IO helpers ---
 
+
 def save_json(obj: Any, path: Path) -> None:
     """Atomic JSON write with indentation."""
     p = Path(path)
@@ -69,6 +70,7 @@ def file_md5(path: Path) -> str:
 
 
 # --- Numeric helpers ---
+
 
 def as_int(x: Any, default: int = 0) -> int:
     """Best-effort int conversion (handles NumPy scalars and strings)."""
@@ -121,6 +123,7 @@ def to_numeric_series(
 
 
 # --- Quantile helpers ---
+
 
 def _as_float_array(x: Iterable[float] | npt.ArrayLike) -> FloatArray:
     """Coerce to a 1-D float array; scalars become length-1 arrays."""

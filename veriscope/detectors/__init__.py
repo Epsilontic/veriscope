@@ -1,4 +1,4 @@
-# veriscope/core/__init__.py
+# veriscope/detectors/__init__.py
 from __future__ import annotations
 
 """
