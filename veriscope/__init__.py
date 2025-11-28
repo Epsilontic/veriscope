@@ -20,9 +20,12 @@ from .core import (
 
 __all__ = [
     "WindowDecl",
-    "DeclTransport", "assert_naturality",
+    "DeclTransport",
+    "assert_naturality",
     "tv_hist_fixed",
-    "epsilon_statistic_bhc", "aggregate_epsilon_stat",
-    "GateEngine", "GateResult",
+    "epsilon_statistic_bhc",
+    "aggregate_epsilon_stat",
+    "GateEngine",
+    "GateResult",
     "__version__",
 ]

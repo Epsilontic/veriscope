@@ -1,16 +1,20 @@
 # veriscope/detectors/learned.py
 from __future__ import annotations
 
-"""
-Public learned detector facade.
+"""Public learned detector facade.
 
 Phase-1 boundary:
 - Never import from legacy_cli_refactor.py.
-- Re-export stable APIs from legacy learned-detector implementation.
+- Re-export only stable APIs from the legacy learned-detector implementation.
+
+Note: The learned-detector *implementation* lives in:
+  - veriscope.runners.legacy.detectors.learned
+This facade intentionally keeps a small surface area to reduce refactor drift.
 """
 
 from typing import Any, Dict, List, Optional
 
+# Default learned-detector feature set used by legacy runs.
 DET_FEATURES: List[str] = [
     "cos_disp",
     "var_out_k",
@@ -23,28 +27,23 @@ DET_FEATURES: List[str] = [
     "corr_effdim_varoutk",
 ]
 
+
 def default_features(cfg: Optional[Dict[str, Any]] = None) -> List[str]:
+    """Return the default list of learned-detector features.
+
+    `cfg` is accepted for forward compatibility but is currently unused.
+    """
     _ = cfg
     return list(DET_FEATURES)
 
-from veriscope.runners.legacy.detectors.learned import (  # noqa: F401
-    _metrics_matrix_with_missing as metrics_matrix_with_missing,
-    _fit_global_robust_norm_precollapse as fit_global_robust_norm_precollapse,
-    _apply_global_norm_impute as apply_global_norm_impute,
-    _train_logistic_ridge_balanced as train_logistic_ridge_balanced,
-    _cv_grouped_fit as cv_grouped_fit,
-    _oof_probs_for_params as oof_probs_for_params,
-    map_threshold_to_gated_fp as map_threshold_to_gated_fp,
+
+# Stable entrypoints only.
+from veriscope.runners.legacy.detectors.learned import (  # noqa: F401,E402
+    map_threshold_to_gated_fp,
 )
 
 __all__ = [
     "DET_FEATURES",
     "default_features",
-    "metrics_matrix_with_missing",
-    "fit_global_robust_norm_precollapse",
-    "apply_global_norm_impute",
-    "train_logistic_ridge_balanced",
-    "cv_grouped_fit",
-    "oof_probs_for_params",
     "map_threshold_to_gated_fp",
 ]

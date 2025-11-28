@@ -29,6 +29,7 @@ from veriscope.runners.legacy.data import _u01_from_hash
 
 try:
     from veriscope.runners.legacy import runtime as _rt  # type: ignore[import]
+
     CFG = getattr(_rt, "CFG", {}) or {}
 except Exception:
     CFG: dict = {}
@@ -169,6 +170,7 @@ def extract_features(
 
 # Backwards-compatible alias name so imports can use the old symbol
 _features_for_loader = extract_features
+
 
 def cov_eigs(Z: torch.Tensor, eps: float = 1e-6) -> Tuple[torch.Tensor, int]:
     """Eigenvalues of covariance with small diagonal jitter; returns (eigs, n_negative)."""

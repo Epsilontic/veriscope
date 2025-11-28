@@ -23,11 +23,12 @@ class WindowBudget:
       - Per-call ceilings are enforced locally inside the metric implementations
         (e.g., CFG['sw2_budget_ms'], CFG['ripser_budget_ms']).
     """
-    sw2_ms: int = 200                # per-run cumulative budget for sliced W2 (ms)
-    ripser_ms: int = 250             # per-run cumulative budget for H0 persistence (ms)
-    total_heavy_ms: int = 180_000    # total wall-clock budget for all heavy metrics in a run
-    sw2_calls: int = 1_000_000       # defensive ceiling; tuned by CFG
-    ripser_calls: int = 1_000_000    # defensive ceiling; tuned by CFG
+
+    sw2_ms: int = 200  # per-run cumulative budget for sliced W2 (ms)
+    ripser_ms: int = 250  # per-run cumulative budget for H0 persistence (ms)
+    total_heavy_ms: int = 180_000  # total wall-clock budget for all heavy metrics in a run
+    sw2_calls: int = 1_000_000  # defensive ceiling; tuned by CFG
+    ripser_calls: int = 1_000_000  # defensive ceiling; tuned by CFG
 
 
 class BudgetLedger:
@@ -78,15 +79,11 @@ class BudgetLedger:
             return False
 
         if kind == "sw2":
-            return (
-                self.used_ms["sw2"] < float(self.lim.sw2_ms)
-                and self.calls["sw2"] < int(self.lim.sw2_calls)
-            )
+            return self.used_ms["sw2"] < float(self.lim.sw2_ms) and self.calls["sw2"] < int(self.lim.sw2_calls)
 
         if kind == "ripser":
-            return (
-                self.used_ms["ripser"] < float(self.lim.ripser_ms)
-                and self.calls["ripser"] < int(self.lim.ripser_calls)
+            return self.used_ms["ripser"] < float(self.lim.ripser_ms) and self.calls["ripser"] < int(
+                self.lim.ripser_calls
             )
 
         # Unknown kinds: only the total budget applies

@@ -1,51 +1,36 @@
 # veriscope/runners/legacy/gate_legacy.py
 from __future__ import annotations
 
-from typing import Dict, Mapping, Union, cast
+from typing import Any, Callable, Dict
 
 import numpy as np
 
-from veriscope.runners.legacy.utils import as_int  # numeric guard
-from veriscope.core.ipm import tv_hist_fixed  # canonical TV kernel
+from veriscope.core.ipm import dPi_product_tv as _core_dPi_product_tv
 
-# Optional FR transport adapter (legacy fallback if unavailable)
-try:
-    from veriscope.fr_integration import DeclTransport as _DECL_TRANSPORT  # type: ignore[attr-defined]
-except Exception:
-    _DECL_TRANSPORT = None  # type: ignore[assignment]
+
+def _apply_for_window(window: Any) -> Callable[[str, np.ndarray], np.ndarray]:
+    """Return an apply(ctx, x) callable for a WindowDecl-like object.
+
+    Priority:
+      1) window._DECL_TRANSPORT (if present)
+      2) identity
+
+    This keeps the legacy 3-arg dPi_product_tv signature while delegating the
+    actual product-TV computation to the canonical core implementation.
+    """
+    adapter = getattr(window, "_DECL_TRANSPORT", None)
+    if adapter is not None and hasattr(adapter, "apply"):
+        return lambda ctx, x: adapter.apply(ctx, np.asarray(x, float))  # type: ignore[attr-defined]
+    return lambda ctx, x: np.asarray(x, float)
 
 
 def dPi_product_tv(
-    window,
+    window: Any,
     past_by_metric: Dict[str, np.ndarray],
     recent_by_metric: Dict[str, np.ndarray],
 ) -> float:
-    tv = 0.0
-
-    # Choose apply: instance adapter if available, else FR global, else identity
-    _adapter = None
-    try:
-        _adapter = getattr(window, "_DECL_TRANSPORT", None)
-    except Exception:
-        _adapter = None
-
-    if _adapter is not None:
-        _apply = _adapter.apply  # type: ignore[assignment]
-    elif _DECL_TRANSPORT is not None:
-        _apply = _DECL_TRANSPORT.apply  # type: ignore[assignment]
-    else:
-        _apply = lambda name, arr: np.asarray(arr, float)
-
-    weights = cast(Mapping[str, float], getattr(window, "weights", {}) or {})
-    bins = as_int(getattr(window, "bins", 16), default=16)
-
-    for m, w in weights.items():
-        if m not in past_by_metric or m not in recent_by_metric:
-            continue
-        a = np.asarray(_apply(m, past_by_metric[m]), dtype=float)
-        b = np.asarray(_apply(m, recent_by_metric[m]), dtype=float)
-        tv += float(cast(Union[int, float], w)) * tv_hist_fixed(a, b, bins)
-    return float(tv)
+    apply = _apply_for_window(window)
+    return _core_dPi_product_tv(window, past_by_metric, recent_by_metric, apply=apply)
 
 
 __all__ = ["dPi_product_tv"]

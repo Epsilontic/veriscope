@@ -44,6 +44,7 @@ def _get_success_target() -> Mapping[str, Any]:
     r = _get_runtime()
     return getattr(r, "SUCCESS_TARGET", SUCCESS_TARGET) if r is not None else SUCCESS_TARGET
 
+
 # Numeric / config / IO shims.
 # Prefer the shared helpers in legacy.utils; fall back to local definitions if missing.
 try:
@@ -113,6 +114,25 @@ def install_decl_transport(transport: Any) -> None:
     _DECL_TRANSPORT = transport
 
 
+def _get_apply_for_decl(window_decl: WindowDecl):
+    """Return an apply(ctx, x) callable for offline eval under a WindowDecl.
+
+    Priority:
+      1) window_decl._DECL_TRANSPORT (if present)
+      2) module-level _DECL_TRANSPORT (installed via install_decl_transport)
+      3) identity
+    """
+    adapter = getattr(window_decl, "_DECL_TRANSPORT", None)
+    if adapter is None:
+        adapter = _DECL_TRANSPORT
+
+    if adapter is not None and hasattr(adapter, "apply"):
+        # Normalize x to float array before applying
+        return lambda ctx, x: adapter.apply(ctx, np.asarray(x, float))  # type: ignore[attr-defined]
+
+    return lambda ctx, x: np.asarray(x, float)
+
+
 # ---------------------------
 # Events & evaluation (UNIFIED GT)
 # ---------------------------
@@ -159,9 +179,7 @@ def compute_events(
         for m in metrics_for_ph:
             xs = _prep_series_for_ph(g0, m)
             win_m = (
-                as_int(cfg.get("ph_win_short"), default=win_default)
-                if (m in SCHEDULED_METRICS)
-                else int(win_default)
+                as_int(cfg.get("ph_win_short"), default=win_default) if (m in SCHEDULED_METRICS) else int(win_default)
             )
             d = dir_map.get(m, "up")
             t, zs, cs = ph_window_sparse(
@@ -322,14 +340,10 @@ def assert_overlay_consistency(
         tc_i = tc if tc is not None else -1
 
         bad_warn = (
-            ((e_tw_i >= 0) and (tw_i < 0))
-            or ((e_tw_i < 0) and (tw_i >= 0))
-            or ((e_tw_i >= 0) and (tw_i != e_tw_i))
+            ((e_tw_i >= 0) and (tw_i < 0)) or ((e_tw_i < 0) and (tw_i >= 0)) or ((e_tw_i >= 0) and (tw_i != e_tw_i))
         )
         bad_col = (
-            ((e_tc_i >= 0) and (tc_i < 0))
-            or ((e_tc_i < 0) and (tc_i >= 0))
-            or ((e_tc_i >= 0) and (tc_i != e_tc_i))
+            ((e_tc_i >= 0) and (tc_i < 0)) or ((e_tc_i < 0) and (tc_i >= 0)) or ((e_tc_i >= 0) and (tc_i != e_tc_i))
         )
 
         if bad_warn or bad_col:
@@ -392,11 +406,7 @@ def bootstrap_stratified(
 
         non_trig = boot[boot["collapse_tag"] == "none"]
         denom = max(1, len(non_trig))
-        fp = (
-            float(np.mean((non_trig["t_warn"].notna()) & (non_trig["t_warn"] >= warm)))
-            if denom > 0
-            else 1.0
-        )
+        fp = float(np.mean((non_trig["t_warn"].notna()) & (non_trig["t_warn"] >= warm))) if denom > 0 else 1.0
         vals_fp.append(float(fp))
 
         leads = (trig["t_collapse"] - trig["t_warn"]).dropna().to_numpy()
@@ -444,12 +454,27 @@ def summarize_detection(rows: pd.DataFrame, warm_idx: int) -> pd.DataFrame:
         out.append(dict(kind="lead_time", n=0, med=np.nan, q1=np.nan, q3=np.nan))
 
         boot = bootstrap_stratified(rows)
-        out.append(dict(kind="detect_rate_ci_boot", lo=boot.get("detect_rate_ci", (np.nan, np.nan))[0],
-                        hi=boot.get("detect_rate_ci", (np.nan, np.nan))[1]))
-        out.append(dict(kind="fp_rate_ci_boot", lo=boot.get("fp_rate_ci", (np.nan, np.nan))[0],
-                        hi=boot.get("fp_rate_ci", (np.nan, np.nan))[1]))
-        out.append(dict(kind="lead_median_ci_boot", lo=boot.get("lead_median_ci", (np.nan, np.nan))[0],
-                        hi=boot.get("lead_median_ci", (np.nan, np.nan))[1]))
+        out.append(
+            dict(
+                kind="detect_rate_ci_boot",
+                lo=boot.get("detect_rate_ci", (np.nan, np.nan))[0],
+                hi=boot.get("detect_rate_ci", (np.nan, np.nan))[1],
+            )
+        )
+        out.append(
+            dict(
+                kind="fp_rate_ci_boot",
+                lo=boot.get("fp_rate_ci", (np.nan, np.nan))[0],
+                hi=boot.get("fp_rate_ci", (np.nan, np.nan))[1],
+            )
+        )
+        out.append(
+            dict(
+                kind="lead_median_ci_boot",
+                lo=boot.get("lead_median_ci", (np.nan, np.nan))[0],
+                hi=boot.get("lead_median_ci", (np.nan, np.nan))[1],
+            )
+        )
         return pd.DataFrame(out)
 
     _tw = to_numeric_series(trig["t_warn"], errors="coerce")
@@ -465,11 +490,7 @@ def summarize_detection(rows: pd.DataFrame, warm_idx: int) -> pd.DataFrame:
         phat = detect_rate
         denom = 1 + z**2 / n_collapse
         center = (phat + z * z / (2 * n_collapse)) / denom
-        half = (
-            z
-            * math.sqrt((phat * (1 - phat) / n_collapse) + z * z / (4 * n_collapse * n_collapse))
-            / denom
-        )
+        half = z * math.sqrt((phat * (1 - phat) / n_collapse) + z * z / (4 * n_collapse * n_collapse)) / denom
         d_lo, d_hi = center - half, center + half
     else:
         d_lo = d_hi = np.nan
@@ -491,12 +512,27 @@ def summarize_detection(rows: pd.DataFrame, warm_idx: int) -> pd.DataFrame:
     out.append(dict(kind="lead_time", n=int(leads.size), med=med, q1=q1, q3=q3))
 
     boot = bootstrap_stratified(rows)
-    out.append(dict(kind="detect_rate_ci_boot", lo=boot.get("detect_rate_ci", (np.nan, np.nan))[0],
-                    hi=boot.get("detect_rate_ci", (np.nan, np.nan))[1]))
-    out.append(dict(kind="fp_rate_ci_boot", lo=boot.get("fp_rate_ci", (np.nan, np.nan))[0],
-                    hi=boot.get("fp_rate_ci", (np.nan, np.nan))[1]))
-    out.append(dict(kind="lead_median_ci_boot", lo=boot.get("lead_median_ci", (np.nan, np.nan))[0],
-                    hi=boot.get("lead_median_ci", (np.nan, np.nan))[1]))
+    out.append(
+        dict(
+            kind="detect_rate_ci_boot",
+            lo=boot.get("detect_rate_ci", (np.nan, np.nan))[0],
+            hi=boot.get("detect_rate_ci", (np.nan, np.nan))[1],
+        )
+    )
+    out.append(
+        dict(
+            kind="fp_rate_ci_boot",
+            lo=boot.get("fp_rate_ci", (np.nan, np.nan))[0],
+            hi=boot.get("fp_rate_ci", (np.nan, np.nan))[1],
+        )
+    )
+    out.append(
+        dict(
+            kind="lead_median_ci_boot",
+            lo=boot.get("lead_median_ci", (np.nan, np.nan))[0],
+            hi=boot.get("lead_median_ci", (np.nan, np.nan))[1],
+        )
+    )
 
     return pd.DataFrame(out)
 
@@ -523,9 +559,7 @@ def summarize_runlevel_fp(events: pd.DataFrame, warm_idx: int) -> float:
     for key, g in none_runs.groupby(["seed", "factor"]):
         sd, fc = cast(Tuple[Any, Any], key)
         tw = g["t_warn"].dropna()
-        hit = (len(tw) > 0) and (
-            as_int(tw.iloc[0], default=-1) >= as_int(warm_idx, default=-1)
-        )
+        hit = (len(tw) > 0) and (as_int(tw.iloc[0], default=-1) >= as_int(warm_idx, default=-1))
         flags.append(bool(hit))
 
     return float(np.mean(flags)) if flags else float("nan")
@@ -574,10 +608,7 @@ def rp_adequacy_flags(
         if int(m2.sum()) >= int(min_pts):
             corr2 = float(np.corrcoef(x2[m2], y2[m2])[0, 1])
 
-        flag = int(
-            (np.isfinite(corr1) and corr1 < corr_min)
-            or (np.isfinite(corr2) and corr2 < corr_min)
-        )
+        flag = int((np.isfinite(corr1) and corr1 < corr_min) or (np.isfinite(corr2) and corr2 < corr_min))
         flags[(as_int(seed, default=0), str(factor))] = flag
 
     return flags
@@ -606,17 +637,9 @@ def _count_finite_pairs(
 ) -> int:
     """Finite-pair count under DeclTransport if installed."""
     try:
-        adapter = getattr(window, "_DECL_TRANSPORT", None)
-        if adapter is not None:
-            tp = adapter.apply(name, past)   # type: ignore[attr-defined]
-            tr = adapter.apply(name, recent) # type: ignore[attr-defined]
-        elif _DECL_TRANSPORT is not None:
-            tp = _DECL_TRANSPORT.apply(name, past)   # type: ignore[attr-defined]
-            tr = _DECL_TRANSPORT.apply(name, recent) # type: ignore[attr-defined]
-        else:
-            tp = np.asarray(past, float)
-            tr = np.asarray(recent, float)
-
+        apply = _get_apply_for_decl(window)
+        tp = apply(name, past)
+        tr = apply(name, recent)
         ta = np.asarray(tp, dtype=float)
         ra = np.asarray(tr, dtype=float)
         return int(min(int(np.isfinite(ta).sum()), int(np.isfinite(ra).sum())))
@@ -647,6 +670,8 @@ def recompute_gate_series_under_decl(
 
     df = df_eval.copy()
     cfg = _get_cfg()
+
+    apply = _get_apply_for_decl(window_decl)
 
     # Normalize key columns to numeric for sorting / slicing
     for c in ("epoch", "seed"):
@@ -682,24 +707,15 @@ def recompute_gate_series_under_decl(
             ps = slice(pos - 2 * W + 1, pos - W + 1)
             rs = slice(pos - W + 1, pos + 1)
 
-            past = {
-                m: _as_float_array(to_numeric_opt(g.get(m)).iloc[ps].to_numpy())
-                for m in mets
-            }
-            recent = {
-                m: _as_float_array(to_numeric_opt(g.get(m)).iloc[rs].to_numpy())
-                for m in mets
-            }
+            past = {m: _as_float_array(to_numeric_opt(g.get(m)).iloc[ps].to_numpy()) for m in mets}
+            recent = {m: _as_float_array(to_numeric_opt(g.get(m)).iloc[rs].to_numpy()) for m in mets}
 
             try:
-                tv = dPi_product_tv(window_decl, past, recent)
+                tv = dPi_product_tv(window_decl, past, recent, apply=apply)
             except Exception:
                 tv = float("nan")
 
-            counts = {
-                m: _count_finite_pairs(window_decl, past[m], recent[m], m)
-                for m in mets
-            }
+            counts = {m: _count_finite_pairs(window_decl, past[m], recent[m], m) for m in mets}
 
             try:
                 if agg_fn is not None:

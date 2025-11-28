@@ -33,6 +33,7 @@ SCHEDULED_METRICS: List[str] = ["sw2", "pers_H0", "mon_entropy", "avg_max_prob"]
 # TTL for scheduled metrics propagation to avoid stale ffill artifacts
 CFG.setdefault("scheduled_ttl", 2 * CFG.get("heavy_every", 6))
 
+
 # ---------------------------
 # PH series preprocessing helper (centralized)
 # ---------------------------
@@ -209,9 +210,8 @@ def _delta(xs: List[float]) -> List[float]:
         out[t] = (b - a) if (np.isfinite(a) and np.isfinite(b)) else np.nan
     return out
 
-def cusum_one_sided(
-zs: List[float], lam: float, direction: str = "down"
-) -> Tuple[Optional[int], List[float]]:
+
+def cusum_one_sided(zs: List[float], lam: float, direction: str = "down") -> Tuple[Optional[int], List[float]]:
     s = 0.0
     track = []
     for t, z in enumerate(zs):
@@ -231,9 +231,7 @@ zs: List[float], lam: float, direction: str = "down"
     return None, track
 
 
-def newma_warn_epoch(
-xs: List[float], fast: float, slow: float, lam: float, burn_in: int
-) -> Optional[int]:
+def newma_warn_epoch(xs: List[float], fast: float, slow: float, lam: float, burn_in: int) -> Optional[int]:
     mu_f = 0.0
     mu_s = 0.0
     for t, x in enumerate(xs):
@@ -247,6 +245,7 @@ xs: List[float], fast: float, slow: float, lam: float, burn_in: int
             if abs(s) > lam:
                 return t
     return None
+
 
 def calibrate_ph_directions(df_cal: pd.DataFrame, metrics: List[str]) -> Dict[str, str]:
     dir_map: Dict[str, str] = {}
@@ -292,7 +291,6 @@ def calibrate_ph_directions(df_cal: pd.DataFrame, metrics: List[str]) -> Dict[st
                     best_dir = d
         dir_map[m] = best_dir
     return dir_map
-
 
 
 __all__ = [
