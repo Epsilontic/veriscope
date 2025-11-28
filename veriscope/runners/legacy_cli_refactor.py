@@ -2046,8 +2046,13 @@ def gt_collapse_time(run_df: pd.DataFrame, grad_cutoff: float) -> Tuple[Optional
     # SOFT: rank-only (native eff_dim below threshold) with patience
     eff = g["eff_dim_gt"].to_numpy() if "eff_dim_gt" in g.columns else g["eff_dim"].to_numpy()
     consec = 0
-    t_first = None
+    t_first: Optional[int] = None
     for t in range(len(ep)):
+        if ep[t] < warm_idx:
+            consec = 0
+            t_first = None
+            continue
+
         cond_rank = np.isfinite(eff[t]) and (eff[t] <= CFG["gt_rank_min"])
         if cond_rank:
             consec += 1
