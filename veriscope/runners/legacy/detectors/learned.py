@@ -71,9 +71,15 @@ def _fit_global_robust_norm_precollapse(df_cal: pd.DataFrame, cols: List[str]) -
     for m in cols:
         sub = df_cal.copy()
         if {"collapse_tag_gt", "t_collapse_gt"}.issubset(sub.columns):
+            cfg = _get_cfg()
+            try:
+                warm_idx = as_int(cfg.get("warmup"), default=0) + as_int(cfg.get("ph_burn"), default=0)
+            except Exception:
+                warm_idx = 0
+
             pre_parts: List[pd.DataFrame] = []
             for _, g in sub.groupby(["seed", "factor"]):
-                tag = str(g["collapse_tag_gt"].iloc[0])
+                tag = _runlevel_tag_from_epochwise(g, warm_idx)
                 tc = g["t_collapse_gt"].iloc[0]
                 if (tag == "soft") and pd.notna(tc):
                     pre_parts.append(g[g["epoch"] < int(tc)])
@@ -128,6 +134,32 @@ def _apply_global_norm_impute(
         Xn[:, j] = (col - med) / scale
     Xn[np.isinf(Xn)] = 0.0
     return Xn
+
+
+# Helper: reduce epochwise collapse_tag_gt to a run-level tag (hard > soft > none)
+def _runlevel_tag_from_epochwise(df: pd.DataFrame, warm_idx: int) -> str:
+    """Reduce epochwise collapse_tag_gt to a run-level tag (hard > soft > none).
+
+    Preference is to consider post-warm epochs only when available.
+    """
+    if df is None or (not isinstance(df, pd.DataFrame)) or df.empty:
+        return "none"
+    if "collapse_tag_gt" not in df.columns:
+        return "none"
+
+    use = df
+    if "epoch" in df.columns:
+        ep = pd.to_numeric(df["epoch"], errors="coerce")
+        post = df[ep >= int(warm_idx)]
+        if not post.empty:
+            use = post
+
+    tags = {str(x) for x in use["collapse_tag_gt"].dropna().astype(str).unique().tolist()}
+    if "hard" in tags:
+        return "hard"
+    if "soft" in tags:
+        return "soft"
+    return "none"
 
 
 def _train_logistic_ridge_balanced(
