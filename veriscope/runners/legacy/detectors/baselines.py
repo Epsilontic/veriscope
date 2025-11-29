@@ -17,7 +17,7 @@ import numpy as np
 import pandas as pd
 
 from veriscope.runners.legacy import runtime as _rt
-from veriscope.runners.legacy.utils import as_int, as_float
+from veriscope.runners.legacy.utils import as_float, as_int
 
 # Runtime config (safe if runtime not installed yet).
 # IMPORTANT: keep a shared reference so later CFG mutations are visible here.
@@ -26,12 +26,14 @@ try:
 except Exception:
     CFG = {}
 
+# TTL for scheduled metrics propagation to avoid stale ffill artifacts
+# Use typed accessors so non-numeric CFG values don't blow up at import time.
+_heavy_every_i = as_int(CFG.get("heavy_every"), default=6)
+CFG.setdefault("scheduled_ttl", 2 * _heavy_every_i)
+
 # Scheduled metrics (cadenced/missing by design) — never fed to the learner.
 # Moved from legacy_cli_refactor.py
 SCHEDULED_METRICS: List[str] = ["sw2", "pers_H0", "mon_entropy", "avg_max_prob"]
-
-# TTL for scheduled metrics propagation to avoid stale ffill artifacts
-CFG.setdefault("scheduled_ttl", 2 * CFG.get("heavy_every", 6))
 
 
 # ---------------------------
@@ -41,6 +43,7 @@ def _prep_series_for_ph(g: pd.DataFrame, metric: str) -> List[float]:
     """Prepare a metric series for PH detection: ffill scheduled metrics, apply validity masks,
     and gate pers_H0 by min repeats and time budget. Returns a Python list with NaNs for invalid epochs.
     """
+
     s = g[metric].copy()
     if metric in SCHEDULED_METRICS:
         s = s.ffill()
@@ -52,7 +55,9 @@ def _prep_series_for_ph(g: pd.DataFrame, metric: str) -> List[float]:
             if np.isfinite(v):
                 last = i
             age[i] = (i - last) if last >= 0 else np.inf
-        ttl = float(CFG.get("scheduled_ttl", 2 * CFG.get("heavy_every", 6)))
+        heavy_every_i = as_int(CFG.get("heavy_every"), default=6)
+        # scheduled_ttl may be missing or non-numeric; fall back safely.
+        ttl = as_float(CFG.get("scheduled_ttl"), default=float(2 * heavy_every_i))
         arr = np.where(age <= ttl, arr, np.nan)
     else:
         arr = s.to_numpy(dtype=float)
@@ -140,10 +145,10 @@ def ph_window_sparse(
     min_points: int,
     two_sided: bool,
 ) -> Tuple[Optional[int], List[float], List[float]]:
-    """
-    Sparse CUSUM-on-robust-z over a series that may contain NaNs.
+    """Sparse CUSUM-on-robust-z over a series that may contain NaNs.
     (Verbatim from legacy_cli_refactor.py.)
     """
+
     thr = max(burn_in, win, 2)
 
     # indices of finite observations in original time space
@@ -253,7 +258,7 @@ def calibrate_ph_directions(df_cal: pd.DataFrame, metrics: List[str]) -> Dict[st
     win_default = as_int(CFG.get("ph_win"), default=0)
     win_short_default = as_int(CFG.get("ph_win_short"), default=win_default)
 
-    from typing import cast, Any
+    from typing import Any, cast
 
     for m in metrics:
         # Make sure win_m is always an int for mypy-clean comparisons
@@ -266,7 +271,24 @@ def calibrate_ph_directions(df_cal: pd.DataFrame, metrics: List[str]) -> Dict[st
                 seed, factor = cast(tuple[Any, Any], key)
                 g = g.sort_values("epoch")
                 t_c_raw = g["t_collapse_gt"].iloc[0] if "t_collapse_gt" in g.columns else np.nan
-                ctag = g["collapse_tag_gt"].iloc[0] if "collapse_tag_gt" in g.columns else "none"
+
+                if "collapse_tag_gt" in g.columns:
+                    use = g
+                    if "epoch" in g.columns:
+                        ep = pd.to_numeric(g["epoch"], errors="coerce")
+                        post = g[ep >= int(warm)]
+                        if not post.empty:
+                            use = post
+                    tags = {str(x) for x in use["collapse_tag_gt"].dropna().astype(str).unique().tolist()}
+                    if "hard" in tags:
+                        ctag = "hard"
+                    elif "soft" in tags:
+                        ctag = "soft"
+                    else:
+                        ctag = "none"
+                else:
+                    ctag = "none"
+
                 t_c_i = as_int(t_c_raw, default=-1)
                 if (t_c_i < 0) or ctag != "soft":
                     continue

@@ -4194,21 +4194,18 @@ def evaluate(df_all: pd.DataFrame, tag: str):
     save_json(dir_map, OUTDIR / f"ph_directions_{tag}.json")
 
     # ---- Run-level collapse tag map for evaluation (needed by summarize_detection) ----
-    collapse_tag_map = {}
-    from typing import cast, Any
-
+    collapse_tag_map: dict[tuple[int, str], str] = {}
     for key, g in df_eval_raw.groupby(["seed", "factor"]):
         sd, fc = cast(tuple[Any, Any], key)
-        ctag_this = "none"
+
         if "collapse_tag_gt" in g.columns:
-            gx = g[g["epoch"] >= warm_idx]
-            vals = gx["collapse_tag_gt"].dropna().astype(str).unique().tolist()
-            if not vals:
-                vals = g["collapse_tag_gt"].dropna().astype(str).unique().tolist()
-            if vals:
-                ctag_this = vals[0]
-        elif "is_collapse_epoch_gt" in g.columns and bool(g["is_collapse_epoch_gt"].any()):
+            ctag_this = _runlevel_collapse_tag(g, warm_idx)
+        elif "is_collapse_epoch_gt" in g.columns and bool(g["is_collapse_epoch_gt"].fillna(False).astype(bool).any()):
+            # legacy fallback if the epochwise tag column isn't present
             ctag_this = "soft"
+        else:
+            ctag_this = "none"
+
         collapse_tag_map[(as_int(sd, default=0), str(fc))] = ctag_this
 
     # ---- RP adequacy on eval: JL/native agreement pre-warm ----
@@ -4266,7 +4263,7 @@ def evaluate(df_all: pd.DataFrame, tag: str):
         seed, factor = cast(tuple[Any, Any], key)
         g = g.sort_values("epoch").copy()
         t_c = g["t_collapse_gt"].iloc[0]
-        ctag = g["collapse_tag_gt"].iloc[0]
+        ctag = _runlevel_collapse_tag(g, warm_idx)
         is_nontrig = ctag == "none"
         if pd.notna(t_c) and ctag in ("soft", "hard"):
             tci = as_int(t_c, default=-1)
@@ -4423,7 +4420,7 @@ def evaluate(df_all: pd.DataFrame, tag: str):
         sd, fc = cast(tuple[Any, Any], key)
         try:
             t_c = g["t_collapse_gt"].iloc[0]
-            ctag = str(g["collapse_tag_gt"].iloc[0])
+            ctag = _runlevel_collapse_tag(g, warm_idx)
         except Exception:
             t_c, ctag = (np.nan, "none")
         gt_by_sf[(as_int(sd, default=0), str(fc))] = (t_c, ctag)
@@ -4570,7 +4567,7 @@ def evaluate(df_all: pd.DataFrame, tag: str):
         t_c_raw = gg["t_collapse_gt"].iloc[0]
         t_c = as_int(t_c_raw, default=-1)
         t_c = t_c if t_c >= 0 else None
-        ctag = str(gg["collapse_tag_gt"].iloc[0])
+        ctag = _runlevel_collapse_tag(gg, warm_idx)
 
         if t_warn is not None and t_c is not None and not (t_warn < t_c):
             t_warn = None
@@ -4739,7 +4736,7 @@ def evaluate(df_all: pd.DataFrame, tag: str):
         t_c_raw = gg["t_collapse_gt"].iloc[0]
         t_c = as_int(t_c_raw, default=-1)
         t_c = t_c if t_c >= 0 else None
-        ctag = str(gg["collapse_tag_gt"].iloc[0])
+        ctag = _runlevel_collapse_tag(gg, warm_idx)
 
         if t_warn is not None and t_c is not None and not (t_warn < t_c):
             t_warn = None
@@ -4830,7 +4827,7 @@ def evaluate(df_all: pd.DataFrame, tag: str):
         t_c_raw = gg["t_collapse_gt"].iloc[0]
         t_c = as_int(t_c_raw, default=-1)
         t_c = t_c if t_c >= 0 else None
-        ctag = str(gg["collapse_tag_gt"].iloc[0])
+        ctag = _runlevel_collapse_tag(gg, warm_idx)
 
         if t_warn is not None and t_c is not None and not (t_warn < t_c):
             t_warn = None
@@ -4883,7 +4880,7 @@ def evaluate(df_all: pd.DataFrame, tag: str):
         t_c = as_int(t_c_raw, default=-1)
         t_c = t_c if t_c >= 0 else None
 
-        ctag = str(gg["collapse_tag_gt"].iloc[0])
+        ctag = _runlevel_collapse_tag(gg, warm_idx)
 
         # Enforce causal ordering
         if t_warn is not None and t_c is not None and not (t_warn < t_c):
