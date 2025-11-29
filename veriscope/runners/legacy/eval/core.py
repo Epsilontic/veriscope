@@ -173,7 +173,16 @@ def compute_events(
         t_collapse_i = as_int(t_raw, default=-1) if pd.notna(t_raw) else -1
         t_collapse = t_collapse_i if t_collapse_i >= 0 else None
 
-        ctag = str(g0["collapse_tag_gt"].iloc[0]) if "collapse_tag_gt" in g0.columns else "none"
+        if "collapse_tag_gt" in g0.columns:
+            tags = {str(x) for x in g0["collapse_tag_gt"].dropna().unique().tolist()}
+            if "hard" in tags:
+                ctag = "hard"
+            elif "soft" in tags:
+                ctag = "soft"
+            else:
+                ctag = "none"
+        else:
+            ctag = "none"
         t_map: Dict[str, Optional[int]] = {}
 
         for m in metrics_for_ph:
@@ -432,10 +441,16 @@ def summarize_detection(rows: pd.DataFrame, warm_idx: int) -> pd.DataFrame:
         return pd.DataFrame(columns=["kind", "n", "successes", "value", "lo", "hi"])
 
     if "collapse_tag" not in rows.columns:
+        rows = rows.copy()
         if "collapse_tag_gt" in rows.columns:
-            rows = rows.rename(columns={"collapse_tag_gt": "collapse_tag"})
+            tags = {str(x) for x in rows["collapse_tag_gt"].dropna().unique().tolist()}
+            if "hard" in tags:
+                rows["collapse_tag"] = "hard"
+            elif "soft" in tags:
+                rows["collapse_tag"] = "soft"
+            else:
+                rows["collapse_tag"] = "none"
         else:
-            rows = rows.copy()
             rows["collapse_tag"] = "none"
 
     out: List[Dict[str, Any]] = []
