@@ -1202,9 +1202,18 @@ CFG_SMOKE.update({"heavy_every": max(1, as_int(CFG_SMOKE.get("epochs", 16), defa
 
 def seeds_for_eval_from_env(CFG_dict):
     """Return seeds for evaluation based on SCAR_EVAL_SPLIT.
+
     SCAR_EVAL_SPLIT: "eval" (default) | "calib" | "both".
+
+    Smoke-mode hardening: if SCAR_SMOKE is truthy and SCAR_EVAL_SPLIT is not set,
+    default to "both" so FP denominators exist in smoke evaluation.
     """
-    mode = os.environ.get("SCAR_EVAL_SPLIT", "eval").lower().strip()
+    raw = os.environ.get("SCAR_EVAL_SPLIT")
+    if raw is None and env_truthy("SCAR_SMOKE"):
+        mode = "both"
+    else:
+        mode = (raw or "eval").lower().strip()
+
     if mode == "both":
         return list(CFG_dict.get("seeds_calib", [])) + list(CFG_dict.get("seeds_eval", []))
     if mode == "calib":
