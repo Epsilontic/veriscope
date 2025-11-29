@@ -20,7 +20,7 @@ if os.environ.get("VS_FAULTHANDLER", "0") == "1":
     faulthandler.register(signal.SIGUSR1, file=sys.stderr, all_threads=True)
     print("[debug] faulthandler SIGUSR1 registered", flush=True)
 # --- end debug faulthandler ---
-from typing import Any, Optional, Dict
+from typing import Any, Optional, Dict, cast
 from pathlib import Path
 
 # ---- Moved mid-file imports ----
@@ -65,7 +65,6 @@ matplotlib.use("Agg")
 import traceback
 from dataclasses import dataclass  # noqa: F401
 from typing import List, Tuple, Iterable
-from typing import cast
 
 
 import matplotlib.pyplot as plt
@@ -3249,7 +3248,7 @@ def monotonicity_checks_for_outliers(df_runs: pd.DataFrame, warm_idx: int, tail:
     Returns a tidy table with booleans and slopes for auditing.
     """
     rows = []
-    from typing import cast, Any
+    from typing import cast
 
     for key, g in df_runs.groupby(["seed", "factor"]):
         sd, fc = cast(tuple[Any, Any], key)
@@ -3321,7 +3320,7 @@ def compute_invariants_and_provenance(df_runs: pd.DataFrame, artifact_csv: Optio
         ftle_cap = ctl_q99 * margin if np.isfinite(ctl_q99) else np.nan
 
     inv = []
-    from typing import cast, Any
+    from typing import cast
 
     for key, g in df_runs.groupby(["seed", "factor"]):
         sd, fc = cast(tuple[Any, Any], key)
@@ -3518,7 +3517,7 @@ def make_plots(df, tr_like, tag, overlay_prefix="learned"):
     fig, ax = plt.subplots(figsize=(11, 0.6 * len(tr_like) + 2))
     rng = np.random.default_rng(123)
     y = 0
-    from typing import cast, Any
+    from typing import cast
 
     for key, sub in df.groupby(["seed", "factor"]):
         seed, factor = cast(tuple[Any, Any], key)
@@ -3564,7 +3563,7 @@ def make_plots(df, tr_like, tag, overlay_prefix="learned"):
 # ---------------------------
 def _ffill_scheduled(df_in: pd.DataFrame) -> pd.DataFrame:
     df = df_in.copy()
-    from typing import cast, Any
+    from typing import cast
 
     for key, g in df.groupby(["seed", "factor"]):
         seed, factor = cast(tuple[Any, Any], key)
@@ -3577,7 +3576,7 @@ def _ffill_scheduled(df_in: pd.DataFrame) -> pd.DataFrame:
 
 def _stationaryize_scheduled(df_in: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
     df = df_in.copy()
-    from typing import cast, Any
+    from typing import cast
 
     for key, g in df.groupby(["seed", "factor"]):
         seed, factor = cast(tuple[Any, Any], key)
@@ -4006,7 +4005,7 @@ def evaluate(df_all: pd.DataFrame, tag: str):
     # ---- Initial GT (t_c0/ctag0 with infinite cutoff) ----
     def add_gt(df_in):
         rows = []
-        from typing import cast, Any
+        from typing import cast
 
         for key, g in df_in.groupby(["seed", "factor"]):
             seed, factor = cast(tuple[Any, Any], key)
@@ -4039,7 +4038,7 @@ def evaluate(df_all: pd.DataFrame, tag: str):
                 df_empty["t_collapse_gt"] = []
             return df_empty
         rows = []
-        from typing import cast, Any
+        from typing import cast
 
         for key, g in df_in.groupby(["seed", "factor"]):
             seed, factor = cast(tuple[Any, Any], key)
@@ -4257,7 +4256,7 @@ def evaluate(df_all: pd.DataFrame, tag: str):
     fp_mask_list = []
     ep_list = []
     tc_soft_list = []
-    from typing import cast, Any
+    from typing import cast
 
     for key, g in df_cal_det.groupby(["seed", "factor"]):
         seed, factor = cast(tuple[Any, Any], key)
@@ -4382,7 +4381,7 @@ def evaluate(df_all: pd.DataFrame, tag: str):
     # Build calibration meta rows and raw feature matrix in deterministic (seed,factor,epoch) order
     meta_rows = []
     X_parts = []
-    from typing import cast, Any
+    from typing import cast
 
     for key, g in df_cal_det.groupby(["seed", "factor"]):
         sd, fc = cast(tuple[Any, Any], key)
@@ -4414,7 +4413,7 @@ def evaluate(df_all: pd.DataFrame, tag: str):
 
     # Precompute per-(seed,factor) collapse target for labeling positives
     gt_by_sf = {}
-    from typing import cast, Any
+    from typing import cast
 
     for key, g in df_cal_det.groupby(["seed", "factor"]):
         sd, fc = cast(tuple[Any, Any], key)
@@ -4505,7 +4504,7 @@ def evaluate(df_all: pd.DataFrame, tag: str):
 
     # ---- Apply learned detector to evaluation runs ----
     rows = []
-    from typing import cast, Any
+    from typing import cast
 
     for key, g in df_eval_det.groupby(["seed", "factor"]):
         seed, factor = cast(tuple[Any, Any], key)
@@ -4668,7 +4667,7 @@ def evaluate(df_all: pd.DataFrame, tag: str):
     rank_win = as_int(CFG.get("rank_win"), default=8)
 
     seq_rows = []
-    from typing import cast, Any
+    from typing import cast
 
     for key, g in df_eval_raw.groupby(["seed", "factor"]):
         seed, factor = cast(tuple[Any, Any], key)
@@ -4769,7 +4768,7 @@ def evaluate(df_all: pd.DataFrame, tag: str):
 
     # ---- NEWMA baseline on PH + non-scheduled spectral/FTLE channels ----
     newma_rows = []
-    from typing import cast, Any
+    from typing import cast
 
     for key, g in df_eval_raw.groupby(["seed", "factor"]):
         seed, factor = cast(tuple[Any, Any], key)
@@ -4858,7 +4857,7 @@ def evaluate(df_all: pd.DataFrame, tag: str):
 
     # ---- Gate-only baseline (uses per-epoch gate_warn) ----
     gate_rows = []
-    from typing import cast, Any
+    from typing import cast
 
     for key, g in df_eval_raw.groupby(["seed", "factor"]):
         seed, factor = cast(tuple[Any, Any], key)
