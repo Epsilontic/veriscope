@@ -3033,34 +3033,108 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
 # Direction calibration for PH & grad cutoff
 # ---------------------------
 def calibrate_grad_cutoff_per_factor(df_cal: pd.DataFrame) -> Dict[str, float]:
+    """\
+    Robust per-factor cutoff for gradient-explosion detection.
+
+    Goal: avoid pathological cutoffs when the calibration distribution has near-zero dispersion
+    (e.g., smoke runs) while still being conservative in production.
+
+    Policy:
+      - exclude epochs with nan_flag or non-finite grad_norm_rel
+      - restrict to post-warm epochs
+      - for runs without (preliminary) collapse, restrict to an early stable window (< warm + ph_win)
+      - for runs with (preliminary) collapse time t_collapse_gt, restrict to epochs < t_collapse_gt
+      - estimate cutoff as max(floor, median + K * 1.4826 * max(MAD, mad_abs_floor), q_upper)
+      - if too few samples, fall back to floor
+
+    Notes:
+      - This function is intended to be called on `df_cal_raw` after the initial GT pass
+        where `t_collapse_gt` is computed with `grad_cutoff=np.inf`, so the preliminary
+        collapse time is not itself driven by the grad cutoff being calibrated.
     """
-    Robust per-factor cutoff:
-        pass
-    - exclude epochs with NaN/inf flags
-    - for runs without collapse, restrict to early stable window to avoid tail inflation
-    - use median + 4·MAD (MAD scaled by 1.4826)
-    """
-    out = {}
+    out: Dict[str, float] = {}
+
     warm = as_int(CFG.get("warmup"), default=0) + as_int(CFG.get("ph_burn"), default=0)
     guard = warm + as_int(CFG.get("ph_win"), default=0)  # early stable window cap
+
+    # Calibration knobs (conservative defaults)
+    floor = as_float(CFG.get("gt_grad_cutoff_floor", 0.10), default=0.10)
+    K = as_float(CFG.get("gt_grad_cutoff_k_mad", 6.0), default=6.0)
+    q_upper = as_float(CFG.get("gt_grad_cutoff_q", 0.995), default=0.995)
+    mad_abs_floor = as_float(CFG.get("gt_grad_cutoff_mad_abs_floor", 0.002), default=0.002)
+    min_samples = as_int(CFG.get("gt_grad_cutoff_min_samples", 32), default=32)
+
+    # Sanity clamps
+    if not np.isfinite(floor) or floor <= 0:
+        floor = 0.10
+    if not np.isfinite(K) or K <= 0:
+        K = 6.0
+    if (not np.isfinite(q_upper)) or (q_upper <= 0.0) or (q_upper >= 1.0):
+        q_upper = 0.995
+    if (not np.isfinite(mad_abs_floor)) or (mad_abs_floor < 0.0):
+        mad_abs_floor = 0.002
+    if min_samples <= 0:
+        min_samples = 32
+
     for factor, gfac in df_cal.groupby("factor"):
-        vals = []
+        vals: List[float] = []
         for _, g in gfac.groupby(["seed", "factor"]):
             g = g.sort_values("epoch")
-            t_c = g["t_collapse_gt"].iloc[0] if "t_collapse_gt" in g.columns else np.nan
-            sub = g[(~g["nan_flag"].astype(bool)) & np.isfinite(g["grad_norm_rel"])]
+
+            ep = pd.to_numeric(g.get("epoch", pd.Series(dtype=float)), errors="coerce")
+            gr = pd.to_numeric(g.get("grad_norm_rel", pd.Series(dtype=float)), errors="coerce")
+            nf = g.get("nan_flag", pd.Series([0] * len(g))).fillna(0).astype(bool)
+
+            # preliminary collapse time (should be derived from grad_cutoff=np.inf pass)
+            t_c = np.nan
+            if "t_collapse_gt" in g.columns:
+                try:
+                    t_c = float(pd.to_numeric(g["t_collapse_gt"], errors="coerce").iloc[0])
+                except Exception:
+                    t_c = np.nan
+
+            sub = pd.DataFrame({"epoch": ep, "grad": gr, "nan": nf})
+            sub = sub[(~sub["nan"]) & np.isfinite(sub["grad"]) & np.isfinite(sub["epoch"])]
+            sub = sub[sub["epoch"] >= int(warm)]
+
             if pd.isna(t_c):
-                sub = sub[sub["epoch"] < guard]
+                # no preliminary collapse -> use early stable window
+                sub = sub[sub["epoch"] < int(guard)]
             else:
                 t_c_i = as_int(t_c, default=-1)
-                sub = sub[sub["epoch"] < t_c_i]
-            vals.extend(sub["grad_norm_rel"].tolist())
-        if vals:
-            med = float(np.median(vals))
-            mad = float(np.median(np.abs(np.array(vals) - med))) + 1e-9
-            out[str(factor)] = med + 4.0 * (1.4826 * mad)
-        else:
-            out[str(factor)] = np.inf
+                if t_c_i >= 0:
+                    sub = sub[sub["epoch"] < int(t_c_i)]
+
+            if len(sub) > 0:
+                vals.extend([float(x) for x in sub["grad"].to_list() if np.isfinite(x)])
+
+        # If insufficient data, fall back to a conservative floor (not inf)
+        if len(vals) < int(min_samples):
+            out[str(factor)] = float(floor)
+            continue
+
+        arr = np.asarray(vals, dtype=float)
+        arr = arr[np.isfinite(arr)]
+        if arr.size < int(min_samples):
+            out[str(factor)] = float(floor)
+            continue
+
+        med = float(np.median(arr))
+        mad = float(np.median(np.abs(arr - med)))
+        mad_eff = max(float(mad), float(mad_abs_floor))
+
+        est_mad = float(med + float(K) * 1.4826 * mad_eff)
+
+        # With small n, a fixed "0.999" is effectively "max"; adapt slightly.
+        q_eff = min(float(q_upper), 1.0 - (1.0 / float(arr.size)))
+        try:
+            est_q = float(np.quantile(arr, q_eff))
+        except Exception:
+            est_q = float(np.max(arr))
+
+        cutoff = max(float(floor), float(est_mad), float(est_q))
+        out[str(factor)] = float(cutoff)
+
     return out
 
 
@@ -4034,6 +4108,18 @@ def evaluate(df_all: pd.DataFrame, tag: str):
 
     # ---- Calibrate grad explosion cutoff per-factor from healthy epochs (robust) ----
     grad_cut_by_factor = calibrate_grad_cutoff_per_factor(df_cal_raw)
+    # --- HARDEN: never allow absurdly low or non-finite grad explosion cutoffs ---
+    _floor = as_float(CFG.get("gt_grad_cutoff_floor", 0.10), default=0.10)
+    if (not np.isfinite(_floor)) or (_floor <= 0):
+        _floor = 0.10
+    for _k in list(grad_cut_by_factor.keys()):
+        try:
+            _v = float(grad_cut_by_factor[_k])
+        except Exception:
+            grad_cut_by_factor[_k] = float(_floor)
+            continue
+        if (not np.isfinite(_v)) or (_v < float(_floor)):
+            grad_cut_by_factor[_k] = float(_floor)
     save_json(grad_cut_by_factor, OUTDIR / f"grad_cutoff_by_factor_{tag}.json")
 
     # ---- FINAL GT with per-factor cutoff ----
