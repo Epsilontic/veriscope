@@ -1513,6 +1513,53 @@ def safe_write_parquet(df: pd.DataFrame, path: Path):
                 pass
 
 
+def _epochwise_collapse_tag_gt(epochs: np.ndarray, t_gt: Optional[int], tag: str, warm_idx: int) -> np.ndarray:
+    """Return per-epoch GT tags in {'none','soft','hard'}.
+
+    Guardrails:
+    - pre-warm epochs are always 'none'
+    - if t_gt is None or tag not in {'soft','hard'}, all epochs are 'none'
+    - otherwise epochs >= t_gt and >= warm_idx take `tag`
+    """
+    ep = np.asarray(epochs, dtype=int)
+    out = np.full(ep.shape, "none", dtype=object)
+    if t_gt is None:
+        return out
+    if tag not in ("soft", "hard"):
+        return out
+    # tag turns on at/after collapse time, but never before warm
+    mask = (ep >= int(t_gt)) & (ep >= int(warm_idx))
+    out[mask] = tag
+    # hard guarantee
+    out[ep < int(warm_idx)] = "none"
+    return out
+
+
+def _runlevel_collapse_tag(df: pd.DataFrame, warm_idx: int) -> str:
+    """Reduce epochwise GT tags to a single run-level tag (hard > soft > none).
+
+    Preference is to consider post-warm epochs only when available.
+    """
+    if df is None or (not isinstance(df, pd.DataFrame)) or df.empty:
+        return "none"
+    if "collapse_tag_gt" not in df.columns:
+        return "none"
+
+    use = df
+    if "epoch" in df.columns:
+        ep = pd.to_numeric(df["epoch"], errors="coerce")
+        post = df[ep >= int(warm_idx)]
+        if not post.empty:
+            use = post
+
+    tags = {str(x) for x in use["collapse_tag_gt"].dropna().astype(str).unique().tolist()}
+    if "hard" in tags:
+        return "hard"
+    if "soft" in tags:
+        return "soft"
+    return "none"
+
+
 # --- Overlay writer: always emit both overlays (soft + hard) for scoring ---
 def _write_both_overlays(ov_all: pd.DataFrame, outdir: Path):
     """
@@ -2094,9 +2141,6 @@ def assign_factors_evenly(all_seeds: List[int]) -> Dict[int, Dict]:
 _DET_LOGGED = False
 
 
-# ---------------------------
-# One run
-# ---------------------------
 def _pick_ftle_batch(loader, seed: int, epoch: int):
     try:
         L = len(loader)
@@ -3968,8 +4012,13 @@ def evaluate(df_all: pd.DataFrame, tag: str):
             seed, factor = cast(tuple[Any, Any], key)
             g = g.sort_values("epoch").copy()
             t_c0, ctag0 = gt_collapse_time(g, grad_cutoff=np.inf)
-            g["t_collapse_gt"] = t_c0
-            g["collapse_tag_gt"] = ctag0
+
+            # Keep t_collapse_gt numeric; NaN denotes “no collapse”
+            g["t_collapse_gt"] = np.nan if t_c0 is None else int(t_c0)
+
+            # Epochwise tag: 'none' until collapse (post-warm), then 'soft'/'hard'
+            ep = pd.to_numeric(g["epoch"], errors="coerce").fillna(-1).to_numpy(dtype=np.int64)
+            g["collapse_tag_gt"] = _epochwise_collapse_tag_gt(ep, t_c0, str(ctag0), int(warm_idx))
             rows.append(g)
         return pd.concat(rows, ignore_index=True) if rows else df_in
 
@@ -3997,8 +4046,13 @@ def evaluate(df_all: pd.DataFrame, tag: str):
             g = g.sort_values("epoch").copy()
             cutoff = grad_cut_by_factor.get(str(factor), np.inf)
             t_c, ctag = gt_collapse_time(g, grad_cutoff=cutoff)
-            g["t_collapse_gt"] = t_c
-            g["collapse_tag_gt"] = ctag
+
+            # Keep t_collapse_gt numeric; NaN denotes “no collapse”
+            g["t_collapse_gt"] = np.nan if t_c is None else int(t_c)
+
+            # Epochwise tag: 'none' until collapse (post-warm), then 'soft'/'hard'
+            ep = pd.to_numeric(g["epoch"], errors="coerce").fillna(-1).to_numpy(dtype=np.int64)
+            g["collapse_tag_gt"] = _epochwise_collapse_tag_gt(ep, t_c, str(ctag), int(warm_idx))
             rows.append(g)
         return pd.concat(rows, ignore_index=True) if rows else df_in
 
