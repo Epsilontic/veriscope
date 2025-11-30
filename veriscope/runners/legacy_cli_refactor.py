@@ -579,18 +579,8 @@ def calibrate_window_from_controls(
     epsilon: float,
     interventions: tuple,
 ) -> WindowDecl:
-    # Normalize factor column and guard empty
-    try:
-        if "factor" in df_control.columns:
-            df_control = df_control.copy()
-            df_control["factor"] = df_control["factor"].astype(str).str.lower().str.strip()
-    except Exception:
-        pass
+    # Guard empty
     if df_control is None or len(df_control) == 0:
-        try:
-            print(f"[WARN] calibrate_window_from_controls: df_control empty; using defaults with epsilon={epsilon}")
-        except Exception:
-            pass
         cal_ranges = {m: (0.0, 1.0) for m in metrics}
         return WindowDecl(
             epsilon=epsilon,
@@ -600,24 +590,53 @@ def calibrate_window_from_controls(
             interventions=interventions,
             cal_ranges=cal_ranges,
         )
-    """Predeclare Φ_W from factor=='none' controls after warm; freeze transport ranges per metric."""
-    cal_ranges = {}
+
+    cal_ranges: Dict[str, Tuple[float, float]] = {}
     for m in metrics:
+        lo, hi = 0.0, 1.0
         if m in df_control.columns:
-            col = to_numeric_opt(df_control.get(m))
-            arr = _as_float_array(col.to_numpy())
-            if arr.size >= 16:
-                lo = float(pct_linear(arr, 1.0))
-                hi = float(pct_linear(arr, 99.0))
-            else:
-                lo, hi = (0.0, 1.0)
-        else:
-            lo, hi = (0.0, 1.0)
+            arr = pd.to_numeric(df_control[m], errors="coerce").to_numpy(dtype=float)
+            arr = arr[np.isfinite(arr)]
+            if arr.size >= 4:
+                lo = float(np.quantile(arr, 0.01))
+                hi = float(np.quantile(arr, 0.99))
+            elif arr.size > 0:
+                lo = float(np.min(arr))
+                hi = float(np.max(arr))
+
+            if np.isfinite(lo) and np.isfinite(hi):
+                if hi <= lo + 1e-12:
+                    # width floor: 5% of scale or 1e-2, whichever larger
+                    scale = max(abs(lo), abs(hi), 1.0)
+                    w = max(0.05 * scale, 1e-2)
+                    lo, hi = lo - 0.5 * w, hi + 0.5 * w
+                else:
+                    # padding
+                    pad = 0.05 * (hi - lo)
+                    lo, hi = lo - pad, hi + pad
+
+        # Nonnegativity for these metrics in your pipeline
+        lo = max(0.0, float(lo))
+        hi = max(lo + 1e-9, float(hi)) if np.isfinite(hi) else 1.0
+
+        # Final sanity fallback
         if not (np.isfinite(lo) and np.isfinite(hi) and hi > lo):
             lo, hi = (0.0, 1.0)
+
         cal_ranges[m] = (lo, hi)
+
+    try:
+        print(f"[cal] calibrate_window_from_controls: cal_ranges={cal_ranges}")
+    except Exception:
+        pass
+
     return WindowDecl(
-        epsilon=epsilon, metrics=metrics, weights=weights, bins=bins, interventions=interventions, cal_ranges=cal_ranges
+        epsilon=epsilon,
+        metrics=metrics,
+        weights=weights,
+        bins=bins,
+        interventions=interventions,
+        cal_ranges=cal_ranges,
     )
 
 
@@ -638,7 +657,12 @@ def calibrate_epsilon_from_controls(
 ) -> Tuple[float, int]:
     """
     Returns (epsilon, n_vals). Falls back to CFG['gate_epsilon'] on empty or invalid input.
+    Always enforces CFG['gate_epsilon_floor'] as a lower bound.
     """
+    eps_floor = as_float(CFG.get("gate_epsilon_floor", 0.02), default=0.02)
+    if (not np.isfinite(eps_floor)) or (eps_floor < 0.0):
+        eps_floor = 0.02
+
     vals: List[float] = []
     try:
         if "factor" in df_control.columns:
@@ -681,7 +705,9 @@ def calibrate_epsilon_from_controls(
             )
         except Exception:
             pass
-        return float(_effective_gate_epsilon(CFG, OUTDIR)), 0
+        fallback = float(_effective_gate_epsilon(CFG, OUTDIR))
+        return max(fallback, float(eps_floor)), 0
+
     if not vals:
         try:
             print(
@@ -689,9 +715,20 @@ def calibrate_epsilon_from_controls(
             )
         except Exception:
             pass
-        return float(_effective_gate_epsilon(CFG, OUTDIR)), 0
+        fallback = float(_effective_gate_epsilon(CFG, OUTDIR))
+        return max(fallback, float(eps_floor)), 0
+
     eps_new, n_vals = _robust_eps(vals, q=float(q), CFG=CFG, out_dir=OUTDIR)
-    return float(eps_new), int(n_vals)
+
+    eps_raw = float(eps_new)
+    eps_clamped = max(eps_raw, float(eps_floor))
+    if int(n_vals) > 0 and eps_clamped == float(eps_floor) and eps_raw < float(eps_floor):
+        try:
+            print(f"[cal] gate_epsilon clamped to floor={eps_floor:.4f} (raw={eps_raw:.6f})")
+        except Exception:
+            pass
+
+    return float(eps_clamped), int(n_vals)
 
 
 def gate_check(
@@ -1156,6 +1193,7 @@ CFG.setdefault("ripser_run_budget_ms", CFG.get("total_heavy_budget_ms", 180_000)
 CFG.setdefault("gate_window", 16)
 CFG.setdefault("gate_bins", 16)
 CFG.setdefault("gate_epsilon", 0.08)
+CFG.setdefault("gate_epsilon_floor", 0.02)  # prevent degenerate ε=0 on small samples
 CFG.setdefault("gate_eps_stat_max_frac", 0.25)
 CFG.setdefault("gate_gain_thresh", 0.05)  # bits per sample (calibrated against controls)
 CFG.setdefault("gate_epsilon_sens", 0.04)  # dedicated κ_sens budget
@@ -1359,6 +1397,7 @@ def write_calibration_capsule(outdir: Path, cal: dict, src_path: Optional[str], 
             "gate_window": as_int(CFG.get("gate_window", 16), default=16),
             "gate_bins": as_int(CFG.get("gate_bins", 16), default=16),
             "gate_epsilon": as_float(CFG.get("gate_epsilon", 0.08), default=0.08),
+            "gate_epsilon_floor": as_float(CFG.get("gate_epsilon_floor", 0.02), default=0.02),
             "gate_eps_stat_max_frac": as_float(CFG.get("gate_eps_stat_max_frac", 0.25), default=0.25),
             "gate_epsilon_sens": as_float(CFG.get("gate_epsilon_sens", 0.04), default=0.04),
             "gate_eps_stat_alpha": as_float(CFG.get("gate_eps_stat_alpha", 0.05), default=0.05),
@@ -1442,6 +1481,7 @@ try:
                 "gate_window": as_int_cfg(CFG.get("gate_window", 16), default=16),
                 "gate_bins": as_int_cfg(CFG.get("gate_bins", 16), default=16),
                 "gate_epsilon": as_float(CFG.get("gate_epsilon", 0.08), default=0.08),
+                "gate_epsilon_floor": as_float(CFG.get("gate_epsilon_floor", 0.02), default=0.02),
                 "gate_eps_stat_max_frac": as_float(CFG.get("gate_eps_stat_max_frac", 0.25), default=0.25),
                 "gate_epsilon_sens": as_float(CFG.get("gate_epsilon_sens", 0.04), default=0.04),
                 "gate_eps_stat_alpha": as_float(CFG.get("gate_eps_stat_alpha", 0.05), default=0.05),
@@ -4034,11 +4074,19 @@ def evaluate(df_all: pd.DataFrame, tag: str):
         try:
             _W = as_int(CFG.get("gate_window", 16), default=16)
             eps_new, n_vals = calibrate_epsilon_from_controls(df_control, window_decl, W=_W, q=0.995)
-            if n_vals > 0:
-                CFG["gate_epsilon"] = float(eps_new)
-                window_decl.epsilon = float(eps_new)
-                if mp.current_process().name == "MainProcess":
-                    print(f"[cal] gate_epsilon calibrated: {CFG['gate_epsilon']:.6f} from {n_vals} TV samples")
+
+            eps_floor = as_float(CFG.get("gate_epsilon_floor", 0.02), default=0.02)
+            if (not np.isfinite(eps_floor)) or (eps_floor < 0.0):
+                eps_floor = 0.02
+            eps_new = max(float(eps_new), float(eps_floor))
+
+            CFG["gate_epsilon"] = float(eps_new)
+            window_decl.epsilon = float(eps_new)
+
+            if mp.current_process().name == "MainProcess":
+                print(
+                    f"[cal] gate_epsilon set: {CFG['gate_epsilon']:.6f} from {int(n_vals)} TV samples (floor={eps_floor:.4f})"
+                )
         except Exception:
             pass
         # Persist for future sweeps and install for any downstream checks in this process
