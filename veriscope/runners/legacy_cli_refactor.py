@@ -1257,7 +1257,7 @@ CFG_SMOKE = dict(
     detector_horizon=3,
     # smoke GT knobs (faster confirmation / less aggressive collapse tagging)
     gt_rank_min=12.0,
-    gt_patience=1,
+    gt_patience=2,
     # keep smoke fast
     gate_early_exit=True,
 )
