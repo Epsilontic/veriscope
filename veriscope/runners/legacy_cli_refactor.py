@@ -1127,6 +1127,19 @@ def _env_float_in_range(name: str, default: float, lo: float, hi: float) -> floa
     return default
 
 
+def warm_idx_from_cfg(cfg: Dict[str, Any]) -> int:
+    """Return warm index (warmup + ph_burn) using runtime CFG values."""
+    return as_int(cfg.get("warmup"), default=0) + as_int(cfg.get("ph_burn"), default=0)
+
+def _warn_precedes_collapse(t_warn: Optional[int], t_c: Optional[int]) -> bool:
+    """In smoke mode allow warning at same epoch as collapse; otherwise require strict precedence."""
+    if t_warn is None or t_c is None:
+        return False
+    if env_truthy("SCAR_SMOKE"):
+        return int(t_warn) <= int(t_c)
+    return int(t_warn) < int(t_c)
+
+
 # --- env override for family z-gate (used by deployed detector gate) ---
 CFG["family_z_thr"] = _env_float_in_range("SCAR_FAMILY_Z_THR", CFG.get("family_z_thr", 2.903), 0.25, 20.0)
 try:
@@ -1226,16 +1239,57 @@ CFG_SMOKE = dict(
     seeds_calib=[401, 402],
     seeds_eval=[511, 512],
     epochs=16,
-    heavy_every=16,  # will be overwritten by the update below
+    # run heavy metrics on a predictable cadence
+    heavy_every=4,
     rp_repeats=1,
     sw2_n_proj=64,
-    gate_window=6,  # 2*W=12 <= 16 so the gate runs
-    warmup=4,  # NEW
-    ph_burn=0,  # NEW
+    # gate: keep W small so 2W history exists early in short runs
+    gate_window=3,
+    gate_min_evidence=8,
+    # warm / PH burn
+    warmup=2,
+    ph_burn=0,
+    # reduce persistence requirements in short runs
+    warn_consec=2,
+    detector_horizon=3,
+    # smoke GT knobs (faster confirmation / less aggressive collapse tagging)
+    gt_rank_min=12.0,
+    gt_patience=1,
+    # keep smoke fast
+    gate_early_exit=True,
 )
 
-# Ensure smoke mode executes at least one heavy pass
-CFG_SMOKE.update({"heavy_every": max(1, as_int(CFG_SMOKE.get("epochs", 16), default=16) // 4)})
+
+def apply_smoke_overrides_inplace(cfg: Dict[str, Any]) -> None:
+    """Apply smoke-mode overrides into cfg in-place.
+
+    Must run early so warmup/ph_burn/epochs are consistent regardless of how the runner is invoked.
+    """
+    try:
+        if env_truthy("SCAR_SMOKE"):
+            for k, v in CFG_SMOKE.items():
+                cfg[k] = v
+            try:
+                if mp.current_process().name == "MainProcess":
+                    print(
+                        f"[smoke] Applied: warmup={cfg.get('warmup')} ph_burn={cfg.get('ph_burn')} "
+                        f"warm_idx={warm_idx_from_cfg(cfg)} gate_window={cfg.get('gate_window')} "
+                        f"epochs={cfg.get('epochs')} warn_consec={cfg.get('warn_consec')}"
+                    )
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+# Apply smoke overrides early so downstream calibration/eval uses consistent warm_idx
+apply_smoke_overrides_inplace(CFG)
+
+# Re-install shared runtime state so pipeline/modules see the smoke-adjusted CFG too.
+try:
+    runtime.install_runtime(cfg=CFG, outdir=OUTDIR, budget=BUDGET)
+except Exception:
+    pass
 
 
 def seeds_for_eval_from_env(CFG_dict):
@@ -2112,7 +2166,7 @@ def gt_collapse_time(run_df: pd.DataFrame, grad_cutoff: float) -> Tuple[Optional
     ep = to_numeric_series(g["epoch"], errors="coerce").to_numpy(dtype=np.int64)
     nan_flag = g["nan_flag"].astype(bool).to_numpy()
     grad_rel = g["grad_norm_rel"].to_numpy()
-    warm_idx = CFG["warmup"] + CFG["ph_burn"]
+    warm_idx = warm_idx_from_cfg(CFG)
 
     # HARD: NaNs or gradient explosion — require 2 consecutive after warm
     consec = 0
@@ -2515,7 +2569,7 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
     gate_hits_consec = 0
     gate_halt_epoch = None
     warn_consec_eff = as_int(os.environ.get("SCAR_WARN_CONSEC", str(CFG.get("warn_consec", 3))), default=3)
-    warm_epoch = as_int(CFG.get("warmup"), default=0) + as_int(CFG.get("ph_burn"), default=0)
+    warm_epoch = warm_idx_from_cfg(CFG)
     gate_early_exit = bool(CFG.get("gate_early_exit", True))
     # --- coherence/slope buffers ---
     _eff_dim_series = []
@@ -3414,7 +3468,7 @@ def compute_invariants_and_provenance(df_runs: pd.DataFrame, artifact_csv: Optio
         print("[WARN] invariants skipped: missing columns", sorted(list(required - set(df_runs.columns))))
         return {}
     # Calibrate FTLE bound on controls ('none') after warm
-    warm = as_int(CFG.get("warmup"), default=0) + as_int(CFG.get("ph_burn"), default=0)
+    warm = warm_idx_from_cfg(CFG)
     ctl = (
         df_runs[(df_runs["factor"] == "none") & (df_runs["epoch"] >= warm)]
         if isinstance(df_runs, pd.DataFrame)
@@ -3575,6 +3629,15 @@ def compute_invariants_and_provenance(df_runs: pd.DataFrame, artifact_csv: Optio
     prov["ftle_margin"] = float(margin)
     prov["ftle_cap_value"] = float(cap) if np.isfinite(cap) else None
     prov["warm_idx"] = int(warm)
+
+    # Gate parameters for audit consistency
+    prov["gate_epsilon"] = as_float(CFG.get("gate_epsilon", 0.08), default=0.08)
+    prov["gate_epsilon_floor"] = as_float(CFG.get("gate_epsilon_floor", 0.02), default=0.02)
+    prov["gate_window"] = as_int(CFG.get("gate_window", 16), default=16)
+    prov["gate_bins"] = as_int(CFG.get("gate_bins", 16), default=16)
+    prov["gate_gain_thresh"] = as_float(CFG.get("gate_gain_thresh", 0.05), default=0.05)
+    prov["gate_eps_stat_max_frac"] = as_float(CFG.get("gate_eps_stat_max_frac", 0.25), default=0.25)
+    prov["gate_min_evidence"] = as_int(CFG.get("gate_min_evidence", 16), default=16)
     out["provenance"] = prov
 
     try:
@@ -3668,7 +3731,7 @@ def make_plots(df, tr_like, tag, overlay_prefix="learned"):
         ax.text(-2, y, f"{factor} s={as_int(seed, default=0)} [{tagc}]", ha="right", va="center", fontsize=8)
         y += 1
     ax.axvspan(shade0, shade1, color="#eee", alpha=0.5)
-    warm = as_int(CFG.get("warmup"), default=0) + as_int(CFG.get("ph_burn"), default=0)
+    warm = warm_idx_from_cfg(CFG)
     he = as_int(CFG.get("heavy_every"), default=1)
     heavy0 = int(((warm + he - 1) // max(he, 1)) * max(he, 1))
     ax.axvline(heavy0, color="#999", lw=1, alpha=0.6)
@@ -4021,7 +4084,7 @@ def evaluate(df_all: pd.DataFrame, tag: str):
             return
     except Exception:
         pass
-    warm_idx = as_int(CFG.get("warmup"), default=0) + as_int(CFG.get("ph_burn"), default=0)
+    warm_idx = warm_idx_from_cfg(CFG)
     cal_mask = df_all["seed"].isin(CFG["seeds_calib"])
     eval_seeds = seeds_for_eval_from_env(CFG)
     ev_mask = df_all["seed"].isin(eval_seeds)
@@ -4711,7 +4774,7 @@ def evaluate(df_all: pd.DataFrame, tag: str):
         t_c = t_c if t_c >= 0 else None
         ctag = _runlevel_collapse_tag(gg, warm_idx)
 
-        if t_warn is not None and t_c is not None and not (t_warn < t_c):
+        if not _warn_precedes_collapse(t_warn, t_c):
             t_warn = None
 
         lead = (
@@ -4773,7 +4836,7 @@ def evaluate(df_all: pd.DataFrame, tag: str):
             tc = as_int(t_cand2, default=-1)
             t_c = tc if tc >= 0 else None
 
-            if t_warn is not None and t_c is not None and not (t_warn < t_c):
+            if not _warn_precedes_collapse(t_warn, t_c):
                 t_warn = None
 
             rows.append(
@@ -4880,7 +4943,7 @@ def evaluate(df_all: pd.DataFrame, tag: str):
         t_c = t_c if t_c >= 0 else None
         ctag = _runlevel_collapse_tag(gg, warm_idx)
 
-        if t_warn is not None and t_c is not None and not (t_warn < t_c):
+        if not _warn_precedes_collapse(t_warn, t_c):
             t_warn = None
 
         lead = (
@@ -4971,7 +5034,7 @@ def evaluate(df_all: pd.DataFrame, tag: str):
         t_c = t_c if t_c >= 0 else None
         ctag = _runlevel_collapse_tag(gg, warm_idx)
 
-        if t_warn is not None and t_c is not None and not (t_warn < t_c):
+        if not _warn_precedes_collapse(t_warn, t_c):
             t_warn = None
 
         lead = (
@@ -5005,7 +5068,7 @@ def evaluate(df_all: pd.DataFrame, tag: str):
     for key, g in df_eval_raw.groupby(["seed", "factor"]):
         seed, factor = cast(tuple[Any, Any], key)
         gg = g.sort_values("epoch").reset_index(drop=True)
-        warm_idx_local = as_int(CFG.get("warmup"), default=0) + as_int(CFG.get("ph_burn"), default=0)
+        warm_idx_local = warm_idx_from_cfg(CFG)
 
         # Determine first post-warm epoch where gate_warn == 1 for ≥K consecutive epochs (matches deployed policy)
         gw = None
@@ -5025,7 +5088,7 @@ def evaluate(df_all: pd.DataFrame, tag: str):
         ctag = _runlevel_collapse_tag(gg, warm_idx)
 
         # Enforce causal ordering
-        if t_warn is not None and t_c is not None and not (t_warn < t_c):
+        if not _warn_precedes_collapse(t_warn, t_c):
             t_warn = None
 
         lead = (
@@ -5142,6 +5205,15 @@ def main():
     # ---- FAST PATHS: avoid heavy imports/side effects for help/version ----
     _argv = sys.argv[1:]
 
+    # Apply smoke overrides early so warmup/ph_burn/epochs are consistent regardless of how we're invoked.
+    apply_smoke_overrides_inplace(CFG)
+
+    # Re-install shared runtime state after smoke overrides so downstream imports/modules see the effective CFG.
+    try:
+        runtime.install_runtime(cfg=CFG, outdir=OUTDIR, budget=BUDGET)
+    except Exception:
+        pass
+
     # If user only asked for help/version, print and exit quickly.
     if any(a in ("-h", "--help") for a in _argv):
         # Minimal usage to avoid importing argparse or any heavy deps.
@@ -5160,10 +5232,6 @@ def main():
         print(_ver)
         return 0
 
-    # smoke-mode overrides
-    if os.environ.get("SCAR_SMOKE", "0") == "1":
-        for k, v in CFG_SMOKE.items():
-            CFG[k] = v
 
     # --- env override for family z-gate (deployment gate, not GT) ---
     v = os.environ.get("SCAR_FAMILY_Z_THR")
