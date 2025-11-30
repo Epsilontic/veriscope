@@ -1131,6 +1131,7 @@ def warm_idx_from_cfg(cfg: Dict[str, Any]) -> int:
     """Return warm index (warmup + ph_burn) using runtime CFG values."""
     return as_int(cfg.get("warmup"), default=0) + as_int(cfg.get("ph_burn"), default=0)
 
+
 def _warn_precedes_collapse(t_warn: Optional[int], t_c: Optional[int]) -> bool:
     """In smoke mode allow warning at same epoch as collapse; otherwise require strict precedence."""
     if t_warn is None or t_c is None:
@@ -1249,6 +1250,8 @@ CFG_SMOKE = dict(
     # warm / PH burn
     warmup=2,
     ph_burn=0,
+    # delay pathological factors so gate can build history
+    factor_start_epoch=8,
     # reduce persistence requirements in short runs
     warn_consec=2,
     detector_horizon=3,
@@ -1269,12 +1272,26 @@ def apply_smoke_overrides_inplace(cfg: Dict[str, Any]) -> None:
         if env_truthy("SCAR_SMOKE"):
             for k, v in CFG_SMOKE.items():
                 cfg[k] = v
+            # Ensure pathological factors start after a healthy prefix in smoke mode
+            try:
+                factor_start = as_int(cfg.get("factor_start_epoch", 8), default=8)
+                facs = cfg.get("factors", [])
+                if isinstance(facs, list):
+                    for f in facs:
+                        if not isinstance(f, dict):
+                            continue
+                        nm = str(f.get("name", "")).lower().strip()
+                        if nm and nm not in ("none", "none_safe"):
+                            f.setdefault("factor_start_epoch", factor_start)
+            except Exception:
+                pass
             try:
                 if mp.current_process().name == "MainProcess":
                     print(
                         f"[smoke] Applied: warmup={cfg.get('warmup')} ph_burn={cfg.get('ph_burn')} "
                         f"warm_idx={warm_idx_from_cfg(cfg)} gate_window={cfg.get('gate_window')} "
-                        f"epochs={cfg.get('epochs')} warn_consec={cfg.get('warn_consec')}"
+                        f"epochs={cfg.get('epochs')} warn_consec={cfg.get('warn_consec')} "
+                        f"factor_start_epoch={cfg.get('factor_start_epoch')}"
                     )
             except Exception:
                 pass
@@ -5231,7 +5248,6 @@ def main():
             _ver = "unknown"
         print(_ver)
         return 0
-
 
     # --- env override for family z-gate (deployment gate, not GT) ---
     v = os.environ.get("SCAR_FAMILY_Z_THR")
