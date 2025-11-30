@@ -484,6 +484,12 @@ class FactorisedTrainDataset(Dataset):
         orig = np.array(base.targets, dtype=np.int64)[np.array(self.indices, dtype=np.int64)]
         self.factor = factor
         self.seed = seed
+        # NEW: epoch-gating state (default: active immediately)
+        try:
+            self.factor_start_epoch = int(factor.get("factor_start_epoch", 0))
+        except Exception:
+            self.factor_start_epoch = 0
+        self.orig_labels = orig.copy()
         self.labels = apply_factor_to_labels(orig, factor, seed)
         self.drop_cfg: Optional[_DropCfg] = None
         if factor["name"] == "class_dropout_window":
@@ -502,6 +508,16 @@ class FactorisedTrainDataset(Dataset):
             }
             self.drop_cfg = dc
         self._epoch: int = 0
+
+    def _factor_active(self) -> bool:
+        """Return True iff the run's factor/pathology is active at the current epoch.
+
+        Fail-open to avoid breaking full runs if something odd happens.
+        """
+        try:
+            return int(self._epoch) >= int(self.factor_start_epoch)
+        except Exception:
+            return True
 
     def set_epoch(self, epoch: int):
         self._epoch = int(epoch)
@@ -524,6 +540,14 @@ class FactorisedTrainDataset(Dataset):
     def __getitem__(self, i):
         idx = self.indices[i]
         x, _ = self.base[idx]
+
+        # NEW: epoch gating for input-space corruptions and label factors.
+        # Do NOT gate class_dropout_window here; the sampler/dropout policy
+        # is already epoch-scoped via should_drop().
+        if self.factor.get("name") != "class_dropout_window":
+            if not self._factor_active():
+                return x, int(self.orig_labels[i])
+
         x = maybe_corrupt_input(x, self.factor, self.seed, self._epoch, idx)
         return x, int(self.labels[i])
 
