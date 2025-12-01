@@ -3047,16 +3047,29 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
         gate_total_evidence = 0
         gate_reason = "not_evaluated"
         gate_counts_json = ""
+        gate_exc = ""
         gate_epsilon_eff = as_float(
             getattr(WINDOW_DECL, "epsilon", CFG.get("gate_epsilon", 0.08)),
             default=as_float(CFG.get("gate_epsilon", 0.08), default=0.08),
         )
         gate_gain_thresh_eff = as_float(CFG.get("gate_gain_thresh", 0.1), default=0.1)
 
-        try:
-            W_gate = as_int(CFG.get("gate_window", 16), default=16)
-            if (WINDOW_DECL is not None) and (len(logs) >= 2 * W_gate):
-                recent = logs[-(2 * W_gate) :]
+        W_gate = as_int(CFG.get("gate_window", 16), default=16)
+
+        # Explicit non-eval reasons (avoid silent fallthrough / swallowed exceptions)
+        if WINDOW_DECL is None:
+            gate_reason = "no_window_decl"
+            gate_warn = 0
+            gate_total_evidence = 0
+            gate_counts_json = ""
+        elif len(logs) < 2 * int(W_gate):
+            gate_reason = "insufficient_history"
+            gate_warn = 0
+            gate_total_evidence = 0
+            gate_counts_json = ""
+        else:
+            try:
+                recent = logs[-(2 * int(W_gate)) :]
 
                 def _series(seg, key):
                     v = np.array([float(r.get(key, np.nan)) for r in seg], dtype=float)
@@ -3066,8 +3079,8 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
                 _metrics_raw = getattr(WINDOW_DECL, "metrics", tuple(getattr(WINDOW_DECL, "weights", {}).keys()))
                 metrics_for_tv = tuple(str(m) for m in _metrics_raw)
 
-                past_dict_all = {m: _series(recent[:W_gate], m) for m in metrics_for_tv}
-                recent_dict_all = {m: _series(recent[W_gate:], m) for m in metrics_for_tv}
+                past_dict_all = {m: _series(recent[: int(W_gate)], m) for m in metrics_for_tv}
+                recent_dict_all = {m: _series(recent[int(W_gate) :], m) for m in metrics_for_tv}
 
                 # counts under the declaration’s common transport adapter
                 _adapter = getattr(WINDOW_DECL, "_DECL_TRANSPORT", None)
@@ -3094,8 +3107,8 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
                     gate_counts_json = ""
 
                 # prequential gain (bits/sample) over the recent half
-                ml = _series(recent[W_gate:], "train_loss")
-                bl = _series(recent[W_gate:], "ewma_loss")
+                ml = _series(recent[int(W_gate) :], "train_loss")
+                bl = _series(recent[int(W_gate) :], "ewma_loss")
                 n = min(ml.size, bl.size)
                 if n > 0:
                     gain_nats = float((bl[:n] - ml[:n]).mean())
@@ -3133,23 +3146,28 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
                     kappa_sens=(gate_kappa if np.isfinite(gate_kappa) else 0.0),
                     eps_stat_alpha=float(CFG.get("gate_eps_stat_alpha", 0.05)),
                 )
-                # Persist the reason for the gate audit
-                gate_reason = str((audit or {}).get("reason", ""))
+
+                gate_warn = int(flag)
+                audit = audit or {}
+                gate_reason = str(audit.get("reason", "evaluated_unknown")) or "evaluated_unknown"
+
                 # --- Gate diagnostics for offline analysis ---
                 gate_epsilon_eff = as_float(
                     getattr(WINDOW_DECL, "epsilon", CFG.get("gate_epsilon", 0.08)),
                     default=as_float(CFG.get("gate_epsilon", 0.08), default=0.08),
                 )
-                gate_worst_tv = as_float((audit or {}).get("worst_tv", np.nan), default=float("nan"))
-                gate_eps_stat = as_float((audit or {}).get("eps_stat", np.nan), default=float("nan"))
-                gate_gain = as_float((audit or {}).get("gain_bits", np.nan), default=float("nan"))
-                gate_kappa = as_float((audit or {}).get("kappa_sens", np.nan), default=float("nan"))
-                gate_warn = int(flag)
+                gate_worst_tv = as_float(audit.get("worst_tv", np.nan), default=float("nan"))
+                gate_eps_stat = as_float(audit.get("eps_stat", np.nan), default=float("nan"))
+                gate_gain = as_float(audit.get("gain_bits", gate_gain), default=float("nan"))
+                gate_kappa = as_float(audit.get("kappa_sens", gate_kappa), default=float("nan"))
+
                 # effective parameters actually used for this check
                 gate_gain_thresh_eff = as_float(CFG.get("gate_gain_thresh", 0.1), default=0.1)
-        except Exception:
-            # keep defaults on any failure path
-            pass
+
+            except Exception as e:
+                gate_exc = repr(e)
+                gate_reason = "evaluated_exception"
+                gate_warn = 0
 
         logs.append(
             dict(
@@ -3241,6 +3259,7 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
                 gate_total_evidence=int(gate_total_evidence),
                 gate_reason=str(gate_reason),
                 gate_counts=str(gate_counts_json),
+                gate_exc=str(gate_exc),
             )
         )
         # hard-stop training when the finite-window gate warns for k consecutive epochs (after warm)
