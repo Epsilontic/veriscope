@@ -17,7 +17,9 @@ from veriscope.core.calibration import aggregate_epsilon_stat
 
 # ---- Epsilon aggregation hook ------------------------------------------------
 
-AggFn = Callable[[WindowDecl, Dict[str, int], float], float]
+# NOTE: resolve_eps is the contract boundary and may accept keyword-only args;
+# keep this alias permissive to avoid false mypy failures across adapters.
+AggFn = Callable[..., float]
 AGGREGATE_EPSILON: Optional[AggFn] = None
 
 ENV: Mapping[str, str] = os.environ
@@ -30,15 +32,42 @@ def _env_to_dict(e: Optional[Mapping[str, str]]) -> Dict[str, str]:
     return dict(e)
 
 
-def resolve_eps(window: WindowDecl, counts: Dict[str, int], alpha: float = 0.05) -> float:
+def resolve_eps(
+    window: WindowDecl,
+    counts: Optional[Dict[str, int]] = None,
+    *,
+    counts_by_metric: Optional[Dict[str, int]] = None,
+    alpha: float = 0.05,
+    **_ignored: Any,
+) -> float:
     """
     Resolve an effective epsilon_stat value from Φ_W and per-metric counts.
 
-    Uses a module-level hook AGGREGATE_EPSILON if set; otherwise falls back
-    to veriscope.core.calibration.aggregate_epsilon_stat.
+    Contract boundary:
+      - Callers may pass counts either positionally (legacy) or via the
+        keyword `counts_by_metric` (newer callers).
+      - Uses a module-level hook AGGREGATE_EPSILON if set; otherwise falls back
+        to veriscope.core.calibration.aggregate_epsilon_stat.
+
+    Returns 0.0 on failure.
     """
+    c = counts_by_metric if counts_by_metric is not None else (counts or {})
     fn = AGGREGATE_EPSILON or aggregate_epsilon_stat
-    return float(fn(window, counts, alpha))
+
+    try:
+        out = fn(window, c, float(alpha))
+        out_f = float(out)
+        return out_f if np.isfinite(out_f) and out_f >= 0.0 else 0.0
+    except TypeError:
+        # Tolerate hook/core signature drift (kw-only implementations).
+        try:
+            out = fn(window, counts_by_metric=c, alpha=float(alpha))
+            out_f = float(out)
+            return out_f if np.isfinite(out_f) and out_f >= 0.0 else 0.0
+        except Exception:
+            return 0.0
+    except Exception:
+        return 0.0
 
 
 def env_truthy(name: str, default: str = "0") -> bool:
@@ -128,7 +157,6 @@ def gate_step_fr(
     gate_window: int,
     metrics_cols: Iterable[str],
     window_decl: WindowDecl,
-    eps_agg_fn: AggFn,
     gate_gain: float,
     gate_kappa: float,
 ) -> Dict[str, float]:
@@ -173,7 +201,8 @@ def gate_step_fr(
     max_frac = float(getattr(ge, "eps_stat_max_frac", 0.25))
 
     try:
-        eps_stat_value = float(eps_agg_fn(window_decl, counts_by_metric, alpha))
+        # Route ε_stat through the stable adapter (contract boundary).
+        eps_stat_value = float(resolve_eps(window_decl, counts_by_metric=counts_by_metric, alpha=alpha))
     except Exception:
         eps_stat_value = 0.0
 
