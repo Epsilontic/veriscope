@@ -194,19 +194,61 @@ try:
     from veriscope.core.gate import GateEngine
     from veriscope.core.transport import DeclTransport
     from veriscope.core.window import FRWindow, WindowDecl
-    from veriscope.core.calibration import aggregate_epsilon_stat as agg_eps
+    from veriscope.core.calibration import aggregate_epsilon_stat as _core_aggregate_epsilon_stat
 except Exception:
     GateEngine = None  # type: ignore[assignment]
     DeclTransport = None  # type: ignore[assignment]
     FRWindow = None  # type: ignore[assignment]
     WindowDecl = None  # type: ignore[assignment]
-    agg_eps = None  # type: ignore[assignment]
+    _core_aggregate_epsilon_stat = None  # type: ignore[assignment]
 
 FRW_CLS: Optional[type] = FRWindow
 TRANS_CLS: Optional[type] = DeclTransport
 GATE_CLS: Optional[type] = GateEngine
 DECL_CLS: Optional[type] = WindowDecl
-AGGREGATE_EPSILON = agg_eps
+
+
+def agg_eps_adapter(
+    window: Any,
+    counts: Optional[Dict[str, int]] = None,
+    *,
+    counts_by_metric: Optional[Dict[str, int]] = None,
+    alpha: float = 0.05,
+    **_ignored: Any,
+) -> float:
+    """Signature-stable ε_stat aggregator.
+
+    Callers may pass counts either positionally (`counts`) or as the keyword
+    `counts_by_metric`. Returns 0.0 on any failure.
+
+    This is deliberately permissive because the runner may operate in a partially
+    wired state (e.g., FR not importable) and we don't want ε aggregation to crash
+    the sweep.
+    """
+    fn = _core_aggregate_epsilon_stat
+    if fn is None:
+        return 0.0
+
+    c = counts_by_metric if counts_by_metric is not None else (counts or {})
+
+    try:
+        out = fn(window, c, float(alpha))
+        out_f = float(out)
+        return out_f if np.isfinite(out_f) and out_f >= 0.0 else 0.0
+    except TypeError:
+        # Tolerate kw-only implementations.
+        try:
+            out = fn(window, counts_by_metric=c, alpha=float(alpha))
+            out_f = float(out)
+            return out_f if np.isfinite(out_f) and out_f >= 0.0 else 0.0
+        except Exception:
+            return 0.0
+    except Exception:
+        return 0.0
+
+
+# Default ε aggregator is the local adapter; FR wiring (below) may override.
+AGGREGATE_EPSILON = agg_eps_adapter
 
 
 # ---- legacy imports (stay as-is) ----
@@ -3576,6 +3618,7 @@ def safe_auc_by_factor(
 
 
 from typing import Iterable, Callable
+from typing import Any, Optional
 
 # --- FR integration holders (process-global; typed for mypy) ---
 USE_FR: bool = False
@@ -3608,6 +3651,37 @@ def _wire_fr_from_decl(win: "WindowDecl") -> None:
     USE_FR = bool(use_fr)
     FR_WIN = fr_win
     GE = ge
+
+
+# --- epsilon aggregation helper (legacy and FR fallback) ---
+from veriscope.core.calibration import aggregate_epsilon_stat as _core_aggregate_epsilon_stat
+
+
+# --- epsilon aggregation helper (legacy and FR fallback) ---
+def agg_eps_adapter(
+    window: Any,
+    counts: Optional[Dict[str, int]] = None,
+    *,
+    counts_by_metric: Optional[Dict[str, int]] = None,
+    alpha: float = 0.05,
+    **_ignored: Any,
+) -> float:
+    """Stable adapter for epsilon-stat aggregation.
+
+    Accepts counts either positionally (legacy) or as `counts_by_metric=` (newer callers).
+    Returns 0.0 on failure.
+    """
+    c = counts_by_metric if counts_by_metric is not None else (counts or {})
+    try:
+        out = _core_aggregate_epsilon_stat(window, c, float(alpha))
+        out_f = float(out)
+        return out_f if np.isfinite(out_f) and out_f >= 0.0 else 0.0
+    except Exception:
+        return 0.0
+
+
+# Default: use the adapter; FR wiring may overwrite this later.
+AGGREGATE_EPSILON = agg_eps_adapter
 
 
 # ---------------------------------
