@@ -5391,6 +5391,19 @@ def evaluate(df_all: pd.DataFrame, tag: str):
         # Determine first post-warm epoch where gate_warn == 1 for ≥K consecutive epochs (matches deployed policy)
         gw = None
         col = "gate_warn_calib" if "gate_warn_calib" in gg.columns else "gate_warn"
+
+        # If calibrated stream never warns post-warm, fall back to raw gate_warn so the baseline is meaningful.
+        if col == "gate_warn_calib":
+            try:
+                epn0 = pd.to_numeric(gg["epoch"], errors="coerce").to_numpy(dtype=float)
+                post0 = epn0 >= float(warm_idx_local)
+                if post0.any():
+                    warned0 = int((gg.loc[post0, col].to_numpy(dtype=float) >= 1.0).sum())
+                    if warned0 == 0:
+                        col = "gate_warn"
+            except Exception:
+                col = "gate_warn"
+
         if col in gg.columns:
             epn = pd.to_numeric(gg["epoch"], errors="coerce").to_numpy(dtype=float)
             hit_idx = np.where((epn >= float(warm_idx_local)) & (gg[col].to_numpy(dtype=float) >= 1.0))[0]
