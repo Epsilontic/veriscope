@@ -1355,6 +1355,7 @@ CFG_SMOKE = dict(
     # gate: keep W small so 2W history exists early in short runs
     gate_window=3,
     gate_min_evidence=4,
+    gate_bins=4,  # smoke-critical: 16 bins is infeasible with tiny evidence
     # warm / PH burn
     warmup=2,
     ph_burn=0,
@@ -1398,8 +1399,8 @@ def apply_smoke_overrides_inplace(cfg: Dict[str, Any]) -> None:
                     print(
                         f"[smoke] Applied: warmup={cfg.get('warmup')} ph_burn={cfg.get('ph_burn')} "
                         f"warm_idx={warm_idx_from_cfg(cfg)} gate_window={cfg.get('gate_window')} "
-                        f"epochs={cfg.get('epochs')} warn_consec={cfg.get('warn_consec')} "
-                        f"factor_start_epoch={cfg.get('factor_start_epoch')}"
+                        f"gate_bins={cfg.get('gate_bins')} epochs={cfg.get('epochs')} "
+                        f"warn_consec={cfg.get('warn_consec')} factor_start_epoch={cfg.get('factor_start_epoch')}"
                     )
             except Exception:
                 pass
@@ -1695,12 +1696,17 @@ try:
         if os.environ.get("SCAR_WARN_CONSEC") is None:
             CFG["warn_consec"] = as_int(CFG_SMOKE.get("warn_consec", 2), default=2)
 
+        # gate_bins is smoke-critical: 16 bins with tiny evidence is statistically infeasible
+        if os.environ.get("SCAR_GATE_BINS") is None:
+            CFG["gate_bins"] = as_int(CFG_SMOKE.get("gate_bins", 4), default=4)
+
         try:
             if mp.current_process().name == "MainProcess":
                 print(
                     "[smoke] post-cal reassert: "
                     f"gate_window={CFG.get('gate_window')} "
                     f"gate_min_evidence={CFG.get('gate_min_evidence')} "
+                    f"gate_bins={CFG.get('gate_bins')} "
                     f"warn_consec={CFG.get('warn_consec')}"
                 )
         except Exception:
@@ -5694,6 +5700,23 @@ def main():
                 interventions=(lambda x: x,),
                 cal_ranges={str(k): (float(v[0]), float(v[1])) for k, v in j["cal_ranges"].items()},
             )
+            # Smoke override: force bins to smoke config unless explicitly overridden
+            if env_truthy("SCAR_SMOKE") and os.environ.get("SCAR_GATE_BINS") is None:
+                smoke_bins = as_int(CFG.get("gate_bins", 4), default=4)
+                try:
+                    cur_bins = int(getattr(window_decl, "bins", smoke_bins))
+                except Exception:
+                    cur_bins = int(smoke_bins)
+                if cur_bins != int(smoke_bins):
+                    try:
+                        if mp.current_process().name == "MainProcess":
+                            print(f"[smoke] overriding WindowDecl.bins: {cur_bins} -> {int(smoke_bins)}")
+                    except Exception:
+                        pass
+                    try:
+                        window_decl.bins = int(smoke_bins)
+                    except Exception:
+                        pass
             install_window_decl(window_decl)
             _wire_fr_from_decl(window_decl)
             _loaded_precal_wd = True
