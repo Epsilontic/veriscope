@@ -23,6 +23,9 @@ if os.environ.get("VS_FAULTHANDLER", "0") == "1":
 from typing import Any, Optional, Dict, cast
 from pathlib import Path
 
+# Central mutable configuration dict (single declaration for type-checkers)
+CFG: Dict[str, Any] = {}
+
 # ---- Moved mid-file imports ----
 import hashlib
 import json
@@ -180,12 +183,8 @@ def pct_linear(a: Iterable[float] | npt.ArrayLike, q: float) -> float:
 try:
     from veriscope.config import CFG as _CFG_CENTER
 
-    # create CFG if not defined yet
-    if "CFG" not in globals():
-        CFG = dict(_CFG_CENTER)
-    else:
-        for _k, _v in _CFG_CENTER.items():
-            CFG.setdefault(_k, _v)
+    for _k, _v in dict(_CFG_CENTER).items():
+        CFG.setdefault(_k, _v)
 except Exception:
     # Keep runner robust if central CFG is absent
     pass
@@ -409,6 +408,8 @@ def env_truthy(name: str, default: str = "0") -> bool:
 
 CAL = env_truthy("SCAR_CALIB")
 SMOKE = env_truthy("SCAR_SMOKE")
+DEBUG_GATE = env_truthy("SCAR_DEBUG_GATE")
+DEBUG_SMOKE = env_truthy("SCAR_DEBUG")  # broader debug flag
 RUN_TAG = "cal" if CAL else ("smoke" if SMOKE else "full_v2")
 
 # Ensure deterministic cuBLAS workspace is configured before torch/cuBLAS init (CUDA 11.x/12.x)
@@ -443,7 +444,7 @@ except Exception:  # pragma: no cover
     _t_avg_pool2d = None  # type: ignore[assignment]
 
 
-def t_avg_pool2d(*args: Any, **kwargs: Any):
+def t_avg_pool2d(*args: Any, **kwargs: Any) -> Any:
     """Compat wrapper so static checkers see a callable; raises if F.avg_pool2d is missing."""
     if _t_avg_pool2d is None:
         raise RuntimeError("torch.nn.functional.avg_pool2d unavailable")
@@ -452,19 +453,19 @@ def t_avg_pool2d(*args: Any, **kwargs: Any):
 
 if t_eigvalsh is None:
 
-    def t_eigvalsh(*args, **kwargs):
+    def t_eigvalsh(*args: Any, **kwargs: Any) -> Any:
         raise RuntimeError("torch.linalg.eigvalsh unavailable")
 
 
 if t_eigvals is None:
 
-    def t_eigvals(*args, **kwargs):
+    def t_eigvals(*args: Any, **kwargs: Any) -> Any:
         raise RuntimeError("torch.linalg.eigvals unavailable")
 
 
 if t_vector_norm is None:
 
-    def t_vector_norm(*args, **kwargs):
+    def t_vector_norm(*args: Any, **kwargs: Any) -> Any:
         raise RuntimeError("torch.linalg.vector_norm unavailable")
 
 
@@ -561,7 +562,7 @@ except Exception:
 # Numerically-stable sigmoid used across train/OOF/eval
 
 
-def _sigmoid_stable(z, cap: float = 60.0):
+def _sigmoid_stable(z: Any, cap: float = 60.0) -> Any:
     """Return sigmoid(z) with clipping to avoid overflow in exp()."""
     zc = np.clip(z, -float(cap), float(cap))
     return 1.0 / (1.0 + np.exp(-zc))
@@ -579,9 +580,12 @@ def calibrate_window_from_controls(
     epsilon: float,
     interventions: tuple,
 ) -> WindowDecl:
+    cal_ranges: Dict[str, Tuple[float, float]] = {}
+
     # Guard empty
     if df_control is None or len(df_control) == 0:
-        cal_ranges = {m: (0.0, 1.0) for m in metrics}
+        for m in metrics:
+            cal_ranges[m] = (0.0, 1.0)
         return WindowDecl(
             epsilon=epsilon,
             metrics=metrics,
@@ -591,7 +595,6 @@ def calibrate_window_from_controls(
             cal_ranges=cal_ranges,
         )
 
-    cal_ranges: Dict[str, Tuple[float, float]] = {}
     for m in metrics:
         lo, hi = 0.0, 1.0
         if m in df_control.columns:
@@ -760,8 +763,21 @@ def gate_check(
                 kappa_sens=float(kappa_sens) if (kappa_sens is not None) and np.isfinite(kappa_sens) else float("inf"),
                 eps_stat_value=float(eps_stat_value),
             )
+            # Provide evidence metadata and a stable reason string for downstream diagnostics
+            try:
+                _min_evidence_fr = as_int(CFG.get("gate_min_evidence", 16), default=16)
+            except Exception:
+                _min_evidence_fr = 16
+            try:
+                _total_evidence_fr = int(sum(int(v) for v in (counts or {}).values()))
+            except Exception:
+                _total_evidence_fr = 0
+            _reason_fr = "evaluated_fr_ok" if bool(getattr(gr, "ok", False)) else "evaluated_fr_fail"
             # Map FR audit keys to legacy ones so downstream code remains unchanged
             audit = {
+                "reason": str(_reason_fr),
+                "total_evidence": int(_total_evidence_fr),
+                "min_evidence": int(_min_evidence_fr),
                 "gain_bits": as_float(gr.audit.get("gain_bits", np.nan), default=float("nan")),
                 "worst_tv": as_float(gr.audit.get("worst_DW", np.nan), default=float("nan")),
                 "eps_stat": as_float(gr.audit.get("eps_stat", np.nan), default=float("nan")),
@@ -786,7 +802,31 @@ def gate_check(
         total_evidence = int(sum(int(v) for v in (counts or {}).values()))
     except Exception:
         total_evidence = 0
+
+    # Debug: checkpoint evidence (rate-limited)
+    _dbg_epoch = -1
+    try:
+        _dbg_epoch = int(counts.get("_epoch", -1)) if isinstance(counts, dict) else -1
+    except Exception:
+        _dbg_epoch = -1
+
+    if DEBUG_GATE and mp.current_process().name == "MainProcess":
+        # Print every 4 epochs in smoke; otherwise print only on explicit skip/fail blocks.
+        _every = 4 if env_truthy("SCAR_SMOKE") else 999999
+        if (_dbg_epoch >= 0) and (_dbg_epoch % _every == 0):
+            try:
+                print(
+                    f"[gate][dbg] epoch={_dbg_epoch} total_evidence={total_evidence} min={min_evidence} counts={counts}"
+                )
+            except Exception:
+                pass
+
     if total_evidence < min_evidence:
+        if DEBUG_GATE and mp.current_process().name == "MainProcess":
+            try:
+                print(f"[gate][dbg] SKIP insufficient_evidence: {total_evidence} < {min_evidence}")
+            except Exception:
+                pass
         return 0, {
             "reason": "insufficient_evidence",
             "total_evidence": int(total_evidence),
@@ -843,13 +883,41 @@ def gate_check(
     worst = float(worst if np.isfinite(worst) else np.inf)
     eps_eff = max(0.0, float(window.epsilon) - eps_stat)
     ok_stability = worst <= eps_eff
+    if DEBUG_GATE and mp.current_process().name == "MainProcess":
+        # Always print on stability failure (useful signal without flooding logs)
+        if not ok_stability:
+            try:
+                print(
+                    f"[gate][dbg] stability_fail worst_tv={worst:.6f} eps_eff={eps_eff:.6f} "
+                    f"eps={float(window.epsilon):.6f} eps_stat={eps_stat:.6f}"
+                )
+            except Exception:
+                pass
 
     # Sensitivity budget κ_sens ≤ ε_sens
     eps_sens = float(max(0.0, CFG.get("gate_epsilon_sens", 0.04)))
     kappa_sens = float(kappa_sens if np.isfinite(kappa_sens) else np.inf)
     ok_kappa = kappa_sens <= eps_sens
 
-    return int(bool(ok_gain and ok_stability and ok_kappa)), {
+    ok = bool(ok_gain and ok_stability and ok_kappa)
+    reason = (
+        "evaluated_ok"
+        if ok
+        else (
+            "evaluated_fail_gain"
+            if not ok_gain
+            else (
+                "evaluated_fail_stability"
+                if not ok_stability
+                else ("evaluated_fail_kappa" if not ok_kappa else "evaluated_fail_unknown")
+            )
+        )
+    )
+
+    return int(ok), {
+        "reason": str(reason),
+        "total_evidence": int(total_evidence),
+        "min_evidence": int(min_evidence),
         "gain_bits": float(gain),
         "worst_tv": float(worst),
         "eps_stat": float(eps_stat),
@@ -981,8 +1049,6 @@ DATA_ROOT = os.environ.get("SCAR_DATA", "./data")
 C = 10  # CIFAR-10 classes
 
 
-if "CFG" not in globals():
-    CFG: Dict[str, Any] = {}
 CFG.update(
     dict(
         # device & determinism
@@ -1218,11 +1284,11 @@ CFG.setdefault("gate_gain_units", "bits/sample")
 try:
     _wb = WindowBudget(
         # Per-run cumulative budgets (ms) for each heavy metric
-        sw2_ms=int(CFG.get("sw2_run_budget_ms", CFG.get("total_heavy_budget_ms", 180_000))),
-        ripser_ms=int(CFG.get("ripser_run_budget_ms", CFG.get("total_heavy_budget_ms", 180_000))),
-        total_heavy_ms=int(CFG.get("total_heavy_budget_ms", 180_000)),
-        sw2_calls=int(CFG.get("sw2_calls_cap", 1_000_000)),
-        ripser_calls=int(CFG.get("ripser_calls_cap", 1_000_000)),
+        sw2_ms=as_int(CFG.get("sw2_run_budget_ms", CFG.get("total_heavy_budget_ms", 180_000)), default=180_000),
+        ripser_ms=as_int(CFG.get("ripser_run_budget_ms", CFG.get("total_heavy_budget_ms", 180_000)), default=180_000),
+        total_heavy_ms=as_int(CFG.get("total_heavy_budget_ms", 180_000), default=180_000),
+        sw2_calls=as_int(CFG.get("sw2_calls_cap", 1_000_000), default=1_000_000),
+        ripser_calls=as_int(CFG.get("ripser_calls_cap", 1_000_000), default=1_000_000),
     )
     BUDGET = BudgetLedger(_wb)
 except Exception:
@@ -1246,7 +1312,7 @@ CFG_SMOKE = dict(
     sw2_n_proj=64,
     # gate: keep W small so 2W history exists early in short runs
     gate_window=3,
-    gate_min_evidence=8,
+    gate_min_evidence=4,
     # warm / PH burn
     warmup=2,
     ph_burn=0,
@@ -1571,6 +1637,64 @@ except Exception as e:
         pass
 
 
+# --- Smoke-mode reassertions AFTER calibration load ---
+# Calibration files often carry production defaults (e.g., gate_min_evidence=16) that break short smoke runs.
+try:
+    if env_truthy("SCAR_SMOKE"):
+        # Only reassert if the user did NOT explicitly override via env.
+        if os.environ.get("SCAR_GATE_MIN_EVIDENCE") is None:
+            # For W_gate=3 and ~2 metrics, max total_evidence is ~6; choose <= 6.
+            CFG["gate_min_evidence"] = as_int(CFG_SMOKE.get("gate_min_evidence", 4), default=4)
+
+        if os.environ.get("SCAR_GATE_WINDOW") is None:
+            CFG["gate_window"] = as_int(CFG_SMOKE.get("gate_window", 3), default=3)
+
+        # warn_consec is smoke-critical for non-null lead_time in short runs
+        if os.environ.get("SCAR_WARN_CONSEC") is None:
+            CFG["warn_consec"] = as_int(CFG_SMOKE.get("warn_consec", 2), default=2)
+
+        try:
+            if mp.current_process().name == "MainProcess":
+                print(
+                    "[smoke] post-cal reassert: "
+                    f"gate_window={CFG.get('gate_window')} "
+                    f"gate_min_evidence={CFG.get('gate_min_evidence')} "
+                    f"warn_consec={CFG.get('warn_consec')}"
+                )
+        except Exception:
+            pass
+
+        # Keep runtime in sync for modules reading runtime.CFG
+        try:
+            runtime.install_runtime(cfg=CFG, outdir=OUTDIR, budget=BUDGET)
+        except Exception:
+            pass
+except Exception:
+    pass
+
+# --- Smoke-mode sanity: clamp unreachable min_evidence (avoid never-evaluated gates) ---
+try:
+    if env_truthy("SCAR_SMOKE") and os.environ.get("SCAR_GATE_MIN_EVIDENCE") is None:
+        W = as_int(CFG.get("gate_window", 3), default=3)
+        min_ev = as_int(CFG.get("gate_min_evidence", 4), default=4)
+
+        # Conservative in-practice upper bound: ~W samples per metric.
+        # Smoke default assumes ~2 metrics feed the gate.
+        n_metrics = 2
+        max_possible = max(1, int(W) * int(n_metrics))
+
+        if min_ev > max_possible:
+            try:
+                print(
+                    f"[smoke][WARN] gate_min_evidence={min_ev} likely unreachable with "
+                    f"gate_window={W} and n_metrics~{n_metrics}; clamping to {max_possible}"
+                )
+            except Exception:
+                pass
+            CFG["gate_min_evidence"] = int(max_possible)
+except Exception:
+    pass
+
 # Repro capsule: persist environment/cuda/library hashes once per sweep
 try:
     repro_path = OUTDIR / "repro.json"
@@ -1603,31 +1727,34 @@ except Exception:
     pass
 
 
-def safe_write_parquet(df: pd.DataFrame, path: Path):
-    # Pin the Parquet engine and fall back loudly to CSV if Arrow is unavailable
+def safe_write_parquet(df: pd.DataFrame, path: Path) -> None:
+    """Write a dataframe to parquet; fall back to CSV on failure.
+
+    This runner is used in long sweeps where robustness matters more than strict
+    parquet availability (e.g., missing pyarrow/fastparquet, transient IO issues).
+    This helper must never raise.
+    """
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
     except Exception:
         pass
+
     try:
-        df.to_parquet(path, engine="pyarrow", index=False)
+        df.to_parquet(path, index=False)
         return
     except Exception as e:
-        # Loud fallback; downstream aggregation explicitly handles CSV
-        csvp = path.with_suffix(".csv")
+        # Fallback to CSV with the same basename.
         try:
+            csvp = path.with_suffix(".csv")
             df.to_csv(csvp, index=False)
             try:
-                print(f"[WARN] parquet write failed ({e}); wrote CSV {csvp.name} instead")
+                print(f"[WARN] parquet write failed ({path.name}); wrote CSV {csvp.name}: {e!r}")
             except Exception:
                 pass
+        except Exception:
+            # Last resort: swallow to keep sweeps alive.
             try:
-                path.with_suffix(".format.txt").write_text("csv")
-            except Exception:
-                pass
-        except Exception as ee:
-            try:
-                print(f"[ERROR] failed both parquet and CSV writes: {ee}")
+                print(f"[WARN] failed to write parquet or CSV for {path}: {e!r}")
             except Exception:
                 pass
 
@@ -2917,6 +3044,9 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
         gate_worst_tv = float("nan")
         gate_eps_stat = float("nan")
         gate_kappa = float("nan")
+        gate_total_evidence = 0
+        gate_reason = "not_evaluated"
+        gate_counts_json = ""
         gate_epsilon_eff = as_float(
             getattr(WINDOW_DECL, "epsilon", CFG.get("gate_epsilon", 0.08)),
             default=as_float(CFG.get("gate_epsilon", 0.08), default=0.08),
@@ -2932,21 +3062,36 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
                     v = np.array([float(r.get(key, np.nan)) for r in seg], dtype=float)
                     return v[np.isfinite(v)]
 
-                # metric names from the installed declaration
-                metrics_for_tv = tuple(getattr(WINDOW_DECL, "metrics", tuple(WINDOW_DECL.weights.keys())))
-                past_dict = {m: _series(recent[:W_gate], m) for m in metrics_for_tv}
-                recent_dict = {m: _series(recent[W_gate:], m) for m in metrics_for_tv}
+                # metric names from the installed declaration (force str keys for consistency)
+                _metrics_raw = getattr(WINDOW_DECL, "metrics", tuple(getattr(WINDOW_DECL, "weights", {}).keys()))
+                metrics_for_tv = tuple(str(m) for m in _metrics_raw)
+
+                past_dict_all = {m: _series(recent[:W_gate], m) for m in metrics_for_tv}
+                recent_dict_all = {m: _series(recent[W_gate:], m) for m in metrics_for_tv}
 
                 # counts under the declaration’s common transport adapter
                 _adapter = getattr(WINDOW_DECL, "_DECL_TRANSPORT", None)
                 _apply = _adapter.apply if (_adapter is not None) else (lambda name, arr: np.asarray(arr, float))
-                counts = {}
+
+                counts_all: Dict[str, int] = {}
                 for m in metrics_for_tv:
-                    a = _apply(m, past_dict.get(m, np.array([], dtype=float)))
-                    b = _apply(m, recent_dict.get(m, np.array([], dtype=float)))
+                    a = _apply(m, past_dict_all.get(m, np.array([], dtype=float)))
+                    b = _apply(m, recent_dict_all.get(m, np.array([], dtype=float)))
                     na = int(np.isfinite(np.asarray(a, float)).sum())
                     nb = int(np.isfinite(np.asarray(b, float)).sum())
-                    counts[m] = int(min(na, nb))
+                    counts_all[m] = int(min(na, nb))
+
+                # Only pass metrics with evidence into gate_check (prevents NaN audit via empty series)
+                metrics_use = [m for m in metrics_for_tv if int(counts_all.get(m, 0)) > 0]
+                past_dict = {m: past_dict_all[m] for m in metrics_use}
+                recent_dict = {m: recent_dict_all[m] for m in metrics_use}
+                counts = {m: int(counts_all[m]) for m in metrics_use}
+
+                gate_total_evidence = int(sum(int(v) for v in counts.values()))
+                try:
+                    gate_counts_json = json.dumps(counts, sort_keys=True)
+                except Exception:
+                    gate_counts_json = ""
 
                 # prequential gain (bits/sample) over the recent half
                 ml = _series(recent[W_gate:], "train_loss")
@@ -2988,6 +3133,8 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
                     kappa_sens=(gate_kappa if np.isfinite(gate_kappa) else 0.0),
                     eps_stat_alpha=float(CFG.get("gate_eps_stat_alpha", 0.05)),
                 )
+                # Persist the reason for the gate audit
+                gate_reason = str((audit or {}).get("reason", ""))
                 # --- Gate diagnostics for offline analysis ---
                 gate_epsilon_eff = as_float(
                     getattr(WINDOW_DECL, "epsilon", CFG.get("gate_epsilon", 0.08)),
@@ -3091,6 +3238,9 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
                 # fixed-partition gate diagnostics
                 gate_eps_stat=float(gate_eps_stat),
                 gate_kappa=float(gate_kappa),
+                gate_total_evidence=int(gate_total_evidence),
+                gate_reason=str(gate_reason),
+                gate_counts=str(gate_counts_json),
             )
         )
         # hard-stop training when the finite-window gate warns for k consecutive epochs (after warm)
@@ -3137,6 +3287,34 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
             break
 
     df = pd.DataFrame(logs)
+
+    # Per-run gate summary: always persist to OUTDIR/sweep.log (auditability) but only print to stdout in smoke/debug.
+    if mp.current_process().name == "MainProcess":
+        try:
+            gate_evals = sum(1 for r in logs if str(r.get("gate_reason", "")).startswith("evaluated"))
+            gate_warns = sum(1 for r in logs if int(r.get("gate_warn", 0) or 0) == 1)
+            gate_insuff = sum(1 for r in logs if str(r.get("gate_reason", "")) == "insufficient_evidence")
+            line = (
+                f"[run] seed={seed} factor={str(factor.get('name', ''))} epochs={len(logs)} "
+                f"gate_evaluated={gate_evals} gate_warns={gate_warns} gate_insufficient={gate_insuff}"
+            )
+
+            # Always-on: append a single line/run to sweep.log to survive stdout truncation.
+            try:
+                with open(OUTDIR / "sweep.log", "a", encoding="utf-8") as _lg:
+                    print(line, file=_lg, flush=True)
+            except Exception:
+                pass
+
+            # Stdout only when explicitly debugging or in smoke mode.
+            if env_truthy("SCAR_SMOKE") or DEBUG_SMOKE:
+                try:
+                    print(line, flush=True)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     return df
 
 
@@ -4084,6 +4262,30 @@ def run_sweep(tag: str):
     md5 = file_md5(target)
     Path(str(target) + ".md5").write_text(f"{md5}  {target.name}\n")
     print(f"[checksum] {target.name} md5={md5}")
+
+    # End-of-sweep diagnostic summary (debug-only): catches "gate never evaluated" quickly.
+    if DEBUG_SMOKE and (df_all is not None) and (not df_all.empty):
+        try:
+            print("\n[debug] Gate Diagnostic Summary:")
+            for col in ["gate_reason", "gate_total_evidence"]:
+                if col in df_all.columns:
+                    try:
+                        vc = df_all[col].value_counts(dropna=False)
+                        # Keep output bounded to avoid log spam on large sweeps.
+                        top = vc.head(25).to_dict()
+                        print(f"  {col}: {top}")
+                    except Exception:
+                        pass
+
+            if "gate_reason" in df_all.columns:
+                try:
+                    reasons = [str(r) for r in df_all["gate_reason"].dropna().unique().tolist()]
+                    if not any("evaluated" in r for r in reasons):
+                        print("[WARN] Gate was NEVER successfully evaluated in any run!")
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     return df_all
 
