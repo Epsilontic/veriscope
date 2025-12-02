@@ -1324,6 +1324,8 @@ CFG.setdefault("gate_epsilon", 0.08)
 CFG.setdefault("gate_epsilon_floor", 0.02)  # prevent degenerate ε=0 on small samples
 CFG.setdefault("gate_eps_stat_max_frac", 0.25)
 CFG.setdefault("gate_gain_thresh", 0.05)  # bits per sample (calibrated against controls)
+CFG.setdefault("gate_gain_q", 0.05)
+CFG.setdefault("gate_gain_thresh_cap", 0.15)  # cap for calibrated gain threshold (bits/sample)
 CFG.setdefault("gate_epsilon_sens", 0.04)  # dedicated κ_sens budget
 CFG.setdefault("gate_min_evidence", 16)
 CFG.setdefault("gate_gain_units", "bits/sample")
@@ -1375,6 +1377,8 @@ CFG_SMOKE = dict(
     gt_patience=2,
     # keep smoke fast
     gate_early_exit=True,
+    gate_gain_q=0.05,
+    gate_gain_thresh=0.02,
 )
 
 # Env vars that, if set, should prevent smoke from overwriting that key
@@ -1383,6 +1387,8 @@ SMOKE_ENV_BYPASS: Dict[str, str] = {
     "gate_min_evidence": "SCAR_GATE_MIN_EVIDENCE",
     "warn_consec": "SCAR_WARN_CONSEC",
     "family_window": "SCAR_FAMILY_WINDOW",
+    "gate_gain_q": "SCAR_GATE_GAIN_Q",
+    "gate_gain_thresh": "SCAR_GATE_GAIN_THRESH",
 }
 
 # All smoke-critical keys live here (single source of truth)
@@ -1398,6 +1404,8 @@ SMOKE_CRITICAL_KEYS: List[str] = [
     "gate_early_exit",
     "warn_consec",
     "family_window",
+    "gate_gain_q",
+    "gate_gain_thresh",
 ]
 
 
@@ -2148,12 +2156,18 @@ def ftle_entropy_grad_lowent(model, xb_small: torch.Tensor, q: float = 0.30) -> 
 
 
 # --- Helper for calibrating gate_gain_thresh from controls ---
-def calibrate_gate_gain_thresh_from_controls(df: pd.DataFrame, W: int, warm: int, q: float = 0.995) -> float:
+def calibrate_gate_gain_thresh_from_controls(df: pd.DataFrame, W: int, warm: int, q: float = 0.05) -> float:
     """
     Calibrate gate_gain threshold (in bits/sample) from control ('none') runs post-warm.
     Uses sliding windows of length W over (ewma_loss - train_loss), averaged per finite window.
     Returns the q-quantile as the threshold and writes a small capsule to OUTDIR.
     """
+    # Defensive clamp: q must be a valid quantile in [0, 1]
+    try:
+        q = float(q)
+    except Exception:
+        q = 0.05
+    q = float(min(max(q, 0.0), 1.0))
     try:
         sub = df[(df["factor"] == "none") & (pd.to_numeric(df["epoch"], errors="coerce") >= int(warm))].copy()
     except Exception:
@@ -2180,6 +2194,8 @@ def calibrate_gate_gain_thresh_from_controls(df: pd.DataFrame, W: int, warm: int
     if not vals:
         return float(CFG.get("gate_gain_thresh", 0.05))
     thr = float(np.quantile(np.array(vals, dtype=float), q))
+    cap = as_float(CFG.get("gate_gain_thresh_cap", 0.15), default=0.15)
+    thr = float(max(0.0, min(thr, cap)))
     try:
         save_json(
             {"gate_gain_thresh": thr, "q": q, "warm": int(warm), "W": int(W)},
@@ -3161,7 +3177,7 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
             getattr(WINDOW_DECL, "epsilon", CFG.get("gate_epsilon", 0.08)),
             default=as_float(CFG.get("gate_epsilon", 0.08), default=0.08),
         )
-        gate_gain_thresh_eff = as_float(CFG.get("gate_gain_thresh", 0.1), default=0.1)
+        gate_gain_thresh_eff = as_float(CFG.get("gate_gain_thresh", 0.05), default=0.05)
 
         W_gate = as_int(CFG.get("gate_window", 16), default=16)
 
@@ -3271,7 +3287,7 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
                 gate_kappa = as_float(audit.get("kappa_sens", gate_kappa), default=float("nan"))
 
                 # effective parameters actually used for this check
-                gate_gain_thresh_eff = as_float(CFG.get("gate_gain_thresh", 0.1), default=0.1)
+                gate_gain_thresh_eff = as_float(CFG.get("gate_gain_thresh", 0.05), default=0.05)
 
             except Exception as e:
                 gate_exc = repr(e)
@@ -4493,22 +4509,42 @@ def evaluate(df_all: pd.DataFrame, tag: str):
 
     # --- calibrate gate gain threshold (bits/sample) from controls ---
     try:
+        # Low-quantile calibration: gate fails only on unusually-low gain.
+        try:
+            q_gain = as_float(os.environ.get("SCAR_GATE_GAIN_Q", CFG.get("gate_gain_q", 0.05)), default=0.05)
+        except Exception:
+            q_gain = 0.05
+        q_gain = float(min(max(float(q_gain), 0.0), 1.0))
+
         CFG["gate_gain_thresh"] = calibrate_gate_gain_thresh_from_controls(
             df_cal_raw,
             W=as_int(CFG.get("gate_window", 16), default=16),
             warm=as_int(warm_idx, default=0),
-            q=0.995,
+            q=q_gain,
         )
+
         update_json(
             OUTDIR / "gate_gain_thresh_calibration.json",
             {
                 "gate_gain_thresh": float(CFG["gate_gain_thresh"]),
                 "W": as_int(CFG.get("gate_window", 16), default=16),
                 "warm": as_int(warm_idx, default=0),
-                "q": 0.995,
+                "q": float(q_gain),
             },
         )
-        print(f"[calib] gate_gain_thresh (bits/sample) = {CFG['gate_gain_thresh']:.4f}")
+
+        # Keep runtime.CFG in sync for offline recompute paths.
+        try:
+            runtime.install_runtime(cfg=CFG, outdir=OUTDIR, budget=BUDGET)
+        except Exception:
+            pass
+
+        try:
+            if mp.current_process().name == "MainProcess":
+                print(f"[calib] gate_gain_thresh (bits/sample) = {CFG['gate_gain_thresh']:.6f} (q={q_gain:.3f})")
+        except Exception:
+            print(f"[calib] gate_gain_thresh (bits/sample) = {CFG['gate_gain_thresh']:.6f} (q={q_gain:.3f})")
+
     except Exception as e:
         print(
             f"[WARN] gate gain calibration failed; keeping CFG['gate_gain_thresh']={CFG.get('gate_gain_thresh')}: {e}"
@@ -5842,7 +5878,7 @@ def main():
     # Preload calibrated gate_gain_thresh from a prior run, if present
     try:
         j = json.loads((OUTDIR / "gate_gain_thresh_calibration.json").read_text())
-        CFG["gate_gain_thresh"] = float(j.get("gate_gain_thresh", CFG.get("gate_gain_thresh", 0.1)))
+        CFG["gate_gain_thresh"] = float(j.get("gate_gain_thresh", CFG.get("gate_gain_thresh", 0.05)))
         print(f"[preload] gate_gain_thresh={CFG['gate_gain_thresh']:.4f}")
     except Exception:
         pass
