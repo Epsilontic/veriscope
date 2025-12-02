@@ -1377,16 +1377,103 @@ CFG_SMOKE = dict(
     gate_early_exit=True,
 )
 
+# Env vars that, if set, should prevent smoke from overwriting that key
+SMOKE_ENV_BYPASS: Dict[str, str] = {
+    "gate_bins": "SCAR_GATE_BINS",
+    "gate_min_evidence": "SCAR_GATE_MIN_EVIDENCE",
+    "warn_consec": "SCAR_WARN_CONSEC",
+    "family_window": "SCAR_FAMILY_WINDOW",
+}
+
+# All smoke-critical keys live here (single source of truth)
+SMOKE_CRITICAL_KEYS: List[str] = [
+    "epochs",
+    "warmup",
+    "ph_burn",
+    "heavy_every",
+    "metric_batches",
+    "gate_window",
+    "gate_bins",
+    "gate_min_evidence",
+    "gate_early_exit",
+    "warn_consec",
+    "family_window",
+]
+
+
+def reconcile_cfg_inplace(cfg: Dict[str, Any], *, stage: str = "") -> None:
+    """Make cfg consistent with env + smoke policy.
+
+    Call this after any load that can overwrite cfg (calibration, window_decl load, etc.).
+    """
+    # 1) Env clamps that reduce work (epochs / seed lists) should win.
+    try:
+        _apply_env_canary_clamps(cfg)
+    except Exception:
+        pass
+
+    # 2) Smoke policy for critical keys.
+    if env_truthy("SCAR_SMOKE"):
+        for k in SMOKE_CRITICAL_KEYS:
+            if k not in CFG_SMOKE:
+                continue
+
+            # Special-case epochs: skip if any epoch clamp env is present.
+            if k == "epochs":
+                if (
+                    os.environ.get("SCAR_MAX_EPOCHS") is not None
+                    or os.environ.get("SCAR_EPOCHS") is not None
+                    or os.environ.get("SCAR_N_EPOCHS") is not None
+                ):
+                    continue
+            else:
+                bypass_env = SMOKE_ENV_BYPASS.get(k)
+                if bypass_env and os.environ.get(bypass_env) is not None:
+                    continue
+
+            cfg[k] = CFG_SMOKE[k]
+
+    # 3) Always-on invariants.
+    try:
+        cfg["var_k_max"] = max(1, int(cfg.get("var_k_max", 32)))
+    except Exception:
+        pass
+
+
+def reconcile_window_decl_inplace(window_decl: Any, cfg: Dict[str, Any]) -> None:
+    """Apply smoke-mode policy to a WindowDecl in-place (e.g., bins)."""
+    if not env_truthy("SCAR_SMOKE"):
+        return
+    # Respect explicit env override for gate bins.
+    if os.environ.get("SCAR_GATE_BINS") is None:
+        try:
+            bins_smoke = int(cfg.get("gate_bins", CFG_SMOKE.get("gate_bins", 4)))
+            cur_bins = int(getattr(window_decl, "bins", bins_smoke))
+            if cur_bins != bins_smoke:
+                try:
+                    if mp.current_process().name == "MainProcess":
+                        print(f"[smoke] overriding WindowDecl.bins: {cur_bins} -> {bins_smoke}")
+                except Exception:
+                    pass
+            window_decl.bins = int(bins_smoke)
+        except Exception:
+            pass
+
 
 def apply_smoke_overrides_inplace(cfg: Dict[str, Any]) -> None:
-    """Apply smoke-mode overrides into cfg in-place.
+    """Legacy smoke-mode helper.
 
-    Must run early so warmup/ph_burn/epochs are consistent regardless of how the runner is invoked.
+    Only applies non-critical smoke behaviour (e.g. factor_start_epoch); core
+    hyperparameters are reconciled via reconcile_cfg_inplace().
     """
     try:
         if env_truthy("SCAR_SMOKE"):
+            # Only apply non-critical entries; critical keys are handled in reconcile_cfg_inplace.
             for k, v in CFG_SMOKE.items():
+                if k in SMOKE_CRITICAL_KEYS:
+                    continue
                 cfg[k] = v
+
             # Ensure pathological factors start after a healthy prefix in smoke mode
             try:
                 factor_start = as_int(cfg.get("factor_start_epoch", 8), default=8)
@@ -1400,10 +1487,11 @@ def apply_smoke_overrides_inplace(cfg: Dict[str, Any]) -> None:
                             f.setdefault("factor_start_epoch", factor_start)
             except Exception:
                 pass
+
             try:
                 if mp.current_process().name == "MainProcess":
                     print(
-                        f"[smoke] Applied: warmup={cfg.get('warmup')} ph_burn={cfg.get('ph_burn')} "
+                        f"[smoke] Applied (legacy): warmup={cfg.get('warmup')} ph_burn={cfg.get('ph_burn')} "
                         f"warm_idx={warm_idx_from_cfg(cfg)} gate_window={cfg.get('gate_window')} "
                         f"gate_bins={cfg.get('gate_bins')} epochs={cfg.get('epochs')} "
                         f"warn_consec={cfg.get('warn_consec')} factor_start_epoch={cfg.get('factor_start_epoch')}"
@@ -1686,43 +1774,10 @@ except Exception as e:
         pass
 
 
-# --- Smoke-mode reassertions AFTER calibration load ---
-# Calibration files often carry production defaults (e.g., gate_min_evidence=16) that break short smoke runs.
+# Reconcile CFG once more after calibration load (calibration may have overwritten gate_* knobs)
 try:
-    if env_truthy("SCAR_SMOKE"):
-        # Only reassert if the user did NOT explicitly override via env.
-        if os.environ.get("SCAR_GATE_MIN_EVIDENCE") is None:
-            # For W_gate=3 and ~2 metrics, max total_evidence is ~6; choose <= 6.
-            CFG["gate_min_evidence"] = as_int(CFG_SMOKE.get("gate_min_evidence", 4), default=4)
-
-        if os.environ.get("SCAR_GATE_WINDOW") is None:
-            CFG["gate_window"] = as_int(CFG_SMOKE.get("gate_window", 3), default=3)
-
-        # warn_consec is smoke-critical for non-null lead_time in short runs
-        if os.environ.get("SCAR_WARN_CONSEC") is None:
-            CFG["warn_consec"] = as_int(CFG_SMOKE.get("warn_consec", 2), default=2)
-
-        # gate_bins is smoke-critical: 16 bins with tiny evidence is statistically infeasible
-        if os.environ.get("SCAR_GATE_BINS") is None:
-            CFG["gate_bins"] = as_int(CFG_SMOKE.get("gate_bins", 4), default=4)
-
-        try:
-            if mp.current_process().name == "MainProcess":
-                print(
-                    "[smoke] post-cal reassert: "
-                    f"gate_window={CFG.get('gate_window')} "
-                    f"gate_min_evidence={CFG.get('gate_min_evidence')} "
-                    f"gate_bins={CFG.get('gate_bins')} "
-                    f"warn_consec={CFG.get('warn_consec')}"
-                )
-        except Exception:
-            pass
-
-        # Keep runtime in sync for modules reading runtime.CFG
-        try:
-            runtime.install_runtime(cfg=CFG, outdir=OUTDIR, budget=BUDGET)
-        except Exception:
-            pass
+    reconcile_cfg_inplace(CFG, stage="post_calibration")
+    runtime.install_runtime(cfg=CFG, outdir=OUTDIR, budget=BUDGET)
 except Exception:
     pass
 
@@ -3316,10 +3371,13 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
                 gate_exc=str(gate_exc),
             )
         )
-        # hard-stop training when the finite-window gate warns for k consecutive epochs (after warm)
+        # hard-stop training when the finite-window gate FAILS for k consecutive evaluated epochs (after warm)
         if gate_early_exit:
             if epoch >= warm_epoch:
-                if int(gate_warn) == 1:
+                # gate_check() returns 1 when the gate PASSES (stable) and 0 when it FAILS (instability).
+                # Only count consecutive FAILs, and only when the gate was actually evaluated (not "insufficient_history", etc.).
+                reason_eval = isinstance(gate_reason, str) and gate_reason.startswith("evaluated")
+                if reason_eval and int(gate_warn) == 0:
                     gate_hits_consec += 1
                 else:
                     gate_hits_consec = 0
@@ -3665,11 +3723,13 @@ def _wire_fr_from_decl(win: "WindowDecl") -> None:
     GE = ge
 
 
-# --- epsilon aggregation helper (legacy and FR fallback) ---
-from veriscope.core.calibration import aggregate_epsilon_stat as _core_aggregate_epsilon_stat
+# --- epsilon aggregation helper (legacy default; do not clobber FR resolver if installed) ---
+try:
+    from veriscope.core.calibration import aggregate_epsilon_stat as _core_aggregate_epsilon_stat
+except Exception:
+    _core_aggregate_epsilon_stat = None
 
 
-# --- epsilon aggregation helper (legacy and FR fallback) ---
 def agg_eps_adapter(
     window: Any,
     counts: Optional[Dict[str, int]] = None,
@@ -3682,18 +3742,28 @@ def agg_eps_adapter(
 
     Accepts counts either positionally (legacy) or as `counts_by_metric=` (newer callers).
     Returns 0.0 on failure.
+
+    NOTE: This is a legacy default. If an FR resolver (e.g., _FR_RESOLVE_EPS) has already
+    installed AGGREGATE_EPSILON, we must not overwrite it.
     """
     c = counts_by_metric if counts_by_metric is not None else (counts or {})
     try:
-        out = _core_aggregate_epsilon_stat(window, c, float(alpha))
+        fn = _core_aggregate_epsilon_stat
+        if fn is None:
+            return 0.0
+        out = fn(window, c, float(alpha))
         out_f = float(out)
         return out_f if np.isfinite(out_f) and out_f >= 0.0 else 0.0
     except Exception:
         return 0.0
 
 
-# Default: use the adapter; FR wiring may overwrite this later.
-AGGREGATE_EPSILON = agg_eps_adapter
+# Only set the default adapter if nothing else (e.g., FR resolver) already installed it.
+try:
+    if globals().get("AGGREGATE_EPSILON") is None:
+        AGGREGATE_EPSILON = agg_eps_adapter
+except Exception:
+    AGGREGATE_EPSILON = agg_eps_adapter
 
 
 # ---------------------------------
@@ -4213,9 +4283,10 @@ def run_sweep(tag: str):
             print(f"[WARN] external monitor unavailable ({e!r}); falling back to clean_val.")
             CFG["monitor_source"] = "clean_val"
 
-    # Optional canary clamps (epochs / seed lists) from env
+    # Reconcile CFG with env/smoke before the sweep starts
     try:
-        _apply_env_canary_clamps(CFG)
+        reconcile_cfg_inplace(CFG, stage="run_sweep")
+        runtime.install_runtime(cfg=CFG, outdir=OUTDIR, budget=BUDGET)
     except Exception:
         pass
 
@@ -4469,6 +4540,9 @@ def evaluate(df_all: pd.DataFrame, tag: str):
 
             CFG["gate_epsilon"] = float(eps_new)
             window_decl.epsilon = float(eps_new)
+
+            # In smoke mode, align WindowDecl bins with effective smoke policy
+            reconcile_window_decl_inplace(window_decl, CFG)
 
             if mp.current_process().name == "MainProcess":
                 print(
@@ -5394,25 +5468,51 @@ def evaluate(df_all: pd.DataFrame, tag: str):
         gg = g.sort_values("epoch").reset_index(drop=True)
         warm_idx_local = warm_idx_from_cfg(CFG)
 
-        # Determine first post-warm epoch where gate_warn == 1 for ≥K consecutive epochs (matches deployed policy)
+        # Determine first post-warm epoch where the gate FAILS (gate_warn bit == 0)
+        # for ≥K consecutive *evaluated* epochs. gate_check() returns 1 for PASS and 0 for FAIL.
         gw = None
+
+        # Prefer offline-calibrated gate if available; fall back to online gate_warn
         col = "gate_warn_calib" if "gate_warn_calib" in gg.columns else "gate_warn"
 
-        # If calibrated stream never warns post-warm, fall back to raw gate_warn so the baseline is meaningful.
-        if col == "gate_warn_calib":
+        # Evaluation mask from ORIGINAL gate_reason (most reliable eval indicator in this file)
+        if "gate_reason" in gg.columns:
+            reason_arr = gg["gate_reason"].astype(str).fillna("").to_numpy()
+            eval_mask = np.array([s.startswith("evaluated") for s in reason_arr], dtype=bool)
+        else:
+            eval_mask = np.ones(len(gg), dtype=bool)
+
+        # Optional additional guard: if gate_total_evidence exists, require minimum evidence
+        if "gate_total_evidence" in gg.columns:
+            try:
+                te = pd.to_numeric(gg["gate_total_evidence"], errors="coerce").fillna(0).to_numpy(dtype=float)
+                min_ev = float(as_int(CFG.get("gate_min_evidence", 16), default=16))
+                eval_mask = eval_mask & (te >= min_ev)
+            except Exception:
+                pass
+
+        # If calibrated stream has *no evaluated failures* post-warm, fall back to raw gate_warn.
+        if col == "gate_warn_calib" and ("gate_warn" in gg.columns):
             try:
                 epn0 = pd.to_numeric(gg["epoch"], errors="coerce").to_numpy(dtype=float)
                 post0 = epn0 >= float(warm_idx_local)
-                if post0.any():
-                    warned0 = int((gg.loc[post0, col].to_numpy(dtype=float) >= 1.0).sum())
-                    if warned0 == 0:
+                gw0 = gg[col].to_numpy(dtype=float)
+                post_eval = post0 & eval_mask & np.isfinite(gw0)
+                if post_eval.any():
+                    fail0 = (gw0 < 0.5) & post_eval
+                    if int(fail0.sum()) == 0:
                         col = "gate_warn"
             except Exception:
                 col = "gate_warn"
 
         if col in gg.columns:
             epn = pd.to_numeric(gg["epoch"], errors="coerce").to_numpy(dtype=float)
-            hit_idx = np.where((epn >= float(warm_idx_local)) & (gg[col].to_numpy(dtype=float) >= 1.0))[0]
+            gw_arr = gg[col].to_numpy(dtype=float)
+
+            # gate failure = gate_warn bit == 0 → count only evaluated epochs (and finite gw values)
+            fail_mask = (gw_arr < 0.5) & eval_mask & np.isfinite(gw_arr)
+
+            hit_idx = np.where((epn >= float(warm_idx_local)) & fail_mask)[0]
             j_end = _first_run_end(hit_idx, as_int(CFG.get("warn_consec", 3), default=3))
             if j_end is not None and j_end >= 0:
                 gw = as_int(gg.iloc[int(hit_idx[int(j_end)])]["epoch"], default=-1)
@@ -5542,11 +5642,10 @@ def main():
     # ---- FAST PATHS: avoid heavy imports/side effects for help/version ----
     _argv = sys.argv[1:]
 
-    # Apply smoke overrides early so warmup/ph_burn/epochs are consistent regardless of how we're invoked.
+    # Apply smoke defaults (non-critical) then reconcile env/smoke policy once at entry.
     apply_smoke_overrides_inplace(CFG)
-
-    # Re-install shared runtime state after smoke overrides so downstream imports/modules see the effective CFG.
     try:
+        reconcile_cfg_inplace(CFG, stage="main_pre")
         runtime.install_runtime(cfg=CFG, outdir=OUTDIR, budget=BUDGET)
     except Exception:
         pass
@@ -5719,23 +5818,8 @@ def main():
                 interventions=(lambda x: x,),
                 cal_ranges={str(k): (float(v[0]), float(v[1])) for k, v in j["cal_ranges"].items()},
             )
-            # Smoke override: force bins to smoke config unless explicitly overridden
-            if env_truthy("SCAR_SMOKE") and os.environ.get("SCAR_GATE_BINS") is None:
-                smoke_bins = as_int(CFG.get("gate_bins", 4), default=4)
-                try:
-                    cur_bins = int(getattr(window_decl, "bins", smoke_bins))
-                except Exception:
-                    cur_bins = int(smoke_bins)
-                if cur_bins != int(smoke_bins):
-                    try:
-                        if mp.current_process().name == "MainProcess":
-                            print(f"[smoke] overriding WindowDecl.bins: {cur_bins} -> {int(smoke_bins)}")
-                    except Exception:
-                        pass
-                    try:
-                        window_decl.bins = int(smoke_bins)
-                    except Exception:
-                        pass
+            # Apply smoke-policy fixes to the loaded WindowDecl (e.g., bins)
+            reconcile_window_decl_inplace(window_decl, CFG)
             install_window_decl(window_decl)
             _wire_fr_from_decl(window_decl)
             _loaded_precal_wd = True
