@@ -1241,9 +1241,15 @@ def warm_idx_from_cfg(cfg: Dict[str, Any]) -> int:
 
 
 def _warn_precedes_collapse(t_warn: Optional[int], t_c: Optional[int]) -> bool:
-    """In smoke mode allow warning at same epoch as collapse; otherwise require strict precedence."""
-    if t_warn is None or t_c is None:
+    """Causal validity check.
+    - If no warning -> invalid (False).
+    - If no collapse -> keep warning (True) so FP is measurable.
+    - If collapse exists -> require precedence (<= in smoke, < otherwise).
+    """
+    if t_warn is None:
         return False
+    if t_c is None:
+        return True
     if env_truthy("SCAR_SMOKE"):
         return int(t_warn) <= int(t_c)
     return int(t_warn) < int(t_c)
