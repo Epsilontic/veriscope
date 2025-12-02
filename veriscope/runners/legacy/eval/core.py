@@ -700,7 +700,7 @@ def recompute_gate_series_under_decl(
     df["gate_warn_calib"] = 0
 
     max_frac = as_float(cfg.get("gate_eps_stat_max_frac", 0.25), default=0.25)
-    thr_gain = as_float(cfg.get("gate_gain_thresh", 0.1), default=0.1)
+    thr_gain = as_float(cfg.get("gate_gain_thresh", 0.05), default=0.05)
     eps_sens = as_float(cfg.get("gate_epsilon_sens", 0.04), default=0.04)
     alpha = as_float(cfg.get("gate_eps_stat_alpha", 0.05), default=0.05)
     ln2 = math.log(2.0)
