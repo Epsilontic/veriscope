@@ -5581,17 +5581,27 @@ def evaluate(df_all: pd.DataFrame, tag: str):
         # Prefer offline-calibrated gate if available; fall back to online gate_warn
         col = "gate_warn_calib" if "gate_warn_calib" in gg.columns else "gate_warn"
 
-        # Evaluation mask from ORIGINAL gate_reason (most reliable eval indicator in this file)
-        if "gate_reason" in gg.columns:
-            reason_arr = gg["gate_reason"].astype(str).fillna("").to_numpy()
+        # Evaluation mask MUST match the chosen stream.
+        reason_col = "gate_reason"
+        if col == "gate_warn_calib" and "gate_reason_calib" in gg.columns:
+            reason_col = "gate_reason_calib"
+
+        if reason_col in gg.columns:
+            reason_arr = gg[reason_col].astype(str).fillna("").to_numpy()
             eval_mask = np.array([s.startswith("evaluated") for s in reason_arr], dtype=bool)
         else:
             eval_mask = np.ones(len(gg), dtype=bool)
 
-        # Optional additional guard: if gate_total_evidence exists, require minimum evidence
-        if "gate_total_evidence" in gg.columns:
+        # Optional evidence guard: prefer calibrated evidence if using calibrated stream
+        evidence_col = None
+        if col == "gate_warn_calib" and "gate_total_evidence_calib" in gg.columns:
+            evidence_col = "gate_total_evidence_calib"
+        elif "gate_total_evidence" in gg.columns:
+            evidence_col = "gate_total_evidence"
+
+        if evidence_col is not None:
             try:
-                te = pd.to_numeric(gg["gate_total_evidence"], errors="coerce").fillna(0).to_numpy(dtype=float)
+                te = pd.to_numeric(gg[evidence_col], errors="coerce").fillna(0).to_numpy(dtype=float)
                 min_ev = float(as_int(CFG.get("gate_min_evidence", 16), default=16))
                 eval_mask = eval_mask & (te >= min_ev)
             except Exception:
