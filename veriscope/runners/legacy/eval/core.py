@@ -671,7 +671,9 @@ def recompute_gate_series_under_decl(
     Offline recompute of gate diagnostics under a fixed WindowDecl.
 
     Returns a COPY of df_eval with:
-      gate_worst_tv_calib, gate_eps_stat_calib, gate_gain_calib, gate_warn_calib, gate_evaluated_calib, gate_reason_calib
+      gate_worst_tv_calib, gate_eps_stat_calib, gate_gain_calib,
+      gate_warn_calib, gate_evaluated_calib, gate_reason_calib,
+      gate_total_evidence_calib
     """
     try:
         from veriscope.core.ipm import dPi_product_tv  # product-TV under Φ_W
@@ -697,6 +699,7 @@ def recompute_gate_series_under_decl(
     df["gate_worst_tv_calib"] = np.nan
     df["gate_eps_stat_calib"] = np.nan
     df["gate_gain_calib"] = np.nan
+    df["gate_total_evidence_calib"] = np.nan
 
     # IMPORTANT: non-evaluated epochs (e.g., insufficient history) must be neutral.
     # gate_warn==1 means PASS; gate_warn==0 means FAIL.
@@ -708,6 +711,7 @@ def recompute_gate_series_under_decl(
     thr_gain = as_float(cfg.get("gate_gain_thresh", 0.05), default=0.05)
     eps_sens = as_float(cfg.get("gate_epsilon_sens", 0.04), default=0.04)
     alpha = as_float(cfg.get("gate_eps_stat_alpha", 0.05), default=0.05)
+    min_evidence = as_int(cfg.get("gate_min_evidence", 0), default=0)
     ln2 = math.log(2.0)
 
     mets = [m for m in getattr(window_decl, "metrics", []) if m in df.columns]
@@ -721,21 +725,39 @@ def recompute_gate_series_under_decl(
         idxs = list(g.index)
 
         for pos, idx in enumerate(idxs):
-            if pos < 2 * W - 1:
+            # Align with ONLINE semantics:
+            # At epoch E (row position pos), compare only prior epochs [0..E-1].
+            # Requires at least 2W prior points -> pos >= 2W.
+            if pos < (2 * W):
                 continue
 
-            ps = slice(pos - 2 * W + 1, pos - W + 1)
-            rs = slice(pos - W + 1, pos + 1)
+            # Exclude current epoch from both windows:
+            # past   = epochs [pos-2W, pos-W)
+            # recent = epochs [pos-W,  pos)
+            ps = slice(pos - (2 * W), pos - W)
+            rs = slice(pos - W, pos)
 
             past = {m: _as_float_array(to_numeric_opt(g.get(m)).iloc[ps].to_numpy()) for m in mets}
             recent = {m: _as_float_array(to_numeric_opt(g.get(m)).iloc[rs].to_numpy()) for m in mets}
+
+            # Evidence accounting (matches online): count finite pairs under DeclTransport.
+            counts = {m: _count_finite_pairs(window_decl, past[m], recent[m], m) for m in mets}
+            evidence_n = int(sum(int(v) for v in (counts or {}).values()))
+            df.loc[idx, "gate_total_evidence_calib"] = int(evidence_n)
+
+            if int(min_evidence) > 0 and evidence_n < int(min_evidence):
+                df.loc[idx, "gate_reason_calib"] = "not_evaluated_insufficient_evidence"
+                continue
 
             try:
                 tv = dPi_product_tv(window_decl, past, recent, apply=apply)
             except Exception:
                 tv = float("nan")
 
-            counts = {m: _count_finite_pairs(window_decl, past[m], recent[m], m) for m in mets}
+            # If TV is not finite, treat as not evaluated (prevents NaN-propagation into events).
+            if not np.isfinite(tv):
+                df.loc[idx, "gate_reason_calib"] = "not_evaluated_nan_tv"
+                continue
 
             try:
                 if agg_fn is not None:
@@ -747,17 +769,15 @@ def recompute_gate_series_under_decl(
 
             if not np.isfinite(eps_stat):
                 eps_stat = 0.0
+
             eps_stat = float(
                 min(
                     max(0.0, eps_stat),
-                    max_frac * float(getattr(window_decl, "epsilon", 0.0)),
+                    float(max_frac) * float(getattr(window_decl, "epsilon", 0.0)),
                 )
             )
 
-            eps_eff = max(
-                0.0,
-                float(getattr(window_decl, "epsilon", 0.0)) - eps_stat,
-            )
+            eps_eff = max(0.0, float(getattr(window_decl, "epsilon", 0.0)) - eps_stat)
 
             try:
                 s_train = series_or_empty(g.get("train_loss"))
@@ -783,8 +803,6 @@ def recompute_gate_series_under_decl(
             ok_kappa = (not np.isfinite(kappa)) or (kappa <= eps_sens)
             flag = int(bool(ok_gain and ok_tv and ok_kappa))
 
-            # Record evaluated status + reason for audit/debug. Non-evaluated epochs
-            # remain neutral via defaults set above.
             if flag == 1:
                 reason = "evaluated_ok"
             elif not ok_gain:
@@ -794,7 +812,7 @@ def recompute_gate_series_under_decl(
             else:
                 reason = "evaluated_fail_kappa"
 
-            df.loc[idx, "gate_worst_tv_calib"] = float(tv) if np.isfinite(tv) else np.nan
+            df.loc[idx, "gate_worst_tv_calib"] = float(tv)
             df.loc[idx, "gate_eps_stat_calib"] = float(eps_stat)
             df.loc[idx, "gate_gain_calib"] = float(gain_bits) if np.isfinite(gain_bits) else np.nan
             df.loc[idx, "gate_warn_calib"] = int(flag)
