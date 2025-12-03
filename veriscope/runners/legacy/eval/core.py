@@ -671,7 +671,7 @@ def recompute_gate_series_under_decl(
     Offline recompute of gate diagnostics under a fixed WindowDecl.
 
     Returns a COPY of df_eval with:
-      gate_worst_tv_calib, gate_eps_stat_calib, gate_gain_calib, gate_warn_calib
+      gate_worst_tv_calib, gate_eps_stat_calib, gate_gain_calib, gate_warn_calib, gate_evaluated_calib, gate_reason_calib
     """
     try:
         from veriscope.core.ipm import dPi_product_tv  # product-TV under Φ_W
@@ -697,7 +697,12 @@ def recompute_gate_series_under_decl(
     df["gate_worst_tv_calib"] = np.nan
     df["gate_eps_stat_calib"] = np.nan
     df["gate_gain_calib"] = np.nan
-    df["gate_warn_calib"] = 0
+
+    # IMPORTANT: non-evaluated epochs (e.g., insufficient history) must be neutral.
+    # gate_warn==1 means PASS; gate_warn==0 means FAIL.
+    df["gate_warn_calib"] = 1
+    df["gate_evaluated_calib"] = 0
+    df["gate_reason_calib"] = "insufficient_history"
 
     max_frac = as_float(cfg.get("gate_eps_stat_max_frac", 0.25), default=0.25)
     thr_gain = as_float(cfg.get("gate_gain_thresh", 0.05), default=0.05)
@@ -778,10 +783,23 @@ def recompute_gate_series_under_decl(
             ok_kappa = (not np.isfinite(kappa)) or (kappa <= eps_sens)
             flag = int(bool(ok_gain and ok_tv and ok_kappa))
 
+            # Record evaluated status + reason for audit/debug. Non-evaluated epochs
+            # remain neutral via defaults set above.
+            if flag == 1:
+                reason = "evaluated_ok"
+            elif not ok_gain:
+                reason = "evaluated_fail_gain"
+            elif not ok_tv:
+                reason = "evaluated_fail_stability"
+            else:
+                reason = "evaluated_fail_kappa"
+
             df.loc[idx, "gate_worst_tv_calib"] = float(tv) if np.isfinite(tv) else np.nan
             df.loc[idx, "gate_eps_stat_calib"] = float(eps_stat)
             df.loc[idx, "gate_gain_calib"] = float(gain_bits) if np.isfinite(gain_bits) else np.nan
             df.loc[idx, "gate_warn_calib"] = int(flag)
+            df.loc[idx, "gate_evaluated_calib"] = 1
+            df.loc[idx, "gate_reason_calib"] = str(reason)
 
     return df
 

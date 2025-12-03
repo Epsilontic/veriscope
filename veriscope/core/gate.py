@@ -49,13 +49,22 @@ class GateEngine:
         intervs: Sequence = tuple(getattr(wd, "interventions", ()) or (lambda x: x,))
         apply = getattr(wd._DECL_TRANSPORT, "apply", lambda name, arr: np.asarray(arr, float))
         worst = 0.0
+        worst_any = False
         for T in intervs:
             tv_sum = 0.0
+            tv_finite = 0
             for m, w in wd.weights.items():
                 a = T(apply(m, past.get(m, np.array([], float))))
                 b = T(apply(m, recent.get(m, np.array([], float))))
-                tv_sum += float(w) * tv_hist_fixed(a, b, wd.bins)
-            worst = max(worst, tv_sum)
+                tv = tv_hist_fixed(a, b, wd.bins)
+                if np.isfinite(tv):
+                    tv_sum += float(w) * float(tv)
+                    tv_finite += 1
+            if tv_finite > 0 and np.isfinite(tv_sum):
+                worst = max(worst, float(tv_sum))
+                worst_any = True
+        if not worst_any:
+            worst = float("nan")
         eps_cap = float(wd.epsilon) * float(min(max(self.cap_frac, 0.0), 1.0))
         eps_stat = float(min(max(0.0, eps_stat_value), eps_cap))
         eps_eff = max(0.0, float(wd.epsilon) - eps_stat)

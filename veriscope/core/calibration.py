@@ -32,10 +32,10 @@ def resolve_epsilon_from_controls(vals: Iterable[Any], q: float, fallback: float
 
 # --- ε-statistics for histogram TV ---
 def epsilon_statistic_bhc(n: int, k: int, alpha: float = 0.05) -> float:
-    """Conservative finite-sample TV slack for a k-bin histogram with n samples.
-    Returns ε_stat in [0,1]."""
+    # No samples => maximum uncertainty.
+    # Downstream code should clamp this to (max_frac * epsilon) anyway.
     if n <= 0:
-        return 0.0
+        return 1.0
     t = max(0.0, math.log(max(2.0, float(k))) + math.log(1.0 / max(alpha, 1e-12)))
     eps = math.sqrt(max(0.0, t / max(2.0 * float(n), 1e-12)))
     return float(min(max(eps, 0.0), 1.0))

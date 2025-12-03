@@ -19,12 +19,14 @@ def tv_hist_fixed(z0: Any, z1: Any, bins: int) -> float:
     b = np.clip(b[np.isfinite(b)], 0.0, 1.0)
     ha, _ = np.histogram(a, bins=bins, range=(0.0, 1.0), density=False)
     hb, _ = np.histogram(b, bins=bins, range=(0.0, 1.0), density=False)
+    # If both sides are empty after filtering, treat them as identical (distance 0).
     if ha.sum() == 0 and hb.sum() == 0:
         return 0.0
-    if ha.sum() == 0:
-        ha = np.ones_like(ha)
-    if hb.sum() == 0:
-        hb = np.ones_like(hb)
+
+    # If either side has no mass, TV is undefined for this window.
+    # Return NaN so callers can treat it as "not evaluated" rather than fabricating a uniform baseline.
+    if ha.sum() == 0 or hb.sum() == 0:
+        return float("nan")
     ha = ha / ha.sum()
     hb = hb / hb.sum()
     return 0.5 * float(np.abs(ha - hb).sum())
