@@ -249,6 +249,7 @@ def agg_eps_adapter(
 
 # Default ε aggregator is the local adapter; FR wiring (below) may override.
 AGGREGATE_EPSILON = agg_eps_adapter
+# NOTE: agg_eps_adapter is defined once near the top of this file; do not redefine it here.
 
 
 # ---- legacy imports (stay as-is) ----
@@ -869,8 +870,8 @@ def gate_check(
                 print(f"[gate][dbg] SKIP insufficient_evidence: {total_evidence} < {min_evidence}")
             except Exception:
                 pass
-        return 0, {
-            "reason": "insufficient_evidence",
+        return 1, {
+            "reason": "not_evaluated_insufficient_evidence",
             "total_evidence": int(total_evidence),
             "min_evidence": int(min_evidence),
             "worst_tv": float("nan"),
@@ -2016,6 +2017,10 @@ except Exception:
     install_window_decl = None  # type: ignore[assignment]
     write_window_audit = None  # type: ignore[assignment]
     write_window_provenance_from_decl = None  # type: ignore[assignment]
+    FRWindow = None  # type: ignore[assignment]
+    DeclTransport = None  # type: ignore[assignment]
+    GateEngine = None  # type: ignore[assignment]
+    WindowDecl = None  # type: ignore[assignment]
 
 # If fr_integration exposes a resolver, hook it into AGGREGATE_EPSILON
 if _FR_RESOLVE_EPS is not None:
@@ -2432,7 +2437,9 @@ def gradient_noise_scale(model: nn.Module, xb: torch.Tensor, yb: torch.Tensor, m
 def gt_collapse_time(run_df: pd.DataFrame, grad_cutoff: float) -> Tuple[Optional[int], str]:
     patience = int(CFG.get("gt_patience", 2))
     g = run_df.sort_values("epoch")
-    ep = to_numeric_series(g["epoch"], errors="coerce").to_numpy(dtype=np.int64)
+    ep_float = to_numeric_series(g["epoch"], errors="coerce").to_numpy(dtype=float)
+    # Avoid NaN -> int64 MIN_INT corruption (e.g., -9223372036854775808)
+    ep = np.where(np.isfinite(ep_float), ep_float, -1.0).astype(np.int64)
     nan_flag = g["nan_flag"].astype(bool).to_numpy()
     grad_rel = g["grad_norm_rel"].to_numpy()
     warm_idx = warm_idx_from_cfg(CFG)
@@ -2535,7 +2542,8 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
     # Ensure any preloaded WindowDecl is installed and FR is wired when run_one is invoked directly
     try:
         if "WINDOW_DECL" in globals() and (WINDOW_DECL is not None):
-            install_window_decl(WINDOW_DECL)
+            if callable(install_window_decl):
+                install_window_decl(WINDOW_DECL)
             _wire_fr_from_decl(WINDOW_DECL)
     except Exception:
         # Never let FR wiring failures break the core training loop.
@@ -2797,7 +2805,7 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
         assert ref_mu_sig[0].shape[1] == H.shape[1], "ref stats dimension mismatch"
 
         # --- Insert fallback WindowDecl if missing ---
-        if WINDOW_DECL is None:
+        if WINDOW_DECL is None and ("WindowDecl" in globals()) and (WindowDecl is not None):
             try:
                 snap = collect_feature_snapshot(model, pool_loader, device, ["var_out_k", "eff_dim"], ref_mu_sig=None)
                 eff_est = float(snap.get("eff_dim", np.array([np.nan], dtype=float))[0])
@@ -2813,16 +2821,22 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
                 interventions=(lambda x: x,),
                 cal_ranges=cal_ranges,
             )
-            install_window_decl(window_decl)
-            _wire_fr_from_decl(window_decl)
+            if callable(install_window_decl):
+                install_window_decl(window_decl)
             try:
-                write_window_provenance_from_decl(OUTDIR, window_decl)
+                _wire_fr_from_decl(window_decl)
             except Exception:
                 pass
-            try:
-                write_window_audit(OUTDIR, window_decl, note="Fallback per-run WindowDecl")
-            except Exception:
-                pass
+            if callable(write_window_provenance_from_decl):
+                try:
+                    write_window_provenance_from_decl(OUTDIR, window_decl)
+                except Exception:
+                    pass
+            if callable(write_window_audit):
+                try:
+                    write_window_audit(OUTDIR, window_decl, note="Fallback per-run WindowDecl")
+                except Exception:
+                    pass
     # ----------------------------------------------------------------------
 
     logs = []
@@ -3052,50 +3066,88 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
         model.train()
         norms = []
         it = iter(tr_loader)
+        batch_i = 0  # number of successfully processed batches so far
         while True:
+            # ---- Fetch with one retry on transient DataLoader issues ----
             try:
                 xb, yb = next(it)
             except StopIteration:
                 break
             except Exception as e:
                 if not did_retry_fetch:
-                    print(f"[WARN] batch fetch failed once; retrying… (seed={seed}, epoch={epoch}): {repr(e)}")
+                    print(
+                        f"[WARN] batch fetch failed once; retrying by rebuilding iterator… (seed={seed}, epoch={epoch}, batch_i={batch_i}): {repr(e)}"
+                    )
                     did_retry_fetch = True
-                    continue
-                nan_seen = True
-                print(f"[WARN] batch fetch failed (seed={seed}, epoch={epoch}): {repr(e)}")
-                traceback.print_exc()
-                break
+                    # IMPORTANT: when `next(it)` raises, the iterator state is not reliable.
+                    # Best-effort: rebuild the iterator and fast-forward to the same batch index.
+                    try:
+                        it = iter(tr_loader)
+                        for _ in range(int(batch_i)):
+                            next(it)
+                        xb, yb = next(it)
+                    except StopIteration:
+                        break
+                    except Exception as e2:
+                        nan_seen = True
+                        print(
+                            f"[WARN] batch fetch failed on retry (seed={seed}, epoch={epoch}, batch_i={batch_i}): {repr(e2)}"
+                        )
+                        traceback.print_exc()
+                        break
+                else:
+                    nan_seen = True
+                    print(f"[WARN] batch fetch failed (seed={seed}, epoch={epoch}, batch_i={batch_i}): {repr(e)}")
+                    traceback.print_exc()
+                    break
 
             xb, yb = xb.to(device), yb.to(device)
-            try:
-                if amp_enabled:
-                    with amp.autocast(device_type=device.type, enabled=amp_enabled):
+
+            # ---- Train step with one retry (recomputes forward/backward) ----
+            step_attempts = 0
+            while True:
+                try:
+                    if amp_enabled:
+                        with amp.autocast(device_type=device.type, enabled=amp_enabled):
+                            logits = model(xb)
+                            loss = F.cross_entropy(logits, yb)
+                        opt.zero_grad(set_to_none=True)
+                        scaler.scale(loss).backward()
+                        if clip_eff:
+                            scaler.unscale_(opt)
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(clip_eff))
+                        scaler.step(opt)
+                        scaler.update()
+                    else:
                         logits = model(xb)
                         loss = F.cross_entropy(logits, yb)
-                    opt.zero_grad(set_to_none=True)
-                    scaler.scale(loss).backward()
-                    if clip_eff:
-                        scaler.unscale_(opt)
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(clip_eff))
-                    scaler.step(opt)
-                    scaler.update()
-                else:
-                    logits = model(xb)
-                    loss = F.cross_entropy(logits, yb)
-                    opt.zero_grad(set_to_none=True)
-                    loss.backward()
-                    if clip_eff:
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(clip_eff))
-                    opt.step()
-            except Exception as e:
-                if not did_retry_step:
-                    print(f"[WARN] train step failed once; retrying… (seed={seed}, epoch={epoch}): {repr(e)}")
-                    did_retry_step = True
-                    continue
-                nan_seen = True
-                print(f"[WARN] train step failed (seed={seed}, epoch={epoch}): {repr(e)}")
-                traceback.print_exc()
+                        opt.zero_grad(set_to_none=True)
+                        loss.backward()
+                        if clip_eff:
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(clip_eff))
+                        opt.step()
+                    break  # success
+                except Exception as e:
+                    if step_attempts == 0 and (not did_retry_step):
+                        print(
+                            f"[WARN] train step failed once; retrying same batch… (seed={seed}, epoch={epoch}): {repr(e)}"
+                        )
+                        did_retry_step = True
+                        step_attempts += 1
+                        # Clear gradients and retry from a clean state
+                        try:
+                            opt.zero_grad(set_to_none=True)
+                        except Exception:
+                            pass
+                        continue
+                    nan_seen = True
+                    print(f"[WARN] train step failed (seed={seed}, epoch={epoch}): {repr(e)}")
+                    traceback.print_exc()
+                    # Abort epoch training loop on repeated failure
+                    step_attempts = 999
+                    break
+
+            if step_attempts >= 999:
                 break
 
             g2 = 0.0
@@ -3111,6 +3163,7 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
                 nan_seen = True
             train_loss_sum += float(loss.detach().item()) * xb.shape[0]
             train_cnt += xb.shape[0]
+            batch_i += 1
         if norms:
             grad_norm_med = float(np.median(norms))
             with torch.no_grad():
@@ -3121,14 +3174,19 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
             grad_norm_rel = float(grad_norm_med / (math.sqrt(max(p2, 1e-12)) + 1e-12))
             grad_valid = 1
         train_loss = train_loss_sum / max(1, train_cnt)
-        ewma_loss = (
-            train_loss
-            if epoch == 0 or np.isnan(train_loss)
-            else (
-                CFG["ewma_alpha"] * train_loss
-                + (1 - CFG["ewma_alpha"]) * (ewma_loss if np.isfinite(ewma_loss) else train_loss)
-            )
-        )
+
+        # Robust EWMA: never overwrite with NaN; initialize sensibly.
+        alpha = float(CFG.get("ewma_alpha", 0.1))
+        if epoch == 0:
+            ewma_loss = float(train_loss) if np.isfinite(train_loss) else 0.0
+        else:
+            if np.isfinite(train_loss):
+                prev = ewma_loss if (ewma_loss is not None and np.isfinite(ewma_loss)) else float(train_loss)
+                ewma_loss = alpha * float(train_loss) + (1.0 - alpha) * float(prev)
+            else:
+                # Keep previous EWMA if available; otherwise fall back to 0.
+                ewma_loss = float(ewma_loss) if (ewma_loss is not None and np.isfinite(ewma_loss)) else 0.0
+
         loss_hist.append(train_loss)
         sma_loss = float(np.mean(loss_hist[-CFG["sma_k"] :])) if len(loss_hist) >= CFG["sma_k"] else float("nan")
 
@@ -3163,8 +3221,10 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
             gns, gns_n = float("nan"), 0
 
         # --- fixed-partition gate (Φ_W) with ε_stat and κ_sens ---
-        # Defaults for logging even when the gate is not evaluated
-        gate_warn = 0
+        # Defaults for logging even when the gate is NOT evaluated.
+        # Semantics: gate_warn=1 means PASS/neutral; gate_warn=0 means FAIL.
+        # Therefore any non-evaluated epoch must be neutral to avoid false failures.
+        gate_warn = 1
         gate_gain = float("nan")
         gate_worst_tv = float("nan")
         gate_eps_stat = float("nan")
@@ -3184,12 +3244,12 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
         # Explicit non-eval reasons (avoid silent fallthrough / swallowed exceptions)
         if WINDOW_DECL is None:
             gate_reason = "no_window_decl"
-            gate_warn = 0
+            gate_warn = 1
             gate_total_evidence = 0
             gate_counts_json = ""
         elif len(logs) < 2 * int(W_gate):
             gate_reason = "insufficient_history"
-            gate_warn = 0
+            gate_warn = 1
             gate_total_evidence = 0
             gate_counts_json = ""
         else:
@@ -3740,38 +3800,10 @@ def _wire_fr_from_decl(win: "WindowDecl") -> None:
 
 
 # --- epsilon aggregation helper (legacy default; do not clobber FR resolver if installed) ---
-try:
-    from veriscope.core.calibration import aggregate_epsilon_stat as _core_aggregate_epsilon_stat
-except Exception:
+# NOTE: `_core_aggregate_epsilon_stat` is imported once near the top of this file; do not re-import here.
+# Guard for safety in case the top-level import was removed/modified.
+if "_core_aggregate_epsilon_stat" not in globals():
     _core_aggregate_epsilon_stat = None
-
-
-def agg_eps_adapter(
-    window: Any,
-    counts: Optional[Dict[str, int]] = None,
-    *,
-    counts_by_metric: Optional[Dict[str, int]] = None,
-    alpha: float = 0.05,
-    **_ignored: Any,
-) -> float:
-    """Stable adapter for epsilon-stat aggregation.
-
-    Accepts counts either positionally (legacy) or as `counts_by_metric=` (newer callers).
-    Returns 0.0 on failure.
-
-    NOTE: This is a legacy default. If an FR resolver (e.g., _FR_RESOLVE_EPS) has already
-    installed AGGREGATE_EPSILON, we must not overwrite it.
-    """
-    c = counts_by_metric if counts_by_metric is not None else (counts or {})
-    try:
-        fn = _core_aggregate_epsilon_stat
-        if fn is None:
-            return 0.0
-        out = fn(window, c, float(alpha))
-        out_f = float(out)
-        return out_f if np.isfinite(out_f) and out_f >= 0.0 else 0.0
-    except Exception:
-        return 0.0
 
 
 # Only set the default adapter if nothing else (e.g., FR resolver) already installed it.
@@ -4606,7 +4638,8 @@ def evaluate(df_all: pd.DataFrame, tag: str):
             },
             OUTDIR / "window_decl_calibrated.json",
         )
-        install_window_decl(window_decl)
+        if callable(install_window_decl):
+            install_window_decl(window_decl)
         _wire_fr_from_decl(window_decl)
         try:
             write_window_audit(
@@ -5142,6 +5175,43 @@ def evaluate(df_all: pd.DataFrame, tag: str):
 
     thresh = float(tau_prime)
 
+    # If there are no evaluation seeds, stop here after calibration-only artifacts.
+    # This avoids downstream empty-frame processing (baselines, overlays, invariants) that can produce
+    # index errors or meaningless outputs.
+    if no_eval:
+        print("[eval] no evaluation seeds present; skipping evaluation-only artifacts.")
+        try:
+            empty_events = pd.DataFrame(
+                columns=[
+                    "run_id",
+                    "seed",
+                    "factor",
+                    "t_warn",
+                    "t_collapse",
+                    "collapse_tag",
+                    "lead_time",
+                ]
+            )
+            empty_events.to_csv(OUTDIR / f"detector_events_{tag}.csv", index=False)
+            # Baseline event placeholders
+            empty_events.to_csv(OUTDIR / f"baseline_events_ewma_{tag}.csv", index=False)
+            empty_events.to_csv(OUTDIR / f"baseline_events_sma_{tag}.csv", index=False)
+            empty_events.to_csv(OUTDIR / f"baseline_events_vote_{tag}.csv", index=False)
+            empty_events.to_csv(OUTDIR / f"baseline_events_seq_{tag}.csv", index=False)
+            empty_events.to_csv(OUTDIR / f"baseline_events_newma_{tag}.csv", index=False)
+            empty_events.to_csv(OUTDIR / f"baseline_events_gate_{tag}.csv", index=False)
+            # Summary placeholders
+            pd.DataFrame([]).to_csv(OUTDIR / f"summary_learned_{tag}.csv", index=False)
+            pd.DataFrame([]).to_csv(OUTDIR / f"summary_baseline_ewma_{tag}.csv", index=False)
+            pd.DataFrame([]).to_csv(OUTDIR / f"summary_baseline_sma_{tag}.csv", index=False)
+            pd.DataFrame([]).to_csv(OUTDIR / f"summary_baseline_vote_{tag}.csv", index=False)
+            pd.DataFrame([]).to_csv(OUTDIR / f"summary_baseline_seq_{tag}.csv", index=False)
+            pd.DataFrame([]).to_csv(OUTDIR / f"summary_baseline_newma_{tag}.csv", index=False)
+            pd.DataFrame([]).to_csv(OUTDIR / f"summary_baseline_gate_{tag}.csv", index=False)
+        except Exception:
+            pass
+        return
+
     # ---- Apply learned detector to evaluation runs ----
     rows = []
     from typing import cast
@@ -5527,23 +5597,25 @@ def evaluate(df_all: pd.DataFrame, tag: str):
             except Exception:
                 pass
 
-        # If calibrated stream has *no evaluated failures* post-warm, fall back to raw gate_warn.
+        # If calibrated stream has *no evaluated epochs* post-warm, fall back to raw gate_warn.
+        # IMPORTANT: do NOT fall back merely because there are no calibrated failures — that is a valid “all clear”.
         if col == "gate_warn_calib" and ("gate_warn" in gg.columns):
             try:
                 epn0 = pd.to_numeric(gg["epoch"], errors="coerce").to_numpy(dtype=float)
                 post0 = epn0 >= float(warm_idx_local)
                 gw0 = gg[col].to_numpy(dtype=float)
                 post_eval = post0 & eval_mask & np.isfinite(gw0)
-                if post_eval.any():
-                    fail0 = (gw0 < 0.5) & post_eval
-                    if int(fail0.sum()) == 0:
-                        col = "gate_warn"
+                # Fall back only if there are no evaluated (finite) calibrated values post-warm.
+                if not bool(post_eval.any()):
+                    col = "gate_warn"
             except Exception:
                 col = "gate_warn"
 
         if col in gg.columns:
             epn = pd.to_numeric(gg["epoch"], errors="coerce").to_numpy(dtype=float)
             gw_arr = gg[col].to_numpy(dtype=float)
+            # Defensive: force non-evaluated epochs to be neutral/pass (gate_warn=1 semantics)
+            gw_arr = np.where(eval_mask, gw_arr, 1.0)
 
             # gate failure = gate_warn bit == 0 → count only evaluated epochs (and finite gw values)
             fail_mask = (gw_arr < 0.5) & eval_mask & np.isfinite(gw_arr)
@@ -5671,9 +5743,7 @@ def evaluate(df_all: pd.DataFrame, tag: str):
     make_plots(df_eval_overlay, base_gate, tag=f"gate_{tag}", overlay_prefix="gate")
 
 
-# ---------------------------
-# Main
-# ---------------------------
+# Note: _calib_fallback_col was removed as dead code.
 def main():
     # ---- FAST PATHS: avoid heavy imports/side effects for help/version ----
     _argv = sys.argv[1:]
