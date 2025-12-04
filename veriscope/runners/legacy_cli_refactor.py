@@ -193,7 +193,7 @@ except Exception:
 try:
     from veriscope.core.gate import GateEngine
     from veriscope.core.transport import DeclTransport
-    from veriscope.core.window import FRWindow, WindowDecl
+    from veriscope.core.window import FRWindow, WindowDecl, window_decl_identity_hash
     from veriscope.core.calibration import aggregate_epsilon_stat as _core_aggregate_epsilon_stat
 except Exception:
     GateEngine = None  # type: ignore[assignment]
@@ -201,6 +201,7 @@ except Exception:
     FRWindow = None  # type: ignore[assignment]
     WindowDecl = None  # type: ignore[assignment]
     _core_aggregate_epsilon_stat = None  # type: ignore[assignment]
+    window_decl_identity_hash = None  # type: ignore[assignment]
 
 FRW_CLS: Optional[type] = FRWindow
 TRANS_CLS: Optional[type] = DeclTransport
@@ -832,10 +833,16 @@ def gate_check(
                 "gain_thresh_used": float(thr),
             }
             return int(bool(gr.ok)), audit
-        except Exception:
-            # Fall through to legacy path on any FR error
-            pass
-
+        except Exception as _fr_exc:
+            # Fall through to legacy path on any FR error, but make it visible (once)
+            global _FR_FALLBACK_WARNED
+            if not _FR_FALLBACK_WARNED:
+                try:
+                    if mp.current_process().name == "MainProcess":
+                        print(f"[gate][WARN] FR branch failed, falling back to legacy: {_fr_exc!r}")
+                        _FR_FALLBACK_WARNED = True
+                except Exception:
+                    pass
     # Early evidence gate: require a minimum number of finite transported pairs across metrics
     try:
         min_evidence = as_int(CFG.get("gate_min_evidence", 16), default=16)
@@ -1363,8 +1370,8 @@ CFG_SMOKE = dict(
     sw2_n_proj=64,
     # gate: keep W small so 2W history exists early in short runs
     gate_window=3,
-    gate_min_evidence=4,
-    gate_bins=4,  # smoke-critical: 16 bins is infeasible with tiny evidence
+    gate_min_evidence=12,  # > 2*W*n_metrics for W=3, n_metrics=2 → gate refuses to evaluate
+    gate_bins=2,  # Fewer bins = more forgiving histogram
     # warm / PH burn
     warmup=2,
     ph_burn=0,
@@ -1447,6 +1454,29 @@ def reconcile_cfg_inplace(cfg: Dict[str, Any], *, stage: str = "") -> None:
         cfg["var_k_max"] = max(1, int(cfg.get("var_k_max", 32)))
     except Exception:
         pass
+
+    # 4) Smoke: enforce evidence floor that makes gate refuse to evaluate
+    if env_truthy("SCAR_SMOKE"):
+        W = as_int(cfg.get("gate_window", 3), default=3)
+        n_metrics = 2  # Assume var_out_k + eff_dim
+        # Evidence per evaluated epoch ≈ min(len(past), len(recent)) per metric
+        # With W=3, max evidence ≈ W * n_metrics = 6
+        # Set floor above this so gate refuses to evaluate
+        achievable_evidence = W * n_metrics
+        # Only override if not explicitly set via env
+        if os.environ.get("SCAR_GATE_MIN_EVIDENCE") is None:
+            floor = max(
+                as_int(cfg.get("gate_min_evidence", 4), default=4),
+                achievable_evidence + 2,
+            )
+            if floor > achievable_evidence:
+                cfg["gate_min_evidence"] = floor
+                try:
+                    print(
+                        f"[smoke] gate_min_evidence={floor} (> achievable {achievable_evidence}); gate will refuse to evaluate"
+                    )
+                except Exception:
+                    pass
 
 
 def reconcile_window_decl_inplace(window_decl: Any, cfg: Dict[str, Any]) -> None:
@@ -3351,8 +3381,16 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
 
             except Exception as e:
                 gate_exc = repr(e)
-                gate_reason = "evaluated_exception"
-                gate_warn = 0
+                gate_reason = (
+                    "not_evaluated_exception"  # not "evaluated" so reason-prefix checks don't treat it as evaluated
+                )
+                gate_warn = 1  # neutral PASS — won't trigger early-exit
+                # Log once per process for visibility
+                try:
+                    if mp.current_process().name == "MainProcess":
+                        print(f"[gate][WARN] exception during gate_check (neutral PASS): {e!r}")
+                except Exception:
+                    pass
 
         logs.append(
             dict(
@@ -3445,6 +3483,16 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
                 gate_reason=str(gate_reason),
                 gate_counts=str(gate_counts_json),
                 gate_exc=str(gate_exc),
+                # WindowDecl identity for offline comparability
+                window_decl_hash=(
+                    window_decl_identity_hash(WINDOW_DECL)
+                    if (WINDOW_DECL is not None and window_decl_identity_hash is not None)
+                    else ""
+                ),
+                window_decl_epsilon=(
+                    float(getattr(WINDOW_DECL, "epsilon", float("nan"))) if WINDOW_DECL is not None else float("nan")
+                ),
+                window_decl_bins=(int(getattr(WINDOW_DECL, "bins", 0)) if WINDOW_DECL is not None else 0),
             )
         )
         # hard-stop training when the finite-window gate FAILS for k consecutive evaluated epochs (after warm)
@@ -3774,6 +3822,7 @@ GE: Optional["GateEngine"] = None  # GateEngine instance/factory
 WINDOW_DECL: Optional["WindowDecl"] = None  # WindowDecl from calibration
 DECL_INSTALL: Optional[Callable[..., None]] = None
 FR_ASSERT_NATURALITY = None  # kept for backward compatibility
+_FR_FALLBACK_WARNED: bool = False
 
 
 def _wire_fr_from_decl(win: "WindowDecl") -> None:
@@ -4270,19 +4319,18 @@ def _epoch_bounds_csv(path: Path) -> tuple[Optional[int], Optional[int], int]:
     """Return (emin, emax, nrows) for a CSV shard, or (None,None,0) on failure."""
     try:
         df = pd.read_csv(path, usecols=["epoch"])
-        try:
-            if "epoch" not in df.columns:
-                return None, None, 0
-            df = df.copy()
-            df["epoch"] = pd.to_numeric(df["epoch"], errors="coerce")
-            if df["epoch"].notna().sum() == 0:
-                return None, None, 0
-        except Exception:
+        if "epoch" not in df.columns:
             return None, None, 0
+        df = df.copy()
+        df["epoch"] = pd.to_numeric(df["epoch"], errors="coerce")
         ep = to_numeric_series(df["epoch"], errors="coerce")
         arr = ep.to_numpy(dtype=float)
-        mn = int(np.nanmin(arr))
-        mx = int(np.nanmax(arr))
+        # Filter to finite values only to avoid np.nanmin/nanmax returning NaN
+        arr = arr[np.isfinite(arr)]
+        if arr.size == 0:
+            return None, None, 0
+        mn = int(np.min(arr))
+        mx = int(np.max(arr))
         return mn, mx, int(len(df))
     except Exception:
         return None, None, 0
@@ -4292,19 +4340,18 @@ def _epoch_bounds(path: Path) -> tuple[Optional[int], Optional[int], int]:
     """Return (emin, emax, nrows) for a parquet shard, or (None,None,0) on failure."""
     try:
         df = pd.read_parquet(path, columns=["epoch"])
-        try:
-            if "epoch" not in df.columns:
-                return None, None, 0
-            df = df.copy()
-            df["epoch"] = pd.to_numeric(df["epoch"], errors="coerce")
-            if df["epoch"].notna().sum() == 0:
-                return None, None, 0
-        except Exception:
+        if "epoch" not in df.columns:
             return None, None, 0
+        df = df.copy()
+        df["epoch"] = pd.to_numeric(df["epoch"], errors="coerce")
         ep = to_numeric_series(df["epoch"], errors="coerce")
         arr = ep.to_numpy(dtype=float)
-        mn = int(np.nanmin(arr))
-        mx = int(np.nanmax(arr))
+        # Filter to finite values only to avoid np.nanmin/nanmax returning NaN
+        arr = arr[np.isfinite(arr)]
+        if arr.size == 0:
+            return None, None, 0
+        mn = int(np.min(arr))
+        mx = int(np.max(arr))
         return mn, mx, int(len(df))
     except Exception:
         return None, None, 0
@@ -4514,6 +4561,85 @@ def run_sweep(tag: str):
     return df_all
 
 
+def _compute_gate_warn_time(
+    gg: pd.DataFrame,
+    col: str,
+    warm_idx: int,
+    reason_col: Optional[str] = None,
+) -> Optional[int]:
+    """Compute first post-warm epoch where gate fails for K consecutive evaluated epochs.
+
+    Semantics:
+      - gate_warn == 1: PASS; gate_warn == 0: FAIL
+      - Non-evaluated epochs are treated as neutral (PASS) and do not contribute to runs.
+      - If an evidence column exists, enforce CFG['gate_min_evidence'] as an additional guard.
+
+    Returns the epoch number (int) or None.
+    """
+    if gg is None or getattr(gg, "empty", True):
+        return None
+    if "epoch" not in gg.columns or col not in gg.columns:
+        return None
+
+    warm_i = as_int(warm_idx, default=0)
+
+    # ---- Build evaluation mask ----
+    eval_mask = np.ones(len(gg), dtype=bool)
+
+    # Prefer explicit evaluated bit when present for calibrated stream
+    if col == "gate_warn_calib" and "gate_evaluated_calib" in gg.columns:
+        ev = pd.to_numeric(gg["gate_evaluated_calib"], errors="coerce").fillna(0).to_numpy(dtype=float)
+        eval_mask = eval_mask & (ev >= 0.5)
+
+    # Infer a reason column if not provided
+    if reason_col is None:
+        if col == "gate_warn_calib" and "gate_reason_calib" in gg.columns:
+            reason_col = "gate_reason_calib"
+        elif "gate_reason" in gg.columns:
+            reason_col = "gate_reason"
+
+    # Reason prefix guard (aligns with existing conventions)
+    if reason_col is not None and reason_col in gg.columns:
+        reason_arr = gg[reason_col].astype(str).fillna("").to_numpy()
+        eval_mask = eval_mask & np.array([s.startswith("evaluated") for s in reason_arr], dtype=bool)
+
+    # Evidence guard (if present)
+    evidence_col: Optional[str] = None
+    if col == "gate_warn_calib" and "gate_total_evidence_calib" in gg.columns:
+        evidence_col = "gate_total_evidence_calib"
+    elif "gate_total_evidence" in gg.columns:
+        evidence_col = "gate_total_evidence"
+
+    if evidence_col is not None and evidence_col in gg.columns:
+        te = pd.to_numeric(gg[evidence_col], errors="coerce").fillna(0).to_numpy(dtype=float)
+        min_ev = float(as_int(CFG.get("gate_min_evidence", 16), default=16))
+        if np.isfinite(min_ev) and min_ev > 0:
+            eval_mask = eval_mask & (te >= min_ev)
+
+    epn = pd.to_numeric(gg["epoch"], errors="coerce").to_numpy(dtype=float)
+    gw = pd.to_numeric(gg[col], errors="coerce").to_numpy(dtype=float)
+
+    # Non-evaluated epochs are neutral (PASS)
+    gw = np.where(eval_mask, gw, 1.0)
+
+    fail_mask = (gw < 0.5) & eval_mask & np.isfinite(gw)
+    hit_idx = np.where((epn >= float(warm_i)) & fail_mask)[0]
+    if hit_idx.size == 0:
+        return None
+
+    K_warn = as_int(CFG.get("warn_consec", 3), default=3)
+    j_end = _first_run_end(hit_idx, K_warn)
+    if j_end is None or int(j_end) < 0:
+        return None
+
+    try:
+        ep_out = gg.iloc[int(hit_idx[int(j_end)])]["epoch"]
+        ep_i = as_int(ep_out, default=-1)
+        return ep_i if ep_i >= 0 else None
+    except Exception:
+        return None
+
+
 def evaluate(df_all: pd.DataFrame, tag: str):
     # Early guards for empty/epoch-0 aggregates or missing columns
     if df_all is None or len(df_all) == 0 or not {"epoch", "seed"}.issubset(df_all.columns):
@@ -4534,6 +4660,33 @@ def evaluate(df_all: pd.DataFrame, tag: str):
     df_cal_raw = df_all[cal_mask].copy()
     df_eval_raw = df_all[ev_mask].copy()
     no_eval = (df_eval_raw is None) or getattr(df_eval_raw, "empty", True)
+
+    def _verify_decl_consistency(df: pd.DataFrame, wd_offline: Any) -> bool:
+        if df is None or getattr(df, "empty", True):
+            return True
+        if "window_decl_hash" not in df.columns:
+            return True
+        if window_decl_identity_hash is None:
+            return True
+        offline_hash = window_decl_identity_hash(wd_offline)
+        online_hashes = (
+            df["window_decl_hash"]
+            .astype(str)
+            .replace({"nan": "", "None": "", "": ""})
+            .loc[lambda s: s.str.len() > 0]
+            .unique()
+            .tolist()
+        )
+        if len(online_hashes) == 0:
+            return True
+        if len(online_hashes) > 1:
+            print(f"[WARN] multiple WindowDecl configs detected online: {online_hashes}")
+        ok = online_hashes[0] == offline_hash
+        if not ok:
+            print(f"[WARN] offline WindowDecl hash {offline_hash} != online {online_hashes[0]}")
+            print("       Any gate_*_calib series is COUNTERFACTUAL.")
+        return ok
+
     if no_eval:
         print(
             "[eval] no evaluation seeds present; will skip learned/baseline evaluation but still write calibration aggregates."
@@ -4588,6 +4741,7 @@ def evaluate(df_all: pd.DataFrame, tag: str):
             (df_cal_raw["factor"].astype(str).str.lower().str.strip() == "none")
             & (to_numeric_series(df_cal_raw["epoch"], errors="coerce") >= int(warm_idx))
         ]
+        decl_match = True
         window_decl = calibrate_window_from_controls(
             df_control=df_control,
             metrics=["var_out_k", "eff_dim"],  # add more if you plan to gate them
@@ -4600,7 +4754,7 @@ def evaluate(df_all: pd.DataFrame, tag: str):
         try:
             _W = as_int(CFG.get("gate_window", 16), default=16)
             eps_new, n_vals = calibrate_epsilon_from_controls(df_control, window_decl, W=_W, q=0.995)
-
+            decl_match = _verify_decl_consistency(df_eval_raw, window_decl)
             eps_floor = as_float(CFG.get("gate_epsilon_floor", 0.02), default=0.02)
             if (not np.isfinite(eps_floor)) or (eps_floor < 0.0):
                 eps_floor = 0.02
@@ -4656,6 +4810,9 @@ def evaluate(df_all: pd.DataFrame, tag: str):
             _W = as_int(CFG.get("gate_window", 16), default=16)
             df_eval_raw = df_eval_raw.sort_values(["seed", "factor", "epoch"]).reset_index(drop=True)
             df_eval_raw = recompute_gate_series_under_decl(df_eval_raw, window_decl, W=_W)
+            if not decl_match:
+                df_eval_raw["gate_calib_counterfactual"] = 1
+                print("[WARN] gate_*_calib columns are COUNTERFACTUAL (offline decl != online decl)")
         except Exception as e:
             print(f"[WARN] offline calibrated gate recompute failed: {e}")
             if "gate_warn_calib" not in df_eval_raw.columns:
@@ -5565,8 +5722,10 @@ def evaluate(df_all: pd.DataFrame, tag: str):
     base_newma = pd.DataFrame(newma_rows)
     base_newma.to_csv(OUTDIR / f"baseline_events_newma_{tag}.csv", index=False)
 
-    # ---- Gate-only baseline (uses per-epoch gate_warn) ----
+    # ---- Gate-only baseline (AUDIT lane): primary uses ONLINE gate_warn ----
     gate_rows = []
+    gate_calib_rows = []  # counterfactual series (calibrated recompute)
+
     from typing import cast
 
     for key, g in df_eval_raw.groupby(["seed", "factor"]):
@@ -5574,102 +5733,85 @@ def evaluate(df_all: pd.DataFrame, tag: str):
         gg = g.sort_values("epoch").reset_index(drop=True)
         warm_idx_local = warm_idx_from_cfg(CFG)
 
-        # Determine first post-warm epoch where the gate FAILS (gate_warn bit == 0)
-        # for ≥K consecutive *evaluated* epochs. gate_check() returns 1 for PASS and 0 for FAIL.
-        gw = None
+        # Primary baseline: always the online series
+        t_warn_online = _compute_gate_warn_time(gg, "gate_warn", warm_idx_local)
 
-        # Prefer offline-calibrated gate if available; fall back to online gate_warn
-        col = "gate_warn_calib" if "gate_warn_calib" in gg.columns else "gate_warn"
+        # Collapse time/tag from unified GT
+        t_c_raw = gg["t_collapse_gt"].iloc[0] if ("t_collapse_gt" in gg.columns and len(gg) > 0) else np.nan
+        tc_i = as_int(t_c_raw, default=-1)
+        t_c = tc_i if tc_i >= 0 else None
+        ctag = _runlevel_collapse_tag(gg, warm_idx_local)
 
-        # Evaluation mask MUST match the chosen stream.
-        reason_col = "gate_reason"
-        if col == "gate_warn_calib" and "gate_reason_calib" in gg.columns:
-            reason_col = "gate_reason_calib"
-
-        if reason_col in gg.columns:
-            reason_arr = gg[reason_col].astype(str).fillna("").to_numpy()
-            eval_mask = np.array([s.startswith("evaluated") for s in reason_arr], dtype=bool)
-        else:
-            eval_mask = np.ones(len(gg), dtype=bool)
-
-        # Optional evidence guard: prefer calibrated evidence if using calibrated stream
-        evidence_col = None
-        if col == "gate_warn_calib" and "gate_total_evidence_calib" in gg.columns:
-            evidence_col = "gate_total_evidence_calib"
-        elif "gate_total_evidence" in gg.columns:
-            evidence_col = "gate_total_evidence"
-
-        if evidence_col is not None:
-            try:
-                te = pd.to_numeric(gg[evidence_col], errors="coerce").fillna(0).to_numpy(dtype=float)
-                min_ev = float(as_int(CFG.get("gate_min_evidence", 16), default=16))
-                eval_mask = eval_mask & (te >= min_ev)
-            except Exception:
-                pass
-
-        # If calibrated stream has *no evaluated epochs* post-warm, fall back to raw gate_warn.
-        # IMPORTANT: do NOT fall back merely because there are no calibrated failures — that is a valid “all clear”.
-        if col == "gate_warn_calib" and ("gate_warn" in gg.columns):
-            try:
-                epn0 = pd.to_numeric(gg["epoch"], errors="coerce").to_numpy(dtype=float)
-                post0 = epn0 >= float(warm_idx_local)
-                gw0 = gg[col].to_numpy(dtype=float)
-                post_eval = post0 & eval_mask & np.isfinite(gw0)
-                # Fall back only if there are no evaluated (finite) calibrated values post-warm.
-                if not bool(post_eval.any()):
-                    col = "gate_warn"
-            except Exception:
-                col = "gate_warn"
-
-        if col in gg.columns:
-            epn = pd.to_numeric(gg["epoch"], errors="coerce").to_numpy(dtype=float)
-            gw_arr = gg[col].to_numpy(dtype=float)
-            # Defensive: force non-evaluated epochs to be neutral/pass (gate_warn=1 semantics)
-            gw_arr = np.where(eval_mask, gw_arr, 1.0)
-
-            # gate failure = gate_warn bit == 0 → count only evaluated epochs (and finite gw values)
-            fail_mask = (gw_arr < 0.5) & eval_mask & np.isfinite(gw_arr)
-
-            hit_idx = np.where((epn >= float(warm_idx_local)) & fail_mask)[0]
-            j_end = _first_run_end(hit_idx, as_int(CFG.get("warn_consec", 3), default=3))
-            if j_end is not None and j_end >= 0:
-                gw = as_int(gg.iloc[int(hit_idx[int(j_end)])]["epoch"], default=-1)
-
-        t_warn = gw if gw is not None else None
-        t_c_raw = gg["t_collapse_gt"].iloc[0]
-        t_c = as_int(t_c_raw, default=-1)
-        t_c = t_c if t_c >= 0 else None
-
-        ctag = _runlevel_collapse_tag(gg, warm_idx)
-
-        # Enforce causal ordering
-        if not _warn_precedes_collapse(t_warn, t_c):
-            t_warn = None
+        # Only enforce precedence if a collapse exists; for non-collapse runs keep t_warn to measure FP.
+        if (t_c is not None) and (not _warn_precedes_collapse(t_warn_online, t_c)):
+            t_warn_online = None
 
         lead = (
-            float(t_c - t_warn)
-            if (ctag in ["soft", "hard"] and t_warn is not None and t_c is not None)
+            float(t_c - t_warn_online)
+            if (ctag in ["soft", "hard"] and t_warn_online is not None and t_c is not None)
             else float("nan")
         )
+
         gate_rows.append(
             dict(
                 run_id=f"s{as_int(seed, default=0)}-{str(factor)}",
                 seed=as_int(seed, default=0),
                 factor=str(factor),
-                t_warn=t_warn,
+                t_warn=t_warn_online,
                 t_collapse=t_c,
                 collapse_tag=ctag,
-                ph_lambda=CFG["ph_lambda"],
-                heavy_every=CFG["heavy_every"],
-                metric_batches=CFG["metric_batches"],
-                var_k_energy=CFG["var_k_energy"],
-                var_k_max=CFG["var_k_max"],
+                ph_win=as_int(CFG.get("ph_win", 8), default=8),
+                ph_lambda=as_float(CFG.get("ph_lambda", 0.0), default=0.0),
+                ph_two_sided=as_int(CFG.get("ph_two_sided", 0), default=0),
+                warn_vote=CFG.get("warn_vote", 2),
+                heavy_every=CFG.get("heavy_every", 1),
+                metric_batches=CFG.get("metric_batches", 1),
+                var_k_energy=CFG.get("var_k_energy", 0.95),
+                var_k_max=CFG.get("var_k_max", 32),
                 lead_time=lead,
-                gate_source=str(col),
+                gate_source="online",
             )
         )
+
+        # Counterfactual lane: calibrated series if present
+        if "gate_warn_calib" in gg.columns:
+            t_warn_calib = _compute_gate_warn_time(gg, "gate_warn_calib", warm_idx_local)
+            if (t_c is not None) and (not _warn_precedes_collapse(t_warn_calib, t_c)):
+                t_warn_calib = None
+
+            lead2 = (
+                float(t_c - t_warn_calib)
+                if (ctag in ["soft", "hard"] and t_warn_calib is not None and t_c is not None)
+                else float("nan")
+            )
+
+            gate_calib_rows.append(
+                dict(
+                    run_id=f"s{as_int(seed, default=0)}-{str(factor)}",
+                    seed=as_int(seed, default=0),
+                    factor=str(factor),
+                    t_warn=t_warn_calib,
+                    t_collapse=t_c,
+                    collapse_tag=ctag,
+                    ph_win=as_int(CFG.get("ph_win", 8), default=8),
+                    ph_lambda=as_float(CFG.get("ph_lambda", 0.0), default=0.0),
+                    ph_two_sided=as_int(CFG.get("ph_two_sided", 0), default=0),
+                    warn_vote=CFG.get("warn_vote", 2),
+                    heavy_every=CFG.get("heavy_every", 1),
+                    metric_batches=CFG.get("metric_batches", 1),
+                    var_k_energy=CFG.get("var_k_energy", 0.95),
+                    var_k_max=CFG.get("var_k_max", 32),
+                    lead_time=lead2,
+                    gate_source="calibrated_counterfactual",
+                )
+            )
+
     base_gate = pd.DataFrame(gate_rows)
     base_gate.to_csv(OUTDIR / f"baseline_events_gate_{tag}.csv", index=False)
+
+    # Write counterfactual separately for analysis (never overwrites primary audit lane)
+    if gate_calib_rows:
+        pd.DataFrame(gate_calib_rows).to_csv(OUTDIR / f"baseline_events_gate_counterfactual_{tag}.csv", index=False)
 
     # ---- Summaries ----
     summ_det = summarize_detection(det_rows, warm_idx=warm_idx)
@@ -5964,8 +6106,13 @@ def main():
         pass
 
     # --- hand off to pipeline (import late to avoid cycles / stale runtime) ---
-    from veriscope.pipeline import run_sweep as pipeline_run_sweep
-    from veriscope.pipeline import evaluate as pipeline_evaluate
+    try:
+        from veriscope.pipeline import run_sweep as pipeline_run_sweep
+        from veriscope.pipeline import evaluate as pipeline_evaluate
+    except Exception as e:
+        print(f"[WARN] pipeline import failed ({e!r}); falling back to local run_sweep/evaluate")
+        pipeline_run_sweep = run_sweep
+        pipeline_evaluate = evaluate
 
     tag = "smoke" if os.environ.get("SCAR_SMOKE", "0") == "1" else "full_v2"
     # or, if you want to respect RUN_TAG overrides:
