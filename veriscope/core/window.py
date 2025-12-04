@@ -2,6 +2,9 @@
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Optional, Protocol, Sequence, Tuple
 
+import hashlib
+import json
+
 import numpy as np
 
 
@@ -30,6 +33,54 @@ class WindowDecl:
 
     def attach_transport(self, transport: Any) -> None:
         self._DECL_TRANSPORT = transport
+
+
+def window_decl_identity_hash(wd: "WindowDecl") -> str:
+    """Stable identity hash for a WindowDecl configuration.
+
+    Captures: epsilon, metrics, weights, bins, cal_ranges.
+    Does NOT capture interventions (lambdas aren't reliably hashable).
+
+    Returns a short 16-hex prefix of SHA-256 over a canonical JSON payload.
+    """
+
+    def _float_pair(v: Any) -> Tuple[float, float]:
+        try:
+            a, b = v  # type: ignore[misc]
+        except Exception:
+            return (float("nan"), float("nan"))
+        try:
+            return (float(a), float(b))
+        except Exception:
+            return (float("nan"), float("nan"))
+
+    metrics = sorted([str(m) for m in (getattr(wd, "metrics", []) or [])])
+
+    weights_raw = getattr(wd, "weights", {}) or {}
+    try:
+        weights_items = sorted((str(k), float(v)) for k, v in weights_raw.items())
+    except Exception:
+        # Fallback if values are not float-castable
+        weights_items = sorted((str(k), float("nan")) for k in weights_raw.keys())
+    weights = {k: v for k, v in weights_items}
+
+    cal_ranges_raw = getattr(wd, "cal_ranges", {}) or {}
+    cal_ranges_items = []
+    for k, v in cal_ranges_raw.items():
+        a, b = _float_pair(v)
+        cal_ranges_items.append((str(k), [a, b]))
+    cal_ranges = {k: v for k, v in sorted(cal_ranges_items)}
+
+    payload = {
+        "epsilon": float(getattr(wd, "epsilon", 0.0)),
+        "metrics": metrics,
+        "weights": weights,
+        "bins": int(getattr(wd, "bins", 0)),
+        "cal_ranges": cal_ranges,
+    }
+
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
 
 
 @dataclass
