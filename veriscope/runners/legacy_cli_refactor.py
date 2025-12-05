@@ -1457,14 +1457,14 @@ CFG_SMOKE = dict(
     gate_window=3,
     gate_min_evidence=3,  # NaN-tolerant: allows 1 metric to be fully missing at first eval (W=3, n_metrics=2)
     gate_min_evidence_full_eps=12,  # Smoke: keep inflation ON at first evaluated epoch (target = 2× ideal evidence)
-    gate_eps_inflation_max=12.0,  # Extra headroom for quantization artifacts at very low evidence
+    gate_eps_inflation_max=4.0,  # Smoke: meaningful inflation without making the gate vacuous
     gate_eps_stat_max_frac=0.10,  # Smoke: keep eps_stat from eating eps_scaled (reduces first-eval false fails)
-    gate_bins=2,  # Fewer bins = more forgiving histogram
+    gate_bins=4,  # Smoke: finer TV resolution than bins=2 while staying light
     # warm / PH burn
     warmup=2,
     ph_burn=0,
     # delay pathological factors so gate can build history
-    factor_start_epoch=8,
+    factor_start_epoch=4,
     # reduce persistence requirements in short runs
     warn_consec=2,
     detector_horizon=3,
@@ -1612,14 +1612,17 @@ def reconcile_cfg_inplace(cfg: Dict[str, Any], *, stage: str = "") -> None:
             if cur_full < full_target:
                 cfg["gate_min_evidence_full_eps"] = int(full_target)
 
-        # Provide extra inflation headroom in smoke unless explicitly overridden.
+        # Validate / sanitize inflation knob in smoke unless explicitly overridden.
+        # Do NOT force it upward (that can make the gate vacuously loose);
+        # just ensure it is finite and >= 1.0.
         if os.environ.get("SCAR_GATE_EPS_INFLATION_MAX") is None:
-            cur_infl = as_float(cfg.get("gate_eps_inflation_max", 12.0), default=12.0)
-            if (not np.isfinite(cur_infl)) or (cur_infl < 1.0):
-                cur_infl = 12.0
-            # Never reduce an explicit config value; only raise if too small.
-            if float(cur_infl) < 12.0:
-                cfg["gate_eps_inflation_max"] = 12.0
+            try:
+                _default_infl = float(CFG_SMOKE.get("gate_eps_inflation_max", 4.0))
+            except Exception:
+                _default_infl = 4.0
+            cur_infl = as_float(cfg.get("gate_eps_inflation_max", _default_infl), default=_default_infl)
+            if (not np.isfinite(cur_infl)) or (float(cur_infl) < 1.0):
+                cfg["gate_eps_inflation_max"] = float(_default_infl)
 
         # In smoke, prevent eps_stat from consuming most of eps_scaled.
         # This reduces first-eval false fails under coarse binning (e.g., bins=2) and tiny evidence.
