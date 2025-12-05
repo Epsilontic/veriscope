@@ -1456,7 +1456,7 @@ CFG_SMOKE = dict(
     # gate: keep W small so 2W history exists early in short runs
     gate_window=3,
     gate_min_evidence=3,  # NaN-tolerant: allows 1 metric to be fully missing at first eval (W=3, n_metrics=2)
-    gate_min_evidence_full_eps=6,  # Ideal evidence in smoke: W(3) × n_metrics(2)
+    gate_min_evidence_full_eps=12,  # Smoke: keep inflation ON at first evaluated epoch (target = 2× ideal evidence)
     gate_eps_inflation_max=12.0,  # Extra headroom for quantization artifacts at very low evidence
     gate_eps_stat_max_frac=0.10,  # Smoke: keep eps_stat from eating eps_scaled (reduces first-eval false fails)
     gate_bins=2,  # Fewer bins = more forgiving histogram
@@ -1602,11 +1602,15 @@ def reconcile_cfg_inplace(cfg: Dict[str, Any], *, stage: str = "") -> None:
         n_metrics = 2
         ideal_evidence = max(1, int(W) * int(n_metrics))
 
-        # Keep full-eps evidence at least the ideal (unless explicitly overridden by env).
+        # Smoke: keep full-eps evidence strictly above the first evaluated evidence so inflation is ON
+        # when total_evidence == ideal_evidence (common in short smoke runs).
+        # Default target is 2× ideal evidence, but never below min_evidence+1.
         if os.environ.get("SCAR_GATE_MIN_EVIDENCE_FULL_EPS") is None:
-            cur_full = as_int(cfg.get("gate_min_evidence_full_eps", ideal_evidence), default=ideal_evidence)
-            if cur_full < ideal_evidence:
-                cfg["gate_min_evidence_full_eps"] = int(ideal_evidence)
+            min_ev_now = as_int(cfg.get("gate_min_evidence", 3), default=3)
+            full_target = max(int(2 * ideal_evidence), int(min_ev_now) + 1)
+            cur_full = as_int(cfg.get("gate_min_evidence_full_eps", full_target), default=full_target)
+            if cur_full < full_target:
+                cfg["gate_min_evidence_full_eps"] = int(full_target)
 
         # Provide extra inflation headroom in smoke unless explicitly overridden.
         if os.environ.get("SCAR_GATE_EPS_INFLATION_MAX") is None:
