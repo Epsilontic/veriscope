@@ -778,6 +778,43 @@ def calibrate_epsilon_from_controls(
     return float(eps_clamped), int(n_vals)
 
 
+def _evidence_scaled_epsilon(
+    eps_base: float,
+    evidence: int,
+    *,
+    min_evidence: int,
+    max_inflation: float,
+) -> float:
+    """Inflate ε when evidence is low to avoid small-sample / quantization false alarms.
+
+    Returns eps_base once evidence >= min_evidence.
+    Linear inflation up to eps_base * max_inflation at evidence=0.
+    """
+    try:
+        eb = float(eps_base)
+    except Exception:
+        eb = 0.0
+    try:
+        ev = int(evidence)
+    except Exception:
+        ev = 0
+    try:
+        me = max(1, int(min_evidence))
+    except Exception:
+        me = 1
+    try:
+        mi = float(max_inflation)
+    except Exception:
+        mi = 1.0
+    if mi < 1.0:
+        mi = 1.0
+    if ev >= me:
+        return eb
+    ratio = max(0.0, min(1.0, float(ev) / float(me)))
+    infl = 1.0 + (mi - 1.0) * (1.0 - ratio)
+    return eb * float(infl)
+
+
 def gate_check(
     window: WindowDecl,
     past: Dict[str, np.ndarray],
@@ -892,6 +929,30 @@ def gate_check(
             "gain_thresh_used": float(thr),
         }
 
+    # Evidence-scaled ε to avoid spurious stability failures at tiny N (e.g., W=3 => evidence=6)
+    try:
+        min_full = as_int(CFG.get("gate_min_evidence_full_eps", 16), default=16)
+    except Exception:
+        min_full = 16
+    if min_full < int(min_evidence):
+        min_full = int(min_evidence)
+    try:
+        max_infl = as_float(CFG.get("gate_eps_inflation_max", 4.0), default=4.0)
+    except Exception:
+        max_infl = 4.0
+    if not np.isfinite(max_infl) or max_infl < 1.0:
+        max_infl = 1.0
+
+    eps_base = float(window.epsilon)
+    eps_scaled = float(
+        _evidence_scaled_epsilon(
+            eps_base,
+            int(total_evidence),
+            min_evidence=int(min_full),
+            max_inflation=float(max_infl),
+        )
+    )
+
     worst = 0.0
     intervs = window.interventions or (lambda x: x,)
     _DECL_TRANSPORT = None
@@ -923,7 +984,7 @@ def gate_check(
     eps_stat = float(eps_stat if np.isfinite(eps_stat) else 0.0)
     max_frac = float(CFG.get("gate_eps_stat_max_frac", 0.25))
     max_frac = float(min(max(max_frac, 0.0), 1.0))  # clamp knob to [0,1]
-    eps_cap = float(window.epsilon) * max_frac
+    eps_cap = float(eps_scaled) * max_frac
     eps_stat = float(min(max(0.0, eps_stat), eps_cap))
 
     # Gain check (bits/sample) vs threshold 'thr' defined above
@@ -931,7 +992,7 @@ def gate_check(
 
     # Stability: worst TV must be ≤ (ε − ε_stat), never negative
     worst = float(worst if np.isfinite(worst) else np.inf)
-    eps_eff = max(0.0, float(window.epsilon) - eps_stat)
+    eps_eff = max(0.0, float(eps_scaled) - eps_stat)
     ok_stability = worst <= eps_eff
     if DEBUG_GATE and mp.current_process().name == "MainProcess":
         # Always print on stability failure (useful signal without flooding logs)
@@ -939,13 +1000,14 @@ def gate_check(
             try:
                 print(
                     f"[gate][dbg] stability_fail worst_tv={worst:.6f} eps_eff={eps_eff:.6f} "
-                    f"eps={float(window.epsilon):.6f} eps_stat={eps_stat:.6f}"
+                    f"eps_scaled={float(eps_scaled):.6f} eps_base={float(eps_base):.6f} eps_stat={eps_stat:.6f}"
                 )
             except Exception:
                 pass
 
     # Sensitivity budget κ_sens ≤ ε_sens
-    eps_sens = float(max(0.0, CFG.get("gate_epsilon_sens", 0.04)))
+    eps_sens = as_float(CFG.get("gate_epsilon_sens", 0.04), default=0.04)
+    eps_sens = float(max(0.0, eps_sens))
     kappa_sens = float(kappa_sens if np.isfinite(kappa_sens) else np.inf)
     ok_kappa = kappa_sens <= eps_sens
 
@@ -971,6 +1033,11 @@ def gate_check(
         "gain_bits": float(gain),
         "worst_tv": float(worst),
         "eps_stat": float(eps_stat),
+        "eps_base": float(eps_base),
+        "eps_scaled": float(eps_scaled),
+        "eps_inflation_factor": float(float(eps_scaled) / max(float(eps_base), 1e-12)),
+        "min_evidence_full_eps": int(min_full),
+        "gate_eps_inflation_max": float(max_infl),
         "kappa_sens": float(kappa_sens if np.isfinite(kappa_sens) else 0.0),
         "counts_by_metric": {k: int(v) for k, v in (counts or {}).items()},
         "eps_aggregation": "cap_to_frac",
@@ -1336,6 +1403,8 @@ CFG.setdefault("gate_gain_q", 0.05)
 CFG.setdefault("gate_gain_thresh_cap", 0.15)  # cap for calibrated gain threshold (bits/sample)
 CFG.setdefault("gate_epsilon_sens", 0.04)  # dedicated κ_sens budget
 CFG.setdefault("gate_min_evidence", 16)
+CFG.setdefault("gate_min_evidence_full_eps", 16)  # evidence at which ε inflation fully turns off
+CFG.setdefault("gate_eps_inflation_max", 4.0)  # max multiplier for ε when evidence is low
 CFG.setdefault("gate_gain_units", "bits/sample")
 
 # Instantiate the global budget ledger using current CFG limits
