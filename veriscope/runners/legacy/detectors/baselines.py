@@ -43,6 +43,9 @@ def _prep_series_for_ph(g: pd.DataFrame, metric: str) -> List[float]:
     """Prepare a metric series for PH detection: ffill scheduled metrics, apply validity masks,
     and gate pers_H0 by min repeats and time budget. Returns a Python list with NaNs for invalid epochs.
     """
+    # Guard: return all-NaN if metric column is missing
+    if metric not in g.columns:
+        return [float("nan")] * len(g)
 
     s = g[metric].copy()
     if metric in SCHEDULED_METRICS:

@@ -237,6 +237,9 @@ def _first_run_end(hit_idx: np.ndarray, L: int) -> int:
     L = int(L)
     if len(hit_idx) < L:
         return -1
+    # Edge case: L <= 1 means any single hit suffices.
+    if L <= 1:
+        return 0
     r = 1
     for j in range(1, len(hit_idx)):
         if hit_idx[j] == hit_idx[j - 1] + 1:

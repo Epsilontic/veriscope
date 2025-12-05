@@ -827,19 +827,32 @@ def gate_check(
 ) -> Tuple[int, Dict[str, Any]]:
     """Joint gate: prequential gain + fixed-partition product–TV with ε_stat and κ_sens."""
     thr = float(gain_thresh)
+    # Evidence must be computed from metric counts only (ignore meta keys like "_epoch").
+    counts_metric: Dict[str, int] = {}
+    try:
+        for k, v in (counts or {}).items():
+            ks = str(k)
+            if ks.startswith("_"):
+                continue
+            try:
+                counts_metric[ks] = int(v)
+            except Exception:
+                continue
+    except Exception:
+        counts_metric = {}
     # --- FR branch: license via D_W with common transport; preserves legacy audit keys ---
     global USE_FR, FR_WIN, GE
     if USE_FR and (FR_WIN is not None) and (GE is not None):
         try:
             # Aggregate ε_stat using the existing routine, then delegate to GateEngine
-            eps_stat_value = AGGREGATE_EPSILON(window, counts_by_metric=counts, alpha=float(eps_stat_alpha))
+            eps_stat_value = AGGREGATE_EPSILON(window, counts_by_metric=counts_metric, alpha=float(eps_stat_alpha))
             # Clamp NaNs to 0 before passing
             if not np.isfinite(eps_stat_value):
                 eps_stat_value = 0.0
             gr = GE.check(
                 past={m: np.asarray(past.get(m, np.array([], float)), dtype=float) for m in window.weights.keys()},
                 recent={m: np.asarray(recent.get(m, np.array([], float)), dtype=float) for m in window.weights.keys()},
-                counts_by_metric={str(k): int(v) for k, v in (counts or {}).items()},
+                counts_by_metric={str(k): int(v) for k, v in (counts_metric or {}).items()},
                 gain_bits=float(gain) if (gain is not None) and np.isfinite(gain) else float("nan"),
                 kappa_sens=float(kappa_sens) if (kappa_sens is not None) and np.isfinite(kappa_sens) else float("inf"),
                 eps_stat_value=float(eps_stat_value),
@@ -850,7 +863,7 @@ def gate_check(
             except Exception:
                 _min_evidence_fr = 16
             try:
-                _total_evidence_fr = int(sum(int(v) for v in (counts or {}).values()))
+                _total_evidence_fr = int(sum(int(v) for v in (counts_metric or {}).values()))
             except Exception:
                 _total_evidence_fr = 0
             _reason_fr = "evaluated_fr_ok" if bool(getattr(gr, "ok", False)) else "evaluated_fr_fail"
@@ -863,7 +876,7 @@ def gate_check(
                 "worst_tv": as_float(gr.audit.get("worst_DW", np.nan), default=float("nan")),
                 "eps_stat": as_float(gr.audit.get("eps_stat", np.nan), default=float("nan")),
                 "kappa_sens": as_float(gr.audit.get("kappa_sens", np.nan), default=float("nan")),
-                "counts_by_metric": {k: int(v) for k, v in (counts or {}).items()},
+                "counts_by_metric": {k: int(v) for k, v in (counts_metric or {}).items()},
                 "eps_aggregation": "cap_to_frac",
                 "gain_units": CFG.get("gate_gain_units", "bits/sample"),
                 "eps_stat_cap_fraction": float(CFG.get("gate_eps_stat_max_frac", 0.25)),
@@ -886,7 +899,7 @@ def gate_check(
     except Exception:
         min_evidence = 16
     try:
-        total_evidence = int(sum(int(v) for v in (counts or {}).values()))
+        total_evidence = int(sum(int(v) for v in (counts_metric or {}).values()))
     except Exception:
         total_evidence = 0
 
@@ -922,7 +935,7 @@ def gate_check(
             "eps_stat": float("nan"),
             "kappa_sens": float(kappa_sens) if (kappa_sens is not None) and np.isfinite(kappa_sens) else float("nan"),
             "gain_bits": float(gain) if (gain is not None) and np.isfinite(gain) else float("nan"),
-            "counts_by_metric": {k: int(v) for k, v in (counts or {}).items()},
+            "counts_by_metric": {k: int(v) for k, v in (counts_metric or {}).items()},
             "eps_aggregation": "cap_to_frac",
             "eps_stat_cap_fraction": float(CFG.get("gate_eps_stat_max_frac", 0.25)),
             "gain_units": CFG.get("gate_gain_units", "bits/sample"),
@@ -930,12 +943,15 @@ def gate_check(
         }
 
     # Evidence-scaled ε to avoid spurious stability failures at tiny N (e.g., W=3 => evidence=6)
+    # eps_scaled is used for eps_stat capping and eps_eff in the stability check.
     try:
         min_full = as_int(CFG.get("gate_min_evidence_full_eps", 16), default=16)
     except Exception:
         min_full = 16
-    if min_full < int(min_evidence):
-        min_full = int(min_evidence)
+    # Ensure inflation still applies on the first evaluated epoch (often total_evidence == min_evidence).
+    # If min_full == min_evidence, inflation would be off exactly when we most need it.
+    min_full = max(int(min_full), int(min_evidence) + 1)
+
     try:
         max_infl = as_float(CFG.get("gate_eps_inflation_max", 4.0), default=4.0)
     except Exception:
@@ -980,7 +996,7 @@ def gate_check(
             worst = max(worst, float("inf"))
 
     # Sampling-slack ε_stat: aggregate, guard, and cap to a fraction of ε
-    eps_stat = AGGREGATE_EPSILON(window, counts_by_metric=counts, alpha=eps_stat_alpha)
+    eps_stat = AGGREGATE_EPSILON(window, counts_by_metric=counts_metric, alpha=eps_stat_alpha)
     eps_stat = float(eps_stat if np.isfinite(eps_stat) else 0.0)
     max_frac = float(CFG.get("gate_eps_stat_max_frac", 0.25))
     max_frac = float(min(max(max_frac, 0.0), 1.0))  # clamp knob to [0,1]
@@ -1039,7 +1055,7 @@ def gate_check(
         "min_evidence_full_eps": int(min_full),
         "gate_eps_inflation_max": float(max_infl),
         "kappa_sens": float(kappa_sens if np.isfinite(kappa_sens) else 0.0),
-        "counts_by_metric": {k: int(v) for k, v in (counts or {}).items()},
+        "counts_by_metric": {k: int(v) for k, v in (counts_metric or {}).items()},
         "eps_aggregation": "cap_to_frac",
         "gain_units": CFG.get("gate_gain_units", "bits/sample"),
         "eps_stat_cap_fraction": float(CFG.get("gate_eps_stat_max_frac", 0.25)),
@@ -1439,7 +1455,10 @@ CFG_SMOKE = dict(
     sw2_n_proj=64,
     # gate: keep W small so 2W history exists early in short runs
     gate_window=3,
-    gate_min_evidence=12,  # > 2*W*n_metrics for W=3, n_metrics=2 → gate refuses to evaluate
+    gate_min_evidence=3,  # NaN-tolerant: allows 1 metric to be fully missing at first eval (W=3, n_metrics=2)
+    gate_min_evidence_full_eps=6,  # Ideal evidence in smoke: W(3) × n_metrics(2)
+    gate_eps_inflation_max=12.0,  # Extra headroom for quantization artifacts at very low evidence
+    gate_eps_stat_max_frac=0.10,  # Smoke: keep eps_stat from eating eps_scaled (reduces first-eval false fails)
     gate_bins=2,  # Fewer bins = more forgiving histogram
     # warm / PH burn
     warmup=2,
@@ -1466,6 +1485,9 @@ SMOKE_ENV_BYPASS: Dict[str, str] = {
     "family_window": "SCAR_FAMILY_WINDOW",
     "gate_gain_q": "SCAR_GATE_GAIN_Q",
     "gate_gain_thresh": "SCAR_GATE_GAIN_THRESH",
+    "gate_min_evidence_full_eps": "SCAR_GATE_MIN_EVIDENCE_FULL_EPS",
+    "gate_eps_inflation_max": "SCAR_GATE_EPS_INFLATION_MAX",
+    "gate_eps_stat_max_frac": "SCAR_GATE_EPS_STAT_MAX_FRAC",
 }
 
 # All smoke-critical keys live here (single source of truth)
@@ -1478,12 +1500,39 @@ SMOKE_CRITICAL_KEYS: List[str] = [
     "gate_window",
     "gate_bins",
     "gate_min_evidence",
+    "gate_min_evidence_full_eps",
+    "gate_eps_inflation_max",
+    "gate_eps_stat_max_frac",
     "gate_early_exit",
     "warn_consec",
     "family_window",
     "gate_gain_q",
     "gate_gain_thresh",
 ]
+
+
+def _log_smoke_final_cfg(cfg: Dict[str, Any], stage: str = "") -> None:
+    """Log final effective smoke CFG values after reconciliation."""
+    if not env_truthy("SCAR_SMOKE"):
+        return
+    try:
+        if mp.current_process().name != "MainProcess":
+            return
+        stage_tag = f" ({stage})" if stage else ""
+        print(
+            f"[smoke] Final CFG{stage_tag}: "
+            f"gate_window={cfg.get('gate_window')} "
+            f"gate_bins={cfg.get('gate_bins')} "
+            f"gate_min_evidence={cfg.get('gate_min_evidence')} "
+            f"gate_min_evidence_full_eps={cfg.get('gate_min_evidence_full_eps')} "
+            f"gate_eps_inflation_max={cfg.get('gate_eps_inflation_max')} "
+            f"gate_eps_stat_max_frac={cfg.get('gate_eps_stat_max_frac')} "
+            f"warmup={cfg.get('warmup')} ph_burn={cfg.get('ph_burn')} "
+            f"warm_idx={warm_idx_from_cfg(cfg)} epochs={cfg.get('epochs')} "
+            f"warn_consec={cfg.get('warn_consec')}"
+        )
+    except Exception:
+        pass
 
 
 def reconcile_cfg_inplace(cfg: Dict[str, Any], *, stage: str = "") -> None:
@@ -1524,28 +1573,59 @@ def reconcile_cfg_inplace(cfg: Dict[str, Any], *, stage: str = "") -> None:
     except Exception:
         pass
 
-    # 4) Smoke: enforce evidence floor that makes gate refuse to evaluate
+    # 4) Smoke: keep gate_min_evidence achievable with NaN tolerance.
+    #    With W=3 and 2 metrics, ideal evidence = 6. But one metric may be partially/fully NaN,
+    #    so we require only (W * 1) = 3 to tolerate one fully-missing metric.
+    #
+    # Do not force the gate to refuse evaluation in smoke; if the current value is too high,
+    # clamp down to the NaN-tolerant bound unless the user explicitly set an env override.
     if env_truthy("SCAR_SMOKE"):
         W = as_int(cfg.get("gate_window", 3), default=3)
-        n_metrics = 2  # Assume var_out_k + eff_dim
-        # Evidence per evaluated epoch ≈ min(len(past), len(recent)) per metric
-        # With W=3, max evidence ≈ W * n_metrics = 6
-        # Set floor above this so gate refuses to evaluate
-        achievable_evidence = W * n_metrics
-        # Only override if not explicitly set via env
+        n_metrics = 2  # assume var_out_k + eff_dim feed the gate in smoke
+        ideal_evidence = max(1, int(W) * int(n_metrics))
+        nan_tolerant_evidence = max(1, int(W) * max(1, int(n_metrics) - 1))
         if os.environ.get("SCAR_GATE_MIN_EVIDENCE") is None:
-            floor = max(
-                as_int(cfg.get("gate_min_evidence", 4), default=4),
-                achievable_evidence + 2,
-            )
-            if floor > achievable_evidence:
-                cfg["gate_min_evidence"] = floor
+            cur = as_int(cfg.get("gate_min_evidence", nan_tolerant_evidence), default=nan_tolerant_evidence)
+            if cur > nan_tolerant_evidence:
+                cfg["gate_min_evidence"] = int(nan_tolerant_evidence)
                 try:
                     print(
-                        f"[smoke] gate_min_evidence={floor} (> achievable {achievable_evidence}); gate will refuse to evaluate"
+                        f"[smoke] gate_min_evidence clamped to {nan_tolerant_evidence} "
+                        f"(NaN-tolerant; ideal={ideal_evidence})"
                     )
                 except Exception:
                     pass
+
+    # 5) Smoke: ensure epsilon-inflation knobs are set for low-evidence quantization artifacts.
+    if env_truthy("SCAR_SMOKE"):
+        W = as_int(cfg.get("gate_window", 3), default=3)
+        n_metrics = 2
+        ideal_evidence = max(1, int(W) * int(n_metrics))
+
+        # Keep full-eps evidence at least the ideal (unless explicitly overridden by env).
+        if os.environ.get("SCAR_GATE_MIN_EVIDENCE_FULL_EPS") is None:
+            cur_full = as_int(cfg.get("gate_min_evidence_full_eps", ideal_evidence), default=ideal_evidence)
+            if cur_full < ideal_evidence:
+                cfg["gate_min_evidence_full_eps"] = int(ideal_evidence)
+
+        # Provide extra inflation headroom in smoke unless explicitly overridden.
+        if os.environ.get("SCAR_GATE_EPS_INFLATION_MAX") is None:
+            cur_infl = as_float(cfg.get("gate_eps_inflation_max", 12.0), default=12.0)
+            if (not np.isfinite(cur_infl)) or (cur_infl < 1.0):
+                cur_infl = 12.0
+            # Never reduce an explicit config value; only raise if too small.
+            if float(cur_infl) < 12.0:
+                cfg["gate_eps_inflation_max"] = 12.0
+
+        # In smoke, prevent eps_stat from consuming most of eps_scaled.
+        # This reduces first-eval false fails under coarse binning (e.g., bins=2) and tiny evidence.
+        if os.environ.get("SCAR_GATE_EPS_STAT_MAX_FRAC") is None:
+            cur_frac = as_float(cfg.get("gate_eps_stat_max_frac", 0.10), default=0.10)
+            if (not np.isfinite(cur_frac)) or (cur_frac < 0.0) or (cur_frac > 1.0):
+                cur_frac = 0.10
+            # Never increase an explicit config value; only clamp down if too large.
+            if float(cur_frac) > 0.10:
+                cfg["gate_eps_stat_max_frac"] = 0.10
 
 
 def reconcile_window_decl_inplace(window_decl: Any, cfg: Dict[str, Any]) -> None:
@@ -1577,10 +1657,12 @@ def apply_smoke_overrides_inplace(cfg: Dict[str, Any]) -> None:
     try:
         if env_truthy("SCAR_SMOKE"):
             # Only apply non-critical entries; critical keys are handled in reconcile_cfg_inplace.
+            applied_keys: List[str] = []
             for k, v in CFG_SMOKE.items():
                 if k in SMOKE_CRITICAL_KEYS:
                     continue
                 cfg[k] = v
+                applied_keys.append(k)
 
             # Ensure pathological factors start after a healthy prefix in smoke mode
             try:
@@ -1598,11 +1680,14 @@ def apply_smoke_overrides_inplace(cfg: Dict[str, Any]) -> None:
 
             try:
                 if mp.current_process().name == "MainProcess":
+                    # Only log what was actually applied here (non-critical keys). Critical keys
+                    # (gate_window, gate_bins, gate_min_evidence, etc.) are applied in reconcile_cfg_inplace().
+                    keys_preview = ", ".join(applied_keys[:5])
+                    ell = "..." if len(applied_keys) > 5 else ""
                     print(
-                        f"[smoke] Applied (legacy): warmup={cfg.get('warmup')} ph_burn={cfg.get('ph_burn')} "
-                        f"warm_idx={warm_idx_from_cfg(cfg)} gate_window={cfg.get('gate_window')} "
-                        f"gate_bins={cfg.get('gate_bins')} epochs={cfg.get('epochs')} "
-                        f"warn_consec={cfg.get('warn_consec')} factor_start_epoch={cfg.get('factor_start_epoch')}"
+                        f"[smoke] Applied (legacy, non-critical only): "
+                        f"factor_start_epoch={cfg.get('factor_start_epoch')} "
+                        f"(keys: {keys_preview}{ell})"
                     )
             except Exception:
                 pass
@@ -1881,10 +1966,10 @@ except Exception as e:
     except Exception:
         pass
 
-
 # Reconcile CFG once more after calibration load (calibration may have overwritten gate_* knobs)
 try:
     reconcile_cfg_inplace(CFG, stage="post_calibration")
+    _log_smoke_final_cfg(CFG, stage="post_calibration")
     runtime.install_runtime(cfg=CFG, outdir=OUTDIR, budget=BUDGET)
 except Exception:
     pass
