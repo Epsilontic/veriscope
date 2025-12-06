@@ -1448,7 +1448,7 @@ except Exception:
 CFG_SMOKE = dict(
     seeds_calib=[401, 402],
     seeds_eval=[511, 512],
-    epochs=16,
+    epochs=24,
     # run heavy metrics on a predictable cadence
     heavy_every=4,
     rp_repeats=1,
@@ -1457,14 +1457,17 @@ CFG_SMOKE = dict(
     gate_window=3,
     gate_min_evidence=3,  # NaN-tolerant: allows 1 metric to be fully missing at first eval (W=3, n_metrics=2)
     gate_min_evidence_full_eps=12,  # Smoke: keep inflation ON at first evaluated epoch (target = 2× ideal evidence)
-    gate_eps_inflation_max=4.0,  # Smoke: meaningful inflation without making the gate vacuous
+    # Gate epsilon: smoke calibration is underdetermined; use a realistic preset with a protective floor.
+    gate_epsilon=0.50,
+    gate_epsilon_floor=0.40,
+    gate_eps_inflation_max=1.5,  # With a realistic base epsilon, inflation can be modest.
     gate_eps_stat_max_frac=0.10,  # Smoke: keep eps_stat from eating eps_scaled (reduces first-eval false fails)
     gate_bins=4,  # Smoke: finer TV resolution than bins=2 while staying light
     # warm / PH burn
     warmup=2,
     ph_burn=0,
-    # delay pathological factors so gate can build history
-    factor_start_epoch=4,
+    # delay pathological factors so the gate can build enough history before collapse onset
+    factor_start_epoch=8,
     # reduce persistence requirements in short runs
     warn_consec=2,
     detector_horizon=3,
@@ -1481,6 +1484,8 @@ CFG_SMOKE = dict(
 SMOKE_ENV_BYPASS: Dict[str, str] = {
     "gate_bins": "SCAR_GATE_BINS",
     "gate_min_evidence": "SCAR_GATE_MIN_EVIDENCE",
+    "gate_epsilon": "SCAR_GATE_EPSILON",
+    "gate_epsilon_floor": "SCAR_GATE_EPSILON_FLOOR",
     "warn_consec": "SCAR_WARN_CONSEC",
     "family_window": "SCAR_FAMILY_WINDOW",
     "gate_gain_q": "SCAR_GATE_GAIN_Q",
@@ -1499,6 +1504,8 @@ SMOKE_CRITICAL_KEYS: List[str] = [
     "metric_batches",
     "gate_window",
     "gate_bins",
+    "gate_epsilon",
+    "gate_epsilon_floor",
     "gate_min_evidence",
     "gate_min_evidence_full_eps",
     "gate_eps_inflation_max",
@@ -1523,6 +1530,7 @@ def _log_smoke_final_cfg(cfg: Dict[str, Any], stage: str = "") -> None:
             f"[smoke] Final CFG{stage_tag}: "
             f"gate_window={cfg.get('gate_window')} "
             f"gate_bins={cfg.get('gate_bins')} "
+            f"gate_epsilon={cfg.get('gate_epsilon')} gate_epsilon_floor={cfg.get('gate_epsilon_floor')} "
             f"gate_min_evidence={cfg.get('gate_min_evidence')} "
             f"gate_min_evidence_full_eps={cfg.get('gate_min_evidence_full_eps')} "
             f"gate_eps_inflation_max={cfg.get('gate_eps_inflation_max')} "
@@ -4760,8 +4768,10 @@ def _compute_gate_warn_time(
             reason_col = "gate_reason"
 
     # Reason prefix guard (aligns with existing conventions)
+    # IMPORTANT: fill NaNs BEFORE astype(str). Otherwise NaN becomes the literal string "nan"
+    # and silently fails the evaluated-prefix check, suppressing warnings.
     if reason_col is not None and reason_col in gg.columns:
-        reason_arr = gg[reason_col].astype(str).fillna("").to_numpy()
+        reason_arr = gg[reason_col].fillna("").astype(str).to_numpy()
         eval_mask = eval_mask & np.array([s.startswith("evaluated") for s in reason_arr], dtype=bool)
 
     # Evidence guard (if present)
@@ -4776,6 +4786,25 @@ def _compute_gate_warn_time(
         min_ev = float(as_int(CFG.get("gate_min_evidence", 16), default=16))
         if np.isfinite(min_ev) and min_ev > 0:
             eval_mask = eval_mask & (te >= min_ev)
+
+    # ---- Debug: audit why warnings might be getting suppressed ----
+    try:
+        if (env_truthy("SCAR_SMOKE") or DEBUG_GATE) and mp.current_process().name == "MainProcess":
+            n_eval = int(np.sum(eval_mask)) if eval_mask is not None else 0
+            # Reason distribution (top-k) if available
+            top_reasons = {}
+            if reason_col is not None and reason_col in gg.columns:
+                try:
+                    top_reasons = gg[reason_col].fillna("").astype(str).value_counts().head(8).to_dict()
+                except Exception:
+                    top_reasons = {}
+            print(
+                f"[gate_warn_time] col={col} reason_col={reason_col} evidence_col={evidence_col} "
+                f"warm={warm_i} n_rows={len(gg)} n_eval={n_eval} top_reasons={top_reasons}",
+                flush=True,
+            )
+    except Exception:
+        pass
 
     epn = pd.to_numeric(gg["epoch"], errors="coerce").to_numpy(dtype=float)
     gw = pd.to_numeric(gg[col], errors="coerce").to_numpy(dtype=float)
