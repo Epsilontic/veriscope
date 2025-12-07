@@ -45,6 +45,36 @@ def _get_success_target() -> Mapping[str, Any]:
     return getattr(r, "SUCCESS_TARGET", SUCCESS_TARGET) if r is not None else SUCCESS_TARGET
 
 
+def _effective_min_lead() -> int:
+    """
+    Effective minimum required lead time for counting a detection as a success.
+
+    Policy:
+      - Base from SUCCESS_TARGET (possibly runtime-overridden)
+      - In smoke mode: default relax to 0 (warn at/before collapse counts as success)
+      - Optional explicit override: SCAR_MIN_LEAD (non-negative int)
+    """
+    import os
+
+    base = _get_success_target()
+    lead = as_int(base.get("min_lead", 2), default=2)
+
+    # Optional explicit override wins (useful for quick experiments)
+    v = os.environ.get("SCAR_MIN_LEAD")
+    if v is not None:
+        try:
+            return max(0, int(str(v).strip()))
+        except Exception:
+            return max(0, int(lead))
+
+    # Smoke default: relax to 0 unless explicitly overridden above
+    env_val = os.environ.get("SCAR_SMOKE", "0").strip().lower()
+    if env_val in ("1", "true", "yes", "on"):
+        return 0
+
+    return max(0, int(lead))
+
+
 # Numeric / config / IO shims.
 # Prefer the shared helpers in legacy.utils; fall back to local definitions if missing.
 try:
@@ -405,12 +435,8 @@ def bootstrap_stratified(
 
         trig = boot[boot["collapse_tag"] == "soft"]
         ncol = len(trig)
-        succ = int(
-            (
-                (trig["t_warn"].notna())
-                & ((trig["t_collapse"] - trig["t_warn"]) >= _get_success_target().get("min_lead", 2))
-            ).sum()
-        )
+        lead_min = int(_effective_min_lead())
+        succ = int(((trig["t_warn"].notna()) & ((trig["t_collapse"] - trig["t_warn"]) >= lead_min)).sum())
         vals_detect.append(float(succ / max(1, ncol)))
 
         non_trig = boot[boot["collapse_tag"] == "none"]
@@ -494,8 +520,8 @@ def summarize_detection(rows: pd.DataFrame, warm_idx: int) -> pd.DataFrame:
 
     _tw = to_numeric_series(trig["t_warn"], errors="coerce")
     _tc = to_numeric_series(trig["t_collapse"], errors="coerce")
-    lead_min = as_int(_get_success_target().get("min_lead", 2), default=2)
-    mask = (_tw.notna()) & ((_tc - _tw) >= int(lead_min))
+    lead_min = int(_effective_min_lead())
+    mask = (_tw.notna()) & ((_tc - _tw) >= lead_min)
 
     successes = int(np.count_nonzero(mask.to_numpy(dtype=bool)))
     detect_rate = successes / max(1, n_collapse)
