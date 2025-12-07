@@ -1474,8 +1474,8 @@ CFG_SMOKE = dict(
     # smoke GT knobs (faster confirmation / less aggressive collapse tagging)
     gt_rank_min=12.0,
     gt_patience=2,
-    # keep smoke fast
-    gate_early_exit=True,
+    # Smoke: keep full traces; do not halt runs early unless explicitly enabled via SCAR_GATE_HALT=1
+    gate_early_exit=False,
     gate_gain_q=0.05,
     gate_gain_thresh=0.02,
 )
@@ -1493,6 +1493,7 @@ SMOKE_ENV_BYPASS: Dict[str, str] = {
     "gate_min_evidence_full_eps": "SCAR_GATE_MIN_EVIDENCE_FULL_EPS",
     "gate_eps_inflation_max": "SCAR_GATE_EPS_INFLATION_MAX",
     "gate_eps_stat_max_frac": "SCAR_GATE_EPS_STAT_MAX_FRAC",
+    "gate_early_exit": "SCAR_GATE_HALT",
 }
 
 # All smoke-critical keys live here (single source of truth)
@@ -1537,7 +1538,8 @@ def _log_smoke_final_cfg(cfg: Dict[str, Any], stage: str = "") -> None:
             f"gate_eps_stat_max_frac={cfg.get('gate_eps_stat_max_frac')} "
             f"warmup={cfg.get('warmup')} ph_burn={cfg.get('ph_burn')} "
             f"warm_idx={warm_idx_from_cfg(cfg)} epochs={cfg.get('epochs')} "
-            f"warn_consec={cfg.get('warn_consec')}"
+            f"warn_consec={cfg.get('warn_consec')} "
+            f"gate_early_exit={cfg.get('gate_early_exit')}"
         )
     except Exception:
         pass
@@ -1937,6 +1939,15 @@ try:
             except Exception as _e:
                 if mp.current_process().name == "MainProcess":
                     print(f"[WARN] bad SCAR_GATE_EPSILON={v!r}: {_e}")
+        v = os.environ.get("SCAR_GATE_HALT")
+        if v is not None:
+            try:
+                CFG["gate_early_exit"] = 1 if env_truthy("SCAR_GATE_HALT") else 0
+                if mp.current_process().name == "MainProcess":
+                    print(f"[env] gate_early_exit={int(bool(CFG['gate_early_exit']))} (from SCAR_GATE_HALT)")
+            except Exception as _e:
+                if mp.current_process().name == "MainProcess":
+                    print(f"[WARN] bad SCAR_GATE_HALT={v!r}: {_e}")
     except Exception:
         pass
     try:
@@ -1955,6 +1966,7 @@ try:
                 "SCAR_GATE_MIN_EVIDENCE": os.environ.get("SCAR_GATE_MIN_EVIDENCE", ""),
                 "SCAR_GATE_GAIN_THRESH": os.environ.get("SCAR_GATE_GAIN_THRESH", ""),
                 "SCAR_GATE_GAIN_UNITS": os.environ.get("SCAR_GATE_GAIN_UNITS", ""),
+                "SCAR_GATE_HALT": os.environ.get("SCAR_GATE_HALT", ""),
             },
             "final": {
                 "gate_min_evidence": as_int_cfg(CFG.get("gate_min_evidence", 16), default=16),
@@ -1967,6 +1979,7 @@ try:
                 "gate_eps_stat_max_frac": as_float(CFG.get("gate_eps_stat_max_frac", 0.25), default=0.25),
                 "gate_epsilon_sens": as_float(CFG.get("gate_epsilon_sens", 0.04), default=0.04),
                 "gate_eps_stat_alpha": as_float(CFG.get("gate_eps_stat_alpha", 0.05), default=0.05),
+                "gate_early_exit": bool(CFG.get("gate_early_exit", True)),
                 "run_tag": RUN_TAG,
                 "calibration_mode": bool(CAL),
                 "smoke_mode": bool(SMOKE),
@@ -3053,6 +3066,16 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
     warn_consec_eff = as_int(os.environ.get("SCAR_WARN_CONSEC", str(CFG.get("warn_consec", 3))), default=3)
     warm_epoch = warm_idx_from_cfg(CFG)
     gate_early_exit = bool(CFG.get("gate_early_exit", True))
+
+    # Effective early-exit policy: default OFF in smoke for full trace capture.
+    # Can be forced via env SCAR_GATE_HALT=1 (or disabled via SCAR_GATE_HALT=0).
+    gate_early_exit_eff = bool(gate_early_exit)
+    if env_truthy("SCAR_SMOKE") and os.environ.get("SCAR_GATE_HALT") is None:
+        gate_early_exit_eff = False
+    if os.environ.get("SCAR_GATE_HALT") is not None:
+        gate_early_exit_eff = env_truthy("SCAR_GATE_HALT")
+    gate_early_exit_eff = bool(gate_early_exit_eff)
+
     # --- coherence/slope buffers ---
     _eff_dim_series = []
     _var_out_k_series = []
@@ -3665,7 +3688,7 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
             )
         )
         # hard-stop training when the finite-window gate FAILS for k consecutive evaluated epochs (after warm)
-        if gate_early_exit:
+        if gate_early_exit_eff:
             if epoch >= warm_epoch:
                 # gate_check() returns 1 when the gate PASSES (stable) and 0 when it FAILS (instability).
                 # Only count consecutive FAILs, and only when the gate was actually evaluated (not "insufficient_history", etc.).
@@ -3691,24 +3714,6 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
                     except Exception:
                         pass
                     break
-        #         if nan_seen:
-        #             # ensure we persist a terminal marker even if the failure was detected without an exception break
-        #             try:
-        #                 (OUTDIR / f"runs_seed{seed}_{tag}.done.json").write_text(
-        #                     json.dumps({"terminal": True, "reason": "nan_flag", "epoch": int(epoch)})
-        #                 )
-        #             except Exception:
-        #                 pass
-        #             break
-        if nan_seen:
-            # ensure we persist a terminal marker even if the failure was detected without an exception break
-            try:
-                (OUTDIR / f"runs_seed{seed}_{tag}.done.json").write_text(
-                    json.dumps({"terminal": True, "reason": "nan_flag", "epoch": int(epoch)})
-                )
-            except Exception:
-                pass
-            break
 
     df = pd.DataFrame(logs)
 
