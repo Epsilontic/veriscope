@@ -433,7 +433,14 @@ def bootstrap_stratified(
             continue
         boot = pd.concat(boot_parts, ignore_index=True)
 
-        trig = boot[boot["collapse_tag"] == "soft"]
+        trig0 = boot[boot["collapse_tag"] == "soft"]
+        # Admissibility guard: do not score collapses that occur before warm (gate not yet evaluable).
+        if (trig0 is not None) and (len(trig0) > 0) and ("t_collapse" in trig0.columns):
+            _tc0 = to_numeric_series(trig0["t_collapse"], errors="coerce")
+            trig = trig0[_tc0.notna() & (_tc0 >= float(warm))].copy()
+        else:
+            trig = trig0
+
         ncol = len(trig)
         lead_min = int(_effective_min_lead())
         succ = int(((trig["t_warn"].notna()) & ((trig["t_collapse"] - trig["t_warn"]) >= lead_min)).sum())
@@ -481,7 +488,14 @@ def summarize_detection(rows: pd.DataFrame, warm_idx: int) -> pd.DataFrame:
 
     out: List[Dict[str, Any]] = []
 
-    trig = rows[rows["collapse_tag"] == "soft"].copy()
+    trig0 = rows[rows["collapse_tag"] == "soft"].copy()
+    # Admissibility guard: do not score collapses that occur before warm_idx (gate not yet evaluable).
+    if (trig0 is not None) and (len(trig0) > 0) and ("t_collapse" in trig0.columns):
+        _tc0 = to_numeric_series(trig0["t_collapse"], errors="coerce")
+        trig = trig0[_tc0.notna() & (_tc0 >= float(warm_idx))].copy()
+    else:
+        trig = trig0
+
     n_collapse = len(trig)
 
     if int(n_collapse) <= 0:
