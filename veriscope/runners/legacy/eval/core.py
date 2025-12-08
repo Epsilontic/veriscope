@@ -486,20 +486,31 @@ def summarize_detection(rows: pd.DataFrame, warm_idx: int) -> pd.DataFrame:
         else:
             rows["collapse_tag"] = "none"
 
+    # === Scoring filter (single source of truth) ===
+    # Keep all non-triggered runs for FP denominators, and only score collapses that occur
+    # at/after warm_idx (gate not yet evaluable pre-warm).
+    rows_scored = rows
+    try:
+        _tag = rows_scored["collapse_tag"].astype(str)
+    except Exception:
+        _tag = pd.Series(["none"] * len(rows_scored), index=rows_scored.index)
+
+    if "t_collapse" in rows_scored.columns:
+        _tc = to_numeric_series(rows_scored["t_collapse"], errors="coerce")
+    else:
+        _tc = pd.Series([np.nan] * len(rows_scored), index=rows_scored.index)
+
+    keep = (_tag == "none") | (_tc.notna() & (_tc >= float(warm_idx)))
+    rows_scored = rows_scored[keep].copy()
+
     out: List[Dict[str, Any]] = []
 
-    trig0 = rows[rows["collapse_tag"] == "soft"].copy()
-    # Admissibility guard: do not score collapses that occur before warm_idx (gate not yet evaluable).
-    if (trig0 is not None) and (len(trig0) > 0) and ("t_collapse" in trig0.columns):
-        _tc0 = to_numeric_series(trig0["t_collapse"], errors="coerce")
-        trig = trig0[_tc0.notna() & (_tc0 >= float(warm_idx))].copy()
-    else:
-        trig = trig0
+    trig = rows_scored[rows_scored["collapse_tag"] == "soft"].copy()
 
     n_collapse = len(trig)
 
     if int(n_collapse) <= 0:
-        non_trig = rows[rows["collapse_tag"] == "none"]
+        non_trig = rows_scored[rows_scored["collapse_tag"] == "none"]
         _ntw = to_numeric_series(non_trig["t_warn"], errors="coerce")
         mask_nt = (_ntw.notna()) & (_ntw >= int(warm_idx))
         fp_nontrig = float(np.mean(mask_nt.to_numpy(dtype=bool))) if len(non_trig) > 0 else 1.0
@@ -508,7 +519,7 @@ def summarize_detection(rows: pd.DataFrame, warm_idx: int) -> pd.DataFrame:
         out.append(dict(kind="fp_nontriggered_after_warm", n=int(len(non_trig)), value=fp_nontrig))
         out.append(dict(kind="lead_time", n=0, med=np.nan, q1=np.nan, q3=np.nan))
 
-        boot = bootstrap_stratified(rows)
+        boot = bootstrap_stratified(rows_scored)
         out.append(
             dict(
                 kind="detect_rate_ci_boot",
@@ -550,7 +561,7 @@ def summarize_detection(rows: pd.DataFrame, warm_idx: int) -> pd.DataFrame:
     else:
         d_lo = d_hi = np.nan
 
-    non_trig = rows[rows["collapse_tag"] == "none"]
+    non_trig = rows_scored[rows_scored["collapse_tag"] == "none"]
     _ntw = to_numeric_series(non_trig["t_warn"], errors="coerce")
     mask_nt = (_ntw.notna()) & (_ntw >= int(warm_idx))
     fp_nontrig = float(np.mean(mask_nt.to_numpy(dtype=bool))) if len(non_trig) > 0 else 1.0
@@ -566,7 +577,7 @@ def summarize_detection(rows: pd.DataFrame, warm_idx: int) -> pd.DataFrame:
     out.append(dict(kind="fp_nontriggered_after_warm", n=int(len(non_trig)), value=fp_nontrig))
     out.append(dict(kind="lead_time", n=int(leads.size), med=med, q1=q1, q3=q3))
 
-    boot = bootstrap_stratified(rows)
+    boot = bootstrap_stratified(rows_scored)
     out.append(
         dict(
             kind="detect_rate_ci_boot",
