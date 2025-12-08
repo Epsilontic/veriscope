@@ -108,3 +108,20 @@ figs/
 window_decl_calibrated.json
 calibration_provenance.json
 pip_freeze.txt
+
+# ---- nanoGPT integration
+# Treat the nanoGPT checkout as an external dependency (clone/submodule), not a vendored copy.
+# If you later decide to vendor nanoGPT code, remove the `nanoGPT/` line and keep the artifact ignores below.
+nanoGPT/
+
+# If you do *not* ignore the whole nanoGPT directory, at minimum ignore its generated artifacts:
+# nanoGPT/data/**/train.bin
+# nanoGPT/data/**/val.bin
+# nanoGPT/data/**/meta.pkl
+# nanoGPT/out/
+# nanoGPT/logs/
+# nanoGPT/wandb/
+
+# ---- veriscope GPT runner artifacts
+veriscope_gpt_run.json
+best_ckpt.pt
