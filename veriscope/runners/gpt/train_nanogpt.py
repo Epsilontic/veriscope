@@ -361,6 +361,34 @@ class VeriscopeGatedTrainer:
         past_slice = recent[:Wm]
         recent_slice = recent[Wm:]
 
+        # --- Spike attribution (overlap-based, not check-iter-based) ---
+        spike_active = False
+        spike_overlap_past = False
+        spike_overlap_recent = False
+        spike_any_overlap = False
+
+        if cfg.lr_spike_at >= 0 and cfg.lr_spike_len > 0:
+            s0 = int(cfg.lr_spike_at)
+            s1 = int(cfg.lr_spike_at + cfg.lr_spike_len)
+
+            def _overlaps_spike(slice_data: List[Dict[str, Any]]) -> bool:
+                for d in slice_data:
+                    it = d.get("iter", None)
+                    if it is None:
+                        continue
+                    try:
+                        it_i = int(it)
+                    except Exception:
+                        continue
+                    if s0 <= it_i < s1:
+                        return True
+                return False
+
+            spike_active = s0 <= int(self.iter_num) < s1
+            spike_overlap_past = _overlaps_spike(past_slice)
+            spike_overlap_recent = _overlaps_spike(recent_slice)
+            spike_any_overlap = spike_overlap_past or spike_overlap_recent
+
         # Build metric arrays
         metrics = list(self.window_decl.weights.keys())
 
@@ -403,6 +431,10 @@ class VeriscopeGatedTrainer:
             "audit": result.audit,
             "gain_bits": gain_bits,
             "iter": self.iter_num,
+            "spike_active": spike_active,
+            "spike_overlap_past": spike_overlap_past,
+            "spike_overlap_recent": spike_overlap_recent,
+            "spike_any_overlap": spike_any_overlap,
         }
 
     def _log_metrics(self, loss: float, input_ids: torch.Tensor):
