@@ -65,6 +65,11 @@ class TrainConfig:
     warmup_iters: int = 2000
     lr_decay_iters: int = 600000
     min_lr: float = 6e-5
+
+    # Pathology injection (optional; for gate validation)
+    lr_spike_at: int = -1          # iteration to start spike; <0 disables
+    lr_spike_len: int = 0          # number of iterations to spike
+    lr_spike_mult: float = 1.0     # multiplier during spike
       
     # Logging
     eval_interval: int = 1000
@@ -402,9 +407,15 @@ class VeriscopeGatedTrainer:
     def train_step(self, X: torch.Tensor, Y: torch.Tensor) -> float:
         """Execute one training step."""
         cfg = self.config
-          
+        
         # Update learning rate
         lr = self._get_lr(self.iter_num)
+
+        # Optional LR spike (gate validation / pathology injection)
+        if cfg.lr_spike_at >= 0 and cfg.lr_spike_len > 0 and cfg.lr_spike_mult != 1.0:
+            if cfg.lr_spike_at <= self.iter_num < (cfg.lr_spike_at + cfg.lr_spike_len):
+                lr = lr * float(cfg.lr_spike_mult)
+
         for param_group in self.optimizer.param_groups:
             param_group["lr"] = lr
           
@@ -553,6 +564,24 @@ if __name__ == "__main__":
     parser.add_argument("--dataset", default="shakespeare_char")
     parser.add_argument("--nanogpt_dir", default="./nanoGPT")
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--lr_spike_at",
+        type=int,
+        default=-1,
+        help="Iteration to start an LR spike (>=0 enables).",
+    )
+    parser.add_argument(
+        "--lr_spike_len",
+        type=int,
+        default=0,
+        help="Number of iterations to apply the LR spike.",
+    )
+    parser.add_argument(
+        "--lr_spike_mult",
+        type=float,
+        default=1.0,
+        help="LR multiplier during the spike window.",
+    )
     args = parser.parse_args()
 
     # Set env for meta.pkl discovery
@@ -570,6 +599,9 @@ if __name__ == "__main__":
         eval_interval=500,
         log_interval=10,
         device=args.device,
+        lr_spike_at=args.lr_spike_at,
+        lr_spike_len=args.lr_spike_len,
+        lr_spike_mult=args.lr_spike_mult,
         # Gate config
         gate_enabled=True,
         gate_window=50,

@@ -1,0 +1,51 @@
+# VCS
+.git
+.gitmodules
+.gitignore
+
+# Python caches / venvs
+__pycache__/
+*.py[cod]
+*.pyd
+*.pyo
+*.so
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+pip-wheel-metadata/
+.eggs/
+
+# Logs / outputs / checkpoints
+*.log
+*.pt
+*.pth
+*.ckpt
+best_ckpt.pt
+veriscope_gpt_run.json
+SCAR_OUTDIR*/
+out/
+outputs/
+runs/
+wandb/
+
+# Data (nanoGPT / datasets)
+nanoGPT/data/
+data/
+*.bin
+*.pkl
+*.parquet
+*.npz
+
+# OS/editor noise
+.DS_Store
+.idea/
+.vscode/
