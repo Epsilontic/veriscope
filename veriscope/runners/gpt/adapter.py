@@ -1,10 +1,11 @@
 # veriscope/runners/gpt/adapter.py
-"""  
-Thin adapter layer: nanoGPT → veriscope FR gating system.  
-
-This adapter extracts hidden states from transformer layers and feeds them  
-to the existing metric/gate infrastructure with minimal changes.  
 """
+Thin adapter layer: nanoGPT → veriscope FR gating system.
+
+This adapter extracts hidden states from transformer layers and feeds them
+to the existing metric/gate infrastructure with minimal changes.
+"""
+
 from __future__ import annotations
 
 import math
@@ -14,22 +15,111 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 # ---- Your existing core imports (unchanged) ----
 from veriscope.core.window import WindowDecl, FRWindow
 from veriscope.core.transport import DeclTransport
 from veriscope.core.gate import GateEngine
-from veriscope.core.calibration import aggregate_epsilon_stat
-from veriscope.runners.legacy.features import (
-    variance_outside_k,
-    cosine_dispersion,
-    _std0,
-)
-from veriscope.runners.legacy.metrics_heavy import (
-    sliced_w2_gpu_budget,
-    topo_h0_jl_agg,
-)
+
+# NOTE: Do NOT import veriscope.runners.legacy.features here.
+# That module pulls in veriscope.runners.legacy.model which imports torchvision.
+# The GPT runner should not depend on torchvision.
+
+
+def _std0(x: torch.Tensor, keepdim: bool = False) -> torch.Tensor:
+    """Std-dev with finite guard. Matches the legacy intent: never return 0."""
+    # unbiased=False for stability on small samples
+    s = x.float().std(dim=0, unbiased=False, keepdim=keepdim)
+    # clamp away zeros
+    return torch.clamp(s, min=1e-8)
+
+
+@torch.no_grad()
+def cosine_dispersion(H: torch.Tensor, seed: int = 0, epoch: int = 0, n_pairs: int = 2048) -> float:
+    """Return mean absolute cosine similarity over random pairs.
+
+    This is bounded in [0, 1] and is typically small for well-spread features.
+    """
+    if H.numel() == 0:
+        return float("nan")
+    X = H.float()
+    n = int(X.shape[0])
+    if n < 2:
+        return 0.0
+    # normalize
+    X = X / torch.clamp(torch.linalg.norm(X, dim=1, keepdim=True), min=1e-8)
+    g = torch.Generator(device=X.device)
+    g.manual_seed(int(seed) + 131 * int(epoch) + 17)
+    m = min(int(n_pairs), n * (n - 1) // 2)
+    i = torch.randint(0, n, (m,), generator=g, device=X.device)
+    j = torch.randint(0, n, (m,), generator=g, device=X.device)
+    # avoid i == j with a cheap fix
+    j = (j + (i == j).to(j.dtype)) % n
+    cos = (X[i] * X[j]).sum(dim=1)
+    return float(torch.mean(torch.abs(cos)).item())
+
+
+@torch.no_grad()
+def variance_outside_k(H: torch.Tensor, k: Optional[int] = None) -> Tuple[float, float, int, float, int, int]:
+    """Geometry summary metrics.
+
+    Returns:
+      (var_out_k, eff_dim, k_used, tail_mass, v_ok, neg_eigs)
+
+    This is a lightweight replacement for the legacy implementation and is
+    designed to be dependency-minimal (no torchvision).
+    """
+    X = H.float()
+    n, d = int(X.shape[0]), int(X.shape[1])
+    if n < 2 or d < 1:
+        return float("nan"), float("nan"), 0, float("nan"), 0, 0
+
+    X = X - X.mean(dim=0, keepdim=True)
+    # Use SVD (stable) to obtain spectrum of covariance
+    # cov eigenvalues are (s^2)/(n-1)
+    try:
+        # full_matrices=False keeps it efficient
+        s = torch.linalg.svdvals(X)
+    except Exception:
+        s = torch.linalg.svdvals(X.cpu())
+    eig = (s * s) / max(1.0, float(n - 1))
+
+    total = float(eig.sum().item())
+    if not np.isfinite(total) or total <= 0.0:
+        return float("nan"), float("nan"), 0, float("nan"), 0, 0
+
+    # Effective dimension: (sum λ)^2 / sum λ^2
+    denom = float((eig * eig).sum().item())
+    eff_dim = (total * total) / denom if denom > 0.0 else float("nan")
+
+    # Choose k if not provided: sqrt(d) clipped to [1, d]
+    if k is None:
+        k_used = int(max(1, min(d, round(math.sqrt(d)))))
+    else:
+        k_used = int(max(1, min(d, int(k))))
+
+    # Sort descending
+    eig_sorted, _ = torch.sort(eig, descending=True)
+    top = float(eig_sorted[:k_used].sum().item())
+    tail = max(0.0, total - top)
+    var_out_k = float(tail / total)
+
+    # tail_mass is kept for compatibility; here equal to variance fraction outside k
+    tail_mass = var_out_k
+    v_ok = 1
+    neg_eigs = 0
+    return var_out_k, float(eff_dim), int(k_used), float(tail_mass), int(v_ok), int(neg_eigs)
+
+
+# Heavy metrics are optional; import lazily and fail closed if unavailable.
+try:
+    from veriscope.runners.legacy.metrics_heavy import (
+        sliced_w2_gpu_budget,
+        topo_h0_jl_agg,
+    )
+except Exception:
+    sliced_w2_gpu_budget = None  # type: ignore[assignment]
+    topo_h0_jl_agg = None  # type: ignore[assignment]
 
 
 @dataclass
@@ -52,13 +142,13 @@ class GPTMetricConfig:
 
 
 class GPTFeatureExtractor:
-    """  
-    Extract hidden states from GPT models for metric computation.  
+    """
+    Extract hidden states from GPT models for metric computation.
 
-    Works with:  
-    - nanoGPT (model.transformer.h[i] layers)  
-    - HuggingFace GPT2 (model.transformer.h[i])  
-    - Any model with .transformer.h attribute  
+    Works with:
+    - nanoGPT (model.transformer.h[i] layers)
+    - HuggingFace GPT2 (model.transformer.h[i])
+    - Any model with .transformer.h attribute
     """
 
     def __init__(
@@ -129,7 +219,7 @@ class GPTFeatureExtractor:
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """  
+        """
         Extract and flatten hidden states from probed layers.
 
         Returns: (N, D) tensor where N = batch * seq positions, D = hidden_dim
@@ -200,7 +290,7 @@ class GPTFeatureExtractor:
 
 
 class GPTMetricComputer:
-    """  
+    """
     Compute veriscope metrics from GPT hidden states.
 
     Adapts the existing metric functions to work with transformer activations.
@@ -237,7 +327,7 @@ class GPTMetricComputer:
         prev_H_jl: Optional[torch.Tensor] = None,
         prev_H_norm: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
-        """  
+        """
         Compute all metrics for one step.
 
         Returns dict with:
@@ -289,8 +379,8 @@ class GPTMetricComputer:
         except Exception:
             metrics["cos_disp"] = float("nan")
 
-        # ---- Topology (your existing implementation) ----
-        if self.config.compute_topo:
+        # ---- Topology (optional) ----
+        if self.config.compute_topo and topo_h0_jl_agg is not None:
             try:
                 pers_h0, topo_done, topo_ms, topo_n_used = topo_h0_jl_agg(
                     H_jl,
@@ -326,7 +416,11 @@ class GPTMetricComputer:
             )
 
         # ---- Distribution shift (SW2) ----
-        if self.config.compute_sw2 and (prev_H_jl is not None or prev_H_norm is not None):
+        if (
+            self.config.compute_sw2
+            and sliced_w2_gpu_budget is not None
+            and (prev_H_jl is not None or prev_H_norm is not None)
+        ):
             try:
                 prev_for_sw2 = prev_H_jl if prev_H_jl is not None else (prev_H_norm @ A)
                 sw2, sw2_ms, n_proj, ok = sliced_w2_gpu_budget(
@@ -371,23 +465,29 @@ class GPTMetricComputer:
 def create_gpt_window_decl(
     epsilon: float = 0.12,
     bins: int = 16,
+    eff_dim_max: float = 64.0,
+    cos_disp_max: float = 0.5,
 ) -> WindowDecl:
-    """  
-    Create a WindowDecl appropriate for GPT training.
+    """Create a WindowDecl appropriate for GPT training.
 
-    Note: cal_ranges should be calibrated from a warmup phase.
-    These are reasonable defaults for transformer hidden state metrics.
+    IMPORTANT: `eff_dim` is computed on the JL-projected representation (H_jl),
+    so it should be calibrated to the projection dimension (default 64), not
+    the model hidden size.
+
+    These `cal_ranges` are defaults; for production, calibrate from a warmup.
     """
+    eff_dim_max = float(max(4.0, eff_dim_max))
+    cos_disp_max = float(max(0.05, cos_disp_max))
     return WindowDecl(
-        epsilon=epsilon,
+        epsilon=float(epsilon),
         metrics=["var_out_k", "eff_dim", "cos_disp"],
         weights={"var_out_k": 0.4, "eff_dim": 0.4, "cos_disp": 0.2},
-        bins=bins,
+        bins=int(bins),
         interventions=(lambda x: x,),
         cal_ranges={
             "var_out_k": (0.0, 1.0),
-            "eff_dim": (0.0, 200.0),  # Adjust based on model size
-            "cos_disp": (0.0, 0.5),
+            "eff_dim": (0.0, eff_dim_max),
+            "cos_disp": (0.0, cos_disp_max),
         },
     )
 
@@ -396,7 +496,7 @@ def create_gpt_gate_engine(
     window_decl: WindowDecl,
     cfg: Dict[str, Any],
 ) -> Tuple[FRWindow, GateEngine]:
-    """  
+    """
     Create FR window and gate engine for GPT training.
 
     Reuses your existing core infrastructure.
