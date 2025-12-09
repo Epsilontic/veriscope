@@ -18,7 +18,9 @@ RUN python3 -m pip install --upgrade pip \
  && python3 -m pip install \
     requests \
     tqdm \
-    tiktoken
+    tiktoken \
+    ripser \
+    persim
 
 WORKDIR /workspace
 CMD ["/bin/bash"]

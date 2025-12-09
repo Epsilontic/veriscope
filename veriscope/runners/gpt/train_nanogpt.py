@@ -7,6 +7,8 @@ Minimal modifications to the standard nanoGPT train.py.
 from __future__ import annotations
   
 import os
+import sys
+from pathlib import Path
 import time
 import math
 from contextlib import nullcontext
@@ -18,8 +20,13 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
   
-# nanoGPT imports (assumes nanoGPT is in path)
-from model import GPTConfig, GPT
+
+# Helper to ensure nanoGPT is importable
+def _ensure_nanogpt_on_path(nanogpt_dir: str) -> None:
+    """Ensure the nanoGPT checkout (containing model.py) is importable."""
+    p = str(Path(nanogpt_dir).resolve())
+    if p not in sys.path:
+        sys.path.insert(0, p)
   
 # Your veriscope imports
 from veriscope.runners.gpt.adapter import (
@@ -162,11 +169,18 @@ class VeriscopeGatedTrainer:
         """Initialize GPT model (uncompiled; compilation happens in __init__ after hooks)."""
         cfg = self.config
 
+        # Ensure nanoGPT (model.py) is importable regardless of cwd.
+        # The CLI sets NANOGPT_DIR from --nanogpt_dir.
+        nanogpt_dir = os.environ.get("NANOGPT_DIR") or "nanoGPT"
+        _ensure_nanogpt_on_path(nanogpt_dir)
+
+        # Import nanoGPT model components after sys.path is prepared.
+        from model import GPTConfig, GPT
+
         # Vocab size should come from data preparation, not hardcoded.
         # nanoGPT convention is: <nanogpt_root>/data/<dataset>/meta.pkl
         if vocab_size is None:
             import pickle
-            from pathlib import Path
 
             meta_path: Optional[Path] = None
 
