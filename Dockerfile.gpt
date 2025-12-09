@@ -15,12 +15,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN python3 -m pip install --upgrade pip \
  && python3 -m pip install --extra-index-url https://download.pytorch.org/whl/cu121 \
     torch \
+    torchvision \
  && python3 -m pip install \
     requests \
     tqdm \
     tiktoken \
     ripser \
-    persim
+    persim \
+    pandas
 
 WORKDIR /workspace
 CMD ["/bin/bash"]

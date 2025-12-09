@@ -1,11 +1,12 @@
 # veriscope/runners/gpt/train_nanogpt.py
-"""  
-nanoGPT training with veriscope FR gating.  
-  
-Minimal modifications to the standard nanoGPT train.py.  
 """
+nanoGPT training with veriscope FR gating.
+
+Minimal modifications to the standard nanoGPT train.py.
+"""
+
 from __future__ import annotations
-  
+
 import os
 import sys
 from pathlib import Path
@@ -14,12 +15,11 @@ import math
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
-  
+
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.nn import functional as F
-  
+
 
 # Helper to ensure nanoGPT is importable
 def _ensure_nanogpt_on_path(nanogpt_dir: str) -> None:
@@ -27,7 +27,8 @@ def _ensure_nanogpt_on_path(nanogpt_dir: str) -> None:
     p = str(Path(nanogpt_dir).resolve())
     if p not in sys.path:
         sys.path.insert(0, p)
-  
+
+
 # Your veriscope imports
 from veriscope.runners.gpt.adapter import (
     GPTMetricConfig,
@@ -37,22 +38,23 @@ from veriscope.runners.gpt.adapter import (
     create_gpt_gate_engine,
 )
 from veriscope.core.calibration import aggregate_epsilon_stat
-  
-  
+
+
 @dataclass
 class TrainConfig:
     """Training configuration."""
+
     # Data
     dataset: str = "openwebtext"
     batch_size: int = 12
     block_size: int = 1024
-      
+
     # Model
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
     dropout: float = 0.0
-      
+
     # Training
     max_iters: int = 600000
     learning_rate: float = 6e-4
@@ -60,22 +62,24 @@ class TrainConfig:
     beta1: float = 0.9
     beta2: float = 0.95
     grad_clip: float = 1.0
-      
+
     # LR schedule
     warmup_iters: int = 2000
     lr_decay_iters: int = 600000
     min_lr: float = 6e-5
 
     # Pathology injection (optional; for gate validation)
-    lr_spike_at: int = -1          # iteration to start spike; <0 disables
-    lr_spike_len: int = 0          # number of iterations to spike
-    lr_spike_mult: float = 1.0     # multiplier during spike
-      
+    lr_spike_at: int = -1  # iteration to start spike; <0 disables
+    lr_spike_len: int = 0  # number of iterations to spike
+    lr_spike_mult: float = 1.0  # multiplier during spike
+    lr_spike_verify: bool = False  # record & print a verification ratio for debugging
+
     # Logging
     eval_interval: int = 1000
     log_interval: int = 10
+    metric_interval: int = 5  # compute veriscope metrics every N iterations
     eval_iters: int = 200
-      
+
     # Veriscope gating
     gate_enabled: bool = True
     gate_window: int = 50  # iterations, not epochs
@@ -83,18 +87,19 @@ class TrainConfig:
     gate_epsilon: float = 0.12
     gate_gain_thresh: float = 0.0  # stability-only by default; tune upward if you want "learning+stability"
     gate_min_evidence: int = 16
-      
+    gate_eps_stat_max_frac: float = 0.25  # cap eps_stat as fraction of epsilon
+
     # Device
     device: str = "cuda"
     dtype: str = "bfloat16"
     compile: bool = False
-  
-  
+
+
 class VeriscopeGatedTrainer:
-    """  
-    GPT trainer with veriscope finite-window gating.  
     """
-      
+    GPT trainer with veriscope finite-window gating.
+    """
+
     def __init__(self, config: TrainConfig):
         self.config = config
         self.device = torch.device(config.device)
@@ -118,9 +123,7 @@ class VeriscopeGatedTrainer:
             # Ensure extractor forwards through the compiled wrapper
             self.extractor.model = self.model
 
-        self.metric_computer = GPTMetricComputer(
-            self.extractor, self.metric_config, self.device
-        )
+        self.metric_computer = GPTMetricComputer(self.extractor, self.metric_config, self.device)
 
         # Optimizer/scaler AFTER potential compilation
         self.optimizer = self._init_optimizer()
@@ -130,16 +133,26 @@ class VeriscopeGatedTrainer:
         self.scaler = torch.amp.GradScaler("cuda", enabled=scaler_enabled)
 
         # Create window declaration and gate engine
-        self.window_decl = create_gpt_window_decl(
-            epsilon=config.gate_epsilon,
-            bins=16,
-        )
+        # Thread eff_dim_max from the JL projection dimension so eff_dim calibration
+        # matches the feature space used by the metric computer.
+        try:
+            self.window_decl = create_gpt_window_decl(
+                epsilon=config.gate_epsilon,
+                bins=16,
+                eff_dim_max=float(self.metric_config.geom_rp_dim),
+            )
+        except TypeError:
+            # Backward-compat: older create_gpt_window_decl signatures
+            self.window_decl = create_gpt_window_decl(
+                epsilon=config.gate_epsilon,
+                bins=16,
+            )
         self.fr_win, self.gate_engine = create_gpt_gate_engine(
             self.window_decl,
             {
                 "gate_gain_thresh": config.gate_gain_thresh,
                 "gate_min_evidence": config.gate_min_evidence,
-                "gate_eps_stat_max_frac": 0.25,
+                "gate_eps_stat_max_frac": float(config.gate_eps_stat_max_frac),
                 "gate_epsilon_sens": 0.04,
             },
         )
@@ -159,7 +172,10 @@ class VeriscopeGatedTrainer:
         # Training state
         self.iter_num = 0
         self.best_val_loss = float("inf")
-      
+
+        # Optional LR trace for spike verification (disabled by default)
+        self._lr_trace: Optional[List[tuple[int, float]]] = [] if config.lr_spike_verify else None
+
     def _get_autocast_context(self):
         """Get appropriate autocast context."""
         cfg = self.config
@@ -169,7 +185,7 @@ class VeriscopeGatedTrainer:
             return torch.amp.autocast(device_type="cuda", dtype=torch.float16)
         else:
             return nullcontext()
-      
+
     def _init_model(self, vocab_size: Optional[int] = None) -> nn.Module:
         """Initialize GPT model (uncompiled; compilation happens in __init__ after hooks)."""
         cfg = self.config
@@ -245,11 +261,11 @@ class VeriscopeGatedTrainer:
         # NOTE: Do NOT compile here - hooks must be registered first.
         # Compilation (if enabled) happens in __init__ after GPTFeatureExtractor setup.
         return model
-      
+
     def _init_optimizer(self) -> torch.optim.Optimizer:
         """Initialize AdamW optimizer with weight decay."""
         cfg = self.config
-          
+
         # Separate parameters for weight decay
         decay_params = []
         no_decay_params = []
@@ -259,19 +275,19 @@ class VeriscopeGatedTrainer:
                     decay_params.append(param)
                 else:
                     no_decay_params.append(param)
-          
+
         optim_groups = [
             {"params": decay_params, "weight_decay": cfg.weight_decay},
             {"params": no_decay_params, "weight_decay": 0.0},
         ]
-          
+
         return torch.optim.AdamW(
             optim_groups,
             lr=cfg.learning_rate,
             betas=(cfg.beta1, cfg.beta2),
             fused=True,  # H100 optimization
         )
-      
+
     def _get_lr(self, it: int) -> float:
         """Learning rate schedule with warmup and cosine decay."""
         cfg = self.config
@@ -293,6 +309,18 @@ class VeriscopeGatedTrainer:
         decay_ratio = min(max(decay_ratio, 0.0), 1.0)
         coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
         return cfg.min_lr + coeff * (cfg.learning_rate - cfg.min_lr)
+
+    def _effective_lr(self, it: int) -> float:
+        """Compute effective LR including any configured spike injection."""
+        cfg = self.config
+        lr = self._get_lr(it)
+
+        if cfg.lr_spike_at >= 0 and cfg.lr_spike_len > 0:
+            if cfg.lr_spike_at <= it < (cfg.lr_spike_at + cfg.lr_spike_len):
+                lr = lr * float(cfg.lr_spike_mult)
+
+        return lr
+
     def _save_checkpoint(self, path: str):
         """Save model checkpoint."""
         # Handle compiled model
@@ -311,50 +339,55 @@ class VeriscopeGatedTrainer:
             path,
         )
         print(f"Saved checkpoint to {path}")
-      
+
     def _compute_gate_check(self) -> Dict[str, Any]:
-        """  
-        Perform finite-window gate check using recent metric history.  
-          
-        Returns audit dict with gate decision and diagnostics.  
         """
-        W = self.config.gate_window
-          
-        if len(self.metric_history) < 2 * W:
+        Perform finite-window gate check using recent metric history.
+
+        Returns audit dict with gate decision and diagnostics.
+        """
+        cfg = self.config
+
+        # gate_window is specified in *iterations*, but metric_history is recorded every metric_interval.
+        # Convert to a metric-snapshot window to keep evidence density consistent.
+        interval = max(1, int(cfg.metric_interval))
+        Wm = max(1, int(cfg.gate_window) // interval)
+
+        if len(self.metric_history) < 2 * Wm:
             return {"ok": True, "reason": "insufficient_history"}
-          
-        # Get past and recent windows
-        recent = self.metric_history[-(2 * W):]
-        past_slice = recent[:W]
-        recent_slice = recent[W:]
-          
+
+        # Get past and recent windows (in metric snapshots)
+        recent = self.metric_history[-(2 * Wm) :]
+        past_slice = recent[:Wm]
+        recent_slice = recent[Wm:]
+
         # Build metric arrays
         metrics = list(self.window_decl.weights.keys())
-          
+
         def _extract(slice_data: List[Dict], key: str) -> np.ndarray:
             vals = [float(d.get(key, np.nan)) for d in slice_data]
             arr = np.array(vals, dtype=float)
             return arr[np.isfinite(arr)]
-          
+
         past_dict = {m: _extract(past_slice, m) for m in metrics}
         recent_dict = {m: _extract(recent_slice, m) for m in metrics}
-          
+
         # Count evidence
         counts = {}
         for m in metrics:
             counts[m] = min(len(past_dict[m]), len(recent_dict[m]))
-          
+
         # Compute prequential gain (bits/sample)
         recent_losses = [d.get("loss", np.nan) for d in recent_slice]
         recent_baselines = [d.get("ewma_loss", np.nan) for d in recent_slice]
-          
-        gain_vals = []
-        for l, b in zip(recent_losses, recent_baselines):
-            if np.isfinite(l) and np.isfinite(b):
-                gain_vals.append((b - l) / math.log(2))  # bits
-          
+
+        gain_vals: List[float] = []
+        for loss_val, baseline_val in zip(recent_losses, recent_baselines):
+            if np.isfinite(loss_val) and np.isfinite(baseline_val):
+                gain_vals.append((baseline_val - loss_val) / math.log(2))  # bits
+
         gain_bits = float(np.mean(gain_vals)) if gain_vals else float("nan")
-          
+
         # Use gate engine
         result = self.gate_engine.check(
             past=past_dict,
@@ -362,18 +395,16 @@ class VeriscopeGatedTrainer:
             counts_by_metric=counts,
             gain_bits=gain_bits,
             kappa_sens=0.0,  # Skip κ_sens for now
-            eps_stat_value=aggregate_epsilon_stat(
-                self.window_decl, counts, alpha=0.05
-            ),
+            eps_stat_value=aggregate_epsilon_stat(self.window_decl, counts, alpha=0.05),
         )
-          
+
         return {
             "ok": result.ok,
             "audit": result.audit,
             "gain_bits": gain_bits,
             "iter": self.iter_num,
         }
-      
+
     def _log_metrics(self, loss: float, input_ids: torch.Tensor):
         """Compute and log metrics for this iteration."""
         # Update EWMA baseline
@@ -383,7 +414,7 @@ class VeriscopeGatedTrainer:
             self.ewma_loss = self.ewma_alpha * loss + (1 - self.ewma_alpha) * self.ewma_loss
 
         # Compute veriscope metrics (every N iterations to save compute)
-        if self.iter_num % 5 == 0:
+        if self.iter_num % max(1, int(self.config.metric_interval)) == 0:
             metrics = self.metric_computer.compute_all(
                 input_ids,
                 run_key=42,
@@ -399,93 +430,110 @@ class VeriscopeGatedTrainer:
             metrics["loss"] = loss
             metrics["ewma_loss"] = self.ewma_loss
             metrics["iter"] = self.iter_num
-            metrics["lr"] = self._get_lr(self.iter_num)
+            metrics["lr"] = self._effective_lr(self.iter_num)
 
             self.metric_history.append(metrics)
             self.loss_history.append(loss)
-      
+
     def train_step(self, X: torch.Tensor, Y: torch.Tensor) -> float:
         """Execute one training step."""
         cfg = self.config
-        
-        # Update learning rate
-        lr = self._get_lr(self.iter_num)
 
-        # Optional LR spike (gate validation / pathology injection)
-        if cfg.lr_spike_at >= 0 and cfg.lr_spike_len > 0 and cfg.lr_spike_mult != 1.0:
-            if cfg.lr_spike_at <= self.iter_num < (cfg.lr_spike_at + cfg.lr_spike_len):
-                lr = lr * float(cfg.lr_spike_mult)
+        # Update learning rate (includes optional spike injection)
+        lr = self._effective_lr(self.iter_num)
 
         for param_group in self.optimizer.param_groups:
             param_group["lr"] = lr
-          
+
+        # Optional: trace effective LR for spike verification
+        if self._lr_trace is not None:
+            try:
+                self._lr_trace.append((int(self.iter_num), float(lr)))
+            except Exception:
+                pass
+
         # Forward pass
         with self.ctx:
             logits, loss = self.model(X, Y)
-          
+
         # Backward pass
         self.scaler.scale(loss).backward()
-          
+
         # Gradient clipping
         if cfg.grad_clip > 0:
             self.scaler.unscale_(self.optimizer)
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), cfg.grad_clip)
-          
+
         # Optimizer step
         self.scaler.step(self.optimizer)
         self.scaler.update()
         self.optimizer.zero_grad(set_to_none=True)
-          
+
         loss_val = loss.item()
-          
+
         # Log metrics
         self._log_metrics(loss_val, X)
-          
+
         # Gate check (after warmup)
         if cfg.gate_enabled and self.iter_num >= cfg.gate_warmup:
             if self.iter_num % cfg.gate_window == 0:
                 gate_result = self._compute_gate_check()
                 self.gate_history.append(gate_result)
-                  
+
                 if not gate_result["ok"]:
                     print(f"\n[GATE] iter={self.iter_num} FAIL: {gate_result['audit']}")
                 elif self.iter_num % (cfg.gate_window * 10) == 0:
                     print(f"[GATE] iter={self.iter_num} OK, gain={gate_result['gain_bits']:.4f} bits")
-          
+
         self.iter_num += 1
         return loss_val
-      
+
     def train(self, get_batch_fn):
         """Main training loop."""
         cfg = self.config
-          
+
         t0 = time.time()
         running_loss = 0.0
-          
+
         while self.iter_num < cfg.max_iters:
             # Get batch
             X, Y = get_batch_fn("train")
             X, Y = X.to(self.device), Y.to(self.device)
-              
+
             # Train step
             loss = self.train_step(X, Y)
             running_loss += loss
-              
+
             # Logging
             if self.iter_num % cfg.log_interval == 0:
                 dt = time.time() - t0
                 avg_loss = running_loss / cfg.log_interval
-                print(f"iter {self.iter_num}: loss {avg_loss:.4f}, time {dt*1000:.2f}ms")
+                print(f"iter {self.iter_num}: loss {avg_loss:.4f}, time {dt * 1000:.2f}ms")
                 running_loss = 0.0
                 t0 = time.time()
-              
+
             # Evaluation
             if self.iter_num % cfg.eval_interval == 0:
                 self._evaluate(get_batch_fn)
-          
+
+        # Optional LR spike verification summary
+        if cfg.lr_spike_verify and cfg.lr_spike_at >= 0 and cfg.lr_spike_len > 0 and self._lr_trace:
+            spike_start = int(cfg.lr_spike_at)
+            spike_end = int(cfg.lr_spike_at + cfg.lr_spike_len)
+            in_spike = [lr for (it, lr) in self._lr_trace if spike_start <= it < spike_end]
+            nearby = [
+                lr
+                for (it, lr) in self._lr_trace
+                if (abs(it - spike_start) <= 100 and not (spike_start <= it < spike_end))
+            ]
+            if in_spike and nearby:
+                ratio = float(np.mean(in_spike) / np.mean(nearby))
+                print(f"[SPIKE VERIFY] effective_lr ratio={ratio:.2f}x (expected {cfg.lr_spike_mult:.2f}x)")
+            else:
+                print("[SPIKE VERIFY] insufficient trace samples to compute ratio")
         print("Training complete!")
         return self.metric_history, self.gate_history
-      
+
     @torch.no_grad()
     def _evaluate(self, get_batch_fn):
         """Evaluate on validation set."""
@@ -508,12 +556,12 @@ class VeriscopeGatedTrainer:
             self._save_checkpoint("best_ckpt.pt")
 
         self.model.train()
-  
-  
+
 
 # -----------------
 # Data loader helper
 # -----------------
+
 
 def get_batch_factory(data_dir: str, block_size: int, batch_size: int, device: str):
     """Create get_batch function compatible with nanoGPT .bin data format."""
@@ -529,21 +577,10 @@ def get_batch_factory(data_dir: str, block_size: int, batch_size: int, device: s
         # need room for x of length block_size and y shifted by 1
         max_start = int(len(data)) - int(block_size) - 1
         if max_start <= 0:
-            raise ValueError(
-                f"Dataset too small for block_size={block_size}: len(data)={len(data)}"
-            )
+            raise ValueError(f"Dataset too small for block_size={block_size}: len(data)={len(data)}")
         ix = torch.randint(max_start, (batch_size,))
-        x = torch.stack(
-            [torch.from_numpy((data[i : i + block_size]).astype(_np.int64)) for i in ix]
-        )
-        y = torch.stack(
-            [
-                torch.from_numpy(
-                    (data[i + 1 : i + 1 + block_size]).astype(_np.int64)
-                )
-                for i in ix
-            ]
-        )
+        x = torch.stack([torch.from_numpy((data[i : i + block_size]).astype(_np.int64)) for i in ix])
+        y = torch.stack([torch.from_numpy((data[i + 1 : i + 1 + block_size]).astype(_np.int64)) for i in ix])
 
         if "cuda" in str(device):
             x = x.pin_memory().to(device, non_blocking=True)
@@ -559,11 +596,41 @@ def get_batch_factory(data_dir: str, block_size: int, batch_size: int, device: s
 if __name__ == "__main__":
     import argparse
     import json
+    import sys
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", default="shakespeare_char")
     parser.add_argument("--nanogpt_dir", default="./nanoGPT")
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--metric_interval",
+        type=int,
+        default=5,
+        help="Compute veriscope metrics every N iterations (controls evidence density).",
+    )
+
+    # Gate configuration
+    parser.add_argument(
+        "--gate_preset",
+        choices=["legacy", "tuned"],
+        default="legacy",
+        help=(
+            "Gate parameter preset. 'legacy' preserves existing defaults. "
+            "'tuned' applies empirically safer defaults for GPT drift, without "
+            "overriding any gate_* flags you explicitly pass on the CLI."
+        ),
+    )
+    parser.add_argument("--gate_window", type=int, default=50)
+    parser.add_argument("--gate_warmup", type=int, default=500)
+    parser.add_argument("--gate_epsilon", type=float, default=0.12)
+    parser.add_argument("--gate_gain_thresh", type=float, default=0.0)
+    parser.add_argument("--gate_min_evidence", type=int, default=16)
+    parser.add_argument(
+        "--gate_eps_stat_max_frac",
+        type=float,
+        default=0.25,
+        help="Cap eps_stat as a fraction of epsilon (effective eps = epsilon - eps_stat_capped).",
+    )
     parser.add_argument(
         "--lr_spike_at",
         type=int,
@@ -582,7 +649,34 @@ if __name__ == "__main__":
         default=1.0,
         help="LR multiplier during the spike window.",
     )
+    parser.add_argument(
+        "--lr_spike_verify",
+        action="store_true",
+        help="Record effective LR each iteration and print a spike verification ratio (debug).",
+    )
+
     args = parser.parse_args()
+
+    def _flag_present(name: str) -> bool:
+        """Return True if a flag (or flag=value) is explicitly present in argv."""
+        for a in sys.argv[1:]:
+            if a == name or a.startswith(name + "="):
+                return True
+        return False
+
+    if args.gate_preset == "tuned":
+        tuned = {
+            "gate_window": 100,
+            "gate_warmup": 1000,
+            "gate_epsilon": 0.15,
+            "gate_gain_thresh": -0.003,
+            "gate_min_evidence": 20,
+            "gate_eps_stat_max_frac": 0.15,
+        }
+        for k, v in tuned.items():
+            flag = "--" + k
+            if not _flag_present(flag):
+                setattr(args, k, v)
 
     # Set env for meta.pkl discovery
     os.environ["NANOGPT_DIR"] = args.nanogpt_dir
@@ -599,14 +693,19 @@ if __name__ == "__main__":
         eval_interval=500,
         log_interval=10,
         device=args.device,
+        metric_interval=args.metric_interval,
         lr_spike_at=args.lr_spike_at,
         lr_spike_len=args.lr_spike_len,
         lr_spike_mult=args.lr_spike_mult,
+        lr_spike_verify=bool(args.lr_spike_verify),
         # Gate config
         gate_enabled=True,
-        gate_window=50,
-        gate_warmup=500,
-        gate_gain_thresh=0.0,
+        gate_window=args.gate_window,
+        gate_warmup=args.gate_warmup,
+        gate_epsilon=args.gate_epsilon,
+        gate_gain_thresh=args.gate_gain_thresh,
+        gate_min_evidence=args.gate_min_evidence,
+        gate_eps_stat_max_frac=args.gate_eps_stat_max_frac,
         # Safer default for initial hook validation
         compile=False,
     )
