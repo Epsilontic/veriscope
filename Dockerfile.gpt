@@ -11,9 +11,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  && rm -rf /var/lib/apt/lists/*
 
 # PyTorch CUDA wheels (cu121 here to match the base)
+# Also install lightweight deps needed for nanoGPT data prep and tokenization.
 RUN python3 -m pip install --upgrade pip \
  && python3 -m pip install --extra-index-url https://download.pytorch.org/whl/cu121 \
-    torch
+    torch \
+ && python3 -m pip install \
+    requests \
+    tqdm \
+    tiktoken
 
 WORKDIR /workspace
 CMD ["/bin/bash"]

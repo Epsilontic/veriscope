@@ -69,7 +69,7 @@ class TrainConfig:
     gate_window: int = 50  # iterations, not epochs
     gate_warmup: int = 1000  # don't gate until model is warmed up
     gate_epsilon: float = 0.12
-    gate_gain_thresh: float = 0.02
+    gate_gain_thresh: float = 0.0  # stability-only by default; tune upward if you want "learning+stability"
     gate_min_evidence: int = 16
       
     # Device
@@ -560,6 +560,7 @@ if __name__ == "__main__":
         gate_enabled=True,
         gate_window=50,
         gate_warmup=500,
+        gate_gain_thresh=0.0,
         # Safer default for initial hook validation
         compile=False,
     )
