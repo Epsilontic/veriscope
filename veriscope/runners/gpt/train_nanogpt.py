@@ -14,7 +14,7 @@ import time
 import math
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -73,6 +73,12 @@ class TrainConfig:
     lr_spike_len: int = 0  # number of iterations to spike
     lr_spike_mult: float = 1.0  # multiplier during spike
     lr_spike_verify: bool = False  # record & print a verification ratio for debugging
+
+    # Data pathology injection (token corruption)
+    data_corrupt_at: int = -1  # iteration to start corruption; <0 disables
+    data_corrupt_len: int = 0  # number of iterations to corrupt
+    data_corrupt_frac: float = 0.0  # fraction of tokens to corrupt per sequence
+    data_corrupt_mode: str = "permute"  # "permute", "random", or "mask"
 
     # Logging
     eval_interval: int = 1000
@@ -321,6 +327,69 @@ class VeriscopeGatedTrainer:
 
         return lr
 
+    def _maybe_corrupt_batch(self, X: torch.Tensor, Y: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Apply token corruption within a configured window.
+
+        Modes:
+          - permute: permute a fraction of positions within each sequence
+          - random: replace a fraction of positions with random token IDs
+          - mask: replace a fraction of positions with token 0
+
+        Returns (X_corrupt, Y). We keep Y unchanged to induce supervised inconsistency.
+        """
+        cfg = self.config
+
+        if cfg.data_corrupt_at < 0 or cfg.data_corrupt_len <= 0 or cfg.data_corrupt_frac <= 0.0:
+            return X, Y
+
+        end = int(cfg.data_corrupt_at) + int(cfg.data_corrupt_len)
+        if not (int(cfg.data_corrupt_at) <= int(self.iter_num) < end):
+            return X, Y
+
+        # expected input IDs shape: [B, T]
+        if X.ndim != 2:
+            return X, Y
+
+        bsz, seq_len = int(X.shape[0]), int(X.shape[1])
+        n_corrupt = int(round(float(seq_len) * float(cfg.data_corrupt_frac)))
+        n_corrupt = max(0, min(seq_len, n_corrupt))
+        if n_corrupt == 0:
+            return X, Y
+
+        Xc = X.clone()
+
+        # deterministic per-iteration generator
+        gen = torch.Generator(device=X.device)
+        gen.manual_seed(int(self.iter_num) * 31337 + 42)
+
+        mode = str(cfg.data_corrupt_mode).lower().strip()
+        if mode not in ("permute", "random", "mask"):
+            raise ValueError(f"Unknown data_corrupt_mode={cfg.data_corrupt_mode!r}")
+
+        # determine vocab_size safely
+        vocab_size = 50304
+        try:
+            if hasattr(self.model, "config") and hasattr(self.model.config, "vocab_size"):
+                vocab_size = int(self.model.config.vocab_size)
+        except Exception:
+            pass
+
+        for b in range(bsz):
+            pos = torch.randperm(seq_len, generator=gen, device=X.device)[:n_corrupt]
+
+            if mode == "permute":
+                shuf = torch.randperm(n_corrupt, generator=gen, device=X.device)
+                Xc[b, pos] = X[b, pos[shuf]]
+
+            elif mode == "random":
+                rnd = torch.randint(0, vocab_size, (n_corrupt,), generator=gen, device=X.device)
+                Xc[b, pos] = rnd
+
+            else:  # mask
+                Xc[b, pos] = 0
+
+        return Xc, Y
+
     def _save_checkpoint(self, path: str):
         """Save model checkpoint."""
         # Handle compiled model
@@ -464,12 +533,24 @@ class VeriscopeGatedTrainer:
             metrics["iter"] = self.iter_num
             metrics["lr"] = self._effective_lr(self.iter_num)
 
+            cfg = self.config
+            active = (
+                cfg.data_corrupt_at >= 0
+                and cfg.data_corrupt_len > 0
+                and cfg.data_corrupt_at <= self.iter_num < (cfg.data_corrupt_at + cfg.data_corrupt_len)
+                and cfg.data_corrupt_frac > 0.0
+            )
+            metrics["data_corrupt_active"] = int(active)
+
             self.metric_history.append(metrics)
             self.loss_history.append(loss)
 
     def train_step(self, X: torch.Tensor, Y: torch.Tensor) -> float:
         """Execute one training step."""
         cfg = self.config
+
+        # Optional token corruption pathology
+        X, Y = self._maybe_corrupt_batch(X, Y)
 
         # Update learning rate (includes optional spike injection)
         lr = self._effective_lr(self.iter_num)
@@ -687,6 +768,32 @@ if __name__ == "__main__":
         help="Record effective LR each iteration and print a spike verification ratio (debug).",
     )
 
+    parser.add_argument(
+        "--data_corrupt_at",
+        type=int,
+        default=-1,
+        help="Iteration to start token corruption (>=0 enables).",
+    )
+    parser.add_argument(
+        "--data_corrupt_len",
+        type=int,
+        default=0,
+        help="Number of iterations to apply token corruption.",
+    )
+    parser.add_argument(
+        "--data_corrupt_frac",
+        type=float,
+        default=0.0,
+        help="Fraction of tokens to corrupt per sequence (e.g., 0.10).",
+    )
+    parser.add_argument(
+        "--data_corrupt_mode",
+        type=str,
+        default="permute",
+        choices=["permute", "random", "mask"],
+        help="Token corruption mode.",
+    )
+
     args = parser.parse_args()
 
     def _flag_present(name: str) -> bool:
@@ -730,6 +837,10 @@ if __name__ == "__main__":
         lr_spike_len=args.lr_spike_len,
         lr_spike_mult=args.lr_spike_mult,
         lr_spike_verify=bool(args.lr_spike_verify),
+        data_corrupt_at=args.data_corrupt_at,
+        data_corrupt_len=args.data_corrupt_len,
+        data_corrupt_frac=args.data_corrupt_frac,
+        data_corrupt_mode=args.data_corrupt_mode,
         # Gate config
         gate_enabled=True,
         gate_window=args.gate_window,
