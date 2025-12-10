@@ -505,7 +505,8 @@ def summarize_detection(rows: pd.DataFrame, warm_idx: int) -> pd.DataFrame:
 
     out: List[Dict[str, Any]] = []
 
-    trig = rows_scored[rows_scored["collapse_tag"] == "soft"].copy()
+    # Include both soft and hard collapses in detection scoring
+    trig = rows_scored[rows_scored["collapse_tag"].isin(["soft", "hard"])].copy()
 
     n_collapse = len(trig)
 

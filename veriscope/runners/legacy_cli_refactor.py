@@ -1331,6 +1331,12 @@ def warm_idx_from_cfg(cfg: Dict[str, Any]) -> int:
     return as_int(cfg.get("warmup"), default=0) + as_int(cfg.get("ph_burn"), default=0)
 
 
+def gate_first_evaluable_epoch(cfg: Dict[str, Any]) -> int:
+    """Return the first epoch where the gate can evaluate (needs 2W history)."""
+    W = as_int(cfg.get("gate_window", 16), default=16)
+    return 2 * W
+
+
 def _warn_precedes_collapse(t_warn: Optional[int], t_c: Optional[int]) -> bool:
     """Causal validity check.
     - If no warning -> invalid (False).
@@ -4903,10 +4909,25 @@ def evaluate(df_all: pd.DataFrame, tag: str):
             q_gain = 0.05
         q_gain = float(min(max(float(q_gain), 0.0), 1.0))
 
+        # Filter to evaluable control epochs only (gate needs 2W history before it can evaluate)
+        gate_eval_start = gate_first_evaluable_epoch(CFG)
+        df_gain_pool = df_cal_raw[
+            (df_cal_raw["factor"].astype(str).str.lower().str.strip() == "none")
+            & (to_numeric_series(df_cal_raw["epoch"], errors="coerce") >= gate_eval_start)
+        ].copy()
+
+        # Only rows where gate was actually evaluated (not insufficient_history)
+        if "gate_reason" in df_gain_pool.columns:
+            df_gain_pool = df_gain_pool[df_gain_pool["gate_reason"].fillna("").astype(str).str.startswith("evaluated")]
+
+        # Fallback safety: if filtering produced an empty pool, fall back to the unfiltered calibration frame
+        if getattr(df_gain_pool, "empty", True):
+            df_gain_pool = df_cal_raw
+
         CFG["gate_gain_thresh"] = calibrate_gate_gain_thresh_from_controls(
-            df_cal_raw,
+            df_gain_pool,
             W=as_int(CFG.get("gate_window", 16), default=16),
-            warm=as_int(warm_idx, default=0),
+            warm=gate_eval_start,
             q=q_gain,
         )
 
@@ -4915,8 +4936,9 @@ def evaluate(df_all: pd.DataFrame, tag: str):
             {
                 "gate_gain_thresh": float(CFG["gate_gain_thresh"]),
                 "W": as_int(CFG.get("gate_window", 16), default=16),
-                "warm": as_int(warm_idx, default=0),
+                "warm": int(gate_eval_start),
                 "q": float(q_gain),
+                "pool_rows": int(len(df_gain_pool)) if df_gain_pool is not None else 0,
             },
         )
 
@@ -4939,23 +4961,63 @@ def evaluate(df_all: pd.DataFrame, tag: str):
 
     # --- Calibrate and persist a fixed-partition WindowDecl from controls (factor=='none' post-warm) ---
     try:
-        df_control = df_cal_raw[
+        # Pool for WindowDecl range calibration (can use broader set)
+        df_control_ranges = df_cal_raw[
             (df_cal_raw["factor"].astype(str).str.lower().str.strip() == "none")
             & (to_numeric_series(df_cal_raw["epoch"], errors="coerce") >= int(warm_idx))
         ]
+        # Keep legacy variable name for downstream uses (audits, etc.)
+        df_control = df_control_ranges
+
         decl_match = True
         window_decl = calibrate_window_from_controls(
-            df_control=df_control,
-            metrics=["var_out_k", "eff_dim"],  # add more if you plan to gate them
+            df_control=df_control_ranges,  # broader pool for ranges
+            metrics=["var_out_k", "eff_dim"],
             weights={"var_out_k": 0.5, "eff_dim": 0.5},
             bins=as_int(CFG.get("gate_bins", 16), default=16),
-            epsilon=as_float(CFG.get("gate_epsilon", 0.08), default=0.08),
+            epsilon=as_float(CFG.get("gate_epsilon", 0.08), default=0.08),  # placeholder
             interventions=(lambda x: x,),
         )
-        # Calibrate epsilon from controls and install into window_decl
+
+        # Pool for epsilon calibration: MUST be evaluable epochs only
+        gate_eval_start = gate_first_evaluable_epoch(CFG)
+        df_control_evaluable = df_cal_raw[
+            (df_cal_raw["factor"].astype(str).str.lower().str.strip() == "none")
+            & (to_numeric_series(df_cal_raw["epoch"], errors="coerce") >= gate_eval_start)
+        ].copy()
+
+        if "gate_reason" in df_control_evaluable.columns:
+            df_control_evaluable = df_control_evaluable[
+                df_control_evaluable["gate_reason"].fillna("").astype(str).str.startswith("evaluated")
+            ]
+
+        # Calibrate epsilon from worst_tv + eps_stat (matches gate acceptance condition)
         try:
             _W = as_int(CFG.get("gate_window", 16), default=16)
-            eps_new, n_vals = calibrate_epsilon_from_controls(df_control, window_decl, W=_W, q=0.995)
+
+            # Compute epsilon from quantile of (worst_tv + eps_stat) on evaluable controls.
+            # This matches the gate condition: worst_tv <= epsilon - eps_stat
+            if (
+                len(df_control_evaluable) >= 16
+                and "gate_worst_tv" in df_control_evaluable.columns
+                and "gate_eps_stat" in df_control_evaluable.columns
+            ):
+                worst_tv = pd.to_numeric(df_control_evaluable["gate_worst_tv"], errors="coerce")
+                eps_stat = pd.to_numeric(df_control_evaluable["gate_eps_stat"], errors="coerce").fillna(0.0)
+                x = (worst_tv + eps_stat).to_numpy(dtype=float)
+                x = x[np.isfinite(x)]
+
+                if len(x) >= 16:
+                    eps_new = float(np.quantile(x, 0.995))
+                    n_vals = int(len(x))
+                    if mp.current_process().name == "MainProcess":
+                        print(f"[cal] epsilon from q99.5(worst_tv + eps_stat) = {eps_new:.4f} (n={n_vals})")
+                else:
+                    # Fallback to legacy calibration
+                    eps_new, n_vals = calibrate_epsilon_from_controls(df_control_evaluable, window_decl, W=_W, q=0.995)
+            else:
+                # Fallback to legacy calibration if columns missing or pool too small
+                eps_new, n_vals = calibrate_epsilon_from_controls(df_control_evaluable, window_decl, W=_W, q=0.995)
             decl_match = _verify_decl_consistency(df_eval_raw, window_decl)
             eps_floor = as_float(CFG.get("gate_epsilon_floor", 0.02), default=0.02)
             if (not np.isfinite(eps_floor)) or (eps_floor < 0.0):
@@ -6022,7 +6084,10 @@ def evaluate(df_all: pd.DataFrame, tag: str):
     summ_vote = summarize_detection(base_vote, warm_idx=warm_idx)
     summ_seq = summarize_detection(seq_events, warm_idx=warm_idx)
     summ_newma = summarize_detection(base_newma, warm_idx=warm_idx)
-    summ_gate = summarize_detection(base_gate, warm_idx=warm_idx)
+
+    # Gate can only detect collapses that occur after it becomes evaluable
+    warm_idx_gate = max(int(warm_idx), gate_first_evaluable_epoch(CFG))
+    summ_gate = summarize_detection(base_gate, warm_idx=warm_idx_gate)
     summ_gate.to_csv(OUTDIR / f"summary_baseline_gate_{tag}.csv", index=False)
 
     # ---- Run-level FP (any warn on 'none' after warm) ----
