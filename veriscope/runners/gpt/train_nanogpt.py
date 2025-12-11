@@ -12,6 +12,7 @@ import sys
 from pathlib import Path
 import time
 import math
+import warnings
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
@@ -38,6 +39,13 @@ from veriscope.runners.gpt.adapter import (
     create_gpt_gate_engine,
 )
 from veriscope.core.calibration import aggregate_epsilon_stat
+
+# Regime-anchored detection imports
+from veriscope.core.regime import (
+    RegimeAnchoredGateEngine,
+    RegimeConfig,
+    compute_build_window,
+)
 
 
 @dataclass
@@ -94,6 +102,16 @@ class TrainConfig:
     gate_gain_thresh: float = 0.0  # stability-only by default; tune upward if you want "learning+stability"
     gate_min_evidence: int = 16
     gate_eps_stat_max_frac: float = 0.25  # cap eps_stat as fraction of epsilon
+
+    # Regime-anchored detection (reference-based drift)
+    regime_enabled: bool = True
+    regime_build_min_iter: int = -1  # Sentinel: auto-compute
+    regime_build_max_iter: int = -1  # Sentinel: auto-compute
+    regime_build_span: int = 1500
+    regime_build_max_dw: float = 0.08
+    regime_build_min_gain: float = -0.01
+    regime_epsilon_mult: float = 1.5
+    regime_min_evidence: int = 50
 
     # Device
     device: str = "cuda"
@@ -153,7 +171,7 @@ class VeriscopeGatedTrainer:
                 epsilon=config.gate_epsilon,
                 bins=16,
             )
-        self.fr_win, self.gate_engine = create_gpt_gate_engine(
+        self.fr_win, base_gate_engine = create_gpt_gate_engine(
             self.window_decl,
             {
                 "gate_gain_thresh": config.gate_gain_thresh,
@@ -162,6 +180,65 @@ class VeriscopeGatedTrainer:
                 "gate_epsilon_sens": 0.04,
             },
         )
+
+        # Determine EARLIEST pathology start for auto build window computation
+        pathology_start: Optional[int] = None
+        if config.lr_spike_at >= 0:
+            pathology_start = int(config.lr_spike_at)
+        if config.data_corrupt_at >= 0:
+            if pathology_start is None or int(config.data_corrupt_at) < pathology_start:
+                pathology_start = int(config.data_corrupt_at)
+
+        # Configure regime detection
+        regime_config = RegimeConfig(
+            enabled=bool(config.regime_enabled),
+            epsilon=None,  # Derive as epsilon_mult * base epsilon
+            epsilon_mult=float(config.regime_epsilon_mult),
+            reference_build_min_iter=int(config.regime_build_min_iter),
+            reference_build_max_iter=int(config.regime_build_max_iter),
+            reference_build_span=int(config.regime_build_span),
+            reference_build_max_dw=float(config.regime_build_max_dw),
+            reference_build_min_gain=float(config.regime_build_min_gain),
+            min_evidence_per_metric=int(config.regime_min_evidence),
+            eps_stat_alpha=0.05,
+            eps_stat_max_frac=float(config.gate_eps_stat_max_frac),
+            max_reference_samples=10000,
+            max_accumulator_windows=20,
+        )
+
+        # Wrap with regime-anchored detection
+        self.gate_engine = RegimeAnchoredGateEngine(
+            base_engine=base_gate_engine,
+            fr_win=self.fr_win,
+            config=regime_config,
+            gate_warmup=int(config.gate_warmup),
+            gate_window=int(config.gate_window),
+            pathology_start=pathology_start,
+        )
+
+        # Log computed build window and effective status
+        build_min, build_max = self.gate_engine.build_window
+        print(
+            f"[REGIME] enabled={self.gate_engine.enabled}, "
+            f"build_window=[{build_min}, {build_max}), "
+            f"epsilon={self.gate_engine.regime_epsilon:.4f}"
+        )
+
+        # Hardening: independently compute build window and warn on mismatch
+        try:
+            bm2, bx2 = compute_build_window(
+                regime_config,
+                gate_warmup=int(config.gate_warmup),
+                gate_window=int(config.gate_window),
+                pathology_start=pathology_start,
+            )
+            if (int(bm2), int(bx2)) != (int(build_min), int(build_max)):
+                warnings.warn(
+                    f"[REGIME] build_window mismatch: engine=[{build_min},{build_max}) vs compute=[{bm2},{bx2})",
+                    RuntimeWarning,
+                )
+        except Exception:
+            pass
 
         # Metric history for gating
         self.metric_history: List[Dict[str, Any]] = []
@@ -493,13 +570,24 @@ class VeriscopeGatedTrainer:
             gain_bits=gain_bits,
             kappa_sens=0.0,  # Skip κ_sens for now
             eps_stat_value=aggregate_epsilon_stat(self.window_decl, counts, alpha=0.05),
+            iter_num=self.iter_num,  # Pass iteration for regime reference timing
         )
+
+        audit = result.audit
 
         return {
             "ok": result.ok,
-            "audit": result.audit,
+            "audit": audit,
             "gain_bits": gain_bits,
             "iter": self.iter_num,
+            # Regime-specific fields (always present for consistency)
+            "change_ok": audit.get("change_ok", True),
+            "regime_ok": audit.get("regime_ok", True),
+            "regime_active": audit.get("regime_active", False),
+            "regime_enabled": audit.get("regime_enabled", False),
+            "ref_established_at": audit.get("ref_established_at"),
+            "ref_just_established": audit.get("ref_just_established", False),
+            # Spike attribution
             "spike_active": spike_active,
             "spike_overlap_past": spike_overlap_past,
             "spike_overlap_recent": spike_overlap_recent,
@@ -593,10 +681,28 @@ class VeriscopeGatedTrainer:
                 gate_result = self._compute_gate_check()
                 self.gate_history.append(gate_result)
 
+                audit = gate_result.get("audit", {})
+
+                # Format regime status
+                if gate_result.get("ref_just_established"):
+                    regime_status = " [REF ESTABLISHED]"
+                elif gate_result.get("regime_active"):
+                    regime_dw = audit.get("regime_worst_DW")
+                    regime_status = f", regime_D_W={regime_dw:.4f}" if regime_dw is not None else ""
+                elif gate_result.get("regime_enabled"):
+                    accum = audit.get("ref_windows_accumulated", 0)
+                    regime_status = f" [REF building: {accum} windows]"
+                else:
+                    regime_status = " [regime disabled]"
+
                 if not gate_result["ok"]:
-                    print(f"\n[GATE] iter={self.iter_num} FAIL: {gate_result['audit']}")
+                    print(
+                        f"\n[GATE] iter={self.iter_num} FAIL: "
+                        f"change_ok={gate_result.get('change_ok')}, "
+                        f"regime_ok={gate_result.get('regime_ok')}{regime_status}"
+                    )
                 elif self.iter_num % (cfg.gate_window * 10) == 0:
-                    print(f"[GATE] iter={self.iter_num} OK, gain={gate_result['gain_bits']:.4f} bits")
+                    print(f"[GATE] iter={self.iter_num} OK, gain={gate_result['gain_bits']:.4f} bits{regime_status}")
 
         self.iter_num += 1
         return loss_val
@@ -794,6 +900,55 @@ if __name__ == "__main__":
         help="Token corruption mode.",
     )
 
+    # Regime detection configuration
+    parser.add_argument(
+        "--no_regime",
+        action="store_true",
+        help="Disable regime-anchored detection (use only change detection).",
+    )
+    parser.add_argument(
+        "--regime_build_min_iter",
+        type=int,
+        default=-1,
+        help="Earliest iteration to establish reference. -1 = auto (gate_warmup + 2*gate_window).",
+    )
+    parser.add_argument(
+        "--regime_build_max_iter",
+        type=int,
+        default=-1,
+        help="Latest iteration to establish reference. -1 = auto (before pathology or min+span).",
+    )
+    parser.add_argument(
+        "--regime_build_span",
+        type=int,
+        default=1500,
+        help="Default build window span when auto-computing max_iter.",
+    )
+    parser.add_argument(
+        "--regime_build_max_dw",
+        type=float,
+        default=0.08,
+        help="Max D_W for reference establishment (should be << epsilon).",
+    )
+    parser.add_argument(
+        "--regime_build_min_gain",
+        type=float,
+        default=-0.01,
+        help="Min gain_bits for reference establishment (learning health gate).",
+    )
+    parser.add_argument(
+        "--regime_epsilon_mult",
+        type=float,
+        default=1.5,
+        help="Regime epsilon = base_epsilon * this multiplier.",
+    )
+    parser.add_argument(
+        "--regime_min_evidence",
+        type=int,
+        default=50,
+        help="Min samples per metric before reference can be established.",
+    )
+
     args = parser.parse_args()
 
     def _flag_present(name: str) -> bool:
@@ -819,6 +974,9 @@ if __name__ == "__main__":
 
     # Set env for meta.pkl discovery
     os.environ["NANOGPT_DIR"] = args.nanogpt_dir
+
+    # Handle regime enabled flag
+    regime_enabled = not bool(args.no_regime)
 
     config = TrainConfig(
         dataset=args.dataset,
@@ -849,6 +1007,15 @@ if __name__ == "__main__":
         gate_gain_thresh=args.gate_gain_thresh,
         gate_min_evidence=args.gate_min_evidence,
         gate_eps_stat_max_frac=args.gate_eps_stat_max_frac,
+        # Regime config
+        regime_enabled=regime_enabled,
+        regime_build_min_iter=args.regime_build_min_iter,
+        regime_build_max_iter=args.regime_build_max_iter,
+        regime_build_span=args.regime_build_span,
+        regime_build_max_dw=args.regime_build_max_dw,
+        regime_build_min_gain=args.regime_build_min_gain,
+        regime_epsilon_mult=args.regime_epsilon_mult,
+        regime_min_evidence=args.regime_min_evidence,
         # Safer default for initial hook validation
         compile=False,
     )

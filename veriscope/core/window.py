@@ -34,6 +34,73 @@ class WindowDecl:
     def attach_transport(self, transport: Any) -> None:
         self._DECL_TRANSPORT = transport
 
+    def copy_with(self, **overrides) -> "WindowDecl":
+        """Create a copy of this WindowDecl with specified fields overridden.
+
+        This is the preferred way to create variant WindowDecls (e.g., with
+        different epsilon) without risking field loss from manual construction.
+
+        If WindowDecl is a dataclass, consider using dataclasses.replace() instead,
+        which this method will delegate to if available.
+
+        Example:
+            regime_decl = base_decl.copy_with(epsilon=0.18)
+
+        Args:
+            **overrides: Field names and new values to override
+
+        Returns:
+            New WindowDecl with overridden fields
+
+        Raises:
+            ValueError: If an unknown field name is provided in overrides
+
+        Note:
+            If WindowDecl gains new fields in the future, this method must be
+            updated to include them. This is a maintenance point.
+        """
+        import copy as _copy
+        import dataclasses as _dc
+
+        # If this is a dataclass, use replace() for robustness
+        if _dc.is_dataclass(self) and not isinstance(self, type):
+            try:
+                return _dc.replace(self, **overrides)
+            except TypeError as e:
+                # Unknown field in overrides
+                raise ValueError(f"Invalid field in overrides: {e}") from e
+
+        # Manual approach for non-dataclass WindowDecl
+        # Get current values for all known constructor args
+        known_fields = {
+            "epsilon",
+            "metrics",
+            "weights",
+            "bins",
+            "interventions",
+            "cal_ranges",
+        }
+
+        # Validate overrides
+        unknown = set(overrides.keys()) - known_fields
+        if unknown:
+            raise ValueError(f"Unknown WindowDecl field(s): {sorted(unknown)}. Valid fields: {sorted(known_fields)}")
+
+        kwargs = {
+            "epsilon": self.epsilon,
+            "metrics": list(self.metrics),
+            "weights": _copy.deepcopy(self.weights),
+            "bins": self.bins,
+            "interventions": self.interventions,
+            "cal_ranges": _copy.deepcopy(getattr(self, "cal_ranges", {})),
+            "_DECL_TRANSPORT": self._DECL_TRANSPORT,
+        }
+
+        # Apply overrides
+        kwargs.update(overrides)
+
+        return WindowDecl(**kwargs)
+
 
 def window_decl_identity_hash(wd: "WindowDecl") -> str:
     """Stable identity hash for a WindowDecl configuration.
