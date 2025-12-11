@@ -1459,10 +1459,10 @@ CFG_SMOKE = dict(
     heavy_every=4,
     rp_repeats=1,
     sw2_n_proj=64,
-    # gate: keep W small so 2W history exists early in short runs
-    gate_window=3,
-    gate_min_evidence=3,  # NaN-tolerant: allows 1 metric to be fully missing at first eval (W=3, n_metrics=2)
-    gate_min_evidence_full_eps=12,  # Smoke: keep inflation ON at first evaluated epoch (target = 2× ideal evidence)
+    # gate: W=1 so 2W history exists by epoch 2 (matches earliest GT collapses in smoke)
+    gate_window=1,
+    gate_min_evidence=3,  # will be clamped down to a NaN-tolerant bound in reconcile_cfg_inplace()
+    gate_min_evidence_full_eps=12,
     # Gate epsilon: smoke calibration is underdetermined; use a realistic preset with a protective floor.
     gate_epsilon=0.50,
     gate_epsilon_floor=0.40,
