@@ -2213,7 +2213,6 @@ def safe_float(x: Any) -> float:
 
 
 # --- General numeric guards for Any/object-typed inputs ---
-from typing import Union
 
 # --- FR integration (optional import; runtime holders below) ---
 try:
@@ -2315,6 +2314,33 @@ def as_json_dict(x: Any) -> dict[str, Any]:
     return {}
 
 
+def _is_admissible_control(row_or_df: Union[pd.Series, pd.DataFrame]) -> Union[bool, pd.Series]:
+    """Admissibility predicate for calibration control pools.
+
+    A row/run is admissible iff:
+      1) factor == 'none' (case/whitespace tolerant)
+      2) PRE-GT stamp says collapse_tag == 'none' (if available)
+
+    If the PRE-GT stamp column is missing, this predicate defaults to allowing rows
+    (so older bundles remain usable), but callers SHOULD log if they expected the column.
+    """
+    if isinstance(row_or_df, pd.DataFrame):
+        df = row_or_df
+        if "factor" not in df.columns:
+            return pd.Series(False, index=df.index)
+        factor_ok = df["factor"].astype(str).str.lower().str.strip() == "none"
+        gt_ok: Union[bool, pd.Series] = True
+        if "_run_collapse_tag_gt_precal" in df.columns:
+            gt_ok = df["_run_collapse_tag_gt_precal"].astype(str) == "none"
+        return factor_ok & gt_ok
+
+    # row path
+    row = row_or_df
+    factor_ok = str(row.get("factor", "")).lower().strip() == "none"
+    gt_ok = str(row.get("_run_collapse_tag_gt_precal", "none")) == "none"
+    return bool(factor_ok and gt_ok)
+
+
 #
 # ---------------------------
 # Model & schedule
@@ -2392,7 +2418,8 @@ def calibrate_gate_gain_thresh_from_controls(df: pd.DataFrame, W: int, warm: int
         q = 0.05
     q = float(min(max(q, 0.0), 1.0))
     try:
-        sub = df[(df["factor"] == "none") & (pd.to_numeric(df["epoch"], errors="coerce") >= int(warm))].copy()
+        ep = pd.to_numeric(df["epoch"], errors="coerce")
+        sub = df[_is_admissible_control(df) & (ep >= int(warm))].copy()
     except Exception:
         return float(CFG.get("gate_gain_thresh", 0.05))
     vals = []
@@ -4899,6 +4926,52 @@ def evaluate(df_all: pd.DataFrame, tag: str):
         print(
             "[eval] no evaluation seeds present; will skip learned/baseline evaluation but still write calibration aggregates."
         )
+    # --- PRE-GT STAMP (anti-contamination): tag runs before using any “controls” pools ---
+    # Rationale: factor labels are not admissibility predicates. Exclude runs that unified GT
+    # already marks as soft/hard collapse from ALL calibration pools.
+    try:
+        if df_cal_raw is not None and isinstance(df_cal_raw, pd.DataFrame) and len(df_cal_raw) > 0:
+            rows = []
+            for (seed, factor), g in df_cal_raw.groupby(["seed", "factor"], sort=False):
+                g = g.sort_values("epoch").copy()
+
+                # Initial GT: infinite cutoff is enough to flag obvious collapse in "controls".
+                t_c0, ctag0 = gt_collapse_time(g, grad_cutoff=np.inf)
+
+                # Epochwise tag with pre-warm forced to 'none'
+                g["t_collapse_gt"] = np.nan if t_c0 is None else int(t_c0)
+                ep = pd.to_numeric(g["epoch"], errors="coerce").fillna(-1).to_numpy(dtype=np.int64)
+                g["collapse_tag_gt"] = _epochwise_collapse_tag_gt(ep, t_c0, str(ctag0), int(warm_idx))
+
+                rows.append(g)
+
+            df_cal_raw = pd.concat(rows, ignore_index=True) if rows else df_cal_raw
+
+            # Run-level reduction: hard > soft > none
+            def _reduce_run_tag(s: pd.Series) -> str:
+                ss = set(s.dropna().astype(str).tolist())
+                if "hard" in ss:
+                    return "hard"
+                if "soft" in ss:
+                    return "soft"
+                return "none"
+
+            df_cal_raw["_run_collapse_tag_gt_precal"] = df_cal_raw.groupby(["seed", "factor"], sort=False)[
+                "collapse_tag_gt"
+            ].transform(_reduce_run_tag)
+
+            try:
+                if mp.current_process().name == "MainProcess":
+                    n_bad = int((df_cal_raw["_run_collapse_tag_gt_precal"].astype(str) != "none").sum())
+                    if n_bad > 0:
+                        print(f"[calib][guard] excluding collapsed rows from calibration pools (GT != 'none'): {n_bad}")
+            except Exception:
+                pass
+    except Exception as _e:
+        try:
+            print(f"[calib][guard][WARN] pre-GT stamp failed; proceeding without GT guard: {_e!r}")
+        except Exception:
+            pass
 
     # --- calibrate gate gain threshold (bits/sample) from controls ---
     try:
@@ -4920,9 +4993,29 @@ def evaluate(df_all: pd.DataFrame, tag: str):
         if "gate_reason" in df_gain_pool.columns:
             df_gain_pool = df_gain_pool[df_gain_pool["gate_reason"].fillna("").astype(str).str.startswith("evaluated")]
 
-        # Fallback safety: if filtering produced an empty pool, fall back to the unfiltered calibration frame
+        # Exclude any calibration runs that unified GT already marks as collapsed (anti-contamination)
+        try:
+            if "_run_collapse_tag_gt_precal" in df_gain_pool.columns:
+                df_gain_pool = df_gain_pool[df_gain_pool["_run_collapse_tag_gt_precal"].astype(str) == "none"].copy()
+        except Exception as _e:
+            try:
+                print(f"[calib][WARN] anti-contamination filter failed (gain_pool): {_e!r}")
+            except Exception:
+                pass
+
+        # Fallback safety: if filtering produced an empty pool, fall back to the least-contaminated pool available
         if getattr(df_gain_pool, "empty", True):
             df_gain_pool = df_cal_raw
+            try:
+                if "_run_collapse_tag_gt_precal" in df_gain_pool.columns:
+                    df_gain_pool = df_gain_pool[
+                        df_gain_pool["_run_collapse_tag_gt_precal"].astype(str) == "none"
+                    ].copy()
+            except Exception as _e:
+                try:
+                    print(f"[calib][WARN] anti-contamination filter failed (gain_pool fallback): {_e!r}")
+                except Exception:
+                    pass
 
         CFG["gate_gain_thresh"] = calibrate_gate_gain_thresh_from_controls(
             df_gain_pool,
@@ -4966,6 +5059,17 @@ def evaluate(df_all: pd.DataFrame, tag: str):
             (df_cal_raw["factor"].astype(str).str.lower().str.strip() == "none")
             & (to_numeric_series(df_cal_raw["epoch"], errors="coerce") >= int(warm_idx))
         ]
+        # Anti-contamination: exclude any runs marked collapsed by GT (if available)
+        try:
+            if "_run_collapse_tag_gt_precal" in df_control_ranges.columns:
+                df_control_ranges = df_control_ranges[
+                    df_control_ranges["_run_collapse_tag_gt_precal"].astype(str) == "none"
+                ].copy()
+        except Exception as _e:
+            try:
+                print(f"[calib][WARN] anti-contamination filter failed (control_ranges): {_e!r}")
+            except Exception:
+                pass
         # Keep legacy variable name for downstream uses (audits, etc.)
         df_control = df_control_ranges
 
@@ -4985,6 +5089,17 @@ def evaluate(df_all: pd.DataFrame, tag: str):
             (df_cal_raw["factor"].astype(str).str.lower().str.strip() == "none")
             & (to_numeric_series(df_cal_raw["epoch"], errors="coerce") >= gate_eval_start)
         ].copy()
+        # Anti-contamination: exclude any runs marked collapsed by GT (if available)
+        try:
+            if "_run_collapse_tag_gt_precal" in df_control_evaluable.columns:
+                df_control_evaluable = df_control_evaluable[
+                    df_control_evaluable["_run_collapse_tag_gt_precal"].astype(str) == "none"
+                ].copy()
+        except Exception as _e:
+            try:
+                print(f"[calib][WARN] anti-contamination filter failed (control_evaluable): {_e!r}")
+            except Exception:
+                pass
 
         if "gate_reason" in df_control_evaluable.columns:
             df_control_evaluable = df_control_evaluable[
@@ -5156,40 +5271,41 @@ def evaluate(df_all: pd.DataFrame, tag: str):
     gtq = float(CFG.get("gt_rank_q", 0.075))
 
     def _soft_quantile_from_controls(df_src, q, warm_idx):
-        """Compute q-quantile of eff_dim_gt (preferred) or eff_dim on control ('none') after warm_idx.
-        Robust to missing columns; returns None if not computable.
+        """Compute q-quantile of eff_dim_gt on control ('none') after warm_idx.
+
+        Anti-contamination: excludes runs marked as collapsed by PRE-GT stamp
+        (`_run_collapse_tag_gt_precal != 'none'`) when that column exists.
+
+        Returns None on failure.
         """
-        # Require control columns to exist
-        if df_src is None or not isinstance(df_src, pd.DataFrame):
+        if df_src is None or (not isinstance(df_src, pd.DataFrame)):
             return None
         if ("factor" not in df_src.columns) or ("epoch" not in df_src.columns):
             return None
 
-        # Filter to controls after warm_idx (coerce epochs to numeric)
+        # Defensive clamp: q must be a valid quantile in [0, 1]
+        try:
+            q = float(q)
+        except Exception:
+            q = 0.05
+        q = float(min(max(q, 0.0), 1.0))
+
         try:
             ep = to_numeric_series(df_src["epoch"], errors="coerce")
-            base = df_src[(df_src["factor"] == "none") & (ep >= int(warm_idx))]
+            base = df_src[_is_admissible_control(df_src) & (ep >= int(warm_idx))].copy()
         except Exception:
             return None
 
-        # Prefer eff_dim_gt; fall back to eff_dim; bail if neither exists
-        if "eff_dim_gt" in base.columns:
-            series = to_numeric_series(base["eff_dim_gt"], errors="coerce")
-        elif "eff_dim" in base.columns:
-            series = to_numeric_series(base["eff_dim"], errors="coerce")
-        else:
+        col = "eff_dim_gt" if "eff_dim_gt" in base.columns else ("eff_dim" if "eff_dim" in base.columns else None)
+        if col is None:
             return None
 
-        # Drop NaNs and compute quantile
-        series = series.dropna()
-        if series.empty:
-            return None
-        arr = series.to_numpy()
         try:
-            return float(np.quantile(arr, float(q)))
-        except TypeError:
-            # numpy <1.22 compatibility
-            return float(np.quantile(arr, float(q), method="linear"))
+            vals = pd.to_numeric(base[col], errors="coerce").to_numpy(dtype=float)
+            vals = vals[np.isfinite(vals)]
+            if vals.size == 0:
+                return None
+            return float(np.quantile(vals, q))
         except Exception:
             return None
 

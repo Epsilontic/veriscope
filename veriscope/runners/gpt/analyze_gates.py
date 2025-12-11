@@ -97,6 +97,14 @@ def analyze_gates(
                 "worst_DW": audit.get("worst_DW", float("nan")),
                 "eps_eff": audit.get("eps_eff", float("nan")),
                 "gain_bits": audit.get("gain_bits", float("nan")),
+                # Regime fields
+                "change_ok": audit.get("change_ok", True),
+                "regime_ok": audit.get("regime_ok", True),
+                "regime_active": audit.get("regime_active", False),
+                "regime_enabled": audit.get("regime_enabled", False),
+                "regime_worst_DW": audit.get("regime_worst_DW", float("nan")),
+                "ref_established_at": audit.get("ref_established_at"),
+                "ref_just_established": audit.get("ref_just_established", False),
             }
         )
 
@@ -142,6 +150,33 @@ def print_analysis(a: Dict[str, Any], verbose: bool) -> None:
     print(f"\nTotal gates: {a['total_gates']}")
     print(f"Gates with spike overlap: {a['total_overlap']}")
     print(f"Gates without overlap:    {a['total_nonoverlap']}")
+
+    # Add regime summary
+    per_gate = a.get("per_gate", [])
+    regime_enabled_count = sum(1 for g in per_gate if g.get("regime_enabled", False))
+    regime_active_count = sum(1 for g in per_gate if g.get("regime_active", False))
+    regime_fail_count = sum(1 for g in per_gate if not g.get("regime_ok", True))
+    change_fail_count = sum(1 for g in per_gate if not g.get("change_ok", True))
+
+    print(f"\n{'=' * 64}")
+    print("REGIME DETECTION SUMMARY")
+    print("=" * 64)
+    print(f"Gates with regime enabled: {regime_enabled_count}/{len(per_gate)}")
+    print(f"Gates with regime active:  {regime_active_count}/{len(per_gate)}")
+    print(f"Change detection fails:    {change_fail_count}")
+    print(f"Regime detection fails:    {regime_fail_count}")
+
+    # Find reference establishment point
+    ref_established = None
+    for g in per_gate:
+        if g.get("ref_just_established"):
+            ref_established = g.get("iter")
+            break
+
+    if ref_established is not None:
+        print(f"Reference established at:  iter {ref_established}")
+    else:
+        print("Reference: NOT ESTABLISHED")
 
     if not verbose:
         return
