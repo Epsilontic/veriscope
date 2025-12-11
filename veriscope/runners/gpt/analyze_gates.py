@@ -1,6 +1,5 @@
 # veriscope/runners/gpt/analyze_gates.py
-"""
-Gate recall/precision analysis for veriscope GPT experiments.
+"""Gate recall/precision analysis for veriscope GPT experiments.
 
 Usage:
   python -m veriscope.runners.gpt.analyze_gates \
@@ -25,8 +24,7 @@ def _recent_window_bounds_iter_space(
     gate_window: int,
     metric_interval: int,
 ) -> Tuple[int, int]:
-    """
-    Compute the iteration range covered by the *recent half-window* for a gate check.
+    """Compute the iteration range covered by the *recent half-window* for a gate check.
 
     In train_nanogpt.py:
       Wm = gate_window // metric_interval (snapshots per half-window)
@@ -53,7 +51,6 @@ def analyze_gates(
     metric_interval: int,
 ) -> Dict[str, Any]:
     spike_end = int(spike_start) + int(spike_len)
-
     data = json.loads(results_path.read_text())
     gates: List[Dict[str, Any]] = list(data.get("gates", []) or [])
 
@@ -80,12 +77,16 @@ def analyze_gates(
         ov1 = min(recent_end, int(spike_end))
         overlap_iters = max(0, ov1 - ov0)
 
-        # normalize by the actual iteration-span of the recent window
+        # Normalize by the actual iteration-span of the recent window
         interval = max(1, int(metric_interval))
         wm = max(1, int(gate_window) // interval)
         w_iter = int(wm * interval)
         overlap_frac = float(overlap_iters) / float(w_iter) if w_iter > 0 else 0.0
 
+        # NOTE: Audit key names must match trainer output in train_nanogpt.py.
+        # The trainer's _compute_gate_check() and RegimeAnchoredGateEngine.check()
+        # populate: change_ok, regime_ok, regime_active, regime_enabled,
+        # regime_worst_DW, worst_DW (change detector), eps_eff, gain_bits.
         per_gate.append(
             {
                 "iter": gate_iter,
@@ -94,20 +95,22 @@ def analyze_gates(
                 "overlaps_spike": overlaps,
                 "overlap_frac": overlap_frac,
                 "recent_window": (recent_start, recent_end),
+                # Change detector fields
                 "worst_DW": audit.get("worst_DW", float("nan")),
                 "eps_eff": audit.get("eps_eff", float("nan")),
                 "gain_bits": audit.get("gain_bits", float("nan")),
-                # Regime fields
-                "change_ok": audit.get("change_ok", True),
-                "regime_ok": audit.get("regime_ok", True),
-                "regime_active": audit.get("regime_active", False),
-                "regime_enabled": audit.get("regime_enabled", False),
+                # Regime fields (defaults are conservative: assume OK if missing)
+                "change_ok": bool(audit.get("change_ok", True)),
+                "regime_ok": bool(audit.get("regime_ok", True)),
+                "regime_active": bool(audit.get("regime_active", False)),
+                "regime_enabled": bool(audit.get("regime_enabled", False)),
                 "regime_worst_DW": audit.get("regime_worst_DW", float("nan")),
                 "ref_established_at": audit.get("ref_established_at"),
-                "ref_just_established": audit.get("ref_just_established", False),
+                "ref_just_established": bool(audit.get("ref_just_established", False)),
             }
         )
 
+    # ---- Union gate confusion matrix (existing behavior) ----
     tp = sum(1 for r in per_gate if r["fail"] and r["overlaps_spike"])
     fp = sum(1 for r in per_gate if r["fail"] and not r["overlaps_spike"])
     fn = sum(1 for r in per_gate if r["ok"] and r["overlaps_spike"])
@@ -117,13 +120,70 @@ def analyze_gates(
     recall = tp / (tp + fn) if (tp + fn) > 0 else float("nan")
     specificity = tn / (tn + fp) if (tn + fp) > 0 else float("nan")
 
+    # ---- Change detection breakdown ----
+    change_tp = sum(1 for r in per_gate if not r["change_ok"] and r["overlaps_spike"])
+    change_fp = sum(1 for r in per_gate if not r["change_ok"] and not r["overlaps_spike"])
+    change_fn = sum(1 for r in per_gate if r["change_ok"] and r["overlaps_spike"])
+    change_tn = sum(1 for r in per_gate if r["change_ok"] and not r["overlaps_spike"])
+
+    change_precision = change_tp / (change_tp + change_fp) if (change_tp + change_fp) > 0 else float("nan")
+    change_recall = change_tp / (change_tp + change_fn) if (change_tp + change_fn) > 0 else float("nan")
+    change_specificity = change_tn / (change_tn + change_fp) if (change_tn + change_fp) > 0 else float("nan")
+
+    # ---- Regime detection breakdown (only when active) ----
+    # Filter to gates where regime was actually active (reference established)
+    regime_active_gates = [r for r in per_gate if r["regime_active"]]
+
+    regime_tp = sum(1 for r in regime_active_gates if not r["regime_ok"] and r["overlaps_spike"])
+    regime_fp = sum(1 for r in regime_active_gates if not r["regime_ok"] and not r["overlaps_spike"])
+    regime_fn = sum(1 for r in regime_active_gates if r["regime_ok"] and r["overlaps_spike"])
+    regime_tn = sum(1 for r in regime_active_gates if r["regime_ok"] and not r["overlaps_spike"])
+
+    regime_precision = regime_tp / (regime_tp + regime_fp) if (regime_tp + regime_fp) > 0 else float("nan")
+    regime_recall = regime_tp / (regime_tp + regime_fn) if (regime_tp + regime_fn) > 0 else float("nan")
+    regime_specificity = regime_tn / (regime_tn + regime_fp) if (regime_tn + regime_fp) > 0 else float("nan")
+
+    # ---- Attribution: who drives union failures in spike window? ----
+    both_fail_in_spike = sum(
+        1
+        for r in per_gate
+        if (not r["change_ok"]) and r["regime_active"] and (not r["regime_ok"]) and r["overlaps_spike"]
+    )
+    change_only_in_spike = sum(
+        1
+        for r in per_gate
+        if (not r["change_ok"]) and (not r["regime_active"] or r["regime_ok"]) and r["overlaps_spike"]
+    )
+    regime_only_in_spike = sum(
+        1 for r in per_gate if r["change_ok"] and r["regime_active"] and (not r["regime_ok"]) and r["overlaps_spike"]
+    )
+
     return {
         "results_file": str(results_path),
         "spike": {"start": int(spike_start), "end": int(spike_end), "len": int(spike_len)},
+        # Union gate (existing)
         "confusion": {"tp": tp, "fp": fp, "fn": fn, "tn": tn},
         "precision": precision,
         "recall": recall,
         "specificity": specificity,
+        # Change detection decomposition
+        "change_confusion": {"tp": change_tp, "fp": change_fp, "fn": change_fn, "tn": change_tn},
+        "change_precision": change_precision,
+        "change_recall": change_recall,
+        "change_specificity": change_specificity,
+        # Regime detection decomposition
+        "regime_confusion": {"tp": regime_tp, "fp": regime_fp, "fn": regime_fn, "tn": regime_tn},
+        "regime_precision": regime_precision,
+        "regime_recall": regime_recall,
+        "regime_specificity": regime_specificity,
+        "regime_active_gates": len(regime_active_gates),
+        # Attribution breakdown
+        "spike_attribution": {
+            "both_fail": both_fail_in_spike,
+            "change_only": change_only_in_spike,
+            "regime_only": regime_only_in_spike,
+        },
+        # Totals
         "total_gates": len(per_gate),
         "total_overlap": tp + fn,
         "total_nonoverlap": tn + fp,
@@ -132,10 +192,12 @@ def analyze_gates(
 
 
 def print_analysis(a: Dict[str, Any], verbose: bool) -> None:
+    # Extract per_gate once at the top; reuse throughout
+    per_gate = a.get("per_gate", [])
     conf = a["confusion"]
 
     print("\n" + "=" * 64)
-    print("GATE RECALL/PRECISION ANALYSIS")
+    print("GATE RECALL/PRECISION ANALYSIS (Union: change OR regime)")
     print("=" * 64)
 
     print("\nConfusion Matrix:")
@@ -151,20 +213,57 @@ def print_analysis(a: Dict[str, Any], verbose: bool) -> None:
     print(f"Gates with spike overlap: {a['total_overlap']}")
     print(f"Gates without overlap:    {a['total_nonoverlap']}")
 
-    # Add regime summary
-    per_gate = a.get("per_gate", [])
+    # ---- Policy Decomposition ----
+    print("\n" + "=" * 64)
+    print("POLICY DECOMPOSITION: CHANGE vs REGIME")
+    print("=" * 64)
+
+    # Change detection
+    cc = a["change_confusion"]
+    print("\n--- CHANGE DETECTION (past vs recent) ---")
+    print("                    | Spike Overlap | No Overlap |")
+    print(f"  Change FAIL       |      {cc['tp']:3d}      |     {cc['fp']:3d}      |")
+    print(f"  Change OK         |      {cc['fn']:3d}      |     {cc['tn']:3d}      |")
+    print(f"\n  Precision:   {a['change_precision']:.3f}")
+    print(f"  Recall:      {a['change_recall']:.3f}")
+    print(f"  Specificity: {a['change_specificity']:.3f}")
+
+    # Regime detection
+    rc = a["regime_confusion"]
+    print(f"\n--- REGIME DETECTION (ref vs recent) [n={a['regime_active_gates']} active gates] ---")
+    print("                    | Spike Overlap | No Overlap |")
+    print(f"  Regime FAIL       |      {rc['tp']:3d}      |     {rc['fp']:3d}      |")
+    print(f"  Regime OK         |      {rc['fn']:3d}      |     {rc['tn']:3d}      |")
+    print(f"\n  Precision:   {a['regime_precision']:.3f}")
+    print(f"  Recall:      {a['regime_recall']:.3f}")
+    print(f"  Specificity: {a['regime_specificity']:.3f}")
+
+    # ---- Attribution breakdown ----
+    print("\n" + "-" * 64)
+    print("SPIKE OVERLAP FAILURE ATTRIBUTION")
+    print("-" * 64)
+
+    change_total_fail = cc["tp"] + cc["fp"]
+    regime_total_fail = rc["tp"] + rc["fp"]
+
+    print(f"Change detector fired {change_total_fail} times total")
+    print(f"Regime detector fired {regime_total_fail} times total")
+
+    attr = a.get("spike_attribution", {})
+    print("\nWithin spike overlap windows:")
+    print(f"  Both detectors failed:    {attr.get('both_fail', 0)}")
+    print(f"  Change-only failed:       {attr.get('change_only', 0)}")
+    print(f"  Regime-only failed:       {attr.get('regime_only', 0)}")
+
+    # ---- Regime state summary ----
     regime_enabled_count = sum(1 for g in per_gate if g.get("regime_enabled", False))
     regime_active_count = sum(1 for g in per_gate if g.get("regime_active", False))
-    regime_fail_count = sum(1 for g in per_gate if not g.get("regime_ok", True))
-    change_fail_count = sum(1 for g in per_gate if not g.get("change_ok", True))
 
     print(f"\n{'=' * 64}")
-    print("REGIME DETECTION SUMMARY")
+    print("REGIME STATE SUMMARY")
     print("=" * 64)
     print(f"Gates with regime enabled: {regime_enabled_count}/{len(per_gate)}")
     print(f"Gates with regime active:  {regime_active_count}/{len(per_gate)}")
-    print(f"Change detection fails:    {change_fail_count}")
-    print(f"Regime detection fails:    {regime_fail_count}")
 
     # Find reference establishment point
     ref_established = None
@@ -181,36 +280,56 @@ def print_analysis(a: Dict[str, Any], verbose: bool) -> None:
     if not verbose:
         return
 
-    overlap = [r for r in a["per_gate"] if r["overlaps_spike"]]
+    # ---- Verbose: detailed table ----
+    overlap = [r for r in per_gate if r["overlaps_spike"]]
     overlap_sorted = sorted(overlap, key=lambda x: x["iter"])
 
     print("\n" + "-" * 64)
     print("GATES WITH SPIKE OVERLAP (sorted by iter)")
     print("-" * 64)
-    print(f"{'iter':>6} | {'status':^8} | {'ov%':>6} | {'worst_DW':>9} | {'eps_eff':>7} | {'gain':>9}")
+    print(f"{'iter':>6} | {'union':^6} | {'change':^6} | {'regime':^6} | {'ov%':>5} | {'chg_DW':>8} | {'reg_DW':>8}")
     print("-" * 64)
 
+    def _fmt(x: Any) -> str:
+        """Format a numeric value, handling nan/None gracefully."""
+        if x is None:
+            return "n/a"
+        try:
+            f = float(x)
+            return f"{f:.4f}" if math.isfinite(f) else "nan"
+        except (ValueError, TypeError):
+            return "n/a"
+
     for r in overlap_sorted:
-        status = "FAIL" if r["fail"] else "ok"
+        union_status = "FAIL" if r["fail"] else "ok"
+        change_status = "FAIL" if not r["change_ok"] else "ok"
+
+        # Regime status: n/a if not active, otherwise FAIL/ok
+        if r["regime_active"]:
+            regime_status = "FAIL" if not r["regime_ok"] else "ok"
+        else:
+            regime_status = "n/a"
+
         ovp = 100.0 * float(r["overlap_frac"])
-        worst = r["worst_DW"]
-        eps = r["eps_eff"]
-        gain = r["gain_bits"]
+        chg_dw = _fmt(r["worst_DW"])
+        reg_dw = _fmt(r["regime_worst_DW"])
 
-        def _fmt(x: Any) -> str:
-            return f"{float(x):.4f}" if isinstance(x, (int, float)) and math.isfinite(float(x)) else "nan"
+        print(
+            f"{r['iter']:>6} | {union_status:^6} | {change_status:^6} | {regime_status:^6} | "
+            f"{ovp:>4.0f}% | {chg_dw:>8} | {reg_dw:>8}"
+        )
 
-        print(f"{r['iter']:>6} | {status:^8} | {ovp:>5.0f}% | {_fmt(worst):>9} | {_fmt(eps):>7} | {_fmt(gain):>9}")
-
-    fns = [r for r in overlap_sorted if (r["ok"] and r["overlaps_spike"])]
+    # ---- False negatives detail ----
+    fns = [r for r in overlap_sorted if r["ok"] and r["overlaps_spike"]]
     if fns:
         print("\n" + "-" * 64)
-        print("FALSE NEGATIVES (overlap but OK)")
+        print("FALSE NEGATIVES (overlap but union OK)")
         print("-" * 64)
         for r in fns:
             rs, re = r["recent_window"]
             print(f"\niter {r['iter']}: recent=[{rs},{re}) overlap={100.0 * r['overlap_frac']:.0f}%")
-            print(f"  worst_DW={r['worst_DW']}, eps_eff={r['eps_eff']}, gain_bits={r['gain_bits']}")
+            print(f"  change_ok={r['change_ok']}, regime_ok={r['regime_ok']}, regime_active={r['regime_active']}")
+            print(f"  change_DW={_fmt(r['worst_DW'])}, regime_DW={_fmt(r['regime_worst_DW'])}")
 
 
 def main() -> None:
