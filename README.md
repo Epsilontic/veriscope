@@ -224,7 +224,7 @@ See the header comment block in `veriscope/runners/gpt/train_nanogpt.py` for the
 - `--metric_interval 2`
 - `--gate_window 75`
 - `--gate_warmup 1500`
-- `--gate_epsilon 0.30`
+- `--gate_epsilon 0.25`
 - `--gate_eps_stat_max_frac 0.15`
 - `--gate_min_evidence 75`
 - `--gate_gain_thresh -0.002`
@@ -239,7 +239,7 @@ python -m veriscope.runners.gpt.train_nanogpt \
     --metric_interval 2 \
     --gate_window 75 \
     --gate_warmup 1500 \
-    --gate_epsilon 0.30 \
+    --gate_epsilon 0.25 \
     --gate_eps_stat_max_frac 0.15 \
     --gate_min_evidence 75 \
     --gate_gain_thresh -0.002 \
@@ -259,7 +259,7 @@ python -m veriscope.runners.gpt.train_nanogpt \
     --metric_interval 2 \
     --gate_window 75 \
     --gate_warmup 1500 \
-    --gate_epsilon 0.30 \
+    --gate_epsilon 0.25 \
     --gate_eps_stat_max_frac 0.15 \
     --gate_min_evidence 75 \
     --gate_gain_thresh -0.002
