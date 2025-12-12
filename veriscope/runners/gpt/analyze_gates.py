@@ -42,6 +42,35 @@ def _windows_overlap(a0: int, a1: int, b0: int, b1: int) -> bool:
     return a0 < b1 and b0 < a1
 
 
+def _is_onset_gate(
+    recent_start: int,
+    recent_end: int,
+    gate_window: int,
+    metric_interval: int,
+    spike_start: int,
+    spike_end: int,
+) -> bool:
+    """True iff past-half does NOT overlap spike, but recent-half DOES.
+
+    This scores whether a *change detector* caught the corruption onset.
+
+    past_half  = [recent_start - W_iter, recent_start)
+    recent_half= [recent_start, recent_end)
+
+    We reuse the same W_iter implied by gate_window and metric_interval.
+    """
+    interval = max(1, int(metric_interval))
+    wm = max(1, int(gate_window) // interval)
+    w_iter = int(wm * interval)
+
+    past_start = int(recent_start) - int(w_iter)
+    past_end = int(recent_start)
+
+    past_overlaps = _windows_overlap(past_start, past_end, int(spike_start), int(spike_end))
+    recent_overlaps = _windows_overlap(int(recent_start), int(recent_end), int(spike_start), int(spike_end))
+    return (not past_overlaps) and recent_overlaps
+
+
 def analyze_gates(
     results_path: Path,
     spike_start: int,
@@ -82,6 +111,15 @@ def analyze_gates(
         w_iter = int(wm * interval)
         overlap_frac = float(overlap_iters) / float(w_iter) if w_iter > 0 else 0.0
 
+        onset_gate = _is_onset_gate(
+            recent_start=recent_start,
+            recent_end=recent_end,
+            gate_window=gate_window,
+            metric_interval=metric_interval,
+            spike_start=int(spike_start),
+            spike_end=int(spike_end),
+        )
+
         # NOTE: Audit key names must match trainer output in train_nanogpt.py.
         # The trainer's _compute_gate_check() and RegimeAnchoredGateEngine.check()
         # populate: change_ok, regime_ok, regime_active, regime_enabled,
@@ -92,6 +130,7 @@ def analyze_gates(
                 "ok": ok,
                 "fail": (not ok),
                 "overlaps_spike": overlaps,
+                "onset_gate": bool(onset_gate),
                 "overlap_frac": overlap_frac,
                 "recent_window": (recent_start, recent_end),
                 # Change detector fields
@@ -141,6 +180,16 @@ def analyze_gates(
     regime_recall = regime_tp / (regime_tp + regime_fn) if (regime_tp + regime_fn) > 0 else float("nan")
     regime_specificity = regime_tn / (regime_tn + regime_fp) if (regime_tn + regime_fp) > 0 else float("nan")
 
+    # ---- Onset scoring (transition into spike): change detector only ----
+    onset_total = sum(1 for r in per_gate if r.get("onset_gate"))
+    onset_change_tp = sum(1 for r in per_gate if r.get("onset_gate") and (not r["change_ok"]))
+    onset_change_fn = sum(1 for r in per_gate if r.get("onset_gate") and r["change_ok"])
+    onset_change_recall = (
+        onset_change_tp / (onset_change_tp + onset_change_fn)
+        if (onset_change_tp + onset_change_fn) > 0
+        else float("nan")
+    )
+
     # ---- Attribution: who drives union failures in spike window? ----
     both_fail_in_spike = sum(
         1
@@ -175,6 +224,13 @@ def analyze_gates(
         "regime_recall": regime_recall,
         "regime_specificity": regime_specificity,
         "regime_active_gates": len(regime_active_gates),
+        # Onset scoring (transition)
+        "onset": {
+            "total": onset_total,
+            "change_tp": onset_change_tp,
+            "change_fn": onset_change_fn,
+            "change_recall": onset_change_recall,
+        },
         # Attribution breakdown
         "spike_attribution": {
             "both_fail": both_fail_in_spike,
@@ -201,6 +257,9 @@ def print_analysis(a: Dict[str, Any], verbose: bool) -> None:
     per_gate = a.get("per_gate", [])
     cc = a["change_confusion"]
     rc = a["regime_confusion"]
+    onset = a.get("onset", {}) or {}
+    onset_total = int(onset.get("total", 0) or 0)
+    onset_tp = int(onset.get("change_tp", 0) or 0)
 
     # =========================================================================
     # EXECUTIVE SUMMARY (what you actually care about)
@@ -213,6 +272,13 @@ def print_analysis(a: Dict[str, Any], verbose: bool) -> None:
     print("\n┌─ CORRUPTION DETECTION (use this for spike experiments) ──────┐")
     print(f"│  Precision:    {_fmt_metric(a['change_precision']):>5}  (when alarmed, was it real?)             │")
     print(f"│  Recall:       {_fmt_metric(a['change_recall']):>5}  (did we catch the corruption?)           │")
+    if onset_total > 0:
+        print(
+            f"│  Onset recall: {_fmt_metric(float(onset.get('change_recall', float('nan')))):>5}  "
+            f"(caught onset: {onset_tp}/{onset_total})               │"
+        )
+    else:
+        print("│  Onset gates:  0     (no transition in window — control or mismatch) │")
     print(f"│  Specificity:  {_fmt_metric(a['change_specificity']):>5}  (quiet when clean?)                      │")
     print(
         f"│  Change FAILs: {cc['tp']:>3} in-spike, {cc['fp']:>3} off-spike (of {a['total_overlap']} overlap gates)  │"
@@ -244,16 +310,26 @@ def print_analysis(a: Dict[str, Any], verbose: bool) -> None:
 
     # Quick verdict (heuristic; interpret cc['tp'] as "true detection" in corrupted runs)
     print("\n" + "-" * 65)
-    change_detected = cc["tp"] > 0
     low_fp = cc["fp"] <= 2
-    if change_detected and low_fp:
-        verdict = "✓ GOOD: Detected corruption with low false alarms"
-    elif change_detected and not low_fp:
-        verdict = "⚠ MIXED: Detected corruption but noisy (consider raising ε)"
-    elif not change_detected and low_fp:
-        verdict = "⚠ MISSED: No detection, but quiet (consider lowering ε)"
+
+    # If there are no onset gates, there is no transition-to-detect in this window.
+    # This is expected for control runs, or indicates a spike window mismatch.
+    if onset_total == 0:
+        if low_fp:
+            verdict = "✓ CONTROL/NO-ONSET: No transition to detect, quiet baseline"
+        else:
+            verdict = "⚠ CONTROL/NO-ONSET: No transition, but noisy (consider raising ε)"
     else:
-        verdict = "✗ BAD: No detection AND noisy"
+        # For spike experiments, success is primarily about catching the onset.
+        change_detected = onset_tp > 0
+        if change_detected and low_fp:
+            verdict = "✓ GOOD: Caught onset with low false alarms"
+        elif change_detected and not low_fp:
+            verdict = "⚠ MIXED: Caught onset but noisy (consider raising ε)"
+        elif not change_detected and low_fp:
+            verdict = "⚠ MISSED: Missed onset, but quiet (consider lowering ε)"
+        else:
+            verdict = "✗ BAD: Missed onset AND noisy"
     print(f" VERDICT: {verdict}")
     print("-" * 65)
 
@@ -293,6 +369,10 @@ def print_analysis(a: Dict[str, Any], verbose: bool) -> None:
     print(f"  Change OK         |      {cc['fn']:3d}      |     {cc['tn']:3d}      |")
     print(f"\n  Precision:   {a['change_precision']:.3f}")
     print(f"  Recall:      {a['change_recall']:.3f}")
+    if onset_total > 0:
+        print(f"  Onset recall: {float(onset.get('change_recall', float('nan'))):.3f} ({onset_tp}/{onset_total})")
+    else:
+        print("  Onset gates:  0 (no transition in window — control or mismatch)")
     print(f"  Specificity: {a['change_specificity']:.3f}")
 
     # Regime detection
@@ -355,7 +435,7 @@ def print_analysis(a: Dict[str, Any], verbose: bool) -> None:
     print("\n" + "-" * 65)
     print(" GATES WITH SPIKE OVERLAP (sorted by iter)")
     print("-" * 65)
-    print(f"{'iter':>6} | {'union':^6} | {'change':^6} | {'regime':^6} | {'ov%':>5} | {'chg_DW':>8} | {'reg_DW':>8}")
+    print(f"{'iter':>6}*| {'union':^6} | {'change':^6} | {'regime':^6} | {'ov%':>5} | {'chg_DW':>8} | {'reg_DW':>8}")
     print("-" * 65)
 
     def _fmt(x: Any) -> str:
@@ -382,10 +462,13 @@ def print_analysis(a: Dict[str, Any], verbose: bool) -> None:
         chg_dw = _fmt(r["worst_DW"])
         reg_dw = _fmt(r["regime_worst_DW"])
 
+        onset_marker = "*" if r.get("onset_gate") else " "
         print(
-            f"{r['iter']:>6} | {union_status:^6} | {change_status:^6} | {regime_status:^6} | "
+            f"{r['iter']:>6}{onset_marker}| {union_status:^6} | {change_status:^6} | {regime_status:^6} | "
             f"{ovp:>4.0f}% | {chg_dw:>8} | {reg_dw:>8}"
         )
+
+    print("(* = onset gate)")
 
     # ---- D_W distribution for spike gates ----
     spike_dws = [r["worst_DW"] for r in overlap_sorted if math.isfinite(r.get("worst_DW", float("nan")))]
