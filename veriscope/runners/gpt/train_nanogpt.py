@@ -18,7 +18,8 @@ Minimal modifications to the standard nanoGPT train.py.
 #   --metric_interval 2
 #   --gate_window 75
 #   --gate_warmup 1500
-#   --gate_epsilon 0.30
+#   --gate_epsilon 0.25
+#   # (optional looser probe: --gate_epsilon 0.30)
 #   --gate_eps_stat_max_frac 0.15
 #   --gate_min_evidence 75
 #   --gate_gain_thresh -0.002
@@ -29,10 +30,12 @@ Minimal modifications to the standard nanoGPT train.py.
 #     --dataset shakespeare_char \
 #     --nanogpt_dir /workspace/nanoGPT \
 #     --device cuda \
+#     --out_dir /workspace/out \
+#     --out_json veriscope_gpt_datainject_perm15_gateE0p25_W75_$(date +%Y%m%d_%H%M%S).json \
 #     --metric_interval 2 \
 #     --gate_window 75 \
 #     --gate_warmup 1500 \
-#     --gate_epsilon 0.30 \
+#     --gate_epsilon 0.25 \
 #     --gate_eps_stat_max_frac 0.15 \
 #     --gate_min_evidence 75 \
 #     --gate_gain_thresh -0.002 \
@@ -870,15 +873,37 @@ if __name__ == "__main__":
         help="Compute veriscope metrics every N iterations (controls evidence density).",
     )
 
+    # Output
+    parser.add_argument(
+        "--out_json",
+        type=str,
+        default="veriscope_gpt_run.json",
+        help=(
+            "Output JSON path (absolute or relative). If relative, it is resolved under --out_dir "
+            "when provided; otherwise relative to the current working directory."
+        ),
+    )
+    parser.add_argument(
+        "--out_dir",
+        type=str,
+        default="",
+        help=(
+            "Optional output directory. If set and --out_json is a relative path, the output is written to "
+            "<out_dir>/<out_json>. The directory is created if missing."
+        ),
+    )
+
     # Gate configuration
     parser.add_argument(
         "--gate_preset",
-        choices=["legacy", "tuned"],
+        choices=["legacy", "tuned", "spike_v1"],
         default="legacy",
         help=(
             "Gate parameter preset. 'legacy' preserves existing defaults. "
             "'tuned' applies empirically safer defaults for GPT drift, without "
-            "overriding any gate_* flags you explicitly pass on the CLI."
+            "overriding any gate_* flags you explicitly pass on the CLI. "
+            "'spike_v1' applies the canonical spike/corruption config (change-focused) "
+            "used for the 2500–2900 token-permutation experiments."
         ),
     )
     parser.add_argument("--gate_window", type=int, default=50)
@@ -1014,6 +1039,23 @@ if __name__ == "__main__":
             if not _flag_present(flag):
                 setattr(args, k, v)
 
+    elif args.gate_preset == "spike_v1":
+        # Canonical, empirically validated spike/corruption smoke config.
+        # Intended for change-focused corruption detection experiments.
+        spike_v1 = {
+            "metric_interval": 2,
+            "gate_window": 75,
+            "gate_warmup": 1500,
+            "gate_epsilon": 0.25,
+            "gate_eps_stat_max_frac": 0.15,
+            "gate_min_evidence": 75,
+            "gate_gain_thresh": -0.002,
+        }
+        for k, v in spike_v1.items():
+            flag = "--" + k
+            if not _flag_present(flag):
+                setattr(args, k, v)
+
     # Set env for meta.pkl discovery
     os.environ["NANOGPT_DIR"] = args.nanogpt_dir
 
@@ -1073,7 +1115,15 @@ if __name__ == "__main__":
     trainer = VeriscopeGatedTrainer(config)
     metrics, gates = trainer.train(get_batch)
 
-    with open("veriscope_gpt_run.json", "w") as f:
+    # Resolve output path
+    out_path = Path(str(args.out_json))
+    out_dir = str(args.out_dir).strip()
+    if out_dir and not out_path.is_absolute():
+        out_path = Path(out_dir) / out_path
+    out_path = out_path.expanduser()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with out_path.open("w") as f:
         json.dump(
             {
                 "metrics": metrics[-100:],  # last 100 for brevity
@@ -1085,3 +1135,4 @@ if __name__ == "__main__":
         )
 
     print(f"Saved {len(metrics)} metric snapshots, {len(gates)} gate checks")
+    print(f"Wrote results JSON to: {out_path}")
