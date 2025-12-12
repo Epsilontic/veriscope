@@ -1478,8 +1478,10 @@ CFG_SMOKE = dict(
     warn_consec=2,
     detector_horizon=3,
     # smoke GT knobs (faster confirmation / less aggressive collapse tagging)
-    gt_rank_min=12.0,
-    gt_patience=2,
+    # For smoke, push soft collapse later so the gate has time to become evaluable.
+    # Slightly stricter rank threshold + longer patience than the full regime.
+    gt_rank_min=14.0,
+    gt_patience=3,
     # Smoke: keep full traces; do not halt runs early unless explicitly enabled via SCAR_GATE_HALT=1
     gate_early_exit=False,
     gate_gain_q=0.05,
