@@ -892,6 +892,14 @@ if __name__ == "__main__":
             "<out_dir>/<out_json>. The directory is created if missing."
         ),
     )
+    parser.add_argument(
+        "--save_all_metrics",
+        action="store_true",
+        help=(
+            "If set, write all metric snapshots to the output JSON. "
+            "By default only the last 100 snapshots are written to keep files small."
+        ),
+    )
 
     # Gate configuration
     parser.add_argument(
@@ -1123,10 +1131,12 @@ if __name__ == "__main__":
     out_path = out_path.expanduser()
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
+    metrics_out = metrics if bool(args.save_all_metrics) else metrics[-100:]
+
     with out_path.open("w") as f:
         json.dump(
             {
-                "metrics": metrics[-100:],  # last 100 for brevity
+                "metrics": metrics_out,
                 "gates": gates,
             },
             f,
@@ -1135,4 +1145,5 @@ if __name__ == "__main__":
         )
 
     print(f"Saved {len(metrics)} metric snapshots, {len(gates)} gate checks")
+    print(f"Wrote {len(metrics_out)} metric snapshots to JSON ({'all' if bool(args.save_all_metrics) else 'last 100'})")
     print(f"Wrote results JSON to: {out_path}")
