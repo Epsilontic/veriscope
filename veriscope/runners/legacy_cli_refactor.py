@@ -1305,6 +1305,28 @@ CFG.update(
     )
 )
 
+# Optional env overrides for regime knobs (apply early so smoke helpers see them).
+# NOTE: These env vars only set CFG values; smoke overwrite/bypass is handled elsewhere.
+try:
+    for _env_name, _cfg_key in (
+        ("SCAR_WARMUP", "warmup"),
+        ("SCAR_PH_BURN", "ph_burn"),
+        ("SCAR_GATE_WINDOW", "gate_window"),
+        ("SCAR_FACTOR_START_EPOCH", "factor_start_epoch"),
+    ):
+        _v = os.environ.get(_env_name)
+        if _v is None:
+            continue
+        try:
+            CFG[_cfg_key] = int(str(_v).strip())
+            if mp.current_process().name == "MainProcess":
+                print(f"[env] {_cfg_key}={CFG[_cfg_key]} (from {_env_name})")
+        except Exception as _e:
+            if mp.current_process().name == "MainProcess":
+                print(f"[WARN] bad {_env_name}={_v!r}: {_e}")
+except Exception:
+    pass
+
 # Default family z-gate; overridden by SCAR_FAMILY_Z_THR if set
 CFG.setdefault("family_z_thr", 2.903)
 
@@ -1502,6 +1524,10 @@ SMOKE_ENV_BYPASS: Dict[str, str] = {
     "gate_eps_inflation_max": "SCAR_GATE_EPS_INFLATION_MAX",
     "gate_eps_stat_max_frac": "SCAR_GATE_EPS_STAT_MAX_FRAC",
     "gate_early_exit": "SCAR_GATE_HALT",
+    "warmup": "SCAR_WARMUP",
+    "ph_burn": "SCAR_PH_BURN",
+    "gate_window": "SCAR_GATE_WINDOW",
+    "factor_start_epoch": "SCAR_FACTOR_START_EPOCH",
 }
 
 # All smoke-critical keys live here (single source of truth)
@@ -1686,6 +1712,9 @@ def apply_smoke_overrides_inplace(cfg: Dict[str, Any]) -> None:
             for k, v in CFG_SMOKE.items():
                 if k in SMOKE_CRITICAL_KEYS:
                     continue
+                bypass_env = SMOKE_ENV_BYPASS.get(k)
+                if bypass_env and os.environ.get(bypass_env) is not None:
+                    continue  # respect explicit env override
                 cfg[k] = v
                 applied_keys.append(k)
 
