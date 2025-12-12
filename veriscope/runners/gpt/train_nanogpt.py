@@ -5,6 +5,48 @@ nanoGPT training with veriscope FR gating.
 Minimal modifications to the standard nanoGPT train.py.
 """
 
+# -------------------------------------------------------------------------
+# CANONICAL GPT SPIKE / CORRUPTION SMOKE CONFIG (empirically validated)
+#
+# This configuration is intended for *change-only* corruption detection
+# experiments (e.g. data corruption between iters 2500–2900). Regime
+# detection may remain enabled, but evaluation should read the
+# "CORRUPTION DETECTION (change-only)" section from analyze_gates.py.
+#
+# Recommended CLI parameters:
+#
+#   --metric_interval 2
+#   --gate_window 75
+#   --gate_warmup 1500
+#   --gate_epsilon 0.30
+#   --gate_eps_stat_max_frac 0.15
+#   --gate_min_evidence 75
+#   --gate_gain_thresh -0.002
+#
+# Example invocation:
+#
+#   python -m veriscope.runners.gpt.train_nanogpt \
+#     --dataset shakespeare_char \
+#     --nanogpt_dir /workspace/nanoGPT \
+#     --device cuda \
+#     --metric_interval 2 \
+#     --gate_window 75 \
+#     --gate_warmup 1500 \
+#     --gate_epsilon 0.30 \
+#     --gate_eps_stat_max_frac 0.15 \
+#     --gate_min_evidence 75 \
+#     --gate_gain_thresh -0.002 \
+#     --data_corrupt_at 2500 \
+#     --data_corrupt_len 400 \
+#     --data_corrupt_frac 0.15 \
+#     --data_corrupt_mode permute
+#
+# NOTE:
+#   • Change detector = "is something happening now?"
+#   • Regime detector = "has the model drifted from a known-good baseline?"
+#   • Do NOT score spike experiments using the union gate when regime is active.
+# -------------------------------------------------------------------------
+
 from __future__ import annotations
 
 import os

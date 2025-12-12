@@ -188,21 +188,21 @@ veriscope
   
 > **Note**: A full sweep takes 2-8 hours depending on hardware.  
   
-### 🤖 GPT Training with Gating  
-  
+### 🤖 GPT Training with Gating
+
 Train a small GPT with veriscope monitoring:  
-  
+
 ```bash  
 cd veriscope  
-  
+
 python -m veriscope.runners.gpt.train_nanogpt \  
     --dataset shakespeare_char \  
     --nanogpt_dir ../nanoGPT \  
     --gate_preset tuned  
 ```  
-  
+
 #### With Pathology Injection (for testing detection)  
-  
+
 ```bash  
 # Inject data corruption at iteration 2500  
 python -m veriscope.runners.gpt.train_nanogpt \  
@@ -213,6 +213,74 @@ python -m veriscope.runners.gpt.train_nanogpt \
     --data_corrupt_frac 0.15 \  
     --data_corrupt_mode permute  
 ```  
+
+#### GPT Spike Experiment (recommended reproducible protocol)
+
+This experiment validates **change-only corruption detection** on a controlled, localized pathology window and uses **regime** as a separate long-horizon drift alarm.
+
+**Canonical config (Spike v1)**  
+See the header comment block in `veriscope/runners/gpt/train_nanogpt.py` for the empirically validated settings. The key parameters are:
+
+- `--metric_interval 2`
+- `--gate_window 75`
+- `--gate_warmup 1500`
+- `--gate_epsilon 0.30`
+- `--gate_eps_stat_max_frac 0.15`
+- `--gate_min_evidence 75`
+- `--gate_gain_thresh -0.002`
+
+**A) Corruption run (15% token permutation, 2500–2900)**
+
+```bash
+python -m veriscope.runners.gpt.train_nanogpt \
+    --dataset shakespeare_char \
+    --nanogpt_dir ../nanoGPT \
+    --device cuda \
+    --metric_interval 2 \
+    --gate_window 75 \
+    --gate_warmup 1500 \
+    --gate_epsilon 0.30 \
+    --gate_eps_stat_max_frac 0.15 \
+    --gate_min_evidence 75 \
+    --gate_gain_thresh -0.002 \
+    --data_corrupt_at 2500 \
+    --data_corrupt_len 400 \
+    --data_corrupt_frac 0.15 \
+    --data_corrupt_mode permute
+```
+
+**B) Clean control run (same settings, no corruption flags)**
+
+```bash
+python -m veriscope.runners.gpt.train_nanogpt \
+    --dataset shakespeare_char \
+    --nanogpt_dir ../nanoGPT \
+    --device cuda \
+    --metric_interval 2 \
+    --gate_window 75 \
+    --gate_warmup 1500 \
+    --gate_epsilon 0.30 \
+    --gate_eps_stat_max_frac 0.15 \
+    --gate_min_evidence 75 \
+    --gate_gain_thresh -0.002
+```
+
+**C) Analyze both runs (spike overlap at 2500–2900)**
+
+```bash
+python -m veriscope.runners.gpt.analyze_gates \
+    --results ./out/veriscope_gpt_run.json \
+    --spike_start 2500 \
+    --spike_len 400 \
+    --gate_window 75 \
+    --metric_interval 2
+```
+
+**How to read the output**
+
+- For spike experiments, use the analyzer’s **EXECUTIVE SUMMARY → “CORRUPTION DETECTION (change-only)”** block.
+- Treat **“BASELINE DRIFT (regime)”** as a separate signal (long-horizon deviation from a known-good reference).
+- Do **not** score spike experiments using the union gate (change ∨ regime) when regime is active; it is intentionally conservative.
   
 ---  
   
