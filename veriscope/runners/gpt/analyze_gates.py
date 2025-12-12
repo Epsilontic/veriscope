@@ -8,6 +8,7 @@ Usage:
       --gate_window 100 \
       --metric_interval 2
 """
+
 from __future__ import annotations
 
 import argparse
@@ -144,10 +145,7 @@ def analyze_gates(
     both_fail_in_spike = sum(
         1
         for r in per_gate
-        if (not r["change_ok"])
-        and r["regime_active"]
-        and (not r["regime_ok"])
-        and r["overlaps_spike"]
+        if (not r["change_ok"]) and r["regime_active"] and (not r["regime_ok"]) and r["overlaps_spike"]
     )
     change_only_in_spike = sum(
         1
@@ -155,9 +153,7 @@ def analyze_gates(
         if (not r["change_ok"]) and (not r["regime_active"] or r["regime_ok"]) and r["overlaps_spike"]
     )
     regime_only_in_spike = sum(
-        1
-        for r in per_gate
-        if r["change_ok"] and r["regime_active"] and (not r["regime_ok"]) and r["overlaps_spike"]
+        1 for r in per_gate if r["change_ok"] and r["regime_active"] and (not r["regime_ok"]) and r["overlaps_spike"]
     )
 
     return {
@@ -215,21 +211,11 @@ def print_analysis(a: Dict[str, Any], verbose: bool) -> None:
 
     # Corruption detection (change-only)
     print("\n┌─ CORRUPTION DETECTION (use this for spike experiments) ──────┐")
+    print(f"│  Precision:    {_fmt_metric(a['change_precision']):>5}  (when alarmed, was it real?)             │")
+    print(f"│  Recall:       {_fmt_metric(a['change_recall']):>5}  (did we catch the corruption?)           │")
+    print(f"│  Specificity:  {_fmt_metric(a['change_specificity']):>5}  (quiet when clean?)                      │")
     print(
-        f"│  Precision:    {_fmt_metric(a['change_precision']):>5}  "
-        f"(when alarmed, was it real?)             │"
-    )
-    print(
-        f"│  Recall:       {_fmt_metric(a['change_recall']):>5}  "
-        f"(did we catch the corruption?)           │"
-    )
-    print(
-        f"│  Specificity:  {_fmt_metric(a['change_specificity']):>5}  "
-        f"(quiet when clean?)                      │"
-    )
-    print(
-        f"│  Change FAILs: {cc['tp']:>3} in-spike, "
-        f"{cc['fp']:>3} off-spike (of {a['total_overlap']} overlap gates)  │"
+        f"│  Change FAILs: {cc['tp']:>3} in-spike, {cc['fp']:>3} off-spike (of {a['total_overlap']} overlap gates)  │"
     )
     print("└─────────────────────────────────────────────────────────────┘")
 
@@ -242,8 +228,7 @@ def print_analysis(a: Dict[str, Any], verbose: bool) -> None:
             f"(reference was established)        │"
         )
         print(
-            f"│  Regime FAILs:   {regime_total_fail:>3} total "
-            f"({rc['tp']} in spike, {rc['fp']} outside)              │"
+            f"│  Regime FAILs:   {regime_total_fail:>3} total ({rc['tp']} in spike, {rc['fp']} outside)              │"
         )
         print(
             f"│  Regime Prec:    {_fmt_metric(a['regime_precision']):>5}  "
@@ -311,9 +296,7 @@ def print_analysis(a: Dict[str, Any], verbose: bool) -> None:
     print(f"  Specificity: {a['change_specificity']:.3f}")
 
     # Regime detection
-    print(
-        f"\n--- REGIME DETECTION (ref vs recent) [n={a['regime_active_gates']} active gates] ---"
-    )
+    print(f"\n--- REGIME DETECTION (ref vs recent) [n={a['regime_active_gates']} active gates] ---")
     print("                    | Spike Overlap | No Overlap |")
     print(f"  Regime FAIL       |      {rc['tp']:3d}      |     {rc['fp']:3d}      |")
     print(f"  Regime OK         |      {rc['fn']:3d}      |     {rc['tn']:3d}      |")
@@ -372,10 +355,7 @@ def print_analysis(a: Dict[str, Any], verbose: bool) -> None:
     print("\n" + "-" * 65)
     print(" GATES WITH SPIKE OVERLAP (sorted by iter)")
     print("-" * 65)
-    print(
-        f"{'iter':>6} | {'union':^6} | {'change':^6} | {'regime':^6} | "
-        f"{'ov%':>5} | {'chg_DW':>8} | {'reg_DW':>8}"
-    )
+    print(f"{'iter':>6} | {'union':^6} | {'change':^6} | {'regime':^6} | {'ov%':>5} | {'chg_DW':>8} | {'reg_DW':>8}")
     print("-" * 65)
 
     def _fmt(x: Any) -> str:
@@ -408,16 +388,12 @@ def print_analysis(a: Dict[str, Any], verbose: bool) -> None:
         )
 
     # ---- D_W distribution for spike gates ----
-    spike_dws = [
-        r["worst_DW"]
-        for r in overlap_sorted
-        if math.isfinite(r.get("worst_DW", float("nan")))
-    ]
+    spike_dws = [r["worst_DW"] for r in overlap_sorted if math.isfinite(r.get("worst_DW", float("nan")))]
     if spike_dws:
         print(
             f"\nSpike-overlap D_W stats: "
             f"min={min(spike_dws):.4f}, max={max(spike_dws):.4f}, "
-            f"mean={sum(spike_dws)/len(spike_dws):.4f}"
+            f"mean={sum(spike_dws) / len(spike_dws):.4f}"
         )
         # Try to show epsilon for context
         first_eps = next(
@@ -438,20 +414,12 @@ def print_analysis(a: Dict[str, Any], verbose: bool) -> None:
         for r in fns:
             rs, re = r["recent_window"]
             print(f"\niter {r['iter']}: recent=[{rs},{re}) overlap={100.0 * r['overlap_frac']:.0f}%")
-            print(
-                f"  change_ok={r['change_ok']}, regime_ok={r['regime_ok']}, "
-                f"regime_active={r['regime_active']}"
-            )
-            print(
-                f"  change_DW={_fmt(r['worst_DW'])}, "
-                f"regime_DW={_fmt(r['regime_worst_DW'])}"
-            )
+            print(f"  change_ok={r['change_ok']}, regime_ok={r['regime_ok']}, regime_active={r['regime_active']}")
+            print(f"  change_DW={_fmt(r['worst_DW'])}, regime_DW={_fmt(r['regime_worst_DW'])}")
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(
-        description="Analyze veriscope gate precision/recall vs spike overlap."
-    )
+    p = argparse.ArgumentParser(description="Analyze veriscope gate precision/recall vs spike overlap.")
     p.add_argument("--results", required=True, type=str)
     p.add_argument("--spike_start", required=True, type=int)
     p.add_argument("--spike_len", required=True, type=int)
