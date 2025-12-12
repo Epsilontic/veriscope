@@ -77,6 +77,7 @@ def analyze_gates(
     spike_len: int,
     gate_window: int,
     metric_interval: int,
+    control: bool = False,
 ) -> Dict[str, Any]:
     spike_end = int(spike_start) + int(spike_len)
     data = json.loads(results_path.read_text())
@@ -132,6 +133,7 @@ def analyze_gates(
                 "overlaps_spike": overlaps,
                 "onset_gate": bool(onset_gate),
                 "overlap_frac": overlap_frac,
+                "is_control": bool(control),
                 "recent_window": (recent_start, recent_end),
                 # Change detector fields
                 "worst_DW": audit.get("worst_DW", float("nan")),
@@ -181,14 +183,22 @@ def analyze_gates(
     regime_specificity = regime_tn / (regime_tn + regime_fp) if (regime_tn + regime_fp) > 0 else float("nan")
 
     # ---- Onset scoring (transition into spike): change detector only ----
-    onset_total = sum(1 for r in per_gate if r.get("onset_gate"))
-    onset_change_tp = sum(1 for r in per_gate if r.get("onset_gate") and (not r["change_ok"]))
-    onset_change_fn = sum(1 for r in per_gate if r.get("onset_gate") and r["change_ok"])
-    onset_change_recall = (
-        onset_change_tp / (onset_change_tp + onset_change_fn)
-        if (onset_change_tp + onset_change_fn) > 0
-        else float("nan")
-    )
+    # IMPORTANT: in control runs (no injection), "onset_gate" is purely a time-window boundary,
+    # not a corruption onset ground-truth. Disable onset scoring under --control.
+    if control:
+        onset_total = 0
+        onset_change_tp = 0
+        onset_change_fn = 0
+        onset_change_recall = float("nan")
+    else:
+        onset_total = sum(1 for r in per_gate if r.get("onset_gate"))
+        onset_change_tp = sum(1 for r in per_gate if r.get("onset_gate") and (not r["change_ok"]))
+        onset_change_fn = sum(1 for r in per_gate if r.get("onset_gate") and r["change_ok"])
+        onset_change_recall = (
+            onset_change_tp / (onset_change_tp + onset_change_fn)
+            if (onset_change_tp + onset_change_fn) > 0
+            else float("nan")
+        )
 
     # ---- Attribution: who drives union failures in spike window? ----
     both_fail_in_spike = sum(
@@ -510,6 +520,9 @@ def main() -> None:
     p.add_argument("--metric_interval", default=2, type=int)
     p.add_argument("--quiet", action="store_true")
     p.add_argument("--json", action="store_true")
+    p.add_argument(
+        "--control", action="store_true", help="Treat this results file as a control run (disable onset scoring)."
+    )
     args = p.parse_args()
 
     analysis = analyze_gates(
@@ -518,6 +531,7 @@ def main() -> None:
         spike_len=args.spike_len,
         gate_window=args.gate_window,
         metric_interval=args.metric_interval,
+        control=bool(args.control),
     )
 
     if args.json:
