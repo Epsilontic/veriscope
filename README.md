@@ -160,13 +160,14 @@ cd ..
   
 Verify installation with a minimal run:  
   
-```bash  
-export SCAR_SMOKE=1  
-export SCAR_OUTDIR=./out_smoke  
-export SCAR_DATA=./data  
-  
-veriscope  
-```  
+```bash
+# Smoke mode accepts truthy values: 1, true, yes, on
+export SCAR_SMOKE=true
+export SCAR_OUTDIR=./out_smoke
+export SCAR_DATA=./data
+
+veriscope
+```
 
 This command runs the default legacy CIFAR runner via the `veriscope` console script and writes a minimal artifact bundle to `SCAR_OUTDIR`.
 
@@ -435,12 +436,14 @@ Veriscope generates **operational collapse event labels** (heuristic, audit-logg
 |----------|---------|-------------|  
 | `SCAR_OUTDIR` | `./scar_bundle_phase4` | Output directory |  
 | `SCAR_DATA` | `./data` | Dataset root |  
-| `SCAR_SMOKE` | `0` | Enable smoke mode (quick E2E) |  
+| `SCAR_SMOKE` | `0` | Enable smoke mode (quick E2E). Truthy values: `1`, `true`, `yes`, `on`. |  
 | `SCAR_FR` | `0` | Enable FR gating |  
 | `SCAR_GATE_EPSILON` | `0.08` | Gate divergence tolerance |  
 | `SCAR_GATE_MIN_EVIDENCE` | `16` | Minimum samples before evaluating |  
 | `SCAR_WARN_CONSEC` | `3` | Consecutive failures to trigger |  
-| `SCAR_NUM_WORKERS` | `0` | DataLoader workers |  
+| `SCAR_NUM_WORKERS` | `0` | DataLoader workers |
+
+Note: Veriscope parses boolean environment variables using a truthy convention. For example, `SCAR_SMOKE=true` and `SCAR_SMOKE=1` behave identically.
   
 ### Gate Tuning  
   
