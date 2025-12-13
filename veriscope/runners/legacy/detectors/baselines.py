@@ -239,19 +239,48 @@ def cusum_one_sided(zs: List[float], lam: float, direction: str = "down") -> Tup
     return None, track
 
 
-def newma_warn_epoch(xs: List[float], fast: float, slow: float, lam: float, burn_in: int) -> Optional[int]:
-    mu_f = 0.0
-    mu_s = 0.0
+def newma_warn_epoch(
+    xs: List[float],
+    fast: float,
+    slow: float,
+    lam: float,
+    burn_in: int,
+    min_points: int = 0,
+) -> Optional[int]:
+    """NEWMA-style fast/slow EWMA crossover detector.
+
+    Smoke-critical fix: initialize both EWMAs to the first finite observation
+    (prevents deterministic cold-start divergence when slow EWMA begins at 0).
+
+    min_points: require at least this many finite observations after burn_in
+    before allowing a trigger (0 disables the guard).
+    """
+    mu_f: Optional[float] = None
+    mu_s: Optional[float] = None
+    n_finite_after_burn = 0
+
     for t, x in enumerate(xs):
         if not np.isfinite(x):
             continue
         a = float(x)
-        mu_f = (1 - fast) * mu_f + fast * a
-        mu_s = (1 - slow) * mu_s + slow * a
-        if t >= burn_in:
+
+        # Cold-start: initialize to the first observed value; do not evaluate on init epoch.
+        if mu_f is None:
+            mu_f = a
+            mu_s = a
+            continue
+
+        mu_f = (1.0 - float(fast)) * mu_f + float(fast) * a
+        mu_s = (1.0 - float(slow)) * mu_s + float(slow) * a
+
+        if t >= int(burn_in):
+            n_finite_after_burn += 1
+            if int(min_points) > 0 and n_finite_after_burn < int(min_points):
+                continue
             s = mu_f - mu_s
-            if abs(s) > lam:
+            if abs(s) > float(lam):
                 return t
+
     return None
 
 
