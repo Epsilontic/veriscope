@@ -1456,6 +1456,11 @@ CFG.setdefault("gate_min_evidence_full_eps", 16)  # evidence at which ε inflati
 CFG.setdefault("gate_eps_inflation_max", 4.0)  # max multiplier for ε when evidence is low
 CFG.setdefault("gate_gain_units", "bits/sample")
 
+# NEWMA baseline: calibration + guards
+CFG.setdefault("newma_lambda", None)  # None => calibrate from controls
+CFG.setdefault("newma_min_points", 3)  # minimum finite points after burn before NEWMA can trigger
+CFG.setdefault("newma_calib_q", 0.995)  # quantile for calibration
+
 # Instantiate the global budget ledger using current CFG limits
 try:
     _wb = WindowBudget(
@@ -6063,6 +6068,99 @@ def evaluate(df_all: pd.DataFrame, tag: str):
     seq_events = pd.DataFrame(seq_rows)
     seq_events.to_csv(OUTDIR / f"baseline_events_seq_{tag}.csv", index=False)
 
+    # ---- NEWMA: calibrate lambda from controls (runner-proof) ----
+    def _calibrate_newma_lambda(
+        df_control: pd.DataFrame,
+        warm: int,
+        fast: float,
+        slow: float,
+        q: float,
+    ) -> float:
+        vals: list[float] = []
+        if df_control is None or df_control.empty:
+            return 3.0
+
+        gcols = [c for c in ("seed", "factor") if c in df_control.columns]
+        groups = df_control.groupby(gcols, sort=False) if gcols else [(None, df_control)]
+
+        for _, g in groups:
+            g = g.sort_values("epoch") if "epoch" in g.columns else g
+
+            for col in ("eff_dim_gt", "eff_dim", "var_out_k"):
+                if col not in g.columns:
+                    continue
+                xs = pd.to_numeric(g[col], errors="coerce").to_numpy(dtype=float)
+
+                mu_f = None
+                mu_s = None
+                for t, x in enumerate(xs):
+                    if not np.isfinite(x):
+                        continue
+                    a = float(x)
+                    if mu_f is None:
+                        mu_f = a
+                        mu_s = a
+                        continue
+                    mu_f = (1.0 - fast) * float(mu_f) + fast * a
+                    mu_s = (1.0 - slow) * float(mu_s) + slow * a
+                    if t >= int(warm):
+                        vals.append(abs(float(mu_f) - float(mu_s)))
+
+        if not vals:
+            return 3.0
+        return float(np.quantile(np.asarray(vals, dtype=float), float(q)))
+
+    q_newma = float(CFG.get("newma_calib_q", 0.995))
+    min_points_newma = int(CFG.get("newma_min_points", 0))
+
+    # Prefer the eval-aligned controls pool if it exists; otherwise fall back to post-warm controls.
+    try:
+        df_control_for_newma = df_control_evaluable  # type: ignore[name-defined]
+    except Exception:
+        df_control_for_newma = df_cal_raw[
+            (df_cal_raw["factor"].astype(str).str.lower().str.strip() == "none")
+            & (to_numeric_series(df_cal_raw["epoch"], errors="coerce") >= int(warm_idx))
+        ].copy()
+
+    if CFG.get("newma_lambda") is None:
+        lam_newma = _calibrate_newma_lambda(
+            df_control_for_newma,
+            warm_idx,
+            float(CFG["newma_fast"]),
+            float(CFG["newma_slow"]),
+            q=q_newma,
+        )
+        CFG["newma_lambda"] = float(lam_newma)
+        try:
+            save_json(
+                {"newma_lambda": float(lam_newma), "q": float(q_newma), "warm_idx": int(warm_idx)},
+                OUTDIR / f"newma_lambda_calibration_{tag}.json",
+            )
+        except Exception:
+            pass
+    else:
+        lam_newma = as_float(CFG.get("newma_lambda"), default=3.0)
+
+    def _newma_warn(xs: list[float]) -> Optional[int]:
+        """Call NEWMA with optional min_points guard (backward-compatible if signature lacks it)."""
+        try:
+            return newma_warn_epoch(
+                xs,
+                fast=CFG["newma_fast"],
+                slow=CFG["newma_slow"],
+                lam=lam_newma,
+                burn_in=warm_idx,
+                min_points=min_points_newma,
+            )
+        except TypeError:
+            return newma_warn_epoch(
+                xs,
+                fast=CFG["newma_fast"],
+                slow=CFG["newma_slow"],
+                lam=lam_newma,
+                burn_in=warm_idx,
+            )
+
     # ---- NEWMA baseline on PH + non-scheduled spectral/FTLE channels ----
     newma_rows = []
     from typing import cast
@@ -6072,49 +6170,38 @@ def evaluate(df_all: pd.DataFrame, tag: str):
         gg = g.sort_values("epoch").reset_index(drop=True)
 
         def _mask_with_valid(series, valid):
+            """Apply optional validity mask and coerce non-finite to NaN."""
             a = np.asarray(series, dtype=float)
-            if valid is None:
-                return a
-            v = np.asarray(valid, dtype=bool)
             out = a.copy()
-            out[~v] = np.nan
+            out[~np.isfinite(out)] = np.nan
+            if valid is None:
+                return out
+            v = np.asarray(valid, dtype=bool)
+            # Only apply mask if shapes line up
+            if v.shape == out.shape:
+                out[~v] = np.nan
             return out
 
         xs_ph = _prep_series_for_ph(gg, "pers_H0")
-        xs_eff = (gg["eff_dim_gt"] if "eff_dim_gt" in gg.columns else gg["eff_dim"]).to_numpy().astype(float).tolist()
-        xs_var = gg["var_out_k"].to_numpy().astype(float).tolist()
-        xs_ftle = _mask_with_valid(gg["ftle"], gg["ftle_valid"] if "ftle_valid" in gg.columns else None).tolist()
+        eff_col = "eff_dim_gt" if "eff_dim_gt" in gg.columns else "eff_dim"
+        xs_eff = _mask_with_valid(gg[eff_col], None).tolist()
 
-        lam_newma = as_float(CFG.get("ph_lambda"), default=0.0)
+        xs_var = _mask_with_valid(
+            gg["var_out_k"],
+            gg["var_out_k_valid"] if "var_out_k_valid" in gg.columns else None,
+        ).tolist()
 
-        t1 = newma_warn_epoch(
-            xs_ph,
-            fast=CFG["newma_fast"],
-            slow=CFG["newma_slow"],
-            lam=lam_newma,
-            burn_in=warm_idx,
-        )
-        t2 = newma_warn_epoch(
-            xs_eff,
-            fast=CFG["newma_fast"],
-            slow=CFG["newma_slow"],
-            lam=lam_newma,
-            burn_in=warm_idx,
-        )
-        t3 = newma_warn_epoch(
-            xs_var,
-            fast=CFG["newma_fast"],
-            slow=CFG["newma_slow"],
-            lam=lam_newma,
-            burn_in=warm_idx,
-        )
-        t4 = newma_warn_epoch(
-            xs_ftle,
-            fast=CFG["newma_fast"],
-            slow=CFG["newma_slow"],
-            lam=lam_newma,
-            burn_in=warm_idx,
-        )
+        xs_ftle = _mask_with_valid(
+            gg["ftle"],
+            gg["ftle_valid"] if "ftle_valid" in gg.columns else None,
+        ).tolist()
+
+        # lam_newma is now precomputed above
+
+        t1 = _newma_warn(xs_ph)
+        t2 = _newma_warn(xs_eff)
+        t3 = _newma_warn(xs_var)
+        t4 = _newma_warn(xs_ftle)
         cand = [t for t in [t1, t2, t3, t4] if t is not None]
         tmin = min(cand) if cand else None
         tw_tmp = as_int(tmin, default=-1) if tmin is not None else -1
