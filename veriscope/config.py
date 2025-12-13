@@ -39,6 +39,12 @@ def _coerce_env(v: str) -> Any:
         return s
 
 
+def _env_truthy(name: str, default: str = "0") -> bool:
+    """Return True if env var is set to a truthy value."""
+    v = str(os.getenv(name, default)).strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
 def load_cfg(path: str | Path | None = None) -> Dict[str, Any]:
     cfg = dict(DEFAULTS)
     p = Path(path) if path else Path(os.getenv("SCAR_CFG", ""))
@@ -47,7 +53,7 @@ def load_cfg(path: str | Path | None = None) -> Dict[str, Any]:
             cfg.update(json.loads(p.read_text()))
         except Exception:
             pass
-    if os.getenv("SCAR_SMOKE", "0") == "1":
+    if _env_truthy("SCAR_SMOKE"):
         # minimal smoke seeds if the runner doesn’t set them
         cfg.setdefault("seeds_calib", [101, 102])
         cfg.setdefault("seeds_eval", [201, 202])

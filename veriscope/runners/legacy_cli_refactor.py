@@ -1293,6 +1293,7 @@ CFG.update(
         gt_rank_min=8.0,  # effective rank threshold (native eff_dim)
         gt_rank_q=0.075,  # quantile for eff_dim(_gt) when calibrating gt_rank_min
         gt_patience=2,  # soft patience
+        gt_min_epoch=0,  # minimum epoch before soft GT can trigger (0 = use warm_idx)
         # workers & I/O
         num_workers=int(os.environ.get("SCAR_NUM_WORKERS", "0")),
         # ops controls
@@ -1308,17 +1309,21 @@ CFG.update(
 # Optional env overrides for regime knobs (apply early so smoke helpers see them).
 # NOTE: These env vars only set CFG values; smoke overwrite/bypass is handled elsewhere.
 try:
-    for _env_name, _cfg_key in (
-        ("SCAR_WARMUP", "warmup"),
-        ("SCAR_PH_BURN", "ph_burn"),
-        ("SCAR_GATE_WINDOW", "gate_window"),
-        ("SCAR_FACTOR_START_EPOCH", "factor_start_epoch"),
+    for _env_name, _cfg_key, _cast in (
+        ("SCAR_WARMUP", "warmup", int),
+        ("SCAR_PH_BURN", "ph_burn", int),
+        ("SCAR_GATE_WINDOW", "gate_window", int),
+        ("SCAR_FACTOR_START_EPOCH", "factor_start_epoch", int),
+        # GT env overrides (so SMOKE_ENV_BYPASS can act as a true override, not just a bypass)
+        ("SCAR_GT_RANK_MIN", "gt_rank_min", float),
+        ("SCAR_GT_PATIENCE", "gt_patience", int),
+        ("SCAR_GT_MIN_EPOCH", "gt_min_epoch", int),
     ):
         _v = os.environ.get(_env_name)
         if _v is None:
             continue
         try:
-            CFG[_cfg_key] = int(str(_v).strip())
+            CFG[_cfg_key] = _cast(str(_v).strip())
             if mp.current_process().name == "MainProcess":
                 print(f"[env] {_cfg_key}={CFG[_cfg_key]} (from {_env_name})")
         except Exception as _e:
@@ -1495,15 +1500,14 @@ CFG_SMOKE = dict(
     warmup=2,
     ph_burn=0,
     # delay pathological factors so the gate can build enough history before collapse onset
-    factor_start_epoch=8,
+    factor_start_epoch=12,  # was 8
     # reduce persistence requirements in short runs
     warn_consec=2,
     detector_horizon=3,
-    # smoke GT knobs (faster confirmation / less aggressive collapse tagging)
-    # For smoke, push soft collapse later so the gate has time to become evaluable.
-    # Slightly stricter rank threshold + longer patience than the full regime.
-    gt_rank_min=14.0,
-    gt_patience=3,
+    # smoke GT knobs (empirically grounded for eff_dim_gt distribution)
+    gt_rank_min=1.30,  # must be below min healthy eff_dim_gt (~1.367 observed)
+    gt_patience=5,  # was 3
+    gt_min_epoch=10,  # NEW: don't allow soft GT before this epoch
     # Smoke: keep full traces; do not halt runs early unless explicitly enabled via SCAR_GATE_HALT=1
     gate_early_exit=False,
     gate_gain_q=0.05,
@@ -1528,9 +1532,17 @@ SMOKE_ENV_BYPASS: Dict[str, str] = {
     "ph_burn": "SCAR_PH_BURN",
     "gate_window": "SCAR_GATE_WINDOW",
     "factor_start_epoch": "SCAR_FACTOR_START_EPOCH",
+    "gt_rank_min": "SCAR_GT_RANK_MIN",
+    "gt_patience": "SCAR_GT_PATIENCE",
+    "gt_min_epoch": "SCAR_GT_MIN_EPOCH",
 }
 
-# All smoke-critical keys live here (single source of truth)
+# Smoke-eligible keys (single source of truth).
+# NOTE: “eligible” means smoke reconciliation MAY overwrite these keys *if*:
+#   (a) the key is present in CFG_SMOKE (i.e., a smoke value is defined), and
+#   (b) there is no active env bypass for that key (SMOKE_ENV_BYPASS), and
+#   (c) for `epochs`, no explicit epoch clamp env var is present.
+# In other words: this list is a whitelist; CFG_SMOKE is the assignment.
 SMOKE_CRITICAL_KEYS: List[str] = [
     "epochs",
     "warmup",
@@ -1550,6 +1562,9 @@ SMOKE_CRITICAL_KEYS: List[str] = [
     "family_window",
     "gate_gain_q",
     "gate_gain_thresh",
+    "gt_rank_min",
+    "gt_patience",
+    "gt_min_epoch",
 ]
 
 
@@ -1590,7 +1605,8 @@ def reconcile_cfg_inplace(cfg: Dict[str, Any], *, stage: str = "") -> None:
     except Exception:
         pass
 
-    # 2) Smoke policy for critical keys.
+    # 2) Smoke policy for eligible keys (whitelist).
+    #    Only keys present in CFG_SMOKE are actually overwritten.
     if env_truthy("SCAR_SMOKE"):
         for k in SMOKE_CRITICAL_KEYS:
             if k not in CFG_SMOKE:
@@ -2606,7 +2622,7 @@ def gradient_noise_scale(model: nn.Module, xb: torch.Tensor, yb: torch.Tensor, m
     BN‑safe: does not mutate running_mean/var or num_batches_tracked. Restores modes.
     Returns (gns, n_micro) with gns=nan on failure.
     """
-    if os.environ.get("SCAR_SMOKE", "0") == "1" and CFG.get("skip_gns_in_smoke", False):
+    if env_truthy("SCAR_SMOKE") and CFG.get("skip_gns_in_smoke", False):
         return float("nan"), 0
     was_training = model.training
 
@@ -2712,6 +2728,7 @@ def gradient_noise_scale(model: nn.Module, xb: torch.Tensor, yb: torch.Tensor, m
 # ---------------------------
 def gt_collapse_time(run_df: pd.DataFrame, grad_cutoff: float) -> Tuple[Optional[int], str]:
     patience = int(CFG.get("gt_patience", 2))
+    gt_min_epoch = int(CFG.get("gt_min_epoch", 0))
     g = run_df.sort_values("epoch")
     ep_float = to_numeric_series(g["epoch"], errors="coerce").to_numpy(dtype=float)
     # Avoid NaN -> int64 MIN_INT corruption (e.g., -9223372036854775808)
@@ -2719,6 +2736,8 @@ def gt_collapse_time(run_df: pd.DataFrame, grad_cutoff: float) -> Tuple[Optional
     nan_flag = g["nan_flag"].astype(bool).to_numpy()
     grad_rel = g["grad_norm_rel"].to_numpy()
     warm_idx = warm_idx_from_cfg(CFG)
+    # Effective minimum epoch for SOFT GT: max(warm_idx, gt_min_epoch)
+    soft_min_epoch = max(int(warm_idx), int(gt_min_epoch))
 
     # HARD: NaNs or gradient explosion — require 2 consecutive after warm
     consec = 0
@@ -2749,7 +2768,7 @@ def gt_collapse_time(run_df: pd.DataFrame, grad_cutoff: float) -> Tuple[Optional
     consec = 0
     t_first: Optional[int] = None
     for t in range(len(ep)):
-        if ep[t] < warm_idx:
+        if ep[t] < soft_min_epoch:
             consec = 0
             t_first = None
             continue
@@ -6528,7 +6547,7 @@ def main():
         pipeline_run_sweep = run_sweep
         pipeline_evaluate = evaluate
 
-    tag = "smoke" if os.environ.get("SCAR_SMOKE", "0") == "1" else "full_v2"
+    tag = RUN_TAG
     # or, if you want to respect RUN_TAG overrides:
     # tag = CFG.get("RUN_TAG", "full_v2")
 
