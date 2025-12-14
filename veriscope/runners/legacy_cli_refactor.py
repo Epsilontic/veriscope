@@ -1459,6 +1459,7 @@ CFG.setdefault("gate_gain_units", "bits/sample")
 # NEWMA baseline: calibration + guards
 CFG.setdefault("newma_lambda", None)  # None => calibrate from controls
 CFG.setdefault("newma_min_points", 3)  # minimum finite points after burn before NEWMA can trigger
+CFG.setdefault("newma_min_agreement", 2)  # minimum metrics that must agree for NEWMA warn
 CFG.setdefault("newma_calib_q", 0.995)  # quantile for calibration
 
 # Instantiate the global budget ledger using current CFG limits
@@ -1508,6 +1509,9 @@ CFG_SMOKE = dict(
     factor_start_epoch=12,  # was 8
     # reduce persistence requirements in short runs
     warn_consec=2,
+    # NEWMA: conservative settings for smoke to avoid spurious FPs from tiny calibration pool
+    newma_min_agreement=2,
+    newma_calib_q=0.99,
     detector_horizon=3,
     # smoke GT knobs (empirically grounded for eff_dim_gt distribution)
     gt_rank_min=1.30,  # must be below min healthy eff_dim_gt (~1.367 observed)
@@ -1540,6 +1544,8 @@ SMOKE_ENV_BYPASS: Dict[str, str] = {
     "gt_rank_min": "SCAR_GT_RANK_MIN",
     "gt_patience": "SCAR_GT_PATIENCE",
     "gt_min_epoch": "SCAR_GT_MIN_EPOCH",
+    "newma_min_agreement": "SCAR_NEWMA_MIN_AGREEMENT",
+    "newma_calib_q": "SCAR_NEWMA_CALIB_Q",
 }
 
 # Smoke-eligible keys (single source of truth).
@@ -6075,7 +6081,21 @@ def evaluate(df_all: pd.DataFrame, tag: str):
         fast: float,
         slow: float,
         q: float,
+        min_samples: int = 100,
     ) -> float:
+        """Calibrate NEWMA threshold λ from control runs.
+
+        Args:
+            df_control: DataFrame containing control runs (factor=='none' or 'none_safe')
+            warm: Warmup index - only consider epochs >= warm
+            fast: Fast EWMA decay rate
+            slow: Slow EWMA decay rate
+            q: Quantile for threshold selection (e.g., 0.995)
+            min_samples: Minimum samples required; returns conservative default if insufficient
+
+        Returns:
+            Calibrated λ threshold, or 3.0 if insufficient data
+        """
         vals: list[float] = []
         if df_control is None or df_control.empty:
             return 3.0
@@ -6086,10 +6106,23 @@ def evaluate(df_all: pd.DataFrame, tag: str):
         for _, g in groups:
             g = g.sort_values("epoch") if "epoch" in g.columns else g
 
-            for col in ("eff_dim_gt", "eff_dim", "var_out_k"):
+            # Calibrate on ALL metrics used by the NEWMA evaluation to ensure scale alignment
+            # Note: pers_H0 is a scheduled metric (may have NaNs), ftle may also be sparse
+            for col in ("pers_H0", "eff_dim_gt", "eff_dim", "var_out_k", "ftle"):
                 if col not in g.columns:
                     continue
                 xs = pd.to_numeric(g[col], errors="coerce").to_numpy(dtype=float)
+
+                # Apply validity mask if available (e.g., ftle_valid, topo_valid for pers_H0)
+                valid_col = f"{col}_valid"
+                if valid_col in g.columns:
+                    valid_mask = g[valid_col].fillna(0).astype(bool).to_numpy()
+                    xs = np.where(valid_mask, xs, np.nan)
+
+                # Special handling for pers_H0: also check topo_done when present
+                if col == "pers_H0" and "topo_done" in g.columns:
+                    topo_mask = pd.to_numeric(g["topo_done"], errors="coerce").fillna(0).to_numpy(dtype=float) >= 1
+                    xs = np.where(topo_mask, xs, np.nan)
 
                 mu_f = None
                 mu_s = None
@@ -6101,26 +6134,54 @@ def evaluate(df_all: pd.DataFrame, tag: str):
                         mu_f = a
                         mu_s = a
                         continue
-                    mu_f = (1.0 - fast) * float(mu_f) + fast * a
-                    mu_s = (1.0 - slow) * float(mu_s) + slow * a
-                    if t >= int(warm):
+                    mu_f = (1.0 - float(fast)) * float(mu_f) + float(fast) * a
+                    mu_s = (1.0 - float(slow)) * float(mu_s) + float(slow) * a
+                    if int(t) >= int(warm):
                         vals.append(abs(float(mu_f) - float(mu_s)))
 
         if not vals:
             return 3.0
+
+        # Guard against unstable quantile estimation with too few samples
+        if len(vals) < int(min_samples):
+            try:
+                if mp.current_process().name == "MainProcess":
+                    print(
+                        f"[WARN] NEWMA calibration has only {len(vals)} samples (< {int(min_samples)}); "
+                        f"using conservative default λ=3.0"
+                    )
+            except Exception:
+                pass
+            return 3.0
+
         return float(np.quantile(np.asarray(vals, dtype=float), float(q)))
 
     q_newma = float(CFG.get("newma_calib_q", 0.995))
     min_points_newma = int(CFG.get("newma_min_points", 0))
 
     # Prefer the eval-aligned controls pool if it exists; otherwise fall back to post-warm controls.
+    # Include both "none" and "none_safe" factors as valid controls for calibration.
     try:
         df_control_for_newma = df_control_evaluable  # type: ignore[name-defined]
     except Exception:
         df_control_for_newma = df_cal_raw[
-            (df_cal_raw["factor"].astype(str).str.lower().str.strip() == "none")
+            (df_cal_raw["factor"].astype(str).str.lower().str.strip().isin(["none", "none_safe"]))
             & (to_numeric_series(df_cal_raw["epoch"], errors="coerce") >= int(warm_idx))
         ].copy()
+
+    # Also filter/expand the pre-fetched df_control_evaluable if it exists but was too restrictive
+    try:
+        if df_control_for_newma is not None and len(df_control_for_newma) > 0:
+            factor_col = df_control_for_newma["factor"].astype(str).str.lower().str.strip()
+            if not factor_col.isin(["none_safe"]).any():
+                none_safe_rows = df_cal_raw[
+                    (df_cal_raw["factor"].astype(str).str.lower().str.strip() == "none_safe")
+                    & (to_numeric_series(df_cal_raw["epoch"], errors="coerce") >= int(warm_idx))
+                ]
+                if len(none_safe_rows) > 0:
+                    df_control_for_newma = pd.concat([df_control_for_newma, none_safe_rows], ignore_index=True)
+    except Exception:
+        pass
 
     if CFG.get("newma_lambda") is None:
         lam_newma = _calibrate_newma_lambda(
@@ -6202,8 +6263,21 @@ def evaluate(df_all: pd.DataFrame, tag: str):
         t2 = _newma_warn(xs_eff)
         t3 = _newma_warn(xs_var)
         t4 = _newma_warn(xs_ftle)
+
+        # Require at least N metrics to trigger to reduce FP from single-metric noise
         cand = [t for t in [t1, t2, t3, t4] if t is not None]
-        tmin = min(cand) if cand else None
+        min_newma_agreement = as_int(CFG.get("newma_min_agreement", 2), default=2)
+
+        if len(cand) >= int(min_newma_agreement):
+            cand_sorted = sorted(cand)
+            tmin = None
+            for candidate_epoch in cand_sorted:
+                n_triggered = sum(1 for t in cand if t <= candidate_epoch)
+                if n_triggered >= int(min_newma_agreement):
+                    tmin = candidate_epoch
+                    break
+        else:
+            tmin = None
         tw_tmp = as_int(tmin, default=-1) if tmin is not None else -1
         t_warn = tw_tmp if tw_tmp >= 0 else None
 
