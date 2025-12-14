@@ -1318,6 +1318,9 @@ try:
         ("SCAR_GT_RANK_MIN", "gt_rank_min", float),
         ("SCAR_GT_PATIENCE", "gt_patience", int),
         ("SCAR_GT_MIN_EPOCH", "gt_min_epoch", int),
+        ("SCAR_NEWMA_MIN_POINTS", "newma_min_points", int),
+        ("SCAR_NEWMA_MIN_AGREEMENT", "newma_min_agreement", int),
+        ("SCAR_NEWMA_CALIB_Q", "newma_calib_q", float),
     ):
         _v = os.environ.get(_env_name)
         if _v is None:
@@ -1546,6 +1549,7 @@ SMOKE_ENV_BYPASS: Dict[str, str] = {
     "gt_min_epoch": "SCAR_GT_MIN_EPOCH",
     "newma_min_agreement": "SCAR_NEWMA_MIN_AGREEMENT",
     "newma_calib_q": "SCAR_NEWMA_CALIB_Q",
+    "newma_min_points": "SCAR_NEWMA_MIN_POINTS",
 }
 
 # Smoke-eligible keys (single source of truth).
