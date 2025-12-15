@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import warnings
-from typing import Callable, Iterable, Optional, Sequence
+from typing import Any, Callable, Dict, Iterable, Optional, Sequence
 
 import numpy as np
 
@@ -81,6 +81,51 @@ class DeclTransport(TransportProtocol):
         span = max(1e-12, float(hi - lo))
         z = (arr - float(lo)) / span
         return np.clip(z, 0.0, 1.0)
+
+    def clip_diagnostics(self, ctx: str, x: np.ndarray) -> Dict[str, Any]:
+        """
+        Diagnostic helper: report what fraction of finite values in `x` would be clipped
+        by the current transport normalization for context `ctx`.
+
+        Returns:
+          {
+            "clip_lo_frac": float,
+            "clip_hi_frac": float,
+            "in_range_frac": float,
+            "n": int,
+            "cal_range": (lo, hi),
+            "observed_range": (xmin, xmax),
+          }
+        """
+        arr = np.asarray(x, float)
+        arr = arr[np.isfinite(arr)]
+        if arr.size == 0:
+            return {
+                "clip_lo_frac": 0.0,
+                "clip_hi_frac": 0.0,
+                "in_range_frac": 1.0,
+                "n": 0,
+                "cal_range": (0.0, 1.0),
+                "observed_range": (float("nan"), float("nan")),
+            }
+
+        lo, hi = self._ranges.get(ctx, (0.0, 1.0))
+        if not (np.isfinite(lo) and np.isfinite(hi) and (hi > lo)):
+            lo, hi = 0.0, 1.0
+
+        n = int(arr.size)
+        clip_lo = int(np.sum(arr < float(lo)))
+        clip_hi = int(np.sum(arr > float(hi)))
+        in_range = n - clip_lo - clip_hi
+
+        return {
+            "clip_lo_frac": float(clip_lo) / float(n),
+            "clip_hi_frac": float(clip_hi) / float(n),
+            "in_range_frac": float(in_range) / float(n),
+            "n": n,
+            "cal_range": (float(lo), float(hi)),
+            "observed_range": (float(np.min(arr)), float(np.max(arr))),
+        }
 
     def natural_with(self, restrict: Callable[..., np.ndarray]) -> bool:
         """

@@ -746,6 +746,16 @@ class VeriscopeGatedTrainer:
                         f"change_ok={gate_result.get('change_ok')}, "
                         f"regime_ok={gate_result.get('regime_ok')}{regime_status}"
                     )
+                    # NEW: Print per-metric breakdown for debugging
+                    _audit = gate_result.get("audit", {}) or {}
+                    per_metric = _audit.get("per_metric_tv", {})
+                    if per_metric:
+                        pm_str = ", ".join(f"{k}={v:.4f}" for k, v in per_metric.items() if isinstance(v, (int, float)))
+                        print(f"       per_metric_tv: {pm_str}")
+                    regime_pm = _audit.get("regime_per_metric", {})
+                    if regime_pm and gate_result.get("regime_active"):
+                        rpm_str = ", ".join(f"{k}={v:.4f}" for k, v in regime_pm.items() if isinstance(v, (int, float)))
+                        print(f"       regime_per_metric: {rpm_str}")
                 elif self.iter_num % (cfg.gate_window * 10) == 0:
                     print(f"[GATE] iter={self.iter_num} OK, gain={gate_result['gain_bits']:.4f} bits{regime_status}")
 

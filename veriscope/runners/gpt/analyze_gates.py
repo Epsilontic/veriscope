@@ -1,3 +1,4 @@
+# veriscope/runners/gpt/analyze_gates.py
 """Gate recall/precision analysis for veriscope GPT experiments.
 
 Usage:

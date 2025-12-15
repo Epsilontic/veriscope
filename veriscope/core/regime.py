@@ -842,14 +842,46 @@ class RegimeAnchoredGateEngine:
 
             regime_ok = regime_result.ok
 
+            # Optional: clipping diagnostics for cal_ranges mismatch.
+            # Only compute when divergence is large to avoid bloating the audit.
+            clip_diag_recent: Dict[str, Any] = {}
+            clip_diag_ref: Dict[str, Any] = {}
+            try:
+                dw_val = float(regime_result.audit.get("worst_DW"))
+            except Exception:
+                dw_val = float("nan")
+
+            if np.isfinite(dw_val) and (dw_val > 0.5):
+                _tr = getattr(self._regime_fr_win, "transport", None)
+                _clip = getattr(_tr, "clip_diagnostics", None)
+                if callable(_clip):
+                    for m in self._metrics_tracked:
+                        try:
+                            clip_diag_recent[m] = _clip(m, recent.get(m, np.array([], float)))
+                        except Exception:
+                            clip_diag_recent[m] = {"error": "clip_diag_failed"}
+                        try:
+                            clip_diag_ref[m] = _clip(m, self._ref.metrics.get(m, np.array([], float)))
+                        except Exception:
+                            clip_diag_ref[m] = {"error": "clip_diag_failed"}
+
             # Capture regime audit details
+            # Prefer per_metric_tv (new), fall back to drifts (legacy), else empty
+            _per_metric = regime_result.audit.get("per_metric_tv") or regime_result.audit.get("drifts") or {}
             regime_audit = {
                 "regime_worst_DW": regime_result.audit.get("worst_DW"),
                 "regime_eps_eff": regime_result.audit.get("eps_eff"),
                 "regime_eps_stat": float(regime_eps_stat),
-                "regime_per_metric": regime_result.audit.get("drifts", {}),
+                "regime_per_metric": _per_metric,
+                "regime_per_metric_n": regime_result.audit.get("per_metric_n", {}),
                 "regime_counts": regime_counts,
             }
+
+            # Attach clipping diagnostics only when computed.
+            if clip_diag_recent:
+                regime_audit["regime_clip_diag_threshold"] = 0.5
+                regime_audit["regime_clip_diag_recent"] = clip_diag_recent
+                regime_audit["regime_clip_diag_ref"] = clip_diag_ref
 
         # 3. Combined decision: fail if EITHER fails
         combined_ok = base_result.ok and regime_ok
