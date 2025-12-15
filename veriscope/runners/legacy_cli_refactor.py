@@ -1373,6 +1373,12 @@ def _warn_precedes_collapse(t_warn: Optional[int], t_c: Optional[int]) -> bool:
     - If no collapse -> keep warning (True) so FP is measurable.
     - If collapse exists -> require precedence (<= in smoke, < otherwise).
     """
+    # Smoke-only debug: trace precedence filtering inputs (main process only)
+    try:
+        if env_truthy("SCAR_SMOKE") and mp.current_process().name == "MainProcess":
+            print(f"[dbg:warn_precedes] t_warn={t_warn} t_c={t_c}")
+    except Exception:
+        pass
     if t_warn is None:
         return False
     if t_c is None:
