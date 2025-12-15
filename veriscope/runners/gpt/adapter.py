@@ -464,7 +464,7 @@ class GPTMetricComputer:
 
 def create_gpt_window_decl(
     epsilon: float = 0.12,
-    bins: int = 16,
+    bins: int = 8,  # Reduced from 16: improves TV estimator variance at n≈37
     eff_dim_max: float = 64.0,
     cos_disp_max: float = 0.5,
 ) -> WindowDecl:
