@@ -1425,7 +1425,8 @@ logs: list[dict[str, Any]] = []
 out: list[str] = []
 
 # Vote baseline metrics — gradient/loss removed to avoid GT leakage / cadence bias.
-VOTE_METRICS = ["cos_disp", "var_out_k", "ftle", "mon_entropy"]
+# NOTE: eff_dim (projected/observable) is safe; eff_dim_gt would be target leakage.
+VOTE_METRICS = ["cos_disp", "var_out_k", "ftle", "mon_entropy", "eff_dim"]
 
 # TTL for scheduled metrics propagation to avoid stale ffill artifacts
 CFG.setdefault("scheduled_ttl", 2 * CFG.get("heavy_every", 6))
@@ -1494,7 +1495,7 @@ except Exception:
 
 # Smoke-mode overrides (fast E2E)
 CFG_SMOKE = dict(
-    seeds_calib=[401, 402],
+    seeds_calib=[401, 402, 403],  # 403 → uniform_label_noise (pathological)
     seeds_eval=[511, 512],
     epochs=24,
     # run heavy metrics on a predictable cadence
@@ -1504,6 +1505,7 @@ CFG_SMOKE = dict(
     # gate: W=1 so 2W history exists by epoch 2 (matches earliest GT collapses in smoke)
     gate_window=1,
     gate_min_evidence=3,  # will be clamped down to a NaN-tolerant bound in reconcile_cfg_inplace()
+    ph_min_points=3,  # smoke has ~7 finite heavy points; default 10 blocks PH detection
     gate_min_evidence_full_eps=12,
     # Gate epsilon: smoke calibration is underdetermined; use a realistic preset with a protective floor.
     gate_epsilon=0.50,
