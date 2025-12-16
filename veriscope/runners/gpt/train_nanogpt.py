@@ -179,6 +179,13 @@ class TrainConfig:
     gate_min_evidence: int = 16
     gate_eps_stat_max_frac: float = 0.25  # cap eps_stat as fraction of epsilon
 
+    # Gate policy: controls when gate FAILs
+    # - "either": FAIL if gain OR stability fails (original default)
+    # - "conjunction": FAIL if gain AND stability both fail
+    # - "persistence": FAIL if stability fails for K consecutive evaluated checks
+    gate_policy: str = "either"
+    gate_persistence_k: int = 2  # For persistence: consecutive exceedances to FAIL
+
     # Regime-anchored detection (reference-based drift)
     regime_enabled: bool = True
     regime_build_min_iter: int = -1  # Sentinel: auto-compute
@@ -259,6 +266,8 @@ class VeriscopeGatedTrainer:
                 "gate_min_evidence": config.gate_min_evidence,
                 "gate_eps_stat_max_frac": float(config.gate_eps_stat_max_frac),
                 "gate_epsilon_sens": 0.04,
+                "gate_policy": config.gate_policy,
+                "gate_persistence_k": config.gate_persistence_k,
             },
         )
 
@@ -715,12 +724,16 @@ class VeriscopeGatedTrainer:
 
         return {
             "ok": result.ok,
+            "warn": getattr(result, "warn", False),
             "audit": audit,
             "gain_bits": gain_bits,
             "iter": self.iter_num,
             # Regime-specific fields (always present for consistency)
             "change_ok": audit.get("change_ok", True),
+            "change_warn": audit.get("change_warn", False),
+            "change_evaluated": audit.get("change_evaluated", True),
             "regime_ok": audit.get("regime_ok", True),
+            "regime_warn": audit.get("regime_warn", False),
             "regime_active": audit.get("regime_active", False),
             "regime_enabled": audit.get("regime_enabled", False),
             "ref_established_at": audit.get("ref_established_at"),
@@ -834,6 +847,13 @@ class VeriscopeGatedTrainer:
 
                 audit = gate_result.get("audit", {})
 
+                # Extract policy/persistence state for logging
+                policy = audit.get("policy", "either")
+                consec_before = audit.get("consecutive_exceedances_before", 0)
+                consec_after = audit.get("consecutive_exceedances_after", 0)
+                pers_k = audit.get("persistence_k", 2)
+                was_evaluated = audit.get("evaluated", True)
+
                 # Format regime status
                 if gate_result.get("ref_just_established"):
                     regime_status = " [REF ESTABLISHED]"
@@ -847,23 +867,42 @@ class VeriscopeGatedTrainer:
                     regime_status = " [regime disabled]"
 
                 if not gate_result["ok"]:
+                    worst_dw = audit.get("worst_DW", float("nan"))
+                    eps_eff = audit.get("eps_eff", float("nan"))
+                    eval_tag = "" if was_evaluated else " [NOT EVALUATED]"
                     print(
                         f"\n[GATE] iter={self.iter_num} FAIL: "
                         f"change_ok={gate_result.get('change_ok')}, "
-                        f"regime_ok={gate_result.get('regime_ok')}{regime_status}"
+                        f"regime_ok={gate_result.get('regime_ok')}{regime_status} "
+                        f"[{policy}, {consec_before}->{consec_after}/{pers_k}]{eval_tag}"
                     )
-                    # NEW: Print per-metric breakdown for debugging
+                    print(f"       D_W={worst_dw:.4f}, eps_eff={eps_eff:.4f}")
+
+                    # Print per-metric breakdown for debugging
                     _audit = gate_result.get("audit", {}) or {}
                     per_metric = _audit.get("per_metric_tv", {})
                     if per_metric:
-                        pm_str = ", ".join(f"{k}={v:.4f}" for k, v in per_metric.items() if isinstance(v, (int, float)))
+                        pm_str = ", ".join(f"{m}={v:.4f}" for m, v in per_metric.items() if isinstance(v, (int, float)))
                         print(f"       per_metric_tv: {pm_str}")
                     regime_pm = _audit.get("regime_per_metric", {})
                     if regime_pm and gate_result.get("regime_active"):
-                        rpm_str = ", ".join(f"{k}={v:.4f}" for k, v in regime_pm.items() if isinstance(v, (int, float)))
+                        rpm_str = ", ".join(f"{m}={v:.4f}" for m, v in regime_pm.items() if isinstance(v, (int, float)))
                         print(f"       regime_per_metric: {rpm_str}")
+                elif gate_result.get("warn"):
+                    # Log WARN: threshold exceeded but not yet FAIL under persistence
+                    worst_dw = audit.get("worst_DW", float("nan"))
+                    eps_eff = audit.get("eps_eff", float("nan"))
+                    print(
+                        f"[GATE] iter={self.iter_num} WARN: "
+                        f"D_W={worst_dw:.4f} > eps_eff={eps_eff:.4f}, "
+                        f"consec={consec_before}->{consec_after}/{pers_k}{regime_status}"
+                    )
                 elif self.iter_num % (cfg.gate_window * 10) == 0:
-                    print(f"[GATE] iter={self.iter_num} OK, gain={gate_result['gain_bits']:.4f} bits{regime_status}")
+                    print(
+                        f"[GATE] iter={self.iter_num} OK, "
+                        f"gain={gate_result['gain_bits']:.4f} bits{regime_status} "
+                        f"[{policy}]"
+                    )
 
         self.iter_num += 1
         return loss_val
@@ -1040,6 +1079,24 @@ if __name__ == "__main__":
         type=float,
         default=0.25,
         help="Cap eps_stat as a fraction of epsilon (effective eps = epsilon - eps_stat_capped).",
+    )
+    parser.add_argument(
+        "--gate_policy",
+        type=str,
+        choices=["either", "conjunction", "persistence"],
+        default="either",
+        help=(
+            "Gate failure policy. "
+            "'either'=fail on gain OR stability (original), "
+            "'conjunction'=fail on gain AND stability, "
+            "'persistence'=fail on K consecutive evaluated stability exceedances."
+        ),
+    )
+    parser.add_argument(
+        "--gate_persistence_k",
+        type=int,
+        default=2,
+        help="For persistence policy: consecutive evaluated exceedances required to FAIL.",
     )
     parser.add_argument(
         "--lr_spike_at",
@@ -1231,6 +1288,8 @@ if __name__ == "__main__":
         gate_gain_thresh=args.gate_gain_thresh,
         gate_min_evidence=args.gate_min_evidence,
         gate_eps_stat_max_frac=args.gate_eps_stat_max_frac,
+        gate_policy=args.gate_policy,
+        gate_persistence_k=args.gate_persistence_k,
         # Regime config
         regime_enabled=regime_enabled,
         regime_build_min_iter=args.regime_build_min_iter,

@@ -35,7 +35,7 @@ import multiprocessing as _mp
 
 from veriscope.core.window import WindowDecl, FRWindow
 from veriscope.core.transport import DeclTransport
-from veriscope.core.gate import GateEngine, GateResult
+from veriscope.core.gate import GateEngine, GateResult  # GatePolicy not needed here
 from veriscope.core.calibration import aggregate_epsilon_stat
 
 # --- Transport saturation diagnostic (rate-limited) ---
@@ -893,6 +893,10 @@ class RegimeAnchoredGateEngine:
             eps_stat_value=eps_stat_value,
         )
 
+        # Extract warn and evaluated status from base result
+        base_warn = getattr(base_result, "warn", False)
+        base_evaluated = base_result.audit.get("evaluated", True)
+
         # If regime detection is disabled, return base result with consistent audit fields
         if not self._enabled_effective:
             audit = dict(base_result.audit)
@@ -901,15 +905,19 @@ class RegimeAnchoredGateEngine:
                     "regime_enabled": False,
                     "regime_auto_disabled": not self.config.enabled or not self._metrics_tracked,
                     "change_ok": base_result.ok,
+                    "change_warn": base_warn,
+                    "change_evaluated": base_evaluated,
                     "regime_ok": True,
+                    "regime_warn": False,
                     "regime_active": False,
                 }
             )
-            return GateResult(ok=base_result.ok, audit=audit)
+            return GateResult(ok=base_result.ok, warn=base_warn, audit=audit)
 
         # 2. Regime detection (if reference established)
         regime_result: Optional[GateResult] = None
         regime_ok = True
+        regime_warn = False
         regime_audit: Dict[str, Any] = {}
 
         if self._ref is not None:
@@ -939,6 +947,7 @@ class RegimeAnchoredGateEngine:
             )
 
             regime_ok = regime_result.ok
+            regime_warn = getattr(regime_result, "warn", False)
 
             # Diagnostic: check for transport saturation when regime fails.
             # Use the EXACT gauge the regime engine uses (self._regime_decl, self._metrics_tracked).
@@ -1040,7 +1049,10 @@ class RegimeAnchoredGateEngine:
             **base_result.audit,
             # Add regime-specific fields (always present for consistency)
             "change_ok": base_result.ok,
+            "change_warn": base_warn,
+            "change_evaluated": base_evaluated,
             "regime_ok": regime_ok,
+            "regime_warn": regime_warn,
             "regime_enabled": self._enabled_effective,
             "regime_active": self._ref is not None,
             "regime_epsilon": self._regime_epsilon,
@@ -1071,7 +1083,8 @@ class RegimeAnchoredGateEngine:
             audit["ref_just_established"] = True
             audit["ref_build_audit"] = self._ref.build_audit if self._ref else {}
 
-        return GateResult(ok=combined_ok, audit=audit)
+        combined_warn = base_warn or regime_warn
+        return GateResult(ok=combined_ok, warn=combined_warn, audit=audit)
 
     def reset_reference(self) -> Dict[str, Any]:
         """
