@@ -75,6 +75,37 @@ def _ensure_nanogpt_on_path(nanogpt_dir: str) -> None:
         sys.path.insert(0, p)
 
 
+def compute_window_spans(
+    gate_window_iters: int,
+    metric_interval_iters: int,
+) -> tuple[int, int, int]:
+    """Compute window spans with correct unit handling.
+
+    All inputs and outputs are in iteration units unless noted.
+
+    Args:
+        gate_window_iters: The gate check cadence in iterations (config.gate_window).
+            Gate checks run when iter_num % gate_window_iters == 0.
+        metric_interval_iters: Stride between metric snapshots in iterations
+            (config.metric_interval).
+
+    Returns:
+        Wm: Number of metric snapshots per half-window. This is what the gate
+            actually uses for past/recent comparisons.
+        window_span_iters: Actual iteration span covered by each half-window
+            (= Wm * metric_interval_iters).
+        stride_iters: Same as metric_interval_iters (returned for convenience).
+
+    This is factored out to ensure consistency between:
+    - VeriscopeGatedTrainer.__init__ (build window computation)
+    - VeriscopeGatedTrainer._compute_gate_check (gate evaluation)
+    """
+    stride_iters = max(1, int(metric_interval_iters))
+    Wm = max(1, int(gate_window_iters) // stride_iters)
+    window_span_iters = Wm * stride_iters
+    return Wm, window_span_iters, stride_iters
+
+
 # Your veriscope imports
 from veriscope.runners.gpt.adapter import (
     GPTMetricConfig,
@@ -157,6 +188,10 @@ class TrainConfig:
     regime_build_min_gain: float = -0.01
     regime_epsilon_mult: float = 1.5
     regime_min_evidence: int = 50
+    regime_build_gap_iters: int = -1  # explicit gap override (-1 = auto)
+
+    # WindowDecl tuning
+    cos_disp_max: float = 1.0
 
     # Device
     device: str = "cuda"
@@ -209,6 +244,7 @@ class VeriscopeGatedTrainer:
                 epsilon=config.gate_epsilon,
                 bins=16,
                 eff_dim_max=float(self.metric_config.geom_rp_dim),
+                cos_disp_max=float(config.cos_disp_max),
             )
         except TypeError:
             # Backward-compat: older create_gpt_window_decl signatures
@@ -234,13 +270,71 @@ class VeriscopeGatedTrainer:
             if pathology_start is None or int(config.data_corrupt_at) < pathology_start:
                 pathology_start = int(config.data_corrupt_at)
 
+        # --- Compute window spans with correct unit handling ---
+        Wm, window_span_iters, _stride_iters = compute_window_spans(config.gate_window, config.metric_interval)
+
+        # Warn if Wm is dangerously small (noisy comparisons)
+        if Wm < 5:
+            print(
+                f"[REGIME WARN] Wm={Wm} snapshots per half-window is small. "
+                f"gate_window={config.gate_window}, metric_interval={config.metric_interval}. "
+                f"Consider increasing gate_window or decreasing metric_interval."
+            )
+
+        # Gap ensures neither "past" nor "recent" half-windows overlap pathology
+        if config.regime_build_gap_iters >= 0:
+            gap_iters = int(config.regime_build_gap_iters)
+        else:
+            gap_iters = 2 * window_span_iters
+
+        # --- Compute build window with correct semantics ---
+        if pathology_start is not None and pathology_start > 0:
+            # CORRUPTION/SPIKE RUN: anchor reference to pre-corruption window
+            build_max = max(0, int(pathology_start) - gap_iters)
+            min_start = int(config.gate_warmup) + gap_iters
+            build_min = max(min_start, build_max - int(config.regime_build_span))
+
+            if build_max <= build_min:
+                print(
+                    f"[REGIME WARN] Build window empty: [{build_min}, {build_max}). "
+                    f"pathology_start={pathology_start}, warmup={config.gate_warmup}, "
+                    f"gap={gap_iters}. Disabling regime for this run."
+                )
+                regime_enabled = False
+                build_min = -1
+                build_max = -1
+            else:
+                regime_enabled = bool(config.regime_enabled)
+                print(
+                    f"[REGIME] Anchored build window to pre-corruption: "
+                    f"[{build_min}, {build_max}) (gap={gap_iters} iters, Wm={Wm})"
+                )
+        else:
+            # CONTROL RUN: anchor reference to stable post-warmup window
+            build_min = int(config.gate_warmup) + gap_iters
+            build_max = build_min + int(config.regime_build_span)
+            max_possible = int(config.max_iters) - gap_iters
+            build_max = min(build_max, max_possible)
+
+            if build_max <= build_min:
+                print(
+                    f"[REGIME WARN] Build window empty for control: [{build_min}, {build_max}). "
+                    f"Disabling regime for this run."
+                )
+                regime_enabled = False
+                build_min = -1
+                build_max = -1
+            else:
+                regime_enabled = bool(config.regime_enabled)
+                print(f"[REGIME] Control run: build window [{build_min}, {build_max})")
+
         # Configure regime detection
         regime_config = RegimeConfig(
-            enabled=bool(config.regime_enabled),
+            enabled=regime_enabled,
             epsilon=None,  # Derive as epsilon_mult * base epsilon
             epsilon_mult=float(config.regime_epsilon_mult),
-            reference_build_min_iter=int(config.regime_build_min_iter),
-            reference_build_max_iter=int(config.regime_build_max_iter),
+            reference_build_min_iter=int(build_min),
+            reference_build_max_iter=int(build_max),
             reference_build_span=int(config.regime_build_span),
             reference_build_max_dw=float(config.regime_build_max_dw),
             reference_build_min_gain=float(config.regime_build_min_gain),
@@ -541,8 +635,7 @@ class VeriscopeGatedTrainer:
 
         # gate_window is specified in *iterations*, but metric_history is recorded every metric_interval.
         # Convert to a metric-snapshot window to keep evidence density consistent.
-        interval = max(1, int(cfg.metric_interval))
-        Wm = max(1, int(cfg.gate_window) // interval)
+        Wm, _, _ = compute_window_spans(cfg.gate_window, cfg.metric_interval)
 
         if len(self.metric_history) < 2 * Wm:
             return {"ok": True, "reason": "insufficient_history"}
@@ -674,6 +767,19 @@ class VeriscopeGatedTrainer:
                 and cfg.data_corrupt_frac > 0.0
             )
             metrics["data_corrupt_active"] = int(active)
+
+            # One-time metric naming invariant check (first snapshot only)
+            if len(self.metric_history) == 0:
+                expected = set(self.window_decl.weights.keys())
+                got = set(metrics.keys())
+                missing = sorted(expected - got)
+                if missing:
+                    import warnings
+
+                    warnings.warn(
+                        f"[VERISCOPE] Missing expected metrics for gate: {missing}",
+                        RuntimeWarning,
+                    )
 
             self.metric_history.append(metrics)
             self.loss_history.append(loss)
@@ -1034,6 +1140,22 @@ if __name__ == "__main__":
         help="Min samples per metric before reference can be established.",
     )
 
+    parser.add_argument(
+        "--regime_build_gap_iters",
+        type=int,
+        default=-1,
+        help=(
+            "Explicit gap (iterations) between build window end and pathology start. "
+            "-1 = auto (2 * window_span_iters). Set to anchor reference closer to corruption."
+        ),
+    )
+    parser.add_argument(
+        "--cos_disp_max",
+        type=float,
+        default=1.0,
+        help=("Upper bound for cos_disp cal_range. Default 1.0 (full range). Use 0.5 to test saturation diagnostic."),
+    )
+
     args = parser.parse_args()
 
     def _flag_present(name: str) -> bool:
@@ -1118,6 +1240,8 @@ if __name__ == "__main__":
         regime_build_min_gain=args.regime_build_min_gain,
         regime_epsilon_mult=args.regime_epsilon_mult,
         regime_min_evidence=args.regime_min_evidence,
+        regime_build_gap_iters=args.regime_build_gap_iters,
+        cos_disp_max=args.cos_disp_max,
         # Safer default for initial hook validation
         compile=False,
     )

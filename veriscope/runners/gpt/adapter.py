@@ -464,20 +464,36 @@ class GPTMetricComputer:
 
 def create_gpt_window_decl(
     epsilon: float = 0.12,
-    bins: int = 8,  # Reduced from 16: improves TV estimator variance at n≈37
+    bins: int = 16,
     eff_dim_max: float = 64.0,
-    cos_disp_max: float = 0.5,
+    cos_disp_max: float = 1.0,  # ← FIXED: was 0.5, caused transport saturation
 ) -> WindowDecl:
     """Create a WindowDecl appropriate for GPT training.
 
-    IMPORTANT: `eff_dim` is computed on the JL-projected representation (H_jl),
-    so it should be calibrated to the projection dimension (default 64), not
-    the model hidden size.
+    IMPORTANT:
+    - `eff_dim` is computed on the JL-projected representation (H_jl),
+      so eff_dim_max should match the projection dimension (default 64).
+    - `cos_disp` is bounded in [0, 1] by definition. The cal_range must
+      cover the full range to avoid transport saturation artifacts.
+    - `var_out_k` is bounded in [0, 1] by construction.
 
-    These `cal_ranges` are defaults; for production, calibrate from a warmup.
+    The weights are intentionally set to downweight cos_disp (0.2) relative
+    to var_out_k and eff_dim (0.4 each), since cos_disp can drift during
+    healthy learning.
     """
     eff_dim_max = float(max(4.0, eff_dim_max))
-    cos_disp_max = float(max(0.05, cos_disp_max))
+    cos_disp_max = float(max(0.1, min(1.0, cos_disp_max)))
+
+    # One-time warning for tight cos_disp range (common misconfiguration)
+    if cos_disp_max < 0.9:
+        try:
+            import multiprocessing as mp
+
+            if mp.current_process().name == "MainProcess":
+                print(f"[WARN] cos_disp_max={cos_disp_max:.2f} is tight; consider 1.0 to avoid transport saturation")
+        except Exception:
+            pass
+
     return WindowDecl(
         epsilon=float(epsilon),
         metrics=["var_out_k", "eff_dim", "cos_disp"],
@@ -487,7 +503,7 @@ def create_gpt_window_decl(
         cal_ranges={
             "var_out_k": (0.0, 1.0),
             "eff_dim": (0.0, eff_dim_max),
-            "cos_disp": (0.0, cos_disp_max),
+            "cos_disp": (0.0, cos_disp_max),  # ← THE FIX: full [0,1] range
         },
     )
 
