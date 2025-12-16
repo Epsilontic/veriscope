@@ -31,11 +31,109 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
+import multiprocessing as _mp
 
 from veriscope.core.window import WindowDecl, FRWindow
 from veriscope.core.transport import DeclTransport
 from veriscope.core.gate import GateEngine, GateResult
 from veriscope.core.calibration import aggregate_epsilon_stat
+
+# --- Transport saturation diagnostic (rate-limited) ---
+_SATURATION_WARN_COUNT: Dict[str, int] = {}
+_SATURATION_WARN_LIMIT = 5
+
+
+def _is_main_process() -> bool:
+    """Check if we're in the main process (stdlib, no torch dependency)."""
+    try:
+        return _mp.current_process().name == "MainProcess"
+    except Exception:
+        return True  # fail open
+
+
+def _validate_cal_range(entry) -> tuple[bool, float, float]:
+    """Validate a cal_ranges entry. Returns (valid, lo, hi)."""
+    if not isinstance(entry, (list, tuple)) or len(entry) != 2:
+        return False, 0.0, 1.0
+    lo, hi = entry
+    try:
+        lo_f, hi_f = float(lo), float(hi)
+    except (TypeError, ValueError):
+        return False, 0.0, 1.0
+    if not (np.isfinite(lo_f) and np.isfinite(hi_f)):
+        return False, 0.0, 1.0
+    if lo_f >= hi_f:
+        return False, 0.0, 1.0
+    return True, lo_f, hi_f
+
+
+def diagnose_transport_saturation(
+    arr: np.ndarray,
+    lo: float,
+    hi: float,
+    name: str = "metric",
+) -> Dict[str, float]:
+    """Compute fraction of samples clipped by transport.
+
+    Uses inclusive bounds with small epsilon for boundary cases.
+
+    NOTE: This diagnostic assumes `arr` contains RAW metric values (not yet
+    transported/binned). In the GPT runner, `recent[m]` comes from
+    metric_history which stores raw scalars, so this is correct. If reusing
+    this engine with already-transported values, the diagnostic is meaningless.
+    """
+    x = np.asarray(arr, dtype=float)
+    x = x[np.isfinite(x)]
+
+    if len(x) == 0:
+        return {"name": name, "n": 0, "clip_lo_frac": np.nan, "clip_hi_frac": np.nan}
+
+    eps = 1e-9
+    n_below = float((x <= lo + eps).sum())
+    n_above = float((x >= hi - eps).sum())
+    n = float(len(x))
+
+    return {
+        "name": name,
+        "n": int(n),
+        "lo": lo,
+        "hi": hi,
+        "actual_min": float(np.min(x)),
+        "actual_max": float(np.max(x)),
+        "actual_q01": float(np.quantile(x, 0.01)) if len(x) >= 10 else float(np.min(x)),
+        "actual_q99": float(np.quantile(x, 0.99)) if len(x) >= 10 else float(np.max(x)),
+        "clip_lo_frac": n_below / n,
+        "clip_hi_frac": n_above / n,
+        "clip_total_frac": (n_below + n_above) / n,
+    }
+
+
+def _maybe_warn_saturation(
+    metric_name: str,
+    diag: Dict[str, float],
+    threshold: float = 0.10,
+) -> None:
+    """Rate-limited warning for transport saturation. Main process only."""
+    # Main process check FIRST (before accounting)
+    if not _is_main_process():
+        return
+
+    clip_frac = diag.get("clip_total_frac", 0.0)
+    if not np.isfinite(clip_frac) or clip_frac < threshold:
+        return
+
+    # Rate limit accounting
+    global _SATURATION_WARN_COUNT
+    count = _SATURATION_WARN_COUNT.get(metric_name, 0)
+    if count >= _SATURATION_WARN_LIMIT:
+        return
+    _SATURATION_WARN_COUNT[metric_name] = count + 1
+
+    print(
+        f"[REGIME DIAG] {metric_name}: {clip_frac * 100:.1f}% clipped, "
+        f"actual_range=[{diag['actual_min']:.4f}, {diag['actual_max']:.4f}], "
+        f"cal_range=[{diag['lo']:.4f}, {diag['hi']:.4f}]"
+    )
 
 
 def _stable_metric_seed(metric_name: str, base_seed: int = 42) -> int:
@@ -841,6 +939,23 @@ class RegimeAnchoredGateEngine:
             )
 
             regime_ok = regime_result.ok
+
+            # Diagnostic: check for transport saturation when regime fails.
+            # Use the EXACT gauge the regime engine uses (self._regime_decl, self._metrics_tracked).
+            if self._ref is not None and (not regime_ok) and self.config.enabled:
+                cal_ranges = getattr(self._regime_decl, "cal_ranges", {})
+                for m in self._metrics_tracked:
+                    if m not in recent:
+                        continue
+                    entry = cal_ranges.get(m)
+                    if entry is None:
+                        continue
+                    valid, lo, hi = _validate_cal_range(entry)
+                    if not valid:
+                        continue
+                    arr = np.asarray(recent.get(m, []), dtype=float)
+                    diag = diagnose_transport_saturation(arr, lo, hi, name=m)
+                    _maybe_warn_saturation(m, diag, threshold=0.10)
 
             # Optional: clipping diagnostics for cal_ranges mismatch.
             # Only compute when divergence is large to avoid bloating the audit.
