@@ -1495,8 +1495,8 @@ except Exception:
 
 # Smoke-mode overrides (fast E2E)
 CFG_SMOKE = dict(
-    seeds_calib=[401, 402, 403],  # 403 → uniform_label_noise (pathological)
-    seeds_eval=[511, 512],
+    seeds_calib=[401, 402, 403, 511],  # include one SOFT collapse seed for calibration
+    seeds_eval=[512],
     epochs=24,
     # run heavy metrics on a predictable cadence
     heavy_every=4,
