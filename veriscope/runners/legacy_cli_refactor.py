@@ -255,6 +255,7 @@ AGGREGATE_EPSILON = agg_eps_adapter
 
 # ---- legacy imports (stay as-is) ----
 from veriscope.runners.legacy import runtime
+
 from veriscope.runners.legacy.utils import (
     save_json,
     update_json,
@@ -266,6 +267,35 @@ from veriscope.runners.legacy.utils import (
     quantile2,
     _as_float_array,
 )
+
+
+# --- Helper: append a message to sweep.log with timestamp and pid (audit trail) ---
+def _append_sweep_log(msg: str) -> None:
+    """Append a message to sweep.log unconditionally (creates if absent).
+
+    Use this for audit trail messages that must survive stdout truncation.
+    Safe to call from any process; includes timestamp + pid prefix.
+    """
+    try:
+        import time
+        import os
+        from pathlib import Path
+
+        outdir = globals().get("OUTDIR", None)
+        if outdir is None:
+            return
+        outdir = Path(outdir)
+
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        pid = os.getpid()
+        log_path = outdir / "sweep.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(f"[{ts} pid={pid}] {msg}\n")
+            f.flush()
+    except Exception:
+        pass  # Never let logging failures break the pipeline
+
 
 from veriscope.runners.legacy.determinism import (
     seed_all,
@@ -1599,11 +1629,12 @@ def _log_smoke_final_cfg(cfg: Dict[str, Any], stage: str = "") -> None:
         if mp.current_process().name != "MainProcess":
             return
         stage_tag = f" ({stage})" if stage else ""
-        print(
+        msg = (
             f"[smoke] Final CFG{stage_tag}: "
             f"gate_window={cfg.get('gate_window')} "
             f"gate_bins={cfg.get('gate_bins')} "
-            f"gate_epsilon={cfg.get('gate_epsilon')} gate_epsilon_floor={cfg.get('gate_epsilon_floor')} "
+            f"gate_epsilon={cfg.get('gate_epsilon')} "
+            f"gate_epsilon_floor={cfg.get('gate_epsilon_floor')} "
             f"gate_min_evidence={cfg.get('gate_min_evidence')} "
             f"gate_min_evidence_full_eps={cfg.get('gate_min_evidence_full_eps')} "
             f"gate_eps_inflation_max={cfg.get('gate_eps_inflation_max')} "
@@ -1613,6 +1644,8 @@ def _log_smoke_final_cfg(cfg: Dict[str, Any], stage: str = "") -> None:
             f"warn_consec={cfg.get('warn_consec')} "
             f"gate_early_exit={cfg.get('gate_early_exit')}"
         )
+        print(msg, flush=True)
+        _append_sweep_log(msg)
     except Exception:
         pass
 
@@ -1631,6 +1664,9 @@ def reconcile_cfg_inplace(cfg: Dict[str, Any], *, stage: str = "") -> None:
     # 2) Smoke policy for eligible keys (whitelist).
     #    Only keys present in CFG_SMOKE are actually overwritten.
     if env_truthy("SCAR_SMOKE"):
+        applied_changes: List[str] = []
+        bypassed_keys: List[str] = []
+
         for k in SMOKE_CRITICAL_KEYS:
             if k not in CFG_SMOKE:
                 continue
@@ -1642,13 +1678,38 @@ def reconcile_cfg_inplace(cfg: Dict[str, Any], *, stage: str = "") -> None:
                     or os.environ.get("SCAR_EPOCHS") is not None
                     or os.environ.get("SCAR_N_EPOCHS") is not None
                 ):
+                    bypassed_keys.append(f"{k} (epoch env clamp)")
                     continue
             else:
                 bypass_env = SMOKE_ENV_BYPASS.get(k)
                 if bypass_env and os.environ.get(bypass_env) is not None:
+                    bypassed_keys.append(f"{k} ({bypass_env}={os.environ.get(bypass_env)})")
                     continue
 
-            cfg[k] = CFG_SMOKE[k]
+            old_val = cfg.get(k)
+            new_val = CFG_SMOKE[k]
+            if old_val != new_val:
+                applied_changes.append(f"{k}: {old_val}->{new_val}")
+            cfg[k] = new_val
+
+        # Log what was changed (main process only, also to sweep.log)
+        try:
+            if mp.current_process().name == "MainProcess":
+                if applied_changes:
+                    preview = applied_changes[:5]
+                    ellipsis = "..." if len(applied_changes) > 5 else ""
+                    msg = f"[smoke][reconcile:{stage}] Applied {len(applied_changes)} overrides: {preview}{ellipsis}"
+                    print(msg, flush=True)
+                    _append_sweep_log(msg)
+                if bypassed_keys:
+                    msg = (
+                        f"[smoke][reconcile:{stage}] Bypassed {len(bypassed_keys)} keys: "
+                        f"{bypassed_keys[:3]}{'...' if len(bypassed_keys) > 3 else ''}"
+                    )
+                    print(msg, flush=True)
+                    _append_sweep_log(msg)
+        except Exception:
+            pass
 
     # 3) Always-on invariants.
     try:
@@ -6668,48 +6729,201 @@ def main():
         except Exception as e:
             Path(OUTDIR / "pip_freeze.txt").write_text(f"<pip freeze failed: {repr(e)}>")
 
-    _loaded_precal_wd = False
-    # Try to load a previously calibrated WindowDecl (from a prior run) before sweeping
+    # ============================================================================
+    # --- Load calibration (file → env overrides) + provenance capsule ---
+    # ============================================================================
+    _cal_path: Optional[str] = None
+    _cal_sha16: Optional[str] = None
     try:
-        wd_path = OUTDIR / "window_decl_calibrated.json"
-        if wd_path.exists():
-            j = json.loads(wd_path.read_text())
-            window_decl = WindowDecl(
-                epsilon=float(j["epsilon"]),
-                metrics=list(j["metrics"]),
-                weights={str(k): float(v) for k, v in j["weights"].items()},
-                bins=int(j["bins"]),
-                interventions=(lambda x: x,),
-                cal_ranges={str(k): (float(v[0]), float(v[1])) for k, v in j["cal_ranges"].items()},
-            )
-            # Apply smoke-policy fixes to the loaded WindowDecl (e.g., bins)
-            reconcile_window_decl_inplace(window_decl, CFG)
-            install_window_decl(window_decl)
-            _wire_fr_from_decl(window_decl)
-            _loaded_precal_wd = True
-            try:
-                write_window_audit(OUTDIR, window_decl, note="Loaded calibrated WindowDecl (pre-sweep)")
-            except Exception:
-                pass
-    except Exception as e:
-        print(f"[WARN] failed to load calibrated WindowDecl pre-sweep: {e}")
-
-    if not _loaded_precal_wd:
-        # Cold start: avoid spurious early exits from fallback gate
+        _cal, _cal_sha16, _cal_path = load_calibration(os.environ.get("SCAR_CALIBRATION"))
+        CFG["gate_min_evidence"] = as_int(_cal.get("gate_min_evidence", 16), default=16)
+        CFG["gate_gain_thresh"] = as_float(_cal.get("gate_gain_thresh", 0.05), default=0.05)
+        CFG["gate_gain_units"] = str(_cal.get("gate_gain_units", "bits/sample"))
         try:
-            if as_int(CFG.get("gate_early_exit", 1), default=1) != 0:
-                CFG["gate_early_exit"] = 0
-                print("[preload] no calibrated WindowDecl found; disabling gate early-exit for this sweep")
+            write_calibration_capsule(OUTDIR, _cal, _cal_path, _cal_sha16)
+        except Exception:
+            pass
+        if mp.current_process().name == "MainProcess":
+            print(
+                f"[cal] min_evidence={CFG['gate_min_evidence']} gain_thresh={CFG['gate_gain_thresh']:.3f} ({CFG['gate_gain_units']})"
+            )
+
+        # Reapply environment overrides LAST so they win over any preloads
+        try:
+            v = os.environ.get("SCAR_GATE_MIN_EVIDENCE")
+            if v is not None:
+                try:
+                    CFG["gate_min_evidence"] = int(v)
+                    if mp.current_process().name == "MainProcess":
+                        print(f"[env] gate_min_evidence={CFG['gate_min_evidence']}")
+                except Exception as _e:
+                    if mp.current_process().name == "MainProcess":
+                        print(f"[WARN] bad SCAR_GATE_MIN_EVIDENCE={v!r}: {_e}")
+
+            v = os.environ.get("SCAR_GATE_GAIN_THRESH")
+            if v is not None:
+                try:
+                    CFG["gate_gain_thresh"] = float(v)
+                    if mp.current_process().name == "MainProcess":
+                        print(f"[env] gate_gain_thresh={CFG['gate_gain_thresh']:.4f}")
+                except Exception as _e:
+                    if mp.current_process().name == "MainProcess":
+                        print(f"[WARN] bad SCAR_GATE_GAIN_THRESH={v!r}: {_e}")
+
+            v = os.environ.get("SCAR_GATE_GAIN_UNITS")
+            if v is not None:
+                CFG["gate_gain_units"] = str(v)
+                if mp.current_process().name == "MainProcess":
+                    print(f"[env] gate_gain_units={CFG['gate_gain_units']!r}")
+
+            v = os.environ.get("SCAR_GATE_EPSILON")
+            if v is not None:
+                try:
+                    CFG["gate_epsilon"] = float(v)
+                    if mp.current_process().name == "MainProcess":
+                        print(f"[env] gate_epsilon={CFG['gate_epsilon']:.6f}")
+                except Exception as _e:
+                    if mp.current_process().name == "MainProcess":
+                        print(f"[WARN] bad SCAR_GATE_EPSILON={v!r}: {_e}")
+
+            v = os.environ.get("SCAR_GATE_HALT")
+            if v is not None:
+                try:
+                    CFG["gate_early_exit"] = 1 if env_truthy("SCAR_GATE_HALT") else 0
+                    if mp.current_process().name == "MainProcess":
+                        print(f"[env] gate_early_exit={int(bool(CFG['gate_early_exit']))} (from SCAR_GATE_HALT)")
+                except Exception as _e:
+                    if mp.current_process().name == "MainProcess":
+                        print(f"[WARN] bad SCAR_GATE_HALT={v!r}: {_e}")
         except Exception:
             pass
 
-    # Preload calibrated gate_gain_thresh from a prior run, if present
+        # Clamp epsilon if user/env supplied something unreasonable
+        try:
+            ge = float(CFG.get("gate_epsilon", 0.08))
+            if not (0.005 <= ge <= 0.5):
+                if mp.current_process().name == "MainProcess":
+                    print(f"[WARN] gate_epsilon out of range ({ge}); clamping to [0.005, 0.5]")
+                CFG["gate_epsilon"] = float(min(max(ge, 0.005), 0.5))
+        except Exception:
+            CFG["gate_epsilon"] = 0.08
+
+    except Exception as e:
+        try:
+            print(f"[WARN] calibration load failed: {e!r}; using defaults")
+        except Exception:
+            pass
+
+    # ============================================================================
+    # UNCONDITIONAL: Capture pre-reconcile snapshot, reconcile, then write audit
+    # ============================================================================
+
+    # Step 1: Capture pre-reconcile snapshot (BEFORE any smoke overrides)
+    _pre_reconcile_snapshot: Dict[str, Any] = {}
     try:
-        j = json.loads((OUTDIR / "gate_gain_thresh_calibration.json").read_text())
-        CFG["gate_gain_thresh"] = float(j.get("gate_gain_thresh", CFG.get("gate_gain_thresh", 0.05)))
-        print(f"[preload] gate_gain_thresh={CFG['gate_gain_thresh']:.4f}")
+        _pre_reconcile_snapshot = {
+            "gate_min_evidence": as_int(CFG.get("gate_min_evidence", 16), default=16),
+            "gate_gain_thresh": as_float(CFG.get("gate_gain_thresh", 0.05), default=0.05),
+            "gate_gain_units": str(CFG.get("gate_gain_units", "bits/sample")),
+            "gate_window": as_int(CFG.get("gate_window", 16), default=16),
+            "gate_bins": as_int(CFG.get("gate_bins", 16), default=16),
+            "gate_epsilon": as_float(CFG.get("gate_epsilon", 0.08), default=0.08),
+            "gate_epsilon_floor": as_float(CFG.get("gate_epsilon_floor", 0.02), default=0.02),
+            "gate_eps_stat_max_frac": as_float(CFG.get("gate_eps_stat_max_frac", 0.25), default=0.25),
+            "gate_epsilon_sens": as_float(CFG.get("gate_epsilon_sens", 0.04), default=0.04),
+            "gate_eps_stat_alpha": as_float(CFG.get("gate_eps_stat_alpha", 0.05), default=0.05),
+            "gate_early_exit": bool(CFG.get("gate_early_exit", True)),
+            "gate_min_evidence_full_eps": as_int(CFG.get("gate_min_evidence_full_eps", 16), default=16),
+            "gate_eps_inflation_max": as_float(CFG.get("gate_eps_inflation_max", 4.0), default=4.0),
+            "warmup": as_int(CFG.get("warmup", 0), default=0),
+            "ph_burn": as_int(CFG.get("ph_burn", 0), default=0),
+            "epochs": as_int(CFG.get("epochs", 72), default=72),
+            "warn_consec": as_int(CFG.get("warn_consec", 3), default=3),
+        }
     except Exception:
         pass
+
+    # Step 2: Reconcile CFG (applies smoke overrides, env clamps, invariants)
+    try:
+        reconcile_cfg_inplace(CFG, stage="post_calibration")
+        _log_smoke_final_cfg(CFG, stage="post_calibration")
+        runtime.install_runtime(cfg=CFG, outdir=OUTDIR, budget=BUDGET)
+    except Exception:
+        pass
+
+    # Step 3: Write precedence summary AFTER reconciliation (includes both snapshots)
+    try:
+        _prec = {
+            "calibration_loaded_from": _cal_path or "",
+            "calibration_sha16": _cal_sha16 or "",
+            "env": {
+                "SCAR_GATE_MIN_EVIDENCE": os.environ.get("SCAR_GATE_MIN_EVIDENCE", ""),
+                "SCAR_GATE_GAIN_THRESH": os.environ.get("SCAR_GATE_GAIN_THRESH", ""),
+                "SCAR_GATE_GAIN_UNITS": os.environ.get("SCAR_GATE_GAIN_UNITS", ""),
+                "SCAR_GATE_HALT": os.environ.get("SCAR_GATE_HALT", ""),
+                "SCAR_SMOKE": os.environ.get("SCAR_SMOKE", ""),
+                "SCAR_MAX_EPOCHS": os.environ.get("SCAR_MAX_EPOCHS", ""),
+                "SCAR_GATE_WINDOW": os.environ.get("SCAR_GATE_WINDOW", ""),
+                "SCAR_GATE_BINS": os.environ.get("SCAR_GATE_BINS", ""),
+                "SCAR_GATE_EPSILON": os.environ.get("SCAR_GATE_EPSILON", ""),
+                "SCAR_WARN_CONSEC": os.environ.get("SCAR_WARN_CONSEC", ""),
+                "SCAR_WARMUP": os.environ.get("SCAR_WARMUP", ""),
+                "SCAR_PH_BURN": os.environ.get("SCAR_PH_BURN", ""),
+            },
+            "pre_reconcile": _pre_reconcile_snapshot,
+            "final": {
+                "gate_min_evidence": as_int(CFG.get("gate_min_evidence", 16), default=16),
+                "gate_gain_thresh": as_float(CFG.get("gate_gain_thresh", 0.05), default=0.05),
+                "gate_gain_units": str(CFG.get("gate_gain_units", "bits/sample")),
+                "gate_window": as_int(CFG.get("gate_window", 16), default=16),
+                "gate_bins": as_int(CFG.get("gate_bins", 16), default=16),
+                "gate_epsilon": as_float(CFG.get("gate_epsilon", 0.08), default=0.08),
+                "gate_epsilon_floor": as_float(CFG.get("gate_epsilon_floor", 0.02), default=0.02),
+                "gate_eps_stat_max_frac": as_float(CFG.get("gate_eps_stat_max_frac", 0.25), default=0.25),
+                "gate_epsilon_sens": as_float(CFG.get("gate_epsilon_sens", 0.04), default=0.04),
+                "gate_eps_stat_alpha": as_float(CFG.get("gate_eps_stat_alpha", 0.05), default=0.05),
+                "gate_early_exit": bool(CFG.get("gate_early_exit", True)),
+                "gate_min_evidence_full_eps": as_int(CFG.get("gate_min_evidence_full_eps", 16), default=16),
+                "gate_eps_inflation_max": as_float(CFG.get("gate_eps_inflation_max", 4.0), default=4.0),
+                "warmup": as_int(CFG.get("warmup", 0), default=0),
+                "ph_burn": as_int(CFG.get("ph_burn", 0), default=0),
+                "warm_idx": warm_idx_from_cfg(CFG),
+                "epochs": as_int(CFG.get("epochs", 72), default=72),
+                "warn_consec": as_int(CFG.get("warn_consec", 3), default=3),
+                "run_tag": str(globals().get("RUN_TAG", "")),
+                "calibration_mode": bool(globals().get("CAL", False)),
+                "smoke_mode": bool(globals().get("SMOKE", env_truthy("SCAR_SMOKE"))),
+            },
+            "smoke_applied": bool(env_truthy("SCAR_SMOKE")),
+            "reconcile_stage": "post_calibration",
+        }
+        save_json(_prec, OUTDIR / "precedence_summary.json")
+        _append_sweep_log(
+            f"precedence_summary written: smoke={_prec['smoke_applied']} final_gate_window={_prec['final']['gate_window']}"
+        )
+    except Exception:
+        pass
+
+    # Step 4: Write dedicated smoke config file for unambiguous audit
+    if env_truthy("SCAR_SMOKE"):
+        try:
+            smoke_final = {
+                "description": "Final CFG values after smoke reconciliation (single source of truth)",
+                "smoke_critical_keys": {k: CFG.get(k) for k in SMOKE_CRITICAL_KEYS if k in CFG},
+                "derived": {
+                    "warm_idx": warm_idx_from_cfg(CFG),
+                    "gate_first_evaluable_epoch": gate_first_evaluable_epoch(CFG),
+                },
+                "env_bypasses_active": {
+                    k: os.environ.get(v) for k, v in SMOKE_ENV_BYPASS.items() if os.environ.get(v) is not None
+                },
+            }
+            save_json(smoke_final, OUTDIR / "smoke_final_cfg.json")
+            _append_sweep_log(
+                f"smoke_final_cfg written: gate_window={smoke_final['smoke_critical_keys'].get('gate_window')}"
+            )
+        except Exception:
+            pass
 
     # --- hand off to pipeline (import late to avoid cycles / stale runtime) ---
     try:
