@@ -1495,8 +1495,8 @@ except Exception:
 
 # Smoke-mode overrides (fast E2E)
 CFG_SMOKE = dict(
-    seeds_calib=[401, 402, 403, 511],  # include one SOFT collapse seed for calibration
-    seeds_eval=[512],
+    seeds_calib=[401, 402, 403, 512],  # include one SOFT collapse seed for calibration
+    seeds_eval=[511, 512],
     epochs=24,
     # run heavy metrics on a predictable cadence
     heavy_every=4,
@@ -4666,7 +4666,7 @@ def run_sweep(tag: str):
         pass
 
     # factor mapping across ALL seeds
-    all_seeds = sorted(list(CFG["seeds_calib"]) + list(CFG["seeds_eval"]))
+    all_seeds = sorted(set(list(CFG["seeds_calib"]) + list(CFG["seeds_eval"])))
     mapping_all = assign_factors_evenly(all_seeds)
     split_map = {as_int(s, default=0): ("calib" if s in CFG["seeds_calib"] else "eval") for s in all_seeds}
     save_json(
