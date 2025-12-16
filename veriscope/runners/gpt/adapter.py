@@ -534,6 +534,8 @@ def create_gpt_gate_engine(
         eps_stat_max_frac=float(cfg.get("gate_eps_stat_max_frac", 0.25)),
         eps_sens=float(cfg.get("gate_epsilon_sens", 0.04)),
         min_evidence=int(cfg.get("gate_min_evidence", 16)),
+        policy=str(cfg.get("gate_policy", "either")),
+        persistence_k=int(cfg.get("gate_persistence_k", 2)),
     )
 
     return fr_win, ge
