@@ -1397,6 +1397,108 @@ def gate_first_evaluable_epoch(cfg: Dict[str, Any]) -> int:
     return 2 * W
 
 
+def validate_gate_evaluability(cfg: Dict[str, Any], context: str = "") -> bool:
+    """
+    Validate that gate can actually evaluate given the epoch count.
+
+    Uses gate_first_evaluable_epoch() to determine the actual evaluability
+    threshold, ensuring this validator stays consistent with the gate logic.
+
+    Args:
+        cfg: Configuration dictionary
+        context: Optional context string for log messages
+
+    Returns:
+        True if at least one epoch will be evaluable, False otherwise
+    """
+    first_evaluable = gate_first_evaluable_epoch(cfg)
+    epochs = as_int(cfg.get("epochs", 72), default=72)
+    W = as_int(cfg.get("gate_window", 16), default=16)
+
+    # Gate can evaluate starting at epoch index `first_evaluable`
+    # (0-indexed: needs `first_evaluable` prior epochs of history)
+    # So we need epochs > first_evaluable for at least one evaluation
+    evaluable_count = max(0, epochs - first_evaluable)
+
+    ctx_str = f" ({context})" if context else ""
+
+    if evaluable_count == 0:
+        max_safe_W = max(1, (epochs - 1) // 2)
+        msg = (
+            f"[CRITICAL]{ctx_str} Gate will NEVER evaluate: "
+            f"epochs={epochs}, gate_window={W}, first_evaluable_epoch={first_evaluable}. "
+            f"Fix: set gate_window<={max_safe_W} OR epochs>={first_evaluable + 1}"
+        )
+
+        # MainProcess-only: print + sweep.log
+        try:
+            if mp.current_process().name == "MainProcess":
+                print(msg, flush=True)
+                _append_sweep_log(
+                    f"CRITICAL{ctx_str}: gate_window={W} incompatible with epochs={epochs}; "
+                    f"gate will never evaluate (first_evaluable={first_evaluable})"
+                )
+        except Exception:
+            pass
+
+        return False
+
+    # Warn if very few epochs will be evaluable (< 4)
+    if evaluable_count < 4:
+        try:
+            if mp.current_process().name == "MainProcess":
+                print(
+                    f"[WARN]{ctx_str} Only {evaluable_count} epochs will be evaluable "
+                    f"(epochs={epochs}, gate_window={W}, first_evaluable={first_evaluable})",
+                    flush=True,
+                )
+        except Exception:
+            pass
+
+    return True
+
+
+def require_gate_eval(cfg: Dict[str, Any]) -> bool:
+    """
+    When True, we fail fast if the gate will never evaluate.
+
+    Default policy:
+      - Require in smoke (SCAR_SMOKE=1)
+      - Require if explicitly requested (SCAR_REQUIRE_GATE_EVAL=1)
+      - Optional heuristic: require when SCAR_CANARY_SEEDS is set
+    """
+    if env_truthy("SCAR_REQUIRE_GATE_EVAL"):
+        return True
+    if env_truthy("SCAR_SMOKE"):
+        return True
+    # Optional heuristic (keep only if you want it):
+    if os.environ.get("SCAR_CANARY_SEEDS") is not None:
+        return True
+    return False
+
+
+def require_gate_eval_or_die(cfg: Dict[str, Any], *, context: str = "") -> None:
+    """
+    Fail fast if gate evaluation is required but impossible.
+    NOTE: No printing here. Logging is done in validate_gate_evaluability (MainProcess-only).
+    """
+    if not require_gate_eval(cfg):
+        return
+
+    ok = validate_gate_evaluability(cfg, context=context)
+    if ok:
+        return
+
+    epochs = as_int(cfg.get("epochs", 72), default=72)
+    W = as_int(cfg.get("gate_window", 16), default=16)
+    first_eval = gate_first_evaluable_epoch(cfg)
+
+    raise RuntimeError(
+        f"Gate will never evaluate ({context}): epochs={epochs}, gate_window={W}, "
+        f"first_evaluable_epoch={first_eval} (needs epochs >= {first_eval + 1})."
+    )
+
+
 def _warn_precedes_collapse(t_warn: Optional[int], t_c: Optional[int]) -> bool:
     """Causal validity check.
     - If no warning -> invalid (False).
@@ -3887,12 +3989,38 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
     # Per-run gate summary: always persist to OUTDIR/sweep.log (auditability) but only print to stdout in smoke/debug.
     if mp.current_process().name == "MainProcess":
         try:
-            gate_evals = sum(1 for r in logs if str(r.get("gate_reason", "")).startswith("evaluated"))
-            gate_warns = sum(1 for r in logs if int(r.get("gate_warn", 0) or 0) == 1)
-            gate_insuff = sum(1 for r in logs if str(r.get("gate_reason", "")) == "insufficient_evidence")
+
+            def _is_eval(r: Dict[str, Any]) -> bool:
+                return str(r.get("gate_reason", "")).startswith("evaluated")
+
+            eval_ct = 0
+            eval_warn_ok = 0
+            not_eval_ct = 0
+            insuff_ct = 0
+            reason_counts: Dict[str, int] = {}
+
+            for r in logs:
+                reason = str(r.get("gate_reason", "unknown"))
+                reason_counts[reason] = reason_counts.get(reason, 0) + 1
+                if _is_eval(r):
+                    eval_ct += 1
+                    # gate_warn==1 means PASS among evaluated epochs
+                    if int(r.get("gate_warn", 0) or 0) == 1:
+                        eval_warn_ok += 1
+                else:
+                    not_eval_ct += 1
+                    if "insufficient" in reason.lower():
+                        insuff_ct += 1
+
+            # Top 3 reasons for immediate diagnosis
+            top_reasons = sorted(reason_counts.items(), key=lambda x: -x[1])[:3]
+            reason_summary = " ".join(f"{k}:{v}" for k, v in top_reasons)
+
             line = (
                 f"[run] seed={seed} factor={str(factor.get('name', ''))} epochs={len(logs)} "
-                f"gate_evaluated={gate_evals} gate_warns={gate_warns} gate_insufficient={gate_insuff}"
+                f"gate_evaluated={eval_ct} gate_eval_ok={eval_warn_ok} "
+                f"gate_not_eval={not_eval_ct} gate_insufficient={insuff_ct} "
+                f"reasons=[{reason_summary}]"
             )
 
             # Always-on: append a single line/run to sweep.log to survive stdout truncation.
@@ -4720,11 +4848,22 @@ def run_sweep(tag: str):
             CFG["monitor_source"] = "clean_val"
 
     # Reconcile CFG with env/smoke before the sweep starts
-    try:
+    if require_gate_eval(CFG):
+        # In require/fail-fast mode, do not validate against a stale CFG.
         reconcile_cfg_inplace(CFG, stage="run_sweep")
         runtime.install_runtime(cfg=CFG, outdir=OUTDIR, budget=BUDGET)
-    except Exception:
-        pass
+    else:
+        try:
+            reconcile_cfg_inplace(CFG, stage="run_sweep")
+            runtime.install_runtime(cfg=CFG, outdir=OUTDIR, budget=BUDGET)
+        except Exception:
+            pass
+
+    # Gate evaluability check (warn always; fail-fast when policy requires)
+    if require_gate_eval(CFG):
+        require_gate_eval_or_die(CFG, context="run_sweep:post_reconcile")
+    else:
+        validate_gate_evaluability(CFG, context="run_sweep:post_reconcile")
 
     # factor mapping across ALL seeds
     all_seeds = sorted(set(list(CFG["seeds_calib"]) + list(CFG["seeds_eval"])))
@@ -6844,12 +6983,24 @@ def main():
         pass
 
     # Step 2: Reconcile CFG (applies smoke overrides, env clamps, invariants)
-    try:
+    if require_gate_eval(CFG):
+        # In require/fail-fast mode, do not continue with a stale CFG snapshot.
         reconcile_cfg_inplace(CFG, stage="post_calibration")
         _log_smoke_final_cfg(CFG, stage="post_calibration")
         runtime.install_runtime(cfg=CFG, outdir=OUTDIR, budget=BUDGET)
-    except Exception:
-        pass
+    else:
+        try:
+            reconcile_cfg_inplace(CFG, stage="post_calibration")
+            _log_smoke_final_cfg(CFG, stage="post_calibration")
+            runtime.install_runtime(cfg=CFG, outdir=OUTDIR, budget=BUDGET)
+        except Exception:
+            pass
+
+    # Step 2b: Gate evaluability check (warn always; fail-fast when policy requires)
+    if require_gate_eval(CFG):
+        require_gate_eval_or_die(CFG, context="main:post_calibration")
+    else:
+        validate_gate_evaluability(CFG, context="main:post_calibration")
 
     # Step 3: Write precedence summary AFTER reconciliation (includes both snapshots)
     try:
