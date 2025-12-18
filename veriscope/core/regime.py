@@ -241,6 +241,20 @@ class RegimeConfig:
     # Enable/disable regime detection entirely (for A/B testing)
     enabled: bool = True
 
+    # Regime decision policy. "inherit" = use base GateEngine policy/persistence_k.
+    policy: str = "inherit"
+    persistence_k: int = 2
+
+
+def _policy_to_str(x: Any) -> str:
+    """Best-effort conversion of a GateEngine policy to a lowercase string."""
+    if x is None:
+        return ""
+    if isinstance(x, str):
+        return x
+    v = getattr(x, "value", None)
+    return str(v) if v is not None else str(x)
+
 
 def compute_build_window(
     config: RegimeConfig,
@@ -430,6 +444,17 @@ class RegimeAnchoredGateEngine:
                 RuntimeWarning,
             )
 
+        base_policy = _policy_to_str(getattr(base_engine, "policy", None)).strip().lower()
+        base_pk = int(getattr(base_engine, "persistence_k", 2))
+
+        cfg_policy = str(getattr(self.config, "policy", "inherit")).strip().lower()
+        if cfg_policy == "inherit":
+            regime_policy = base_policy or "either"
+            regime_pk = base_pk
+        else:
+            regime_policy = cfg_policy
+            regime_pk = int(getattr(self.config, "persistence_k", 2))
+
         self.regime_engine = GateEngine(
             frwin=self._regime_fr_win,
             gain_thresh=-1e9,  # Disable gain check - regime is drift-only
@@ -437,7 +462,11 @@ class RegimeAnchoredGateEngine:
             eps_stat_max_frac=float(self.config.eps_stat_max_frac),
             eps_sens=self._eps_sens_used,
             min_evidence=int(base_min_evidence),
+            policy=str(regime_policy),
+            persistence_k=int(regime_pk),
         )
+        self._regime_policy = str(regime_policy)
+        self._regime_persistence_k = int(regime_pk)
 
         # Reference state
         self._ref: Optional[RegimeReference] = None
@@ -1056,6 +1085,8 @@ class RegimeAnchoredGateEngine:
             "regime_enabled": self._enabled_effective,
             "regime_active": self._ref is not None,
             "regime_epsilon": self._regime_epsilon,
+            "regime_policy": getattr(self, "_regime_policy", ""),
+            "regime_persistence_k": int(getattr(self, "_regime_persistence_k", 2)),
             "regime_eps_sens_used": self._eps_sens_used,
             "regime_eps_sens_from_base": self._eps_sens_from_base,
         }

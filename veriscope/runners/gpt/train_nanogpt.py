@@ -197,6 +197,10 @@ class TrainConfig:
     regime_min_evidence: int = 50
     regime_build_gap_iters: int = -1  # explicit gap override (-1 = auto)
 
+    # Optional: freeze GPT feature normalization once regime reference is established.
+    # This makes anchored regime comparisons use a fixed metric gauge.
+    freeze_metric_gauge_on_ref: bool = False
+
     # WindowDecl tuning
     cos_disp_max: float = 1.0
 
@@ -290,60 +294,35 @@ class VeriscopeGatedTrainer:
                 f"Consider increasing gate_window or decreasing metric_interval."
             )
 
-        # Gap ensures neither "past" nor "recent" half-windows overlap pathology
-        if config.regime_build_gap_iters >= 0:
-            gap_iters = int(config.regime_build_gap_iters)
-        else:
-            gap_iters = 2 * window_span_iters
-
-        # --- Compute build window with correct semantics ---
-        if pathology_start is not None and pathology_start > 0:
-            # CORRUPTION/SPIKE RUN: anchor reference to pre-corruption window
-            build_max = max(0, int(pathology_start) - gap_iters)
-            min_start = int(config.gate_warmup) + gap_iters
-            build_min = max(min_start, build_max - int(config.regime_build_span))
-
-            if build_max <= build_min:
-                print(
-                    f"[REGIME WARN] Build window empty: [{build_min}, {build_max}). "
-                    f"pathology_start={pathology_start}, warmup={config.gate_warmup}, "
-                    f"gap={gap_iters}. Disabling regime for this run."
-                )
-                regime_enabled = False
-                build_min = -1
-                build_max = -1
-            else:
-                regime_enabled = bool(config.regime_enabled)
-                print(
-                    f"[REGIME] Anchored build window to pre-corruption: "
-                    f"[{build_min}, {build_max}) (gap={gap_iters} iters, Wm={Wm})"
-                )
-        else:
-            # CONTROL RUN: anchor reference to stable post-warmup window
-            build_min = int(config.gate_warmup) + gap_iters
-            build_max = build_min + int(config.regime_build_span)
-            max_possible = int(config.max_iters) - gap_iters
-            build_max = min(build_max, max_possible)
-
-            if build_max <= build_min:
-                print(
-                    f"[REGIME WARN] Build window empty for control: [{build_min}, {build_max}). "
-                    f"Disabling regime for this run."
-                )
-                regime_enabled = False
-                build_min = -1
-                build_max = -1
-            else:
-                regime_enabled = bool(config.regime_enabled)
-                print(f"[REGIME] Control run: build window [{build_min}, {build_max})")
-
+        # ---------------------------------------------------------------------
         # Configure regime detection
-        regime_config = RegimeConfig(
+        # IMPORTANT: Do not recompute build windows here.
+        # Let veriscope/core/regime.py::compute_build_window() be the canonical source.
+        # We only validate/clamp explicit user inputs.
+        # ---------------------------------------------------------------------
+        regime_enabled = bool(config.regime_enabled)
+
+        rb_min = int(config.regime_build_min_iter)
+        rb_max = int(config.regime_build_max_iter)
+
+        # Clamp explicit values to feasible iteration range (non-fatal).
+        if rb_min >= 0:
+            rb_min = max(0, min(int(config.max_iters), rb_min))
+        if rb_max >= 0:
+            rb_max = max(0, min(int(config.max_iters), rb_max))
+
+        # If user explicitly provided both, ensure it's valid; fail closed.
+        if rb_min >= 0 and rb_max >= 0 and rb_max <= rb_min:
+            print(f"[REGIME WARN] Explicit build window invalid: [{rb_min}, {rb_max}). Disabling regime for this run.")
+            regime_enabled = False
+
+        # Configure regime detection. Build-window semantics are resolved inside RegimeAnchoredGateEngine.
+        regime_kwargs: Dict[str, Any] = dict(
             enabled=regime_enabled,
             epsilon=None,  # Derive as epsilon_mult * base epsilon
             epsilon_mult=float(config.regime_epsilon_mult),
-            reference_build_min_iter=int(build_min),
-            reference_build_max_iter=int(build_max),
+            reference_build_min_iter=int(rb_min),
+            reference_build_max_iter=int(rb_max),
             reference_build_span=int(config.regime_build_span),
             reference_build_max_dw=float(config.regime_build_max_dw),
             reference_build_min_gain=float(config.regime_build_min_gain),
@@ -353,6 +332,18 @@ class VeriscopeGatedTrainer:
             max_reference_samples=10000,
             max_accumulator_windows=20,
         )
+
+        # Preserve gap override if RegimeConfig supports it (field name may vary across versions).
+        try:
+            fields = getattr(RegimeConfig, "__dataclass_fields__", {}) or {}
+            for gap_name in ("reference_build_gap_iters", "build_gap_iters", "reference_gap_iters"):
+                if gap_name in fields:
+                    regime_kwargs[gap_name] = int(config.regime_build_gap_iters)
+                    break
+        except Exception:
+            pass
+
+        regime_config = RegimeConfig(**regime_kwargs)
 
         # Wrap with regime-anchored detection
         self.gate_engine = RegimeAnchoredGateEngine(
@@ -371,6 +362,23 @@ class VeriscopeGatedTrainer:
             f"build_window=[{build_min}, {build_max}), "
             f"epsilon={self.gate_engine.regime_epsilon:.4f}"
         )
+
+        # If explicit override was requested, warn about tightness (few gate checks / insufficient evidence).
+        explicit_override = (int(config.regime_build_min_iter) >= 0) or (int(config.regime_build_max_iter) >= 0)
+        if explicit_override and self.gate_engine.enabled:
+            gw = max(1, int(config.gate_window))
+            first_check = ((build_min + gw - 1) // gw) * gw
+            last_check = ((build_max - 1) // gw) * gw
+            n_checks = 0 if first_check >= build_max else (1 + (last_check - first_check) // gw)
+
+            # Each check contributes ~Wm samples per metric; estimate checks needed to reach min_evidence_per_metric.
+            need_checks = int((int(config.regime_min_evidence) + int(Wm) - 1) // int(Wm)) if int(Wm) > 0 else 2
+            if n_checks < need_checks:
+                print(
+                    f"[REGIME WARN] Explicit build window contains only {n_checks} gate check(s); "
+                    f"need ~{need_checks} to satisfy min_evidence_per_metric={config.regime_min_evidence} with Wm={Wm}. "
+                    f"Reference establishment may never trigger."
+                )
 
         # Hardening: independently compute build window and warn on mismatch
         try:
@@ -857,6 +865,13 @@ class VeriscopeGatedTrainer:
                 # Format regime status
                 if gate_result.get("ref_just_established"):
                     regime_status = " [REF ESTABLISHED]"
+                    if bool(cfg.freeze_metric_gauge_on_ref):
+                        try:
+                            if hasattr(self.extractor, "freeze_reference_frame"):
+                                self.extractor.freeze_reference_frame()
+                                print("[REGIME] Froze GPT metric gauge on reference establishment.")
+                        except Exception as e:
+                            print(f"[REGIME WARN] Failed to freeze metric gauge: {e}")
                 elif gate_result.get("regime_active"):
                     regime_dw = audit.get("regime_worst_DW")
                     regime_status = f", regime_D_W={regime_dw:.4f}" if regime_dw is not None else ""
@@ -1213,6 +1228,12 @@ if __name__ == "__main__":
         help=("Upper bound for cos_disp cal_range. Default 1.0 (full range). Use 0.5 to test saturation diagnostic."),
     )
 
+    parser.add_argument(
+        "--freeze_metric_gauge_on_ref",
+        action="store_true",
+        help="Freeze GPT feature normalization when regime reference is established.",
+    )
+
     args = parser.parse_args()
 
     def _flag_present(name: str) -> bool:
@@ -1301,6 +1322,7 @@ if __name__ == "__main__":
         regime_min_evidence=args.regime_min_evidence,
         regime_build_gap_iters=args.regime_build_gap_iters,
         cos_disp_max=args.cos_disp_max,
+        freeze_metric_gauge_on_ref=bool(args.freeze_metric_gauge_on_ref),
         # Safer default for initial hook validation
         compile=False,
     )
@@ -1326,11 +1348,82 @@ if __name__ == "__main__":
 
     metrics_out = metrics if bool(args.save_all_metrics) else metrics[-100:]
 
+    # Persist reference + config metadata for analysis tooling.
+    reference_info: Dict[str, Any] = {}
+    try:
+        if hasattr(trainer.gate_engine, "get_reference_stats"):
+            ref_stats = trainer.gate_engine.get_reference_stats() or {}
+            reference_info = {
+                "established_at": ref_stats.get("established_at"),
+                "n_samples_per_metric": ref_stats.get("n_samples_per_metric"),
+                "metrics_tracked": ref_stats.get("metrics_tracked"),
+                "regime_epsilon": ref_stats.get("regime_epsilon"),
+            }
+    except Exception:
+        reference_info = {}
+
+    # Fallback: derive established_at from gate audit stream if not provided.
+    try:
+        if reference_info.get("established_at") is None:
+            for g in gates or []:
+                a = (g or {}).get("audit", {}) or {}
+                ra = a.get("ref_established_at", None)
+                if ra is not None:
+                    reference_info["established_at"] = ra
+                    break
+    except Exception:
+        pass
+
+    # Always persist the effective build window / epsilon from the constructed engine.
+    try:
+        reference_info["build_window"] = list(getattr(trainer.gate_engine, "build_window", (None, None)))
+        reference_info["regime_epsilon"] = float(getattr(trainer.gate_engine, "regime_epsilon", float("nan")))
+    except Exception:
+        pass
+
+    config_snapshot = {
+        "gate": {
+            "metric_interval": config.metric_interval,
+            "gate_window": config.gate_window,
+            "gate_warmup": config.gate_warmup,
+            "gate_epsilon": config.gate_epsilon,
+            "gate_policy": config.gate_policy,
+            "gate_persistence_k": config.gate_persistence_k,
+            "gate_min_evidence": config.gate_min_evidence,
+            "gate_eps_stat_max_frac": config.gate_eps_stat_max_frac,
+            "gate_gain_thresh": config.gate_gain_thresh,
+        },
+        "regime": {
+            "regime_enabled": config.regime_enabled,
+            "regime_build_min_iter_requested": config.regime_build_min_iter,
+            "regime_build_max_iter_requested": config.regime_build_max_iter,
+            "regime_build_span": config.regime_build_span,
+            "regime_build_gap_iters": config.regime_build_gap_iters,
+            "regime_epsilon_mult": config.regime_epsilon_mult,
+            "regime_build_max_dw": config.regime_build_max_dw,
+            "regime_build_min_gain": config.regime_build_min_gain,
+            "regime_min_evidence": config.regime_min_evidence,
+            "freeze_metric_gauge_on_ref": config.freeze_metric_gauge_on_ref,
+        },
+        "pathology": {
+            "data_corrupt_at": config.data_corrupt_at,
+            "data_corrupt_len": config.data_corrupt_len,
+            "data_corrupt_frac": config.data_corrupt_frac,
+            "data_corrupt_mode": config.data_corrupt_mode,
+            "lr_spike_at": config.lr_spike_at,
+            "lr_spike_len": config.lr_spike_len,
+            "lr_spike_mult": config.lr_spike_mult,
+        },
+        "argv": list(sys.argv),
+    }
+
     with out_path.open("w") as f:
         json.dump(
             {
                 "metrics": metrics_out,
                 "gates": gates,
+                "reference": reference_info,
+                "config": config_snapshot,
             },
             f,
             indent=2,

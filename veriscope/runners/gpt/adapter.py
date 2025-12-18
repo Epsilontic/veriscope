@@ -167,6 +167,7 @@ class GPTFeatureExtractor:
         self._ref_mu: Optional[torch.Tensor] = None
         self._ref_sig: Optional[torch.Tensor] = None
         self._ref_count: int = 0
+        self._ref_frozen: bool = False
 
         self._setup_hooks()
 
@@ -264,6 +265,8 @@ class GPTFeatureExtractor:
 
     def update_reference_frame(self, H: torch.Tensor, ema_alpha: float = 0.1):
         """Update running reference (μ, σ) for normalization."""
+        if self._ref_frozen:
+            return
         mu = H.mean(dim=0, keepdim=True)
         sig = _std0(H, keepdim=True) + 1e-8
 
@@ -275,6 +278,10 @@ class GPTFeatureExtractor:
             self._ref_sig = ema_alpha * sig + (1 - ema_alpha) * self._ref_sig
 
         self._ref_count += 1
+
+    def freeze_reference_frame(self) -> None:
+        """Freeze normalization statistics (anchored regime semantics)."""
+        self._ref_frozen = True
 
     def normalize(self, H: torch.Tensor) -> torch.Tensor:
         """Normalize features using reference frame."""
@@ -339,9 +346,9 @@ class GPTMetricComputer:
         # Extract hidden states
         H_raw = self.extractor.extract_features(input_ids)
 
-        # Update and apply normalization
-        self.extractor.update_reference_frame(H_raw)
+        # Normalize using the previous reference frame, then update it.
         H_norm = self.extractor.normalize(H_raw)
+        self.extractor.update_reference_frame(H_raw)
 
         # JL projection for geometry metrics
         d_in = H_norm.shape[1]
