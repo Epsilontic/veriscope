@@ -26,10 +26,11 @@ try:
 except Exception:
     CFG = {}
 
-# TTL for scheduled metrics propagation to avoid stale ffill artifacts
-# Use typed accessors so non-numeric CFG values don't blow up at import time.
-_heavy_every_i = as_int(CFG.get("heavy_every"), default=6)
-CFG.setdefault("scheduled_ttl", 2 * _heavy_every_i)
+
+def _scheduled_ttl_default() -> float:
+    heavy_every_i = as_int(CFG.get("heavy_every"), default=6)
+    return float(2 * heavy_every_i)
+
 
 # Scheduled metrics (cadenced/missing by design) — never fed to the learner.
 # Moved from legacy_cli_refactor.py
@@ -49,18 +50,18 @@ def _prep_series_for_ph(g: pd.DataFrame, metric: str) -> List[float]:
 
     s = g[metric].copy()
     if metric in SCHEDULED_METRICS:
+        raw_arr = s.to_numpy(dtype=float)
         s = s.ffill()
         # apply TTL to scheduled metrics to avoid stale carry-over
         arr = s.to_numpy(dtype=float)
         age = np.full_like(arr, np.inf, dtype=float)
         last = -1
-        for i, v in enumerate(arr):
+        for i, v in enumerate(raw_arr):
             if np.isfinite(v):
                 last = i
             age[i] = (i - last) if last >= 0 else np.inf
-        heavy_every_i = as_int(CFG.get("heavy_every"), default=6)
         # scheduled_ttl may be missing or non-numeric; fall back safely.
-        ttl = as_float(CFG.get("scheduled_ttl"), default=float(2 * heavy_every_i))
+        ttl = as_float(CFG.get("scheduled_ttl"), default=_scheduled_ttl_default())
         arr = np.where(age <= ttl, arr, np.nan)
     else:
         arr = s.to_numpy(dtype=float)
