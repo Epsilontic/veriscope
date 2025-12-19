@@ -6543,17 +6543,34 @@ def evaluate(df_all: pd.DataFrame, tag: str):
 
     # ---- Gate-only baseline (AUDIT lane): primary uses ONLINE gate_warn ----
     gate_rows = []
-    gate_calib_rows = []  # counterfactual series (calibrated recompute)
-
-    from typing import cast
+    gate_calib_rows = []  # optional analysis lane (forced calibrated stream)
 
     for key, g in df_eval_raw.groupby(["seed", "factor"]):
         seed, factor = cast(tuple[Any, Any], key)
         gg = g.sort_values("epoch").reset_index(drop=True)
         warm_idx_local = warm_idx_from_cfg(CFG)
 
-        # Primary baseline: always the online series
-        t_warn_online = _compute_gate_warn_time(gg, "gate_warn", warm_idx_local)
+        # Prefer calibrated gate stream when present AND not marked counterfactual; else fall back to online.
+        use_calib = False
+        if "gate_warn_calib" in gg.columns:
+            if "gate_calib_counterfactual" in gg.columns:
+                cc = pd.to_numeric(gg["gate_calib_counterfactual"], errors="coerce").fillna(0).to_numpy()
+                use_calib = bool(np.nanmax(cc) <= 0)
+            else:
+                use_calib = True
+
+        warn_col = "gate_warn_calib" if use_calib else "gate_warn"
+        reason_col = None
+        if use_calib and "gate_reason_calib" in gg.columns:
+            reason_col = "gate_reason_calib"
+        elif (not use_calib) and "gate_reason" in gg.columns:
+            reason_col = "gate_reason"
+
+        # Compute t_warn from the chosen stream (reason-aware when supported).
+        try:
+            t_warn = _compute_gate_warn_time(gg, warn_col, warm_idx_local, reason_col=reason_col)
+        except TypeError:
+            t_warn = _compute_gate_warn_time(gg, warn_col, warm_idx_local)
 
         # Collapse time/tag from unified GT
         t_c_raw = gg["t_collapse_gt"].iloc[0] if ("t_collapse_gt" in gg.columns and len(gg) > 0) else np.nan
@@ -6561,23 +6578,29 @@ def evaluate(df_all: pd.DataFrame, tag: str):
         t_c = tc_i if tc_i >= 0 else None
         ctag = _runlevel_collapse_tag(gg, warm_idx_local)
 
-        # Only enforce precedence if a collapse exists; for non-collapse runs keep t_warn to measure FP.
-        if (t_c is not None) and (not _warn_precedes_collapse(t_warn_online, t_c)):
-            t_warn_online = None
+        # Enforce precedence only if a collapse exists; otherwise keep warning for FP accounting.
+        if (t_c is not None) and (not _warn_precedes_collapse(t_warn, t_c)):
+            t_warn = None
+
+        # FIX A: if there is a collapse and no warning was found, DO NOT set warn-at-collapse.
+        # Write NaN so summaries correctly count it as a miss.
+        t_warn_out = np.nan if t_warn is None else float(t_warn)
+        t_c_out = np.nan if t_c is None else float(t_c)
 
         lead = (
-            float(t_c - t_warn_online)
-            if (ctag in ["soft", "hard"] and t_warn_online is not None and t_c is not None)
+            float(t_c - t_warn)  # type: ignore[operator]
+            if (ctag in ("soft", "hard") and (t_warn is not None) and (t_c is not None))
             else float("nan")
         )
+        detected = int(ctag in ("soft", "hard") and (t_warn is not None) and (t_c is not None))
 
         gate_rows.append(
             dict(
                 run_id=f"s{as_int(seed, default=0)}-{str(factor)}",
                 seed=as_int(seed, default=0),
                 factor=str(factor),
-                t_warn=t_warn_online,
-                t_collapse=t_c,
+                t_warn=t_warn_out,
+                t_collapse=t_c_out,
                 collapse_tag=ctag,
                 ph_win=as_int(CFG.get("ph_win", 8), default=8),
                 ph_lambda=as_float(CFG.get("ph_lambda", 0.0), default=0.0),
@@ -6588,19 +6611,30 @@ def evaluate(df_all: pd.DataFrame, tag: str):
                 var_k_energy=CFG.get("var_k_energy", 0.95),
                 var_k_max=CFG.get("var_k_max", 32),
                 lead_time=lead,
-                gate_source="online",
+                detected=detected,
+                gate_source=("calibrated" if use_calib else "online"),
+                gate_warn_col=warn_col,
             )
         )
 
-        # Counterfactual lane: calibrated series if present
+        # Optional counterfactual lane: force calibrated stream even if marked counterfactual; keep separate file.
         if "gate_warn_calib" in gg.columns:
-            t_warn_calib = _compute_gate_warn_time(gg, "gate_warn_calib", warm_idx_local)
+            try:
+                t_warn_calib = _compute_gate_warn_time(
+                    gg,
+                    "gate_warn_calib",
+                    warm_idx_local,
+                    reason_col=("gate_reason_calib" if "gate_reason_calib" in gg.columns else None),
+                )
+            except TypeError:
+                t_warn_calib = _compute_gate_warn_time(gg, "gate_warn_calib", warm_idx_local)
+
             if (t_c is not None) and (not _warn_precedes_collapse(t_warn_calib, t_c)):
                 t_warn_calib = None
 
             lead2 = (
                 float(t_c - t_warn_calib)
-                if (ctag in ["soft", "hard"] and t_warn_calib is not None and t_c is not None)
+                if (ctag in ("soft", "hard") and t_warn_calib is not None and t_c is not None)
                 else float("nan")
             )
 
@@ -6609,8 +6643,8 @@ def evaluate(df_all: pd.DataFrame, tag: str):
                     run_id=f"s{as_int(seed, default=0)}-{str(factor)}",
                     seed=as_int(seed, default=0),
                     factor=str(factor),
-                    t_warn=t_warn_calib,
-                    t_collapse=t_c,
+                    t_warn=(np.nan if t_warn_calib is None else float(t_warn_calib)),
+                    t_collapse=(np.nan if t_c is None else float(t_c)),
                     collapse_tag=ctag,
                     ph_win=as_int(CFG.get("ph_win", 8), default=8),
                     ph_lambda=as_float(CFG.get("ph_lambda", 0.0), default=0.0),
@@ -6624,7 +6658,6 @@ def evaluate(df_all: pd.DataFrame, tag: str):
                     gate_source="calibrated_counterfactual",
                 )
             )
-
     base_gate = pd.DataFrame(gate_rows)
     base_gate.to_csv(OUTDIR / f"baseline_events_gate_{tag}.csv", index=False)
 
