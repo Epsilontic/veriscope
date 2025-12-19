@@ -48,7 +48,7 @@ def _env_truthy(name: str, default: str = "0") -> bool:
 def load_cfg(path: str | Path | None = None) -> Dict[str, Any]:
     cfg = dict(DEFAULTS)
     p = Path(path) if path else Path(os.getenv("SCAR_CFG", ""))
-    if p and p.exists():
+    if p and p.is_file():
         try:
             cfg.update(json.loads(p.read_text()))
         except Exception:

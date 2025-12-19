@@ -1505,16 +1505,15 @@ def _warn_precedes_collapse(t_warn: Optional[int], t_c: Optional[int]) -> bool:
     - If no collapse -> keep warning (True) so FP is measurable.
     - If collapse exists -> require precedence (<= in smoke, < otherwise).
     """
-    # Smoke-only debug: trace precedence filtering inputs (main process only)
-    try:
-        if env_truthy("SCAR_SMOKE") and mp.current_process().name == "MainProcess":
-            print(f"[dbg:warn_precedes] t_warn={t_warn} t_c={t_c}")
-    except Exception:
-        pass
+
     if t_warn is None:
         return False
     if t_c is None:
         return True
+
+    # Debug / correctness mode: force strict precedence even in smoke.
+    if env_truthy("SCAR_STRICT_PRECEDENCE"):
+        return int(t_warn) < int(t_c)
     if env_truthy("SCAR_SMOKE"):
         return int(t_warn) <= int(t_c)
     return int(t_warn) < int(t_c)
@@ -5185,6 +5184,27 @@ def evaluate(df_all: pd.DataFrame, tag: str):
     df_eval_raw = df_all[ev_mask].copy()
     no_eval = (df_eval_raw is None) or getattr(df_eval_raw, "empty", True)
 
+    # --- Helper: enforce GT collapse time is within observed epoch range ---
+    def _sanitize_t_collapse_in_window(g: pd.DataFrame, t_c: Optional[int], ctag: str) -> tuple[Optional[int], str]:
+        """If GT proposes a collapse time after the last recorded epoch, treat as no-collapse."""
+        try:
+            ep = pd.to_numeric(g["epoch"], errors="coerce").to_numpy(dtype=float)
+            ep = ep[np.isfinite(ep)]
+            epoch_max = int(ep.max()) if ep.size else -1
+        except Exception:
+            epoch_max = -1
+
+        if t_c is None:
+            return None, "none"
+        try:
+            tci = int(t_c)
+        except Exception:
+            return None, "none"
+
+        if epoch_max >= 0 and tci > epoch_max:
+            return None, "none"
+        return tci, str(ctag)
+
     def _verify_decl_consistency(df: pd.DataFrame, wd_offline: Any) -> bool:
         if df is None or getattr(df, "empty", True):
             return True
@@ -5226,6 +5246,7 @@ def evaluate(df_all: pd.DataFrame, tag: str):
 
                 # Initial GT: infinite cutoff is enough to flag obvious collapse in "controls".
                 t_c0, ctag0 = gt_collapse_time(g, grad_cutoff=np.inf)
+                t_c0, ctag0 = _sanitize_t_collapse_in_window(g, t_c0, ctag0)
 
                 # Epochwise tag with pre-warm forced to 'none'
                 g["t_collapse_gt"] = np.nan if t_c0 is None else int(t_c0)
@@ -5497,6 +5518,7 @@ def evaluate(df_all: pd.DataFrame, tag: str):
             seed, factor = cast(tuple[Any, Any], key)
             g = g.sort_values("epoch").copy()
             t_c0, ctag0 = gt_collapse_time(g, grad_cutoff=np.inf)
+            t_c0, ctag0 = _sanitize_t_collapse_in_window(g, t_c0, ctag0)
 
             # Keep t_collapse_gt numeric; NaN denotes “no collapse”
             g["t_collapse_gt"] = np.nan if t_c0 is None else int(t_c0)
@@ -5543,6 +5565,7 @@ def evaluate(df_all: pd.DataFrame, tag: str):
             g = g.sort_values("epoch").copy()
             cutoff = grad_cut_by_factor.get(str(factor), np.inf)
             t_c, ctag = gt_collapse_time(g, grad_cutoff=cutoff)
+            t_c, ctag = _sanitize_t_collapse_in_window(g, t_c, ctag)
 
             # Keep t_collapse_gt numeric; NaN denotes “no collapse”
             g["t_collapse_gt"] = np.nan if t_c is None else int(t_c)
@@ -6038,6 +6061,65 @@ def evaluate(df_all: pd.DataFrame, tag: str):
             pass
         return
 
+    # --- Invariant (smoke/debug): emitted event times must be in the run's observed epoch set ---
+    def _assert_events_in_epoch_set(df_events: pd.DataFrame, df_source: pd.DataFrame, label: str) -> None:
+        # Cheap, high-value regression guard: only run in smoke or debug.
+        if not (env_truthy("SCAR_SMOKE") or env_truthy("SCAR_DEBUG") or env_truthy("SCAR_DEBUG_GATE")):
+            return
+        if df_events is None or (not isinstance(df_events, pd.DataFrame)) or df_events.empty:
+            return
+        if df_source is None or (not isinstance(df_source, pd.DataFrame)) or df_source.empty:
+            return
+
+        try:
+            epochs_by_run: dict[tuple[int, str], set[int]] = {}
+            for (seed0, factor0), g0 in df_source.groupby(["seed", "factor"], sort=False):
+                ep = pd.to_numeric(g0["epoch"], errors="coerce").to_numpy(dtype=float)
+                ep = ep[np.isfinite(ep)]
+                if ep.size == 0:
+                    continue
+                key0 = (as_int(seed0, default=0), str(factor0))
+                epochs_by_run[key0] = set(int(x) for x in ep.astype(int).tolist())
+
+            bad: list[tuple[tuple[int, str], str, int]] = []
+            for _, r in df_events.iterrows():
+                key = (as_int(r.get("seed"), default=0), str(r.get("factor")))
+                ep_set = epochs_by_run.get(key)
+                if not ep_set:
+                    continue
+                for col in ("t_warn", "t_collapse"):
+                    tv = r.get(col, np.nan)
+                    if tv is None:
+                        continue
+                    try:
+                        fv = float(tv)
+                    except Exception:
+                        continue
+                    if not np.isfinite(fv):
+                        continue
+                    ti = int(fv)
+                    if ti not in ep_set:
+                        bad.append((key, col, ti))
+
+            if bad:
+                key, col, ti = bad[0]
+                msg = (
+                    f"[eval][invariant] {label}: {len(bad)} event time(s) not in epoch set; "
+                    f"first key={key} col={col} t={ti}"
+                )
+                try:
+                    print(msg, flush=True)
+                except Exception:
+                    pass
+                try:
+                    _append_sweep_log(msg)
+                except Exception:
+                    pass
+                raise AssertionError(msg)
+        except Exception:
+            # If the checker itself fails (not a detected mismatch), do not break the sweep.
+            return
+
     # ---- Apply learned detector to evaluation runs ----
     rows = []
     from typing import cast
@@ -6133,6 +6215,7 @@ def evaluate(df_all: pd.DataFrame, tag: str):
             )
         )
     det_rows = pd.DataFrame(rows)
+    _assert_events_in_epoch_set(det_rows, df_eval_raw, label=f"detector_events_{tag}")
     det_rows.to_csv(OUTDIR / f"detector_events_{tag}.csv", index=False)
 
     # ---- Baseline postprocess (PH tables → canonical columns) ----
@@ -6189,6 +6272,7 @@ def evaluate(df_all: pd.DataFrame, tag: str):
                 )
             )
         out = pd.DataFrame(rows)
+        _assert_events_in_epoch_set(out, df_eval_raw, label=f"baseline_events_{name}_{tag}")
         out.to_csv(OUTDIR / f"baseline_events_{name}_{tag}.csv", index=False)
         return out
 
@@ -6300,6 +6384,7 @@ def evaluate(df_all: pd.DataFrame, tag: str):
             )
         )
     seq_events = pd.DataFrame(seq_rows)
+    _assert_events_in_epoch_set(seq_events, df_eval_raw, label=f"baseline_events_seq_{tag}")
     seq_events.to_csv(OUTDIR / f"baseline_events_seq_{tag}.csv", index=False)
 
     # ---- NEWMA: calibrate lambda from controls (runner-proof) ----
@@ -6539,16 +6624,18 @@ def evaluate(df_all: pd.DataFrame, tag: str):
             )
         )
     base_newma = pd.DataFrame(newma_rows)
+    _assert_events_in_epoch_set(base_newma, df_eval_raw, label=f"baseline_events_newma_{tag}")
     base_newma.to_csv(OUTDIR / f"baseline_events_newma_{tag}.csv", index=False)
 
     # ---- Gate-only baseline (AUDIT lane): primary uses ONLINE gate_warn ----
     gate_rows = []
+    gate_rows_drift_only = []
     gate_calib_rows = []  # optional analysis lane (forced calibrated stream)
 
     for key, g in df_eval_raw.groupby(["seed", "factor"]):
         seed, factor = cast(tuple[Any, Any], key)
         gg = g.sort_values("epoch").reset_index(drop=True)
-        warm_idx_local = warm_idx_from_cfg(CFG)
+        warm_idx_local = max(warm_idx_from_cfg(CFG), gate_first_evaluable_epoch(CFG))
 
         # Prefer calibrated gate stream when present AND not marked counterfactual; else fall back to online.
         use_calib = False
@@ -6572,15 +6659,49 @@ def evaluate(df_all: pd.DataFrame, tag: str):
         except TypeError:
             t_warn = _compute_gate_warn_time(gg, warn_col, warm_idx_local)
 
+        # Drift-only lane: ignore gain failures entirely; only count stability/kappa failures.
+        t_warn_drift = None
+        try:
+            if reason_col is not None and reason_col in gg.columns:
+                epn = pd.to_numeric(gg["epoch"], errors="coerce").to_numpy(dtype=float)
+                gw = pd.to_numeric(gg[warn_col], errors="coerce").to_numpy(dtype=float)
+                rs = gg[reason_col].fillna("").astype(str).to_numpy()
+
+                # Only consider evaluated epochs.
+                eval_mask = np.array([s.startswith("evaluated") for s in rs], dtype=bool)
+
+                # Allowed drift reasons (exclude evaluated_fail_gain by construction).
+                allowed = (rs == "evaluated_fail_stability") | (rs == "evaluated_fail_kappa")
+
+                fail_mask = (gw < 0.5) & eval_mask & allowed & (epn >= float(warm_idx_local))
+                hit_idx = np.where(fail_mask)[0]
+
+                K_warn = as_int(CFG.get("warn_consec", 3), default=3)
+                j_end = _first_run_end(hit_idx, K_warn)
+                if (j_end is not None) and int(j_end) >= 0:
+                    j_start = int(j_end) - int(K_warn) + 1
+                    if j_start < 0:
+                        j_start = 0
+                    # use the first epoch of the K-length failure run
+                    t_warn_drift = as_int(gg.iloc[int(hit_idx[int(j_start)])]["epoch"], default=-1)
+                    if t_warn_drift < 0:
+                        t_warn_drift = None
+        except Exception:
+            t_warn_drift = None
+
         # Collapse time/tag from unified GT
         t_c_raw = gg["t_collapse_gt"].iloc[0] if ("t_collapse_gt" in gg.columns and len(gg) > 0) else np.nan
         tc_i = as_int(t_c_raw, default=-1)
         t_c = tc_i if tc_i >= 0 else None
-        ctag = _runlevel_collapse_tag(gg, warm_idx_local)
+        ctag = _runlevel_collapse_tag(gg, warm_idx)
 
         # Enforce precedence only if a collapse exists; otherwise keep warning for FP accounting.
         if (t_c is not None) and (not _warn_precedes_collapse(t_warn, t_c)):
             t_warn = None
+
+        # Drift-only lane: apply the same precedence rule (only if a collapse exists).
+        if (t_c is not None) and (not _warn_precedes_collapse(t_warn_drift, t_c)):
+            t_warn_drift = None
 
         # FIX A: if there is a collapse and no warning was found, DO NOT set warn-at-collapse.
         # Write NaN so summaries correctly count it as a miss.
@@ -6614,6 +6735,30 @@ def evaluate(df_all: pd.DataFrame, tag: str):
                 detected=detected,
                 gate_source=("calibrated" if use_calib else "online"),
                 gate_warn_col=warn_col,
+            )
+        )
+
+        lead_drift = (
+            float(t_c - t_warn_drift)  # type: ignore[operator]
+            if (ctag in ("soft", "hard") and (t_warn_drift is not None) and (t_c is not None))
+            else float("nan")
+        )
+        detected_drift = int(ctag in ("soft", "hard") and (t_warn_drift is not None) and (t_c is not None))
+
+        gate_rows_drift_only.append(
+            dict(
+                run_id=f"s{as_int(seed, default=0)}-{str(factor)}",
+                seed=as_int(seed, default=0),
+                factor=str(factor),
+                t_warn=(np.nan if t_warn_drift is None else float(t_warn_drift)),
+                t_collapse=(np.nan if t_c is None else float(t_c)),
+                collapse_tag=ctag,
+                lead_time=lead_drift,
+                detected=detected_drift,
+                gate_source=("calibrated" if use_calib else "online"),
+                gate_lane="drift_only",
+                gate_warn_col=warn_col,
+                gate_reason_col=(reason_col if reason_col is not None else ""),
             )
         )
 
@@ -6659,11 +6804,18 @@ def evaluate(df_all: pd.DataFrame, tag: str):
                 )
             )
     base_gate = pd.DataFrame(gate_rows)
+    _assert_events_in_epoch_set(base_gate, df_eval_raw, label=f"baseline_events_gate_{tag}")
     base_gate.to_csv(OUTDIR / f"baseline_events_gate_{tag}.csv", index=False)
+    if gate_rows_drift_only:
+        base_gate_drift = pd.DataFrame(gate_rows_drift_only)
+        _assert_events_in_epoch_set(base_gate_drift, df_eval_raw, label=f"baseline_events_gate_drift_only_{tag}")
+        base_gate_drift.to_csv(OUTDIR / f"baseline_events_gate_drift_only_{tag}.csv", index=False)
 
     # Write counterfactual separately for analysis (never overwrites primary audit lane)
     if gate_calib_rows:
-        pd.DataFrame(gate_calib_rows).to_csv(OUTDIR / f"baseline_events_gate_counterfactual_{tag}.csv", index=False)
+        base_gate_cf = pd.DataFrame(gate_calib_rows)
+        _assert_events_in_epoch_set(base_gate_cf, df_eval_raw, label=f"baseline_events_gate_counterfactual_{tag}")
+        base_gate_cf.to_csv(OUTDIR / f"baseline_events_gate_counterfactual_{tag}.csv", index=False)
 
     # ---- Summaries ----
     summ_det = summarize_detection(det_rows, warm_idx=warm_idx)
@@ -6685,7 +6837,8 @@ def evaluate(df_all: pd.DataFrame, tag: str):
     run_fp_vote = summarize_runlevel_fp(base_vote, warm_idx=warm_idx)
     run_fp_seq = summarize_runlevel_fp(seq_events, warm_idx=warm_idx)
     run_fp_newma = summarize_runlevel_fp(base_newma, warm_idx=warm_idx)
-    run_fp_gate = summarize_runlevel_fp(base_gate, warm_idx=warm_idx)
+    # Gate FP accounting should honor the gate's evaluability threshold (needs 2W history)
+    run_fp_gate = summarize_runlevel_fp(base_gate, warm_idx=warm_idx_gate)
 
     summ_det.to_csv(OUTDIR / f"summary_learned_{tag}.csv", index=False)
     summ_ewma.to_csv(OUTDIR / f"summary_baseline_ewma_{tag}.csv", index=False)
