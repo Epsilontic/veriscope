@@ -406,6 +406,7 @@ def assert_overlay_consistency(
 
 def bootstrap_stratified(
     rows: pd.DataFrame,
+    warm_idx: int,
     B: int = 200,
 ) -> Dict[str, Tuple[float, float]]:
     rng = np.random.default_rng(123456)
@@ -417,8 +418,7 @@ def bootstrap_stratified(
     vals_fp: List[float] = []
     vals_med: List[float] = []
 
-    cfg = _get_cfg()
-    warm = as_int(cfg.get("warmup"), default=0) + as_int(cfg.get("ph_burn"), default=0)
+    warm = int(warm_idx)
 
     for _ in range(B):
         boot_parts = []
@@ -433,7 +433,7 @@ def bootstrap_stratified(
             continue
         boot = pd.concat(boot_parts, ignore_index=True)
 
-        trig0 = boot[boot["collapse_tag"] == "soft"]
+        trig0 = boot[boot["collapse_tag"].isin(["soft", "hard"])]
         # Admissibility guard: do not score collapses that occur before warm (gate not yet evaluable).
         if (trig0 is not None) and (len(trig0) > 0) and ("t_collapse" in trig0.columns):
             _tc0 = to_numeric_series(trig0["t_collapse"], errors="coerce")
@@ -447,8 +447,10 @@ def bootstrap_stratified(
         vals_detect.append(float(succ / max(1, ncol)))
 
         non_trig = boot[boot["collapse_tag"] == "none"]
-        denom = max(1, len(non_trig))
-        fp = float(np.mean((non_trig["t_warn"].notna()) & (non_trig["t_warn"] >= warm))) if denom > 0 else 1.0
+        if len(non_trig) > 0:
+            fp = float(np.mean((non_trig["t_warn"].notna()) & (non_trig["t_warn"] >= warm)))
+        else:
+            fp = float("nan")
         vals_fp.append(float(fp))
 
         leads = (trig["t_collapse"] - trig["t_warn"]).dropna().to_numpy()
@@ -520,7 +522,7 @@ def summarize_detection(rows: pd.DataFrame, warm_idx: int) -> pd.DataFrame:
         out.append(dict(kind="fp_nontriggered_after_warm", n=int(len(non_trig)), value=fp_nontrig))
         out.append(dict(kind="lead_time", n=0, med=np.nan, q1=np.nan, q3=np.nan))
 
-        boot = bootstrap_stratified(rows_scored)
+        boot = bootstrap_stratified(rows_scored, warm_idx=warm_idx)
         out.append(
             dict(
                 kind="detect_rate_ci_boot",
@@ -578,7 +580,7 @@ def summarize_detection(rows: pd.DataFrame, warm_idx: int) -> pd.DataFrame:
     out.append(dict(kind="fp_nontriggered_after_warm", n=int(len(non_trig)), value=fp_nontrig))
     out.append(dict(kind="lead_time", n=int(leads.size), med=med, q1=q1, q3=q3))
 
-    boot = bootstrap_stratified(rows_scored)
+    boot = bootstrap_stratified(rows_scored, warm_idx=warm_idx)
     out.append(
         dict(
             kind="detect_rate_ci_boot",
