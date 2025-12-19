@@ -2334,17 +2334,33 @@ def _epochwise_collapse_tag_gt(epochs: np.ndarray, t_gt: Optional[int], tag: str
     Guardrails:
     - pre-warm epochs are always 'none'
     - if t_gt is None or tag not in {'soft','hard'}, all epochs are 'none'
+      (with normalization: accepts case/whitespace and prefix variants like 'SOFT', 'soft ', 'soft_collapse')
     - otherwise epochs >= t_gt and >= warm_idx take `tag`
     """
     ep = np.asarray(epochs, dtype=int)
     out = np.full(ep.shape, "none", dtype=object)
+
     if t_gt is None:
         return out
-    if tag not in ("soft", "hard"):
+
+    # Normalize tag: accept case/whitespace/prefix variants from upstream GT logic.
+    # This prevents silent all-'none' tagging when gt_collapse_time returns e.g. 'SOFT' or 'soft_*'.
+    try:
+        tag_s = str(tag).strip().lower()
+    except Exception:
+        tag_s = ""
+
+    if tag_s.startswith("soft"):
+        tag_s = "soft"
+    elif tag_s.startswith("hard"):
+        tag_s = "hard"
+    else:
         return out
+
     # tag turns on at/after collapse time, but never before warm
     mask = (ep >= int(t_gt)) & (ep >= int(warm_idx))
-    out[mask] = tag
+    out[mask] = tag_s
+
     # hard guarantee
     out[ep < int(warm_idx)] = "none"
     return out
