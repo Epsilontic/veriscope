@@ -4,6 +4,7 @@ from __future__ import annotations
 from enum import Enum
 from dataclasses import dataclass
 from typing import Any, Dict, Sequence, Tuple, TYPE_CHECKING
+import warnings
 
 import numpy as np
 
@@ -13,12 +14,43 @@ if TYPE_CHECKING:
     from .window import FRWindow
 
 
+_POLICY_PARSE_WARNED: bool = False
+
+
+def _warn_policy_parse_once(msg: str) -> None:
+    global _POLICY_PARSE_WARNED
+    if _POLICY_PARSE_WARNED:
+        return
+    _POLICY_PARSE_WARNED = True
+    warnings.warn(msg, RuntimeWarning, stacklevel=2)
+
+
+def _gain_flags(gain_bits: Any, gain_thr: float) -> tuple[bool, bool, bool, float]:
+    """Return (gain_is_finite, ok_gain, gain_below, gain_bits_float).
+
+    Convention: non-numeric or non-finite gain => not evaluated => ok_gain True, gain_below False.
+    """
+    try:
+        gb = float(gain_bits)
+    except Exception:
+        return (False, True, False, float("nan"))
+    if not np.isfinite(gb):
+        return (False, True, False, float("nan"))
+    thr = float(gain_thr)
+    return (True, gb >= thr, gb < thr, float(gb))
+
+
 class GatePolicy(Enum):
     """Gate failure policy."""
 
     EITHER = "either"  # Fail if gain OR stability fails (original behavior)
     CONJUNCTION = "conjunction"  # Fail if gain AND stability both fail
+
+    # Legacy semantics: persistence on stability, BUT gain/kappa still veto immediately.
     PERSISTENCE = "persistence"  # Fail if stability fails for K consecutive evaluated checks
+
+    # NEW opt-in: stability-only persistence (kappa veto), gain audited only.
+    PERSISTENCE_STABILITY = "persistence_stability"
 
 
 @dataclass
@@ -47,12 +79,26 @@ class GateEngine:
         self.eps_sens = float(eps_sens)
         self.min_evidence = int(max(0, min_evidence))
 
-        # Parse policy (string -> enum, default to EITHER on invalid)
-        policy_str = str(policy).lower().strip()
+        # Parse policy (string -> enum, normalize aliases; conservative default on invalid)
+        policy_in = policy  # preserve original for audit/debug
+        policy_str_raw = str(policy_in).lower().strip()
+
+        aliases = {
+            "persist": "persistence",
+            "persistence_stab": "persistence_stability",
+            "persistence_only": "persistence_stability",
+            "persistence-stability": "persistence_stability",
+        }
+        policy_str_norm = aliases.get(policy_str_raw, policy_str_raw)
+
         try:
-            self.policy = GatePolicy(policy_str)
+            self.policy = GatePolicy(policy_str_norm)
         except ValueError:
-            self.policy = GatePolicy.EITHER
+            _warn_policy_parse_once(
+                f"Unknown gate policy input={policy_in!r} normalized={policy_str_norm!r}. "
+                f"Defaulting to 'persistence' (conservative). Valid={[p.value for p in GatePolicy]}."
+            )
+            self.policy = GatePolicy.PERSISTENCE
         self.persistence_k = max(1, int(persistence_k))
 
         # State for persistence policy (only updated on evaluated checks)
@@ -68,6 +114,9 @@ class GateEngine:
         eps_stat_value: float,
     ) -> GateResult:
         wd = self.win.decl
+
+        gain_is_finite, ok_gain, gain_below, gain_bits_f = _gain_flags(gain_bits, self.gain_thr)
+        persistence_fail_flag = False  # always emitted in audit
 
         # Check evidence first (early return if insufficient)
         # NOTE: This changes behavior from original (which set ok_evidence=False).
@@ -92,11 +141,15 @@ class GateEngine:
                     consecutive_exceedances_after=self._consecutive_exceedances,
                     persistence_k=self.persistence_k,
                     # Include what we can compute
-                    gain_bits=float(gain_bits) if np.isfinite(gain_bits) else float("nan"),
+                    gain_bits=float(gain_bits_f),
+                    gain_thr=float(self.gain_thr),
+                    gain_evaluated=bool(gain_is_finite),
+                    ok_gain=bool(ok_gain),
                     eps=float(wd.epsilon),
                     eps_sens=float(self.eps_sens),
                     kappa_sens=float(kappa_sens) if np.isfinite(kappa_sens) else float("nan"),
                     kappa_checked=bool(np.isfinite(kappa_sens)),
+                    persistence_fail=bool(persistence_fail_flag),
                     counts_by_metric={k: int(v) for k, v in (counts_by_metric or {}).items()},
                     # Schema consistency (unevaluated → placeholders)
                     worst_DW=float("nan"),
@@ -106,7 +159,7 @@ class GateEngine:
                     per_metric_n={},
                     drifts={},
                     dw_exceeds_threshold=False,
-                    gain_below_threshold=bool(np.isfinite(gain_bits) and (gain_bits < self.gain_thr)),
+                    gain_below_threshold=bool(gain_below),
                 ),
             )
 
@@ -176,10 +229,14 @@ class GateEngine:
                     consecutive_exceedances_after=self._consecutive_exceedances,
                     persistence_k=self.persistence_k,
                     # Provide expected numeric fields as NaN where appropriate
-                    gain_bits=float(gain_bits) if np.isfinite(gain_bits) else float("nan"),
+                    gain_bits=float(gain_bits_f),
+                    gain_thr=float(self.gain_thr),
+                    gain_evaluated=bool(gain_is_finite),
+                    ok_gain=bool(ok_gain),
                     worst_DW=float("nan"),
                     eps=float(wd.epsilon),
                     eps_sens=float(self.eps_sens),
+                    persistence_fail=bool(persistence_fail_flag),
                     eps_stat=float("nan"),
                     eps_eff=float("nan"),
                     kappa_sens=float(kappa_sens) if np.isfinite(kappa_sens) else float("nan"),
@@ -201,11 +258,8 @@ class GateEngine:
         eps_eff = max(0.0, float(wd.epsilon) + float(self.eps_sens) - eps_stat)
 
         # Threshold checks
-        ok_gain = np.isfinite(gain_bits) and (gain_bits >= self.gain_thr)
         ok_stab = np.isfinite(worst) and (worst <= eps_eff)
         dw_exceeds = np.isfinite(worst) and (worst > eps_eff)
-        gain_below = np.isfinite(gain_bits) and (gain_bits < self.gain_thr)
-
         kappa_is_finite = np.isfinite(kappa_sens)
         ok_k = (not kappa_is_finite) or (kappa_sens <= self.eps_sens)
 
@@ -236,8 +290,8 @@ class GateEngine:
                     self._consecutive_exceedances = 0
             # else: don't touch counter (no finite metrics to evaluate)
 
-            # Fail only after K consecutive exceedances
             persistence_fail = self._consecutive_exceedances >= self.persistence_k
+            persistence_fail_flag = bool(persistence_fail)
 
             # Stability check uses persistence; gain and kappa still immediate
             ok_stab_persist = not persistence_fail
@@ -250,6 +304,23 @@ class GateEngine:
             if gain_below:
                 self._consecutive_exceedances = 0
 
+        elif self.policy == GatePolicy.PERSISTENCE_STABILITY:
+            # Only update persistence counter on evaluated checks
+            if evaluated:
+                if dw_exceeds:
+                    self._consecutive_exceedances += 1
+                else:
+                    self._consecutive_exceedances = 0
+
+            persistence_fail = self._consecutive_exceedances >= self.persistence_k
+            persistence_fail_flag = bool(persistence_fail)
+
+            # Gain is ignored for ok/warn/fail. Kappa veto remains immediate.
+            ok = bool((not persistence_fail) and ok_k)
+
+            # Warn = current exceedance before sustained fail (consistent with persistence)
+            warn = bool(dw_exceeds and (not persistence_fail))
+
         else:
             # Fallback to EITHER
             ok = bool(ok_gain and ok_stab and ok_k)
@@ -261,13 +332,16 @@ class GateEngine:
             warn=warn,
             audit=dict(
                 # Existing fields (UNCHANGED)
-                gain_bits=float(gain_bits) if np.isfinite(gain_bits) else float("nan"),
+                gain_bits=float(gain_bits_f),
+                gain_thr=float(self.gain_thr),
+                gain_evaluated=bool(gain_is_finite),
+                ok_gain=bool(ok_gain),
                 worst_DW=float(worst) if np.isfinite(worst) else float("nan"),
                 eps=float(wd.epsilon),
                 eps_sens=float(self.eps_sens),
                 eps_stat=float(eps_stat),
                 eps_eff=float(eps_eff),
-                kappa_sens=float(kappa_sens if kappa_is_finite else 0.0),
+                kappa_sens=(float(kappa_sens) if bool(kappa_is_finite) else float("nan")),
                 kappa_checked=bool(kappa_is_finite),
                 counts_by_metric={k: int(v) for k, v in (counts_by_metric or {}).items()},
                 evidence_total=int(evidence_n),
@@ -281,8 +355,10 @@ class GateEngine:
                 # NEW fields (additive only)
                 evaluated=evaluated,
                 policy=self.policy.value,
-                dw_exceeds_threshold=dw_exceeds,
-                gain_below_threshold=gain_below,
+                dw_exceeds_threshold=bool(dw_exceeds),
+                gain_below_threshold=bool(gain_below),
+                ok_stab=bool(ok_stab),
+                persistence_fail=bool(persistence_fail_flag),
                 consecutive_exceedances=consecutive_after,
                 consecutive_exceedances_before=consecutive_before,
                 consecutive_exceedances_after=consecutive_after,
