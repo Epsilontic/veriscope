@@ -284,7 +284,8 @@ class VeriscopeGatedTrainer:
                 pathology_start = int(config.data_corrupt_at)
 
         # --- Compute window spans with correct unit handling ---
-        Wm, window_span_iters, _stride_iters = compute_window_spans(config.gate_window, config.metric_interval)
+        Wm, window_span_iters, stride_iters = compute_window_spans(config.gate_window, config.metric_interval)
+        default_gap_iters = max(2 * int(window_span_iters), 2 * int(stride_iters))
 
         # Warn if Wm is dangerously small (noisy comparisons)
         if Wm < 5:
@@ -324,6 +325,7 @@ class VeriscopeGatedTrainer:
             reference_build_min_iter=int(rb_min),
             reference_build_max_iter=int(rb_max),
             reference_build_span=int(config.regime_build_span),
+            reference_build_gap_iters=int(config.regime_build_gap_iters),
             reference_build_max_dw=float(config.regime_build_max_dw),
             reference_build_min_gain=float(config.regime_build_min_gain),
             min_evidence_per_metric=int(config.regime_min_evidence),
@@ -333,15 +335,7 @@ class VeriscopeGatedTrainer:
             max_accumulator_windows=20,
         )
 
-        # Preserve gap override if RegimeConfig supports it (field name may vary across versions).
-        try:
-            fields = getattr(RegimeConfig, "__dataclass_fields__", {}) or {}
-            for gap_name in ("reference_build_gap_iters", "build_gap_iters", "reference_gap_iters"):
-                if gap_name in fields:
-                    regime_kwargs[gap_name] = int(config.regime_build_gap_iters)
-                    break
-        except Exception:
-            pass
+        # (gap override block deleted)
 
         regime_config = RegimeConfig(**regime_kwargs)
 
@@ -353,6 +347,7 @@ class VeriscopeGatedTrainer:
             gate_warmup=int(config.gate_warmup),
             gate_window=int(config.gate_window),
             pathology_start=pathology_start,
+            default_gap_iters=int(default_gap_iters),
         )
 
         # Log computed build window and effective status
@@ -387,6 +382,7 @@ class VeriscopeGatedTrainer:
                 gate_warmup=int(config.gate_warmup),
                 gate_window=int(config.gate_window),
                 pathology_start=pathology_start,
+                default_gap_iters=int(default_gap_iters),
             )
             if (int(bm2), int(bx2)) != (int(build_min), int(build_max)):
                 warnings.warn(
@@ -655,7 +651,19 @@ class VeriscopeGatedTrainer:
         Wm, _, _ = compute_window_spans(cfg.gate_window, cfg.metric_interval)
 
         if len(self.metric_history) < 2 * Wm:
-            return {"ok": True, "reason": "insufficient_history"}
+            # Not enough history to form past/recent windows => not evaluated.
+            # Include iter for downstream overlap analysis (analyze_gates.py).
+            reason = "not_evaluated_insufficient_history"
+            return {
+                "ok": True,
+                "warn": False,
+                "iter": int(self.iter_num),
+                "reason": reason,
+                "audit": {
+                    "evaluated": False,
+                    "reason": reason,
+                },
+            }
 
         # Get past and recent windows (in metric snapshots)
         recent = self.metric_history[-(2 * Wm) :]
@@ -737,7 +745,10 @@ class VeriscopeGatedTrainer:
             "gain_bits": gain_bits,
             "iter": self.iter_num,
             # Regime-specific fields (always present for consistency)
-            "change_ok": audit.get("change_ok", True),
+            # Tri-state fields must remain nullable; `change_ok` is back-compat only.
+            "change_ok": bool(audit.get("change_ok", True)),
+            "change_dw_ok": audit.get("change_dw_ok", None),
+            "change_gain_ok": audit.get("change_gain_ok", None),
             "change_warn": audit.get("change_warn", False),
             "change_evaluated": audit.get("change_evaluated", True),
             "regime_ok": audit.get("regime_ok", True),
@@ -1098,13 +1109,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--gate_policy",
         type=str,
-        choices=["either", "conjunction", "persistence"],
+        choices=["either", "conjunction", "persistence", "persistence_stability"],
         default="either",
         help=(
             "Gate failure policy. "
             "'either'=fail on gain OR stability (original), "
             "'conjunction'=fail on gain AND stability, "
-            "'persistence'=fail on K consecutive evaluated stability exceedances."
+            "'persistence'=legacy persistence on stability with gain/kappa immediate veto, "
+            "'persistence_stability'=persistence on stability only with kappa veto; gain is audited only."
         ),
     )
     parser.add_argument(
@@ -1268,6 +1280,7 @@ if __name__ == "__main__":
             "gate_eps_stat_max_frac": 0.15,
             "gate_min_evidence": 75,
             "gate_gain_thresh": -0.002,
+            "gate_policy": "persistence_stability",
         }
         for k, v in spike_v1.items():
             flag = "--" + k

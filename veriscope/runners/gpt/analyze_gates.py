@@ -15,8 +15,29 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import numpy as np
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
+
+# Strict bool coercion helper to avoid NumPy-bool identity traps.
+def _as_opt_bool(x: Any) -> Optional[bool]:
+    """Coerce bool/np.bool_ and integer-like 0/1 to Optional[bool].
+
+    Returns None for anything else (including floats, strings, etc.).
+    """
+    if x is None:
+        return None
+    # bool is a subclass of int, so check bool first
+    if isinstance(x, (bool, np.bool_)):
+        return bool(x)
+    if isinstance(x, (int, np.integer)):
+        if int(x) == 0:
+            return False
+        if int(x) == 1:
+            return True
+        return None
+    return None
 
 
 def _recent_window_bounds_iter_space(
@@ -72,6 +93,98 @@ def _is_onset_gate(
     return (not past_overlaps) and recent_overlaps
 
 
+def _parse_gate_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    audit = row.get("audit", {}) or {}
+
+    # Prefer namespaced base_reason, fallback to legacy reason, then gate_reason, then row-level reason
+    reason = str(
+        audit.get(
+            "base_reason",
+            audit.get(
+                "reason",
+                row.get(
+                    "gate_reason",
+                    row.get("reason", ""),
+                ),
+            ),
+        )
+    ).strip()
+
+    # Prefer explicit evaluated flag when present; otherwise infer from reason.
+    evaluated_flag = _as_opt_bool(audit.get("evaluated", None))
+    not_eval = (
+        reason.startswith("not_evaluated") or ("insufficient_evidence" in reason) or ("insufficient_history" in reason)
+    )
+    evaluated = (not not_eval) if evaluated_flag is None else bool(evaluated_flag)
+
+    chg = _as_opt_bool(audit.get("change_dw_ok", None))  # Optional[bool]
+
+    change_ok_bool = None
+    if evaluated and (chg is not None):
+        change_ok_bool = bool(chg)
+
+    return {
+        "reason": reason or None,
+        "base_reason": audit.get("base_reason", reason or None),
+        "evaluated": bool(evaluated),
+        "change_dw_ok": chg,
+        "change_ok_bool": change_ok_bool,
+        "base_ok": bool(audit.get("base_ok", True)),
+        "change_gain_ok": _as_opt_bool(audit.get("change_gain_ok", None)),
+    }
+
+
+def _change_valid_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [r for r in rows if bool(r.get("evaluated", False)) and (r.get("change_dw_ok", None) is not None)]
+
+
+def _compute_change_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    n_total = len(rows)
+    excluded_not_evaluated = sum(1 for r in rows if not bool(r.get("evaluated", False)))
+    excluded_unknown_stability = sum(
+        1 for r in rows if bool(r.get("evaluated", False)) and (r.get("change_dw_ok", None) is None)
+    )
+
+    valid = _change_valid_rows(rows)
+
+    tp = sum(1 for r in valid if (r.get("change_dw_ok") is False) and bool(r.get("overlaps_spike", False)))
+    fp = sum(1 for r in valid if (r.get("change_dw_ok") is False) and (not bool(r.get("overlaps_spike", False))))
+    fn = sum(1 for r in valid if (r.get("change_dw_ok") is True) and bool(r.get("overlaps_spike", False)))
+    tn = sum(1 for r in valid if (r.get("change_dw_ok") is True) and (not bool(r.get("overlaps_spike", False))))
+
+    precision = tp / (tp + fp) if (tp + fp) > 0 else float("nan")
+    recall = tp / (tp + fn) if (tp + fn) > 0 else float("nan")
+    specificity = tn / (tn + fp) if (tn + fp) > 0 else float("nan")
+
+    return {
+        "n_total": int(n_total),
+        "excluded_not_evaluated": int(excluded_not_evaluated),
+        "excluded_unknown_stability": int(excluded_unknown_stability),
+        "n_valid": int(len(valid)),
+        "confusion": {"tp": int(tp), "fp": int(fp), "fn": int(fn), "tn": int(tn)},
+        "precision": float(precision),
+        "recall": float(recall),
+        "specificity": float(specificity),
+    }
+
+
+def _count_gain_fps(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    gain_fp = [
+        r
+        for r in rows
+        if bool(r.get("evaluated", False)) and (r.get("change_dw_ok") is True) and (not bool(r.get("base_ok", True)))
+    ]
+
+    dist: Dict[str, int] = {}
+    for r in gain_fp:
+        v_raw = r.get("change_gain_ok", None)
+        v = _as_opt_bool(v_raw)
+        k = "None" if v is None else ("True" if bool(v) else "False")
+        dist[k] = dist.get(k, 0) + 1
+
+    return {"n_gain_fp": int(len(gain_fp)), "change_gain_ok_distribution": dist}
+
+
 def analyze_gates(
     results_path: Path,
     spike_start: int,
@@ -89,6 +202,7 @@ def analyze_gates(
         gate_iter = int(g.get("iter", 0) or 0)
         ok = bool(g.get("ok", True))
         audit = g.get("audit", {}) or {}
+        parsed = _parse_gate_row(g)
 
         recent_start, recent_end = _recent_window_bounds_iter_space(
             gate_iter=gate_iter,
@@ -122,10 +236,6 @@ def analyze_gates(
             spike_end=int(spike_end),
         )
 
-        # NOTE: Audit key names must match trainer output in train_nanogpt.py.
-        # The trainer's _compute_gate_check() and RegimeAnchoredGateEngine.check()
-        # populate: change_ok, regime_ok, regime_active, regime_enabled,
-        # regime_worst_DW, worst_DW (change detector), eps_eff, gain_bits.
         per_gate.append(
             {
                 "iter": gate_iter,
@@ -141,13 +251,20 @@ def analyze_gates(
                 "eps_eff": audit.get("eps_eff", float("nan")),
                 "gain_bits": audit.get("gain_bits", float("nan")),
                 # Regime fields (defaults are conservative: assume OK if missing)
-                "change_ok": bool(audit.get("change_ok", True)),
+                # "change_ok": bool(audit.get("change_ok", True)),
                 "regime_ok": bool(audit.get("regime_ok", True)),
                 "regime_active": bool(audit.get("regime_active", False)),
                 "regime_enabled": bool(audit.get("regime_enabled", False)),
                 "regime_worst_DW": audit.get("regime_worst_DW", float("nan")),
                 "ref_established_at": audit.get("ref_established_at"),
                 "ref_just_established": bool(audit.get("ref_just_established", False)),
+                # New: parsed change detector fields
+                "base_reason": parsed.get("base_reason"),
+                "evaluated": bool(parsed.get("evaluated", True)),
+                "change_dw_ok": parsed.get("change_dw_ok", None),
+                "change_ok_bool": parsed.get("change_ok_bool", None),
+                "base_ok": bool(parsed.get("base_ok", True)),
+                "change_gain_ok": parsed.get("change_gain_ok", None),
             }
         )
 
@@ -162,14 +279,11 @@ def analyze_gates(
     specificity = tn / (tn + fp) if (tn + fp) > 0 else float("nan")
 
     # ---- Change detection breakdown ----
-    change_tp = sum(1 for r in per_gate if (not r["change_ok"]) and r["overlaps_spike"])
-    change_fp = sum(1 for r in per_gate if (not r["change_ok"]) and (not r["overlaps_spike"]))
-    change_fn = sum(1 for r in per_gate if r["change_ok"] and r["overlaps_spike"])
-    change_tn = sum(1 for r in per_gate if r["change_ok"] and (not r["overlaps_spike"]))
-
-    change_precision = change_tp / (change_tp + change_fp) if (change_tp + change_fp) > 0 else float("nan")
-    change_recall = change_tp / (change_tp + change_fn) if (change_tp + change_fn) > 0 else float("nan")
-    change_specificity = change_tn / (change_tn + change_fp) if (change_tn + change_fp) > 0 else float("nan")
+    change_metrics = _compute_change_metrics(per_gate)
+    cc = change_metrics["confusion"]
+    change_precision = change_metrics["precision"]
+    change_recall = change_metrics["recall"]
+    change_specificity = change_metrics["specificity"]
 
     # ---- Regime detection breakdown (only when active) ----
     regime_active_gates = [r for r in per_gate if r["regime_active"]]
@@ -192,9 +306,14 @@ def analyze_gates(
         onset_change_fn = 0
         onset_change_recall = float("nan")
     else:
-        onset_total = sum(1 for r in per_gate if r.get("onset_gate"))
-        onset_change_tp = sum(1 for r in per_gate if r.get("onset_gate") and (not r["change_ok"]))
-        onset_change_fn = sum(1 for r in per_gate if r.get("onset_gate") and r["change_ok"])
+        onset_candidates = [
+            r
+            for r in per_gate
+            if r.get("onset_gate") and bool(r.get("evaluated", False)) and (r.get("change_dw_ok", None) is not None)
+        ]
+        onset_total = len(onset_candidates)
+        onset_change_tp = sum(1 for r in onset_candidates if (r.get("change_dw_ok") is False))
+        onset_change_fn = sum(1 for r in onset_candidates if (r.get("change_dw_ok") is True))
         onset_change_recall = (
             onset_change_tp / (onset_change_tp + onset_change_fn)
             if (onset_change_tp + onset_change_fn) > 0
@@ -202,18 +321,30 @@ def analyze_gates(
         )
 
     # ---- Attribution: who drives union failures in spike window? ----
+    valid_change = _change_valid_rows(per_gate)
+
     both_fail_in_spike = sum(
         1
-        for r in per_gate
-        if (not r["change_ok"]) and r["regime_active"] and (not r["regime_ok"]) and r["overlaps_spike"]
+        for r in valid_change
+        if (r.get("change_dw_ok") is False)
+        and bool(r.get("regime_active", False))
+        and (not bool(r.get("regime_ok", True)))
+        and bool(r.get("overlaps_spike", False))
     )
     change_only_in_spike = sum(
         1
-        for r in per_gate
-        if (not r["change_ok"]) and (not r["regime_active"] or r["regime_ok"]) and r["overlaps_spike"]
+        for r in valid_change
+        if (r.get("change_dw_ok") is False)
+        and (not bool(r.get("regime_active", False)) or bool(r.get("regime_ok", True)))
+        and bool(r.get("overlaps_spike", False))
     )
     regime_only_in_spike = sum(
-        1 for r in per_gate if r["change_ok"] and r["regime_active"] and (not r["regime_ok"]) and r["overlaps_spike"]
+        1
+        for r in valid_change
+        if (r.get("change_dw_ok") is True)
+        and bool(r.get("regime_active", False))
+        and (not bool(r.get("regime_ok", True)))
+        and bool(r.get("overlaps_spike", False))
     )
 
     return {
@@ -225,7 +356,7 @@ def analyze_gates(
         "recall": recall,
         "specificity": specificity,
         # Change detection decomposition
-        "change_confusion": {"tp": change_tp, "fp": change_fp, "fn": change_fn, "tn": change_tn},
+        "change_confusion": cc,
         "change_precision": change_precision,
         "change_recall": change_recall,
         "change_specificity": change_specificity,
@@ -253,6 +384,8 @@ def analyze_gates(
         "total_overlap": tp + fn,
         "total_nonoverlap": tn + fp,
         "per_gate": per_gate,
+        "change_metrics": change_metrics,
+        "gain_fps": _count_gain_fps(per_gate),
     }
 
 
@@ -267,6 +400,10 @@ def print_analysis(a: Dict[str, Any], verbose: bool) -> None:
     # Extract per_gate once at the top; reuse throughout
     per_gate = a.get("per_gate", [])
     cc = a["change_confusion"]
+    change_metrics = a.get("change_metrics", {}) or {}
+    n_valid = int(change_metrics.get("n_valid", 0) or 0)
+    ex_ne = int(change_metrics.get("excluded_not_evaluated", 0) or 0)
+    ex_unk = int(change_metrics.get("excluded_unknown_stability", 0) or 0)
     rc = a["regime_confusion"]
     onset = a.get("onset", {}) or {}
     onset_total = int(onset.get("total", 0) or 0)
@@ -291,9 +428,8 @@ def print_analysis(a: Dict[str, Any], verbose: bool) -> None:
     else:
         print("│  Onset gates:  0     (no transition in window — control or mismatch) │")
     print(f"│  Specificity:  {_fmt_metric(a['change_specificity']):>5}  (quiet when clean?)                      │")
-    print(
-        f"│  Change FAILs: {cc['tp']:>3} in-spike, {cc['fp']:>3} off-spike (of {a['total_overlap']} overlap gates)  │"
-    )
+    print(f"│  Change FAILs: {cc['tp']:>3} in-spike, {cc['fp']:>3} off-spike (valid n={n_valid})               │")
+    print(f"│  Exclusions:   {ex_ne:>3} not-evaluated, {ex_unk:>3} unknown-stability                              │")
     print("└─────────────────────────────────────────────────────────────┘")
 
     # Baseline drift (regime)
@@ -386,6 +522,8 @@ def print_analysis(a: Dict[str, Any], verbose: bool) -> None:
         print("  Onset gates:  0 (no transition in window — control or mismatch)")
     print(f"  Specificity: {a['change_specificity']:.3f}")
 
+    print(f"  Valid rows: {n_valid}  | excluded_not_evaluated={ex_ne}, excluded_unknown_stability={ex_unk}")
+
     # Regime detection
     print(f"\n--- REGIME DETECTION (ref vs recent) [n={a['regime_active_gates']} active gates] ---")
     print("                    | Spike Overlap | No Overlap |")
@@ -461,7 +599,12 @@ def print_analysis(a: Dict[str, Any], verbose: bool) -> None:
 
     for r in overlap_sorted:
         union_status = "FAIL" if r["fail"] else "ok"
-        change_status = "FAIL" if not r["change_ok"] else "ok"
+        if r.get("change_dw_ok") is True:
+            change_status = "ok"
+        elif r.get("change_dw_ok") is False:
+            change_status = "FAIL"
+        else:
+            change_status = "n/a"
 
         # Regime status: n/a if not active, otherwise FAIL/ok
         if r["regime_active"]:
@@ -508,7 +651,10 @@ def print_analysis(a: Dict[str, Any], verbose: bool) -> None:
         for r in fns:
             rs, re = r["recent_window"]
             print(f"\niter {r['iter']}: recent=[{rs},{re}) overlap={100.0 * r['overlap_frac']:.0f}%")
-            print(f"  change_ok={r['change_ok']}, regime_ok={r['regime_ok']}, regime_active={r['regime_active']}")
+            print(
+                f"  change_dw_ok={r.get('change_dw_ok')}, evaluated={r.get('evaluated')}, base_reason={r.get('base_reason')}, "
+                f"regime_ok={r['regime_ok']}, regime_active={r['regime_active']}"
+            )
             print(f"  change_DW={_fmt(r['worst_DW'])}, regime_DW={_fmt(r['regime_worst_DW'])}")
 
 

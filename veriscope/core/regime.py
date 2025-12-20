@@ -215,6 +215,10 @@ class RegimeConfig:
     # Default span for build window when auto-computing max_iter
     reference_build_span: int = 1500
 
+    # Explicit safety gap between pathology_start and reference build window end.
+    # -1 => use default_gap_iters passed by caller (trainer).
+    reference_build_gap_iters: int = -1
+
     # ---- Quality gates for reference establishment ----
     # Reference only established if base check worst_DW <= this threshold
     # Set conservatively below epsilon to ensure "truly healthy" baseline
@@ -256,57 +260,63 @@ def _policy_to_str(x: Any) -> str:
     return str(v) if v is not None else str(x)
 
 
+def _not_evaluated_from_reason(reason: str) -> bool:
+    """Check if reason indicates gate was not evaluated."""
+    r = str(reason or "").strip()
+    return r.startswith("not_evaluated") or ("insufficient_evidence" in r)
+
+
+def _as_opt_bool(x: Any) -> Optional[bool]:
+    """
+    Coerce bool/np.bool_ and integer-like 0/1 to Optional[bool].
+
+    Returns None for anything else (including floats, strings, etc.)
+    to avoid accidental truthiness traps.
+    """
+    if x is None:
+        return None
+    if isinstance(x, (bool, np.bool_)):
+        return bool(x)
+    if isinstance(x, (int, np.integer)):
+        if x == 0:
+            return False
+        if x == 1:
+            return True
+        return None
+    return None
+
+
 def compute_build_window(
     config: RegimeConfig,
     gate_warmup: int,
     gate_window: int,
     pathology_start: Optional[int] = None,
+    default_gap_iters: Optional[int] = None,
 ) -> Tuple[int, int]:
     """
-    Compute the reference build window from gate config.
+    Compute the reference build interval as a half-open range: [min_iter, max_iter).
 
-    Called at runtime to resolve sentinel values (-1) in RegimeConfig.
-
-    Args:
-        config: RegimeConfig (may have sentinel values)
-        gate_warmup: Warmup iterations before gating starts
-        gate_window: Window size for gate checks
-        pathology_start: If known, iteration where pathology begins
-                        (caller should pass earliest among multiple pathologies)
-
-    Returns:
-        (min_iter, max_iter) for reference build window
+    If max_iter <= min_iter, the window contains zero eligible checks; reference
+    cannot be established. This is allowed but should be surfaced loudly by the
+    caller/wrapper.
     """
-    # Derive min_iter
-    if config.reference_build_min_iter >= 0:
-        min_iter = int(config.reference_build_min_iter)
+    min_iter = int(max(int(gate_warmup), int(config.reference_build_min_iter)))
+
+    if int(config.reference_build_max_iter) >= 0:
+        return int(min_iter), int(config.reference_build_max_iter)
+
+    default_max = int(min_iter) + int(config.reference_build_span)
+
+    if pathology_start is not None and int(pathology_start) >= 0:
+        gap = int(config.reference_build_gap_iters)
+        if gap < 0:
+            gap = int(default_gap_iters) if default_gap_iters is not None else int(gate_window)
+        safe_max = int(pathology_start) - int(gap)
+        max_iter = min(int(default_max), int(safe_max))
     else:
-        # Default: after warmup + 2 windows (need history for gate evaluation)
-        min_iter = int(gate_warmup) + 2 * int(gate_window)
+        max_iter = int(default_max)
 
-    # Derive max_iter
-    if config.reference_build_max_iter >= 0:
-        max_iter = int(config.reference_build_max_iter)
-    else:
-        # Default: min_iter + build_span, but before any known pathology
-        default_max = min_iter + int(config.reference_build_span)
-
-        if pathology_start is not None and pathology_start >= 0:
-            # Stop before pathology with safety margin
-            safe_max = int(pathology_start) - int(gate_window)
-            max_iter = max(min_iter + 100, min(default_max, safe_max))
-        else:
-            max_iter = default_max
-
-    # Ensure valid window
-    if max_iter <= min_iter:
-        max_iter = min_iter + max(100, int(config.reference_build_span))
-        warnings.warn(
-            f"Reference build window was invalid; adjusted to [{min_iter}, {max_iter})",
-            RuntimeWarning,
-        )
-
-    return min_iter, max_iter
+    return int(min_iter), int(max_iter)
 
 
 class RegimeAnchoredGateEngine:
@@ -342,6 +352,7 @@ class RegimeAnchoredGateEngine:
         gate_warmup: int = 0,
         gate_window: int = 50,
         pathology_start: Optional[int] = None,
+        default_gap_iters: Optional[int] = None,
     ):
         """
         Args:
@@ -357,13 +368,25 @@ class RegimeAnchoredGateEngine:
         self.fr_win = fr_win
         self.config = config or RegimeConfig()
 
-        # Compute build window from sentinels
+        # Compute build window (half-open: [min_iter, max_iter))
         self._build_min_iter, self._build_max_iter = compute_build_window(
-            self.config,
+            config=self.config,
             gate_warmup=gate_warmup,
             gate_window=gate_window,
             pathology_start=pathology_start,
+            default_gap_iters=default_gap_iters,
         )
+
+        # Stable forced-block for empty build windows (do not auto-bump).
+        self._ref_build_forced_block: Optional[str] = None
+        if self._build_max_iter <= self._build_min_iter:
+            self._ref_build_forced_block = "empty_build_window"
+            warnings.warn(
+                f"Reference build window is empty: [{self._build_min_iter}, {self._build_max_iter}). "
+                f"Reference cannot be established.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
         # Canonicalize tracked metrics to weights.keys()
         # This matches what GateEngine actually iterates over during D_W computation
@@ -922,20 +945,121 @@ class RegimeAnchoredGateEngine:
             eps_stat_value=eps_stat_value,
         )
 
-        # Extract warn and evaluated status from base result
+        # =========================================================================
+        # WRAPPER AUDIT: shallow copy preserves all base keys for schema compat
+        # =========================================================================
+        audit_base = base_result.audit or {}
+        audit: Dict[str, Any] = dict(audit_base)  # shallow copy, never mutate audit_base
+
         base_warn = getattr(base_result, "warn", False)
-        base_evaluated = base_result.audit.get("evaluated", True)
+
+        # =========================================================================
+        # DETERMINE EVALUATION STATUS
+        # =========================================================================
+        reason = str(audit_base.get("reason", "")).strip()
+        not_eval = _not_evaluated_from_reason(reason)
+
+        evaluated_flag = _as_opt_bool(audit_base.get("evaluated", None))
+        base_evaluated = False if not_eval else (evaluated_flag if evaluated_flag is not None else True)
+
+        # =========================================================================
+        # DW STABILITY: prefer explicit flag, fallback to inference
+        # Capture actual values for backfill
+        # =========================================================================
+        worst_dw_val: Optional[float] = None
+        eps_eff_val: Optional[float] = None
+
+        dw_ex = _as_opt_bool(audit_base.get("dw_exceeds_threshold", None))
+        if dw_ex is None:
+            try:
+                worst_dw_val = float(audit_base.get("worst_DW"))
+                eps_eff_val = float(audit_base.get("eps_eff"))
+                if np.isfinite(worst_dw_val) and np.isfinite(eps_eff_val):
+                    dw_ex = bool(worst_dw_val > eps_eff_val)
+                else:
+                    worst_dw_val = None
+                    eps_eff_val = None
+            except Exception:
+                worst_dw_val = None
+                eps_eff_val = None
+                dw_ex = None
+
+        if (not base_evaluated) or (dw_ex is None):
+            change_dw_ok: Optional[bool] = None
+        else:
+            change_dw_ok = not dw_ex
+
+        # =========================================================================
+        # GAIN-EVALUATED INFERENCE (supports gain_evaluated if present)
+        # =========================================================================
+        gain_eval = _as_opt_bool(audit_base.get("gain_evaluated", None))
+        if gain_eval is None:
+            try:
+                gb = float(audit_base.get("gain_bits"))
+                gain_eval = bool(np.isfinite(gb))
+            except Exception:
+                gain_eval = False
+
+        if (not base_evaluated) or (not gain_eval):
+            change_gain_ok: Optional[bool] = None
+        else:
+            change_gain_ok = not bool(audit_base.get("gain_below_threshold", False))
+
+        base_ok = bool(base_result.ok)
+
+        # =========================================================================
+        # BACKFILL LEGACY KEYS WITH ACTUAL VALUES
+        # setdefault: never overwrites existing values from audit_base
+        # =========================================================================
+        audit.setdefault("reason", reason or None)
+        if audit.get("evaluated", None) is None:
+            audit["evaluated"] = bool(base_evaluated)
+
+        audit.setdefault("dw_exceeds_threshold", dw_ex)
+        audit.setdefault("worst_DW", worst_dw_val)
+        audit.setdefault("eps_eff", eps_eff_val)
+
+        # =========================================================================
+        # WRAPPER SEMANTICS (tri-state + back-compat)
+        # =========================================================================
+        audit.update(
+            {
+                "base_ok": base_ok,
+                "base_evaluated": bool(base_evaluated),
+                "change_dw_ok": change_dw_ok,  # Optional[bool]
+                "change_gain_ok": change_gain_ok,  # Optional[bool]
+                # Back-compat only: unknown -> False (never use to regenerate tri-state)
+                "change_ok": bool(change_dw_ok is True),
+            }
+        )
+
+        # =========================================================================
+        # NAMESPACED BASE DIAGNOSTICS (for unambiguous downstream analysis)
+        # =========================================================================
+        audit.update(
+            {
+                "base_reason": reason or None,
+                "base_worst_DW": (
+                    audit_base.get("worst_DW") if audit_base.get("worst_DW") is not None else worst_dw_val
+                ),
+                "base_dw_exceeds_threshold": dw_ex,
+                "base_eps_eff": (audit_base.get("eps_eff") if audit_base.get("eps_eff") is not None else eps_eff_val),
+                "base_eps_stat_used": audit_base.get("eps_stat", None),
+                "base_eps": audit_base.get("eps", None),
+                "base_gain_bits": audit_base.get("gain_bits", None),
+                "base_gain_evaluated": audit_base.get("gain_evaluated", None),
+                "base_gain_thr": audit_base.get("gain_thr", None),
+            }
+        )
 
         # If regime detection is disabled, return base result with consistent audit fields
         if not self._enabled_effective:
-            audit = dict(base_result.audit)
             audit.update(
                 {
                     "regime_enabled": False,
                     "regime_auto_disabled": not self.config.enabled or not self._metrics_tracked,
-                    "change_ok": base_result.ok,
                     "change_warn": base_warn,
-                    "change_evaluated": base_evaluated,
+                    "change_evaluated": bool(base_evaluated),
                     "regime_ok": True,
                     "regime_warn": False,
                     "regime_active": False,
@@ -1044,52 +1168,66 @@ class RegimeAnchoredGateEngine:
         ref_build_status: Dict[str, Any] = {}
 
         if self._ref is None:
-            # Check each establishment condition in order
-            in_phase, phase_reason = self._in_reference_build_phase(iter_num)
-            ref_build_status["in_build_phase"] = in_phase
-
-            if not in_phase:
-                ref_build_status["blocked"] = f"not_in_build_phase: {phase_reason}"
+            # =========================================================================
+            # REFERENCE BUILD GATING
+            # =========================================================================
+            if getattr(self, "_ref_build_forced_block", None) is not None:
+                ref_build_status["blocked"] = str(self._ref_build_forced_block)
             else:
-                base_evaluated, eval_reason = self._base_check_was_evaluated(base_result)
-                ref_build_status["base_evaluated"] = base_evaluated
+                in_phase, phase_reason = self._in_reference_build_phase(iter_num)
+                ref_build_status["in_build_phase"] = in_phase
 
-                if not base_evaluated:
-                    ref_build_status["blocked"] = f"base_not_evaluated: {eval_reason}"
-                elif not base_result.ok:
-                    ref_build_status["blocked"] = "base_check_failed"
+                if not in_phase:
+                    ref_build_status["blocked"] = f"not_in_build_phase: {phase_reason}"
+                elif change_dw_ok is not True:
+                    ref_build_status["blocked"] = "base_stability_not_ok_or_not_evaluated"
                 else:
-                    quality_ok, quality_reason, quality_audit = self._meets_quality_gates(base_result, gain_bits)
-                    ref_build_status["quality_gates"] = quality_audit
-                    ref_build_status["quality_ok"] = quality_ok
-
-                    if not quality_ok:
-                        ref_build_status["blocked"] = f"quality_gate: {quality_reason}"
+                    # Preserve existing safety checks (conservative)
+                    if not bool(base_evaluated):
+                        ref_build_status["blocked"] = "base_not_evaluated"
+                    elif not bool(base_ok):
+                        ref_build_status["blocked"] = "base_check_failed"
                     else:
-                        # All gates passed, try to establish
-                        established, establish_reason = self._try_establish_reference(recent, iter_num, quality_audit)
-                        ref_newly_established = established
-                        if not established:
-                            ref_build_status["blocked"] = establish_reason
+                        quality_ok, quality_reason, quality_audit = self._meets_quality_gates(base_result, gain_bits)
+                        ref_build_status["quality_gates"] = quality_audit
+                        ref_build_status["quality_ok"] = quality_ok
+
+                        if not quality_ok:
+                            ref_build_status["blocked"] = f"quality_gate: {quality_reason}"
+                        else:
+                            established, establish_reason = self._try_establish_reference(
+                                recent, iter_num, quality_audit
+                            )
+                            ref_newly_established = established
+                            if not established:
+                                ref_build_status["blocked"] = establish_reason
+
+            # Explicit window semantics in status
+            ref_build_status.update(
+                {
+                    "build_window_min_iter": int(self._build_min_iter),
+                    "build_window_max_iter": int(self._build_max_iter),
+                    "build_window_semantics": "[min_iter, max_iter)",
+                }
+            )
 
         # 5. Build comprehensive audit trail
-        audit: Dict[str, Any] = {
-            # Inherit all base audit fields
-            **base_result.audit,
-            # Add regime-specific fields (always present for consistency)
-            "change_ok": base_result.ok,
-            "change_warn": base_warn,
-            "change_evaluated": base_evaluated,
-            "regime_ok": regime_ok,
-            "regime_warn": regime_warn,
-            "regime_enabled": self._enabled_effective,
-            "regime_active": self._ref is not None,
-            "regime_epsilon": self._regime_epsilon,
-            "regime_policy": getattr(self, "_regime_policy", ""),
-            "regime_persistence_k": int(getattr(self, "_regime_persistence_k", 2)),
-            "regime_eps_sens_used": self._eps_sens_used,
-            "regime_eps_sens_from_base": self._eps_sens_from_base,
-        }
+        audit.update(
+            {
+                # Add regime-specific fields (always present for consistency)
+                "change_warn": base_warn,
+                "change_evaluated": bool(base_evaluated),
+                "regime_ok": regime_ok,
+                "regime_warn": regime_warn,
+                "regime_enabled": self._enabled_effective,
+                "regime_active": self._ref is not None,
+                "regime_epsilon": self._regime_epsilon,
+                "regime_policy": getattr(self, "_regime_policy", ""),
+                "regime_persistence_k": int(getattr(self, "_regime_persistence_k", 2)),
+                "regime_eps_sens_used": self._eps_sens_used,
+                "regime_eps_sens_from_base": self._eps_sens_from_base,
+            }
+        )
 
         # Add regime-specific audit
         audit.update(regime_audit)
