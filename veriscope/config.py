@@ -15,6 +15,15 @@ DEFAULTS: Dict[str, Any] = {
     "gate_bins": 16,
     "gate_min_evidence": 16,
     "gate_gain_thresh": 0.10,  # bits/sample
+    # Gate decision policy.
+    # Core GateEngine policies: either|conjunction|persistence|persistence_stability
+    # Legacy-only convenience: stability_only (legacy runner); FR init maps it to persistence_stability,k=1.
+    "gate_policy": "either",
+    "gate_persistence_k": 2,
+    # Gain baseline definition:
+    #   - uniform: gain_bits = (log(C) - loss_nats)/log(2)    (stable at convergence)
+    #   - ewma:    gain_bits = (ewma_loss - loss_nats)/log(2) (legacy; tends to 0 at convergence)
+    "gate_gain_baseline": "uniform",
     "gate_epsilon": 0.08,
     "gate_eps_stat_max_frac": 0.25,
     "eps_sens": 0.04,
@@ -24,6 +33,12 @@ DEFAULTS: Dict[str, Any] = {
     "var_k_max": 32,
     "device": "cuda" if os.getenv("CUDA_VISIBLE_DEVICES", "") else "cpu",
 }
+
+
+def _env_truthy(name: str, default: str = "0") -> bool:
+    """Return True iff os.environ[name] parses as a truthy flag."""
+    v = os.environ.get(name, default)
+    return str(v).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _coerce_env(v: str) -> Any:
@@ -37,12 +52,6 @@ def _coerce_env(v: str) -> Any:
         return f
     except Exception:
         return s
-
-
-def _env_truthy(name: str, default: str = "0") -> bool:
-    """Return True if env var is set to a truthy value."""
-    v = str(os.getenv(name, default)).strip().lower()
-    return v in ("1", "true", "yes", "on")
 
 
 def load_cfg(path: str | Path | None = None) -> Dict[str, Any]:
