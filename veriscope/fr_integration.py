@@ -22,8 +22,6 @@ from veriscope.core.calibration import aggregate_epsilon_stat
 AggFn = Callable[..., float]
 AGGREGATE_EPSILON: Optional[AggFn] = None
 
-ENV: Mapping[str, str] = os.environ
-
 
 def _env_to_dict(e: Optional[Mapping[str, str]]) -> Dict[str, str]:
     """Materialize an env mapping as a plain dict (for typing sanity)."""
@@ -70,9 +68,12 @@ def resolve_eps(
         return 0.0
 
 
-def env_truthy(name: str, default: str = "0") -> bool:
-    """Return True iff ENV[name] parses as a truthy flag."""
-    v = ENV.get(name, default)
+def env_truthy(name: str, default: str = "0", env: Optional[Mapping[str, str]] = None) -> bool:
+    """Return True iff env[name] parses as a truthy flag (env overrides os.environ)."""
+    # Deterministic fallback—if env passed use it, else use os.environ directly.
+    # Avoids brittle globals that may not be a Mapping or may not exist.
+    src = env if env is not None else os.environ
+    v = src.get(name, default)
     return str(v).strip().lower() in {"1", "true", "yes", "on"}
 
 
@@ -81,7 +82,7 @@ def env_truthy(name: str, default: str = "0") -> bool:
 
 def init_fr(
     window_decl: Optional[WindowDecl],
-    cfg: Dict[str, Any],
+    cfg: Mapping[str, Any],
     env: Optional[Mapping[str, str]] = None,
 ) -> Tuple[bool, Optional[FRWindow], Optional[GateEngine]]:
     """
@@ -90,9 +91,12 @@ def init_fr(
     Returns (use_fr, FR_WIN, GE) where use_fr is the SCAR_FR toggle coming
     from the environment, and FR_WIN/GE are None if no declaration is given.
     """
-    env_map: Dict[str, str] = _env_to_dict(env)
-    use_fr = str(env_map.get("SCAR_FR", "0")).strip().lower() in {"1", "true", "yes", "on"}
+    env_map: Dict[str, str] = dict(os.environ) if env is None else dict(env)
 
+    # Enable FR license path?
+    use_fr = env_truthy("SCAR_FR", default="0", env=env_map)
+    if not use_fr:
+        return False, None, None
     if window_decl is None:
         return False, None, None
 
@@ -131,9 +135,25 @@ def init_fr(
 
     # Evidence floor for gating
     try:
-        _min_evidence = int(os.getenv("SCAR_GATE_MIN_EVIDENCE", "0"))
+        _min_evidence = int(env_map.get("SCAR_GATE_MIN_EVIDENCE", "0"))
     except Exception:
         _min_evidence = 0
+
+    # Gate policy/persistence (env wins over cfg).
+    # Core policies: either|conjunction|persistence|persistence_stability
+    # Legacy-only "stability_only" maps to persistence_stability with k=1.
+    policy_raw = str(env_map.get("SCAR_GATE_POLICY", cfg.get("gate_policy", "either"))).strip().lower()
+    try:
+        persistence_k = int(env_map.get("SCAR_GATE_PERSISTENCE_K", cfg.get("gate_persistence_k", 2)))
+    except Exception:
+        persistence_k = 2
+    persistence_k = int(max(1, persistence_k))
+
+    if policy_raw == "stability_only":
+        policy = "persistence_stability"
+        persistence_k = 1
+    else:
+        policy = policy_raw
 
     ge = GateEngine(
         frwin=fr_win,
@@ -142,7 +162,17 @@ def init_fr(
         eps_stat_max_frac=float(cfg.get("gate_eps_stat_max_frac", 0.25)),
         eps_sens=float(cfg.get("gate_epsilon_sens", cfg.get("eps_sens", 0.04))),
         min_evidence=int(_min_evidence),
+        policy=policy,
+        persistence_k=persistence_k,
     )
+
+    # Requested vs effective policy transparency (GateEngine may normalize/fallback in its parser).
+    # Use underscore-prefixed attributes to avoid collision with future GateEngine properties.
+    try:
+        ge._vs_policy_requested = str(policy_raw)
+        ge._vs_policy_effective = str(getattr(getattr(ge, "policy", None), "value", getattr(ge, "policy", policy)))
+    except Exception:
+        pass
 
     return use_fr, fr_win, ge
 

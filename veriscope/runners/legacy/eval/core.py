@@ -1,6 +1,7 @@
 # veriscope/runners/legacy/eval/core.py
 from __future__ import annotations
 
+import os
 import json
 import math
 from pathlib import Path
@@ -753,13 +754,22 @@ def recompute_gate_series_under_decl(
     df["gate_worst_tv_calib"] = np.nan
     df["gate_eps_stat_calib"] = np.nan
     df["gate_gain_calib"] = np.nan
-    df["gate_total_evidence_calib"] = np.nan
+
+    # Debug/parity fields
+    df["gate_eps_eff_calib"] = np.nan
+    df["gate_eps_scaled_calib"] = np.nan
+    df["gate_total_evidence_calib"] = 0
+    df["gate_kappa_checked_calib"] = 0
+    df["gate_kappa_sens_calib"] = np.nan
 
     # IMPORTANT: non-evaluated epochs (e.g., insufficient history) must be neutral.
     # gate_warn==1 means PASS; gate_warn==0 means FAIL.
     df["gate_warn_calib"] = 1
     df["gate_evaluated_calib"] = 0
     df["gate_reason_calib"] = "insufficient_history"
+    # WARN-but-not-fail channel (persistence pre-trigger); keep separate from PASS/FAIL
+    df["gate_warn_pending_calib"] = 0
+    df["gate_consecutive_exceedances_calib"] = 0
 
     max_frac = as_float(cfg.get("gate_eps_stat_max_frac", 0.25), default=0.25)
     thr_gain = as_float(cfg.get("gate_gain_thresh", 0.05), default=0.05)
@@ -767,6 +777,129 @@ def recompute_gate_series_under_decl(
     alpha = as_float(cfg.get("gate_eps_stat_alpha", 0.05), default=0.05)
     min_evidence = as_int(cfg.get("gate_min_evidence", 0), default=0)
     ln2 = math.log(2.0)
+
+    num_classes = as_int(cfg.get("num_classes", 10), default=10)
+    # Precedence: env > cfg (so exports affect offline recompute too)
+    gain_baseline = (
+        str(os.environ.get("SCAR_GATE_GAIN_BASELINE", cfg.get("gate_gain_baseline", "uniform"))).strip().lower()
+    )
+    policy_requested = str(os.environ.get("SCAR_GATE_POLICY", cfg.get("gate_policy", "either"))).strip().lower()
+    try:
+        persistence_k = int(os.environ.get("SCAR_GATE_PERSISTENCE_K", cfg.get("gate_persistence_k", 2)))
+    except Exception:
+        persistence_k = 2
+    persistence_k = max(1, int(persistence_k))
+
+    # Map legacy-only policy to GateEngine-equivalent semantics
+    if policy_requested == "stability_only":
+        policy = "persistence_stability"
+        persistence_k = 1
+    else:
+        policy = policy_requested
+
+    df["gate_policy_requested_calib"] = policy_requested
+    df["gate_policy_effective_calib"] = policy
+    df["gate_gain_baseline_calib"] = gain_baseline
+    df["gate_persistence_k_calib"] = int(persistence_k)
+
+    # FIX #1: Evidence-based epsilon inflation for offline recompute.
+    # Must match online _evidence_scaled_epsilon byte-for-byte, including:
+    #   - gate_eps_inflation_max default = 4.0 (not 2.0)
+    #   - min_full >= min_evidence + 1 guard
+    #   - clamp max_infl >= 1.0
+    #   - identical interpolation form
+    gate_eps_inflation_max = as_float(cfg.get("gate_eps_inflation_max", 4.0), default=4.0)
+    gate_eps_inflation_max = float(max(1.0, gate_eps_inflation_max))  # clamp >= 1
+    min_evidence_full_eps = as_int(cfg.get("gate_min_evidence_full_eps", min_evidence), default=min_evidence)
+    # Critical guard: ensures inflation applies on first evaluated epoch
+    min_evidence_full_eps = max(min_evidence_full_eps, min_evidence + 1)
+
+    def _evidence_scaled_epsilon_offline(
+        eps_base: float,
+        total_evidence: int,
+        min_evidence_full: int,
+        max_inflation: float,
+    ) -> float:
+        """
+        Offline mirror of legacy_cli._evidence_scaled_epsilon (byte-for-byte logic).
+        Returns inflated epsilon when evidence is below min_evidence_full.
+        """
+        eps_base = float(max(0.0, eps_base))
+        total_evidence = int(max(0, total_evidence))
+        min_evidence_full = int(max(1, min_evidence_full))
+        max_inflation = float(max(1.0, max_inflation))
+        if total_evidence >= min_evidence_full:
+            return eps_base
+        if total_evidence <= 0:
+            return eps_base * max_inflation
+        # Linear interpolation: inflation decreases as evidence increases
+        frac = float(total_evidence) / float(min_evidence_full)
+        infl = 1.0 + (max_inflation - 1.0) * (1.0 - frac)
+        return eps_base * float(infl)
+
+    def _parse_evidence_from_row(row_idx: int, g: pd.DataFrame, mets: List[str]) -> int:
+        """
+        Extract total evidence robustly.
+
+        Precedence:
+          1) gate_total_evidence / total_evidence scalar column (if present)
+          2) gate_counts / counts_by_metric JSON dict columns (sum only known metric keys when possible)
+          3) fallback: sum integer-like non-negative metric columns
+        """
+        # (1) Prefer explicit evidence column if present (strictly safest)
+        for col in ("gate_total_evidence", "total_evidence"):
+            if col in g.columns:
+                try:
+                    v = g[col].iloc[row_idx]
+                    if pd.notna(v):
+                        return int(max(0, int(v)))
+                except Exception:
+                    pass
+
+        total = 0
+        allowed = set(map(str, mets)) if mets else None
+
+        # (2) Prefer gate_counts JSON (stringified dict with integer counts)
+        for col_name in ("gate_counts", "counts_by_metric"):
+            if col_name in g.columns:
+                try:
+                    raw = g[col_name].iloc[row_idx]
+                    if pd.notna(raw) and raw:
+                        parsed = json.loads(str(raw)) if isinstance(raw, str) else raw
+                        if isinstance(parsed, dict):
+                            for k, v in parsed.items():
+                                # Sum only intended metric keys when we know them.
+                                if allowed is not None and str(k) not in allowed:
+                                    continue
+                                try:
+                                    total += int(v)
+                                except (TypeError, ValueError):
+                                    pass
+                            if total > 0:
+                                return total
+                except Exception:
+                    pass
+
+        # (3) Fallback: sum per-metric columns only if they look like integer counts
+        for met in mets:
+            if met in g.columns:
+                try:
+                    val = g[met].iloc[row_idx]
+                    if pd.notna(val):
+                        # Only treat as count if it's a non-negative integer-like value
+                        fval = float(val)
+                        if fval >= 0 and fval == int(fval):
+                            total += int(fval)
+                except Exception:
+                    pass
+        return total
+
+    def _gain_flags_like_core(gain_bits: float, thr: float) -> Tuple[bool, bool, bool]:
+        """Return (gain_checked, ok_gain, gain_below) matching core semantics: non-finite => not checked => OK."""
+        gain_checked = bool(np.isfinite(gain_bits))
+        ok_gain = True if (not gain_checked) else bool(float(gain_bits) >= float(thr))
+        gain_below = False if (not gain_checked) else bool(float(gain_bits) < float(thr))
+        return gain_checked, ok_gain, gain_below
 
     mets = [m for m in getattr(window_decl, "metrics", []) if m in df.columns]
     agg_fn = AGGREGATE_EPSILON
@@ -777,6 +910,7 @@ def recompute_gate_series_under_decl(
             continue
 
         idxs = list(g.index)
+        consec = 0
 
         for pos, idx in enumerate(idxs):
             # Align with ONLINE semantics:
@@ -797,10 +931,28 @@ def recompute_gate_series_under_decl(
             # Evidence accounting (matches online): count finite pairs under DeclTransport.
             counts = {m: _count_finite_pairs(window_decl, past[m], recent[m], m) for m in mets}
             evidence_n = int(sum(int(v) for v in (counts or {}).values()))
-            df.loc[idx, "gate_total_evidence_calib"] = int(evidence_n)
 
-            if int(min_evidence) > 0 and evidence_n < int(min_evidence):
+            # Prefer explicit per-row evidence if present; otherwise fall back to recomputed evidence.
+            total_evidence = _parse_evidence_from_row(pos, g, mets)
+            if int(total_evidence) <= 0:
+                total_evidence = int(evidence_n)
+            df.loc[idx, "gate_total_evidence_calib"] = int(total_evidence)
+
+            # Compute inflated epsilon for audit parity (even if not evaluated due to evidence).
+            eps_base = float(getattr(window_decl, "epsilon", 0.0))
+            eps_scaled = _evidence_scaled_epsilon_offline(
+                eps_base=eps_base,
+                total_evidence=int(total_evidence),
+                min_evidence_full=int(min_evidence_full_eps),
+                max_inflation=float(gate_eps_inflation_max),
+            )
+            df.loc[idx, "gate_eps_scaled_calib"] = float(eps_scaled)
+
+            if int(min_evidence) > 0 and int(total_evidence) < int(min_evidence):
+                df.loc[idx, "gate_evaluated_calib"] = 0
                 df.loc[idx, "gate_reason_calib"] = "not_evaluated_insufficient_evidence"
+                df.loc[idx, "gate_warn_pending_calib"] = 0
+                df.loc[idx, "gate_consecutive_exceedances_calib"] = int(consec)
                 continue
 
             try:
@@ -811,6 +963,8 @@ def recompute_gate_series_under_decl(
             # If TV is not finite, treat as not evaluated (prevents NaN-propagation into events).
             if not np.isfinite(tv):
                 df.loc[idx, "gate_reason_calib"] = "not_evaluated_nan_tv"
+                df.loc[idx, "gate_warn_pending_calib"] = 0
+                df.loc[idx, "gate_consecutive_exceedances_calib"] = int(consec)
                 continue
 
             try:
@@ -827,11 +981,18 @@ def recompute_gate_series_under_decl(
             eps_stat = float(
                 min(
                     max(0.0, eps_stat),
-                    float(max_frac) * float(getattr(window_decl, "epsilon", 0.0)),
+                    # FIX #1: Cap eps_stat against inflated epsilon (not base) for parity with online
+                    float(max_frac) * float(eps_scaled),
                 )
             )
 
-            eps_eff = max(0.0, float(getattr(window_decl, "epsilon", 0.0)) - eps_stat)
+            # Canonical GateEngine stability slack:
+            # eps_eff = eps_scaled + eps_sens - eps_stat_capped
+            eps_eff = max(
+                0.0,
+                float(eps_scaled) + float(eps_sens) - float(eps_stat),
+            )
+            df.loc[idx, "gate_eps_eff_calib"] = float(eps_eff)
 
             try:
                 s_train = series_or_empty(g.get("train_loss"))
@@ -839,7 +1000,18 @@ def recompute_gate_series_under_decl(
                 model_losses = to_numeric_opt(s_train).iloc[rs].to_numpy(dtype=np.float64)
                 base_losses = to_numeric_opt(s_ewma).iloc[rs].to_numpy(dtype=np.float64)
                 msk = np.isfinite(model_losses) & np.isfinite(base_losses)
-                gain_bits = float(((base_losses[msk] - model_losses[msk]).mean()) / ln2) if msk.any() else float("nan")
+
+                if gain_baseline == "uniform":
+                    mm = np.isfinite(model_losses)
+                    if mm.any():
+                        base_nats = float(math.log(max(2, int(num_classes))))
+                        gain_bits = float((base_nats - float(np.mean(model_losses[mm]))) / ln2)
+                    else:
+                        gain_bits = float("nan")
+                else:
+                    gain_bits = (
+                        float(((base_losses[msk] - model_losses[msk]).mean()) / ln2) if msk.any() else float("nan")
+                    )
             except Exception:
                 gain_bits = float("nan")
 
@@ -852,19 +1024,67 @@ def recompute_gate_series_under_decl(
             else:
                 kappa = float("nan")
 
-            ok_gain = np.isfinite(gain_bits) and (gain_bits >= thr_gain)
-            ok_tv = np.isfinite(tv) and (tv <= eps_eff)
-            ok_kappa = (not np.isfinite(kappa)) or (kappa <= eps_sens)
-            flag = int(bool(ok_gain and ok_tv and ok_kappa))
+            gain_checked, ok_gain, gain_below = _gain_flags_like_core(gain_bits, thr_gain)
+            ok_tv = bool(np.isfinite(tv) and (tv <= eps_eff))
+            dw_exceeds = bool(np.isfinite(tv) and (tv > eps_eff))
 
-            if flag == 1:
-                reason = "evaluated_ok"
-            elif not ok_gain:
-                reason = "evaluated_fail_gain"
-            elif not ok_tv:
-                reason = "evaluated_fail_stability"
-            else:
-                reason = "evaluated_fail_kappa"
+            # Canonical GateEngine κ semantics: non-finite => not checked => OK
+            kappa_checked = bool(np.isfinite(kappa))
+            ok_kappa = bool((not kappa_checked) or (float(kappa) <= float(eps_sens)))
+            df.loc[idx, "gate_kappa_checked_calib"] = int(kappa_checked)
+            df.loc[idx, "gate_kappa_sens_calib"] = float(kappa) if kappa_checked else np.nan
+
+            warn_pending = False
+            persistence_fail = False
+
+            if policy in ("persistence", "persistence_stability"):
+                # Update streak ONLY on evaluated checks (tv finite, evidence OK)
+                if dw_exceeds:
+                    consec += 1
+                else:
+                    consec = 0
+                persistence_fail = bool(consec >= int(persistence_k))
+                warn_pending = bool(dw_exceeds and (not persistence_fail))
+
+                if policy == "persistence":
+                    # Match GateEngine: reset streak only if gain is finite and below threshold.
+                    if gain_checked and gain_below:
+                        consec = 0
+                        persistence_fail = False
+                        warn_pending = False
+
+                ok = bool(ok_kappa and (not persistence_fail))
+                flag = int(ok)
+                if flag == 1:
+                    reason = "evaluated_ok"
+                elif not ok_kappa:
+                    reason = "evaluated_fail_kappa"
+                else:
+                    reason = "evaluated_fail_stability"
+
+            elif policy == "either":
+                ok = bool(ok_kappa and (ok_gain or ok_tv))
+                flag = int(ok)
+                if flag == 1:
+                    reason = "evaluated_ok"
+                elif not ok_kappa:
+                    reason = "evaluated_fail_kappa"
+                elif not ok_gain:
+                    reason = "evaluated_fail_gain"
+                else:
+                    reason = "evaluated_fail_stability"
+
+            else:  # conjunction (default)
+                ok = bool(ok_kappa and ok_gain and ok_tv)
+                flag = int(ok)
+                if flag == 1:
+                    reason = "evaluated_ok"
+                elif not ok_gain:
+                    reason = "evaluated_fail_gain"
+                elif not ok_tv:
+                    reason = "evaluated_fail_stability"
+                else:
+                    reason = "evaluated_fail_kappa"
 
             df.loc[idx, "gate_worst_tv_calib"] = float(tv)
             df.loc[idx, "gate_eps_stat_calib"] = float(eps_stat)
@@ -872,6 +1092,8 @@ def recompute_gate_series_under_decl(
             df.loc[idx, "gate_warn_calib"] = int(flag)
             df.loc[idx, "gate_evaluated_calib"] = 1
             df.loc[idx, "gate_reason_calib"] = str(reason)
+            df.loc[idx, "gate_warn_pending_calib"] = int(bool(warn_pending))
+            df.loc[idx, "gate_consecutive_exceedances_calib"] = int(consec)
 
     return df
 

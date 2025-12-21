@@ -14,6 +14,8 @@ import os
 import faulthandler
 import signal
 import sys
+import math
+import numpy as np
 
 # Enable with VS_FAULTHANDLER=1. Send `kill -USR1 <pid>` to dump Python stacks.
 if os.environ.get("VS_FAULTHANDLER", "0") == "1":
@@ -29,7 +31,6 @@ CFG: Dict[str, Any] = {}
 # ---- Moved mid-file imports ----
 import hashlib
 import json
-import math
 import os
 import shutil
 import subprocess
@@ -71,7 +72,6 @@ from typing import List, Tuple, Iterable
 
 
 import matplotlib.pyplot as plt
-import numpy as np
 from typing import Any
 
 
@@ -845,6 +845,38 @@ def _evidence_scaled_epsilon(
     return eb * float(infl)
 
 
+def _gain_bits_from_recent_losses(
+    train_losses_nats: np.ndarray,
+    *,
+    baseline: str,
+    ewma_losses_nats: Optional[np.ndarray] = None,
+    num_classes: int = 10,
+) -> float:
+    """
+    Compute gain in bits/sample from recent loss arrays.
+    baseline:
+      - "uniform": gain_bits = (log(C) - mean(train_loss))/log(2)
+      - "ewma":    gain_bits = mean(ewma_loss - train_loss)/log(2)  (legacy; tends to 0 at convergence)
+    """
+    ln2 = math.log(2.0)
+    x = np.asarray(train_losses_nats, dtype=float)
+    xm = x[np.isfinite(x)]
+    if xm.size == 0:
+        return float("nan")
+    b = str(baseline or "").strip().lower()
+    if b == "uniform":
+        base_nats = float(math.log(max(2, int(num_classes))))
+        return float((base_nats - float(np.mean(xm))) / ln2)
+    if ewma_losses_nats is None:
+        return float("nan")
+    y = np.asarray(ewma_losses_nats, dtype=float)
+    ym = y[np.isfinite(y)]
+    n = min(xm.size, ym.size)
+    if n <= 0:
+        return float("nan")
+    return float((float(np.mean(ym[:n] - xm[:n]))) / ln2)
+
+
 def gate_check(
     window: WindowDecl,
     past: Dict[str, np.ndarray],
@@ -1033,12 +1065,18 @@ def gate_check(
     eps_cap = float(eps_scaled) * max_frac
     eps_stat = float(min(max(0.0, eps_stat), eps_cap))
 
-    # Gain check (bits/sample) vs threshold 'thr' defined above
-    ok_gain = np.isfinite(gain) and (gain >= thr)
+    # Gain check (GateEngine parity): non-finite => not checked => OK
+    gain_checked = bool(np.isfinite(gain))
+    ok_gain = True if (not gain_checked) else bool(float(gain) >= float(thr))
 
-    # Stability: worst TV must be ≤ (ε − ε_stat), never negative
+    # Stability: worst TV must be ≤ (ε_scaled + ε_sens − ε_stat), never negative
     worst = float(worst if np.isfinite(worst) else np.inf)
-    eps_eff = max(0.0, float(eps_scaled) - eps_stat)
+
+    # Sensitivity budget ε_sens is also stability slack in GateEngine/offline parity.
+    eps_sens = as_float(CFG.get("gate_epsilon_sens", 0.04), default=0.04)
+    eps_sens = float(max(0.0, eps_sens))
+
+    eps_eff = max(0.0, float(eps_scaled) + float(eps_sens) - float(eps_stat))
     ok_stability = worst <= eps_eff
     if DEBUG_GATE and mp.current_process().name == "MainProcess":
         # Always print on stability failure (useful signal without flooding logs)
@@ -1052,8 +1090,6 @@ def gate_check(
                 pass
 
     # Sensitivity budget κ_sens ≤ ε_sens
-    eps_sens = as_float(CFG.get("gate_epsilon_sens", 0.04), default=0.04)
-    eps_sens = float(max(0.0, eps_sens))
     kappa_sens = float(kappa_sens if np.isfinite(kappa_sens) else np.inf)
     ok_kappa = kappa_sens <= eps_sens
 
@@ -1063,7 +1099,7 @@ def gate_check(
         if ok
         else (
             "evaluated_fail_gain"
-            if not ok_gain
+            if (gain_checked and (not ok_gain))
             else (
                 "evaluated_fail_stability"
                 if not ok_stability
@@ -2685,8 +2721,20 @@ def calibrate_gate_gain_thresh_from_controls(df: pd.DataFrame, W: int, warm: int
                 n = int(m.sum())
                 if n == 0:
                     continue
-                gain_nats = float((bs[m] - xs[m]).sum() / n)
-                vals.append(float(gain_nats / math.log(2.0)))
+                baseline = (
+                    str(os.environ.get("SCAR_GATE_GAIN_BASELINE", CFG.get("gate_gain_baseline", "uniform")))
+                    .strip()
+                    .lower()
+                )
+
+                ln2 = math.log(2.0)
+                if baseline == "uniform":
+                    base_nats = float(math.log(max(2, int(CFG.get("num_classes", 10)))))
+                    gain_bits = (base_nats - float(np.mean(xs[m]))) / ln2
+                else:
+                    gain_bits = float(np.mean(bs[m] - xs[m])) / ln2
+
+                vals.append(float(gain_bits))
     except Exception:
         pass
     if not vals:
@@ -3800,12 +3848,19 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
                 # prequential gain (bits/sample) over the recent half
                 ml = _series(recent[int(W_gate) :], "train_loss")
                 bl = _series(recent[int(W_gate) :], "ewma_loss")
-                n = min(ml.size, bl.size)
-                if n > 0:
-                    gain_nats = float((bl[:n] - ml[:n]).mean())
-                    gate_gain = gain_nats / math.log(2.0)  # bits/sample
-                else:
-                    gate_gain = float("nan")
+
+                baseline = (
+                    str(os.environ.get("SCAR_GATE_GAIN_BASELINE", CFG.get("gate_gain_baseline", "uniform")))
+                    .strip()
+                    .lower()
+                )
+
+                gate_gain = _gain_bits_from_recent_losses(
+                    ml,
+                    baseline=baseline,
+                    ewma_losses_nats=bl,  # used only when baseline == "ewma"
+                    num_classes=int(CFG.get("num_classes", 10)),
+                )
 
                 # κ_sens probe sparsely (augmentation-only by default)
                 gate_kappa = 0.0
