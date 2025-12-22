@@ -60,7 +60,7 @@ import math
 import warnings
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Set
 
 import numpy as np
 import torch
@@ -195,6 +195,8 @@ class TrainConfig:
     regime_build_min_gain: float = -0.01
     regime_epsilon_mult: float = 1.5
     regime_min_evidence: int = 50
+    regime_min_windows: int = 5
+    freeze_metric_gauge_min_ref_updates: int = 25
     regime_build_gap_iters: int = -1  # explicit gap override (-1 = auto)
 
     # Optional: freeze GPT feature normalization once regime reference is established.
@@ -335,7 +337,10 @@ class VeriscopeGatedTrainer:
             max_accumulator_windows=20,
         )
 
-        # (gap override block deleted)
+        # Optional: newer RegimeConfig supports enforcing a minimum number of gate windows
+        # before establishing the reference (variance reduction). Guard for backward compatibility.
+        if "min_windows_for_reference" in getattr(RegimeConfig, "__annotations__", {}):
+            regime_kwargs["min_windows_for_reference"] = int(getattr(config, "regime_min_windows", 0))
 
         regime_config = RegimeConfig(**regime_kwargs)
 
@@ -350,6 +355,15 @@ class VeriscopeGatedTrainer:
             default_gap_iters=int(default_gap_iters),
         )
 
+        # Metric gauge freezing (optional): freeze before reference is built.
+        self._freeze_gauge_at_iter: Optional[int] = None
+        self._freeze_gauge_first_check: Optional[int] = None
+        self._freeze_gauge_window_start_iter: Optional[int] = None
+        # NOTE: GPTFeatureExtractor._ref_count increments once per metric snapshot (i.e., once per
+        # compute_all() call), NOT once per training iteration. It scales with metric_interval.
+        self._freeze_metric_gauge_min_ref_updates: int = int(getattr(config, "freeze_metric_gauge_min_ref_updates", 0))
+        self._freeze_defer_log_every: int = 500
+
         # Log computed build window and effective status
         build_min, build_max = self.gate_engine.build_window
         print(
@@ -357,6 +371,23 @@ class VeriscopeGatedTrainer:
             f"build_window=[{build_min}, {build_max}), "
             f"epsilon={self.gate_engine.regime_epsilon:.4f}"
         )
+        # Freeze gauge BEFORE the first eligible reference-building gate check uses "recent" samples.
+        # Gate checks happen at iter multiples of gate_window. Metric snapshots happen every metric_interval.
+        # We freeze at window_start so that all metric snapshots used to build the reference are in the frozen gauge.
+        if bool(config.freeze_metric_gauge_on_ref) and bool(self.gate_engine.enabled):
+            gw = max(1, int(config.gate_window))
+            mi = max(1, int(config.metric_interval))
+            first_check = ((int(build_min) + gw - 1) // gw) * gw
+            last_snap = (int(first_check) // mi) * mi
+            freeze_at = max(0, int(last_snap) - int(window_span_iters))
+            self._freeze_gauge_first_check = int(first_check)
+            self._freeze_gauge_window_start_iter = int(freeze_at)
+            self._freeze_gauge_at_iter = int(freeze_at)
+            print(
+                f"[REGIME] freeze_metric_gauge_on_ref=True -> will freeze GPT metric gauge at iter={self._freeze_gauge_at_iter} "
+                f"(first_check={first_check}, last_snap={last_snap}, window_start={freeze_at}, build_min={build_min}, "
+                f"window_span_iters={window_span_iters}, min_ref_updates={self._freeze_metric_gauge_min_ref_updates})"
+            )
 
         # If explicit override was requested, warn about tightness (few gate checks / insufficient evidence).
         explicit_override = (int(config.regime_build_min_iter) >= 0) or (int(config.regime_build_max_iter) >= 0)
@@ -772,6 +803,34 @@ class VeriscopeGatedTrainer:
         else:
             self.ewma_loss = self.ewma_alpha * loss + (1 - self.ewma_alpha) * self.ewma_loss
 
+        # Optional: freeze metric gauge once, at the planned pre-reference point.
+        # We gate freezing on extractor._ref_count, which counts metric snapshots (compute_all calls),
+        # not training iters. This avoids freezing a noisy normalization estimate.
+        if self._freeze_gauge_at_iter is not None and int(self.iter_num) >= int(self._freeze_gauge_at_iter):
+            ref_count = int(getattr(self.extractor, "_ref_count", 0) or 0)
+            if ref_count < int(self._freeze_metric_gauge_min_ref_updates):
+                # Defer freezing until we have enough reference-frame updates.
+                if int(self.iter_num) % int(self._freeze_defer_log_every) == 0:
+                    extra = ""
+                    if self._freeze_gauge_window_start_iter is not None and int(self.iter_num) >= int(
+                        self._freeze_gauge_window_start_iter
+                    ):
+                        extra = " (WARNING: past window_start; reference may be mixed-gauge)"
+                    print(
+                        f"[REGIME] freeze deferred at iter={self.iter_num}: ref_updates={ref_count} < "
+                        f"min_ref_updates={self._freeze_metric_gauge_min_ref_updates}{extra}"
+                    )
+            else:
+                try:
+                    self.extractor.freeze_reference_frame()
+                    print(
+                        f"[REGIME] Froze GPT metric gauge at iter={self.iter_num} "
+                        f"(scheduled {self._freeze_gauge_at_iter}, ref_updates={ref_count})."
+                    )
+                except Exception as e:
+                    print(f"[REGIME WARN] Failed to freeze metric gauge at iter={self.iter_num}: {e}")
+                self._freeze_gauge_at_iter = None
+
         # Compute veriscope metrics (every N iterations to save compute)
         if self.iter_num % max(1, int(self.config.metric_interval)) == 0:
             metrics = self.metric_computer.compute_all(
@@ -876,13 +935,6 @@ class VeriscopeGatedTrainer:
                 # Format regime status
                 if gate_result.get("ref_just_established"):
                     regime_status = " [REF ESTABLISHED]"
-                    if bool(cfg.freeze_metric_gauge_on_ref):
-                        try:
-                            if hasattr(self.extractor, "freeze_reference_frame"):
-                                self.extractor.freeze_reference_frame()
-                                print("[REGIME] Froze GPT metric gauge on reference establishment.")
-                        except Exception as e:
-                            print(f"[REGIME WARN] Failed to freeze metric gauge: {e}")
                 elif gate_result.get("regime_active"):
                     regime_dw = audit.get("regime_worst_DW")
                     regime_status = f", regime_D_W={regime_dw:.4f}" if regime_dw is not None else ""
@@ -1100,6 +1152,18 @@ if __name__ == "__main__":
     parser.add_argument("--gate_epsilon", type=float, default=0.12)
     parser.add_argument("--gate_gain_thresh", type=float, default=0.0)
     parser.add_argument("--gate_min_evidence", type=int, default=16)
+    parser.add_argument(
+        "--regime_min_windows",
+        type=int,
+        default=5,
+        help="Min gate windows to accumulate before establishing regime reference (variance reduction).",
+    )
+    parser.add_argument(
+        "--freeze_metric_gauge_min_ref_updates",
+        type=int,
+        default=25,
+        help="Min metric snapshots used to build gauge before freezing (counts compute_all calls).",
+    )
     parser.add_argument(
         "--gate_eps_stat_max_frac",
         type=float,
@@ -1333,6 +1397,8 @@ if __name__ == "__main__":
         regime_build_min_gain=args.regime_build_min_gain,
         regime_epsilon_mult=args.regime_epsilon_mult,
         regime_min_evidence=args.regime_min_evidence,
+        regime_min_windows=args.regime_min_windows,
+        freeze_metric_gauge_min_ref_updates=args.freeze_metric_gauge_min_ref_updates,
         regime_build_gap_iters=args.regime_build_gap_iters,
         cos_disp_max=args.cos_disp_max,
         freeze_metric_gauge_on_ref=bool(args.freeze_metric_gauge_on_ref),
@@ -1359,7 +1425,48 @@ if __name__ == "__main__":
     out_path = out_path.expanduser()
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    metrics_out = metrics if bool(args.save_all_metrics) else metrics[-100:]
+    # --- select a compact but relevant metric subset for JSON output ---
+    def _select_metrics_for_output(
+        all_metrics: List[Dict[str, Any]],
+        keep_last_n: int,
+        extra_ranges: List[Tuple[int, int]],
+    ) -> List[Dict[str, Any]]:
+        if not all_metrics:
+            return []
+        keep: Set[int] = set(range(max(0, len(all_metrics) - int(keep_last_n)), len(all_metrics)))
+        for i, m in enumerate(all_metrics):
+            it = m.get("iter", None)
+            if it is None:
+                continue
+            try:
+                it_i = int(it)
+            except Exception:
+                continue
+            for a, b in extra_ranges:
+                if int(a) <= it_i < int(b):
+                    keep.add(i)
+                    break
+        return [all_metrics[i] for i in sorted(keep)]
+
+    if bool(args.save_all_metrics):
+        metrics_out = metrics
+    else:
+        # Keep last 100 + padded ranges around reference build and configured pathologies.
+        # compute_window_spans() is defined in this module.
+        Wm, window_span_iters, _ = compute_window_spans(config.gate_window, config.metric_interval)
+        build_min, build_max = trainer.gate_engine.build_window
+        pad = 2 * int(window_span_iters)
+        ranges: List[Tuple[int, int]] = []
+        ranges.append((max(0, int(build_min) - pad), min(int(config.max_iters), int(build_max) + pad)))
+        if int(config.data_corrupt_at) >= 0 and int(config.data_corrupt_len) > 0:
+            s0 = int(config.data_corrupt_at)
+            s1 = int(config.data_corrupt_at + config.data_corrupt_len)
+            ranges.append((max(0, s0 - pad), min(int(config.max_iters), s1 + pad)))
+        if int(config.lr_spike_at) >= 0 and int(config.lr_spike_len) > 0:
+            s0 = int(config.lr_spike_at)
+            s1 = int(config.lr_spike_at + config.lr_spike_len)
+            ranges.append((max(0, s0 - pad), min(int(config.max_iters), s1 + pad)))
+        metrics_out = _select_metrics_for_output(metrics, keep_last_n=100, extra_ranges=ranges)
 
     # Persist reference + config metadata for analysis tooling.
     reference_info: Dict[str, Any] = {}
@@ -1417,6 +1524,8 @@ if __name__ == "__main__":
             "regime_build_min_gain": config.regime_build_min_gain,
             "regime_min_evidence": config.regime_min_evidence,
             "freeze_metric_gauge_on_ref": config.freeze_metric_gauge_on_ref,
+            "regime_min_windows": config.regime_min_windows,
+            "freeze_metric_gauge_min_ref_updates": int(config.freeze_metric_gauge_min_ref_updates),
         },
         "pathology": {
             "data_corrupt_at": config.data_corrupt_at,
@@ -1444,5 +1553,8 @@ if __name__ == "__main__":
         )
 
     print(f"Saved {len(metrics)} metric snapshots, {len(gates)} gate checks")
-    print(f"Wrote {len(metrics_out)} metric snapshots to JSON ({'all' if bool(args.save_all_metrics) else 'last 100'})")
+    print(
+        f"Wrote {len(metrics_out)} metric snapshots to JSON ("
+        f"{'all' if bool(args.save_all_metrics) else 'selected subset'})"
+    )
     print(f"Wrote results JSON to: {out_path}")
