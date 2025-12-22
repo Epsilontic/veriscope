@@ -368,6 +368,11 @@ class RegimeAnchoredGateEngine:
         self.fr_win = fr_win
         self.config = config or RegimeConfig()
 
+        # Reference-build starvation diagnostics (observability only)
+        # Counts windows where one or more tracked metrics are missing/empty in `recent`.
+        self._ref_incomplete_windows_skipped: int = 0
+        self._ref_last_incomplete_missing: List[str] = []
+
         # Compute build window (half-open: [min_iter, max_iter))
         self._build_min_iter, self._build_max_iter = compute_build_window(
             config=self.config,
@@ -806,6 +811,21 @@ class RegimeAnchoredGateEngine:
         """
         self._n_ref_attempts += 1
 
+        # Starvation diagnostic (observability only): track incomplete windows.
+        # A window is considered incomplete if any tracked metric is missing or has
+        # no finite samples in this `recent` payload.
+        missing: List[str] = []
+        for m in self._metrics_tracked:
+            v = recent.get(m, None)
+            arr = np.asarray(v if v is not None else [], dtype=np.float64).ravel()
+            if arr.size > 0:
+                arr = arr[np.isfinite(arr)]
+            if arr.size == 0:
+                missing.append(m)
+        if missing:
+            self._ref_incomplete_windows_skipped += 1
+            self._ref_last_incomplete_missing = sorted(missing)
+
         # Bound accumulator growth (drop oldest window if at capacity)
         if len(self._accumulating) >= self.config.max_accumulator_windows:
             self._accumulating.pop(0)
@@ -852,6 +872,8 @@ class RegimeAnchoredGateEngine:
                 "quality_gates": quality_audit,
                 "windows_used": len(self._accumulating),
                 "n_attempts": self._n_ref_attempts,
+                "incomplete_windows_skipped": int(self._ref_incomplete_windows_skipped),
+                "last_incomplete_missing": list(self._ref_last_incomplete_missing),
             },
         )
 
@@ -1208,6 +1230,8 @@ class RegimeAnchoredGateEngine:
                     "build_window_min_iter": int(self._build_min_iter),
                     "build_window_max_iter": int(self._build_max_iter),
                     "build_window_semantics": "[min_iter, max_iter)",
+                    "ref_incomplete_windows_skipped": int(self._ref_incomplete_windows_skipped),
+                    "ref_last_incomplete_missing": list(self._ref_last_incomplete_missing),
                 }
             )
 
@@ -1268,6 +1292,9 @@ class RegimeAnchoredGateEngine:
         }
         self._ref = None
         self._accumulating = []
+        # Reset starvation diagnostics
+        self._ref_incomplete_windows_skipped = 0
+        self._ref_last_incomplete_missing = []
         return summary
 
     def get_reference_stats(self) -> Optional[Dict[str, Any]]:
@@ -1291,6 +1318,8 @@ class RegimeAnchoredGateEngine:
             "min_evidence_per_metric": self.config.min_evidence_per_metric,
             "reference_established": self._ref is not None,
             "build_phase": [self._build_min_iter, self._build_max_iter],
+            "ref_incomplete_windows_skipped": int(self._ref_incomplete_windows_skipped),
+            "ref_last_incomplete_missing": list(self._ref_last_incomplete_missing),
         }
 
     def get_diagnostics(self) -> Dict[str, Any]:

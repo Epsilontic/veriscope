@@ -185,6 +185,36 @@ def _count_gain_fps(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     return {"n_gain_fp": int(len(gain_fp)), "change_gain_ok_distribution": dist}
 
 
+def _expand_results_args(results_args: List[str]) -> List[Path]:
+    """
+    Expand a list of --results tokens into a de-duped list of Paths.
+
+    Supports comma-separated entries within a token:
+      --results a.json,b.json c.json
+
+    Dedupe key normalizes without requiring existence:
+      - expanduser (~)
+      - resolve(strict=False) (collapses ./, ../, etc.)
+    """
+    out: List[Path] = []
+    seen: set[str] = set()
+    for token in results_args or []:
+        for part in str(token).split(","):
+            part = part.strip()
+            if not part:
+                continue
+            p2 = Path(part).expanduser()
+            try:
+                key = str(p2.resolve(strict=False))
+            except Exception:
+                key = str(p2)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(p2)
+    return out
+
+
 def analyze_gates(
     results_path: Path,
     spike_start: int,
@@ -660,7 +690,7 @@ def print_analysis(a: Dict[str, Any], verbose: bool) -> None:
 
 def main() -> None:
     p = argparse.ArgumentParser(description="Analyze veriscope gate precision/recall vs spike overlap.")
-    p.add_argument("--results", required=True, type=str)
+    p.add_argument("--results", required=True, nargs="+", type=str)
     p.add_argument("--spike_start", required=True, type=int)
     p.add_argument("--spike_len", required=True, type=int)
     p.add_argument("--gate_window", default=100, type=int)
@@ -672,21 +702,37 @@ def main() -> None:
     )
     args = p.parse_args()
 
-    analysis = analyze_gates(
-        results_path=Path(args.results),
-        spike_start=args.spike_start,
-        spike_len=args.spike_len,
-        gate_window=args.gate_window,
-        metric_interval=args.metric_interval,
-        control=bool(args.control),
-    )
+    results_paths = _expand_results_args(args.results)
+    if not results_paths:
+        raise SystemExit("No --results paths provided after parsing.")
+
+    analyses: List[Dict[str, Any]] = [
+        analyze_gates(
+            results_path=rp,
+            spike_start=args.spike_start,
+            spike_len=args.spike_len,
+            gate_window=args.gate_window,
+            metric_interval=args.metric_interval,
+            control=bool(args.control),
+        )
+        for rp in results_paths
+    ]
 
     if args.json:
+        out_obj: Any = analyses[0] if len(analyses) == 1 else analyses
         if args.quiet:
-            analysis = {k: v for (k, v) in analysis.items() if k != "per_gate"}
-        print(json.dumps(analysis, indent=2, default=str))
+            if isinstance(out_obj, list):
+                out_obj = [{k: v for (k, v) in a.items() if k != "per_gate"} for a in out_obj]
+            else:
+                out_obj = {k: v for (k, v) in out_obj.items() if k != "per_gate"}
+        print(json.dumps(out_obj, indent=2, default=str))
     else:
-        print_analysis(analysis, verbose=not args.quiet)
+        for a in analyses:
+            if len(analyses) > 1:
+                print("\n" + "=" * 80)
+                print(f"RESULTS: {a.get('results_file', '')}")
+                print("=" * 80)
+            print_analysis(a, verbose=not args.quiet)
 
 
 if __name__ == "__main__":

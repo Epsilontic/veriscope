@@ -48,11 +48,13 @@ def cosine_dispersion(H: torch.Tensor, seed: int = 0, epoch: int = 0, n_pairs: i
         return 0.0
     # normalize
     X = X / torch.clamp(torch.linalg.norm(X, dim=1, keepdim=True), min=1e-8)
-    g = torch.Generator(device=X.device)
+    # Portable determinism: sample indices on CPU, then move to X.device.
+    # (Avoid device-dependent RNG divergences across CUDA/MPS/CPU.)
+    g = torch.Generator()  # CPU generator
     g.manual_seed(int(seed) + 131 * int(epoch) + 17)
     m = min(int(n_pairs), n * (n - 1) // 2)
-    i = torch.randint(0, n, (m,), generator=g, device=X.device)
-    j = torch.randint(0, n, (m,), generator=g, device=X.device)
+    i = torch.randint(0, n, (m,), generator=g).to(X.device)
+    j = torch.randint(0, n, (m,), generator=g).to(X.device)
     # avoid i == j with a cheap fix
     j = (j + (i == j).to(j.dtype)) % n
     cos = (X[i] * X[j]).sum(dim=1)
@@ -219,6 +221,7 @@ class GPTFeatureExtractor:
         self,
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
+        seed: Optional[int] = None,
     ) -> torch.Tensor:
         """
         Extract and flatten hidden states from probed layers.
@@ -247,7 +250,17 @@ class GPTFeatureExtractor:
 
                 # Optional: subsample tokens (ensure indices are on the same device as h)
                 if T > self.config.max_tokens_per_batch:
-                    idx_sample = torch.randperm(T, device=h.device)[: self.config.max_tokens_per_batch]
+                    K = int(self.config.max_tokens_per_batch)
+                    if seed is None:
+                        idx_sample = torch.randperm(T, device=h.device)[:K]
+                    else:
+                        # Portable determinism: CPU generator -> CPU randperm -> move indices to device.
+                        # Mix layer index so different probed layers don't share the same subsample.
+                        seed_eff = (int(seed) + 1009 * int(idx) + 17) % (2**31)
+                        g = torch.Generator()  # CPU generator (no device=; portable across torch versions)
+                        g.manual_seed(int(seed_eff))
+                        idx_cpu = torch.randperm(T, generator=g)[:K]  # CPU by default
+                        idx_sample = idx_cpu.to(h.device)
                     h = h[:, idx_sample, :]
 
                 # Flatten to (N, D)
@@ -344,7 +357,7 @@ class GPTMetricComputer:
             - raw features for gating
         """
         # Extract hidden states
-        H_raw = self.extractor.extract_features(input_ids)
+        H_raw = self.extractor.extract_features(input_ids, seed=int(run_key))
 
         # Normalize using the previous reference frame, then update it.
         H_norm = self.extractor.normalize(H_raw)
