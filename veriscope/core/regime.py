@@ -20,12 +20,16 @@ Final revision addressing:
 - eps_sens fallback tracked and warned
 - "not_evaluated" added to skip_reasons
 - Missing/non-finite worst_DW fails quality gate (conservative)
+- Missing/non-finite gain_bits fails quality gate (conservative)
+- min_windows_for_reference only counts complete windows
+- cal_ranges validated for value correctness, not just key presence
 """
 
 from __future__ import annotations
 
 import copy
 import hashlib
+import os
 import warnings
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -38,9 +42,14 @@ from veriscope.core.transport import DeclTransport
 from veriscope.core.gate import GateEngine, GateResult  # GatePolicy not needed here
 from veriscope.core.calibration import aggregate_epsilon_stat
 
+
 # --- Transport saturation diagnostic (rate-limited) ---
 _SATURATION_WARN_COUNT: Dict[str, int] = {}
 _SATURATION_WARN_LIMIT = 5
+
+# --- Regime sanity diagnostics (rate-limited) ---
+_SANITY_WARN_COUNT: Dict[str, int] = {}
+_SANITY_WARN_LIMIT = 5
 
 
 def _is_main_process() -> bool:
@@ -51,8 +60,14 @@ def _is_main_process() -> bool:
         return True  # fail open
 
 
-def _validate_cal_range(entry) -> tuple[bool, float, float]:
-    """Validate a cal_ranges entry. Returns (valid, lo, hi)."""
+def _validate_cal_range(entry) -> Tuple[bool, float, float]:
+    """Validate a cal_ranges entry. Returns (valid, lo, hi).
+
+    A cal_range is valid if:
+    - It's a list/tuple of exactly 2 elements
+    - Both elements are finite floats
+    - lo < hi (strict inequality)
+    """
     if not isinstance(entry, (list, tuple)) or len(entry) != 2:
         return False, 0.0, 1.0
     lo, hi = entry
@@ -84,27 +99,25 @@ def diagnose_transport_saturation(
     """
     x = np.asarray(arr, dtype=float)
     x = x[np.isfinite(x)]
-
     if len(x) == 0:
         return {"name": name, "n": 0, "clip_lo_frac": np.nan, "clip_hi_frac": np.nan}
-
     eps = 1e-9
     n_below = float((x <= lo + eps).sum())
     n_above = float((x >= hi - eps).sum())
-    n = float(len(x))
-
+    n = int(len(x))
+    n_f = float(n)
     return {
         "name": name,
-        "n": int(n),
+        "n": n,
         "lo": lo,
         "hi": hi,
         "actual_min": float(np.min(x)),
         "actual_max": float(np.max(x)),
         "actual_q01": float(np.quantile(x, 0.01)) if len(x) >= 10 else float(np.min(x)),
         "actual_q99": float(np.quantile(x, 0.99)) if len(x) >= 10 else float(np.max(x)),
-        "clip_lo_frac": n_below / n,
-        "clip_hi_frac": n_above / n,
-        "clip_total_frac": (n_below + n_above) / n,
+        "clip_lo_frac": n_below / n_f,
+        "clip_hi_frac": n_above / n_f,
+        "clip_total_frac": (n_below + n_above) / n_f,
     }
 
 
@@ -134,6 +147,18 @@ def _maybe_warn_saturation(
         f"actual_range=[{diag['actual_min']:.4f}, {diag['actual_max']:.4f}], "
         f"cal_range=[{diag['lo']:.4f}, {diag['hi']:.4f}]"
     )
+
+
+def _maybe_sanity_warn(key: str, msg: str) -> None:
+    """Rate-limited sanity warning. Main process only."""
+    if not _is_main_process():
+        return
+    global _SANITY_WARN_COUNT
+    c = _SANITY_WARN_COUNT.get(key, 0)
+    if c >= _SANITY_WARN_LIMIT:
+        return
+    _SANITY_WARN_COUNT[key] = c + 1
+    warnings.warn(msg, RuntimeWarning, stacklevel=2)
 
 
 def _stable_metric_seed(metric_name: str, base_seed: int = 42) -> int:
@@ -177,8 +202,13 @@ class RegimeConfig:
 
     Default values are SENTINELS (-1). At runtime, compute_build_window() derives
     actual values from gate config:
-        min_iter = gate_warmup + 2 * gate_window
-        max_iter = min(pathology_start - gate_window, min_iter + build_span)
+        min_iter = gate_warmup + 2 * gate_window  (when reference_build_min_iter == -1)
+        max_iter = min(min_iter + build_span, pathology_start - gap)
+
+    Where `gap` is determined by:
+        - reference_build_gap_iters if >= 0 (explicit override)
+        - default_gap_iters passed by caller (typically 2 * window_span_iters)
+        - gate_window as final fallback
 
     Evidence Requirements:
     ---------------------
@@ -197,12 +227,12 @@ class RegimeConfig:
     - reference_build_max_dw: worst D_W must be well below epsilon
     - reference_build_min_gain: learning must be progressing (not stalled/diverging)
     - If worst_DW is missing/non-finite, quality gate FAILS (conservative)
+    - If gain_bits is non-finite, quality gate FAILS (conservative)
     """
 
     # ---- Epsilon configuration ----
     # Epsilon for regime check: explicit value, or None to derive from base
     epsilon: Optional[float] = None
-
     # If epsilon is None, regime_epsilon = base_epsilon * epsilon_mult
     epsilon_mult: float = 1.5
 
@@ -211,19 +241,16 @@ class RegimeConfig:
     # Only establish reference during [min_iter, max_iter)
     reference_build_min_iter: int = -1
     reference_build_max_iter: int = -1
-
     # Default span for build window when auto-computing max_iter
     reference_build_span: int = 1500
-
     # Explicit safety gap between pathology_start and reference build window end.
-    # -1 => use default_gap_iters passed by caller (trainer).
+    # -1 => use default_gap_iters passed by caller (trainer), or gate_window as fallback.
     reference_build_gap_iters: int = -1
 
     # ---- Quality gates for reference establishment ----
     # Reference only established if base check worst_DW <= this threshold
     # Set conservatively below epsilon to ensure "truly healthy" baseline
     reference_build_max_dw: float = 0.08  # Should be << epsilon (default 0.12)
-
     # Reference only established if gain_bits >= this floor (learning health)
     # Slightly negative OK during warmup phase
     reference_build_min_gain: float = -0.01
@@ -232,6 +259,15 @@ class RegimeConfig:
     # Min samples PER METRIC (not total) before establishing reference
     # NOTE: This is for reference establishment, NOT for GateEngine.min_evidence
     min_evidence_per_metric: int = 50
+
+    # ---- Minimum windows for reference establishment ----
+    # Require this many COMPLETE gate windows to be accumulated before reference
+    # can be established. A window is "complete" if ALL tracked metrics have at
+    # least one finite sample. This ensures temporal coverage even when
+    # min_evidence_per_metric is reached quickly (e.g., large Wm).
+    # Setting to 0 disables this check.
+    # NOTE: Must be <= max_accumulator_windows or reference can never establish.
+    min_windows_for_reference: int = 5
 
     # ---- eps_stat parameters for regime divergence calculation ----
     eps_stat_alpha: float = 0.05
@@ -299,14 +335,32 @@ def compute_build_window(
     If max_iter <= min_iter, the window contains zero eligible checks; reference
     cannot be established. This is allowed but should be surfaced loudly by the
     caller/wrapper.
+
+    Sentinel semantics for reference_build_min_iter:
+        -1 (default): min_iter = gate_warmup + 2*gate_window
+            This ensures at least 2 full windows of "past" data exist before
+            the build phase begins.
+        >= 0 (explicit): min_iter = max(gate_warmup, explicit_value)
+            User override, floored at gate_warmup for safety.
+
+    Gap semantics for max_iter when pathology_start is known:
+        1. If config.reference_build_gap_iters >= 0, use that (explicit override)
+        2. Else if default_gap_iters is provided, use that (caller's preference)
+        3. Else use gate_window as final fallback
+
+        max_iter = min(min_iter + build_span, pathology_start - gap)
     """
-    min_iter = int(max(int(gate_warmup), int(config.reference_build_min_iter)))
+    if int(config.reference_build_min_iter) >= 0:
+        # User explicitly set a value; respect it but floor at gate_warmup
+        min_iter = int(max(int(gate_warmup), int(config.reference_build_min_iter)))
+    else:
+        # Sentinel case: derive from gate config per documented semantics
+        min_iter = int(gate_warmup) + 2 * int(gate_window)
 
     if int(config.reference_build_max_iter) >= 0:
         return int(min_iter), int(config.reference_build_max_iter)
 
     default_max = int(min_iter) + int(config.reference_build_span)
-
     if pathology_start is not None and int(pathology_start) >= 0:
         gap = int(config.reference_build_gap_iters)
         if gap < 0:
@@ -334,8 +388,12 @@ class RegimeAnchoredGateEngine:
     2. Base check was actually evaluated (not skipped due to insufficient evidence)
     3. Base check passed (ok=True)
     4. Base check worst_DW is present, finite, and <= reference_build_max_dw
-    5. Gain >= reference_build_min_gain (learning health gate)
+    5. Gain is finite and >= reference_build_min_gain (learning health gate)
     6. All tracked metrics have >= min_evidence_per_metric samples accumulated
+    7. At least min_windows_for_reference COMPLETE windows accumulated
+
+    A window is "complete" if ALL tracked metrics have at least one finite sample.
+    Incomplete windows are skipped and do not count toward min_windows_for_reference.
 
     Once established, reference is frozen until manual reset_reference() call.
 
@@ -363,6 +421,8 @@ class RegimeAnchoredGateEngine:
             gate_window: Gate window size (for computing build window)
             pathology_start: If known, when pathology begins (for computing build window).
                             Caller should pass earliest among multiple pathologies.
+            default_gap_iters: Default gap between build window end and pathology start.
+                              If None, falls back to gate_window.
         """
         self.base = base_engine
         self.fr_win = fr_win
@@ -370,6 +430,7 @@ class RegimeAnchoredGateEngine:
 
         # Reference-build starvation diagnostics (observability only)
         # Counts windows where one or more tracked metrics are missing/empty in `recent`.
+        # These windows are SKIPPED (not added to accumulator) per the "complete windows" rule.
         self._ref_incomplete_windows_skipped: int = 0
         self._ref_last_incomplete_missing: List[str] = []
 
@@ -397,7 +458,6 @@ class RegimeAnchoredGateEngine:
         # This matches what GateEngine actually iterates over during D_W computation
         weights_keys = set(fr_win.decl.weights.keys())
         decl_metrics = set(fr_win.decl.metrics)
-
         if weights_keys != decl_metrics:
             warnings.warn(
                 f"WindowDecl.metrics ({sorted(decl_metrics)}) differs from "
@@ -406,8 +466,10 @@ class RegimeAnchoredGateEngine:
                 RuntimeWarning,
             )
 
-        # Validate cal_ranges exist for all tracked metrics
+        # Validate cal_ranges: both key presence AND value validity
         cal_ranges = getattr(fr_win.decl, "cal_ranges", {}) or {}
+
+        # First pass: drop metrics missing from cal_ranges
         missing_cal = weights_keys - set(cal_ranges.keys())
         if missing_cal:
             warnings.warn(
@@ -416,6 +478,23 @@ class RegimeAnchoredGateEngine:
                 RuntimeWarning,
             )
             weights_keys = weights_keys - missing_cal
+
+        # Second pass: drop metrics with invalid cal_range values
+        invalid_cal: Set[str] = set()
+        for m in list(weights_keys):
+            entry = cal_ranges.get(m)
+            valid, _, _ = _validate_cal_range(entry)
+            if not valid:
+                invalid_cal.add(m)
+
+        if invalid_cal:
+            warnings.warn(
+                f"Metrics {sorted(invalid_cal)} have invalid cal_ranges entries "
+                f"(non-finite, inverted, or malformed). "
+                f"Dropping these metrics from regime tracking.",
+                RuntimeWarning,
+            )
+            weights_keys = weights_keys - invalid_cal
 
         self._metrics_tracked: Set[str] = weights_keys
 
@@ -427,6 +506,28 @@ class RegimeAnchoredGateEngine:
                 RuntimeWarning,
             )
             self._enabled_effective = False
+
+        # Guard against impossible configuration: min_windows_for_reference > max_accumulator_windows
+        # If this holds, reference can never be established because we evict windows at capacity.
+        try:
+            min_win_req = int(getattr(self.config, "min_windows_for_reference", 0) or 0)
+        except Exception:
+            min_win_req = 0
+        try:
+            max_accum = int(getattr(self.config, "max_accumulator_windows", 20))
+        except Exception:
+            max_accum = 20
+
+        if min_win_req > max_accum and self._enabled_effective:
+            warnings.warn(
+                f"min_windows_for_reference ({min_win_req}) > max_accumulator_windows ({max_accum}). "
+                f"Reference can never be established. Clamping min_windows_for_reference to {max_accum}.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            self._min_windows_for_reference_effective = int(max_accum)
+        else:
+            self._min_windows_for_reference_effective = int(min_win_req)
 
         # Derive regime epsilon from base if not explicitly set
         base_epsilon = float(fr_win.decl.epsilon)
@@ -441,11 +542,13 @@ class RegimeAnchoredGateEngine:
             fr_win.decl,
             self._regime_epsilon,
         )
+
         # Keep regime decl consistent with the tracked metric set.
         # We may drop metrics (e.g., missing cal_ranges) from self._metrics_tracked,
         # but GateEngine.check() typically iterates over decl.weights.keys().
         # If the decl still contains dropped metrics, it can trigger missing-key / no-data paths.
         self._regime_decl = self._prune_decl_to_metrics(self._regime_decl, self._metrics_tracked)
+
         # Create regime FRWindow with cloned decl
         regime_transport = DeclTransport(self._regime_decl)
         self._regime_decl.attach_transport(regime_transport)
@@ -474,8 +577,8 @@ class RegimeAnchoredGateEngine:
 
         base_policy = _policy_to_str(getattr(base_engine, "policy", None)).strip().lower()
         base_pk = int(getattr(base_engine, "persistence_k", 2))
-
         cfg_policy = str(getattr(self.config, "policy", "inherit")).strip().lower()
+
         if cfg_policy == "inherit":
             regime_policy = base_policy or "either"
             regime_pk = base_pk
@@ -544,7 +647,6 @@ class RegimeAnchoredGateEngine:
             "Consider adding copy_with() method to WindowDecl for robustness.",
             RuntimeWarning,
         )
-
         return WindowDecl(
             epsilon=float(new_epsilon),
             metrics=list(decl.metrics),
@@ -565,10 +667,8 @@ class RegimeAnchoredGateEngine:
         reconstruction via the known WindowDecl constructor args.
         """
         keep = set(metrics)
-
         weights2 = {k: decl.weights[k] for k in decl.weights.keys() if k in keep}
         metrics2 = [m for m in list(getattr(decl, "metrics", [])) if m in keep]
-
         cal_ranges = getattr(decl, "cal_ranges", None)
         cal_ranges2 = None
         if isinstance(cal_ranges, dict):
@@ -638,19 +738,18 @@ class RegimeAnchoredGateEngine:
     # ---- Internal helpers ----
 
     def _get_per_metric_counts(self, data: Dict[str, np.ndarray]) -> Dict[str, int]:
-        """Extract sample counts per metric from data arrays."""
-        counts = {}
+        counts: Dict[str, int] = {}
         for m in self._metrics_tracked:
             arr = data.get(m)
             if arr is None:
                 counts[m] = 0
-            elif isinstance(arr, np.ndarray):
-                counts[m] = int(arr.size)
-            else:
-                try:
-                    counts[m] = int(len(arr))
-                except TypeError:
-                    counts[m] = 0
+                continue
+            try:
+                x = np.asarray(arr, dtype=float).ravel()
+            except Exception:
+                counts[m] = 0
+                continue
+            counts[m] = int(np.isfinite(x).sum())
         return counts
 
     def _all_metrics_have_min_evidence(
@@ -707,7 +806,6 @@ class RegimeAnchoredGateEngine:
         """
         if arr.size <= max_samples:
             return arr
-
         seed = _stable_metric_seed(metric_name, base_seed=42)
         rng = np.random.default_rng(seed=seed)
         indices = rng.choice(arr.size, size=max_samples, replace=False)
@@ -720,12 +818,10 @@ class RegimeAnchoredGateEngine:
         Returns (in_phase, reason_if_not).
         """
         iter_num = int(iter_num)
-
         if iter_num < self._build_min_iter:
             return False, f"iter={iter_num} < min={self._build_min_iter}"
         if iter_num >= self._build_max_iter:
             return False, f"iter={iter_num} >= max={self._build_max_iter}"
-
         return True, ""
 
     def _meets_quality_gates(
@@ -735,11 +831,11 @@ class RegimeAnchoredGateEngine:
     ) -> Tuple[bool, str, Dict[str, Any]]:
         """
         Check if base result meets quality gates for reference establishment.
-
-        CONSERVATIVE: If worst_DW is missing or non-finite, the gate FAILS.
+        CONSERVATIVE STANCE:
+        - If worst_DW is missing or non-finite, the gate FAILS.
+        - If gain_bits is non-finite, the gate FAILS.
         This prevents establishing reference during phases where divergence
-        wasn't properly computed.
-
+        or learning health wasn't properly computed.
         Returns (passes, reason_if_failed, gate_values).
         """
         cfg = self.config
@@ -759,7 +855,6 @@ class RegimeAnchoredGateEngine:
                 "worst_DW_missing: cannot establish reference without divergence measurement",
                 gate_values,
             )
-
         try:
             dw_val = float(worst_dw)
             gate_values["worst_DW"] = dw_val
@@ -784,14 +879,31 @@ class RegimeAnchoredGateEngine:
                 gate_values,
             )
 
-        # Gate 2: gain must be above floor
-        gate_values["gain_bits"] = gain_bits
+        # Gate 2: gain must be finite and above floor
+        # Prefer the base engine's audited gain_bits when present/finite; fall back to wrapper arg.
+        gain_use = gain_bits
+        try:
+            g_audit = float(audit.get("gain_bits"))
+            if np.isfinite(g_audit):
+                gain_use = g_audit
+        except Exception:
+            pass
+
+        gate_values["gain_bits"] = gain_use
         gate_values["min_gain_threshold"] = cfg.reference_build_min_gain
 
-        if np.isfinite(gain_bits) and gain_bits < cfg.reference_build_min_gain:
+        # CONSERVATIVE: non-finite gain fails the quality gate
+        if not np.isfinite(gain_use):
             return (
                 False,
-                f"gain_bits={gain_bits:.4f} < threshold={cfg.reference_build_min_gain:.4f}",
+                f"gain_bits_nonfinite: {gain_use} is not finite",
+                gate_values,
+            )
+
+        if gain_use < cfg.reference_build_min_gain:
+            return (
+                False,
+                f"gain_bits={gain_use:.4f} < threshold={cfg.reference_build_min_gain:.4f}",
                 gate_values,
             )
 
@@ -805,39 +917,54 @@ class RegimeAnchoredGateEngine:
     ) -> Tuple[bool, str]:
         """
         Accumulate healthy samples; establish reference once ALL metrics
-        have sufficient evidence.
+        have sufficient evidence AND minimum COMPLETE windows accumulated.
+
+        A window is "complete" if ALL tracked metrics have at least one finite sample.
+        Incomplete windows are SKIPPED (not added to accumulator) and recorded
+        in _ref_incomplete_windows_skipped for observability.
 
         Returns (established, reason_if_not).
         """
         self._n_ref_attempts += 1
 
-        # Starvation diagnostic (observability only): track incomplete windows.
-        # A window is considered incomplete if any tracked metric is missing or has
-        # no finite samples in this `recent` payload.
+        # Check for incomplete window: any tracked metric missing or with no finite samples
         missing: List[str] = []
+        snapshot: Dict[str, np.ndarray] = {}
+
         for m in self._metrics_tracked:
             v = recent.get(m, None)
             arr = np.asarray(v if v is not None else [], dtype=np.float64).ravel()
+            # Filter to finite values only
             if arr.size > 0:
                 arr = arr[np.isfinite(arr)]
+
             if arr.size == 0:
                 missing.append(m)
+            else:
+                snapshot[m] = arr.copy()
+
+        # If any tracked metric is missing/empty, this is an INCOMPLETE window
+        # Skip it entirely (do not add to accumulator) per the strict completeness rule
         if missing:
             self._ref_incomplete_windows_skipped += 1
             self._ref_last_incomplete_missing = sorted(missing)
+            return False, f"incomplete_window_skipped: missing={sorted(missing)}"
+
+        # Window is complete - proceed with accumulation
 
         # Bound accumulator growth (drop oldest window if at capacity)
         if len(self._accumulating) >= self.config.max_accumulator_windows:
             self._accumulating.pop(0)
 
-        # Add current window to accumulator (copy to avoid mutation)
-        snapshot = {}
-        for k, v in recent.items():
-            if k in self._metrics_tracked:
-                arr = np.asarray(v, dtype=np.float64).ravel()
-                if arr.size > 0:
-                    snapshot[k] = arr.copy()
+        # Add current COMPLETE window to accumulator
         self._accumulating.append(snapshot)
+
+        # Minimum temporal coverage requirement (COMPLETE windows, not just any windows).
+        # This ensures temporal coverage across the tracked metric set.
+        # Use the effective (possibly clamped) value from __init__.
+        min_w = int(getattr(self, "_min_windows_for_reference_effective", 0) or 0)
+        if min_w > 0 and len(self._accumulating) < min_w:
+            return False, f"insufficient_complete_windows: have={len(self._accumulating)} need={min_w}"
 
         # Check if we have enough evidence per metric
         merged_counts = self._count_accumulated_samples()
@@ -845,7 +972,6 @@ class RegimeAnchoredGateEngine:
             merged_counts,
             self.config.min_evidence_per_metric,
         )
-
         if not sufficient:
             return False, f"insufficient_evidence: shortfall={shortfall}"
 
@@ -871,6 +997,8 @@ class RegimeAnchoredGateEngine:
             build_audit={
                 "quality_gates": quality_audit,
                 "windows_used": len(self._accumulating),
+                "min_windows_required": int(min_w),
+                "max_accumulator_windows": int(self.config.max_accumulator_windows),
                 "n_attempts": self._n_ref_attempts,
                 "incomplete_windows_skipped": int(self._ref_incomplete_windows_skipped),
                 "last_incomplete_missing": list(self._ref_last_incomplete_missing),
@@ -879,50 +1007,7 @@ class RegimeAnchoredGateEngine:
 
         # Clear accumulator
         self._accumulating = []
-
         return True, ""
-
-    def _base_check_was_evaluated(self, base_result: GateResult) -> Tuple[bool, str]:
-        """
-        Determine if the base check actually evaluated (not skipped
-        due to insufficient history/evidence).
-
-        Returns (was_evaluated, reason_if_not).
-        """
-        audit = base_result.audit
-
-        # Check for known "skip" reasons that indicate non-evaluation
-        reason = str(audit.get("reason", "")).lower()
-        skip_reasons = (
-            "insufficient_history",
-            "insufficient_evidence",
-            "not_evaluated",  # Generic catch-all
-            "warmup",
-            "skip",
-            "no_data",
-            "no_metrics",
-        )
-        for sr in skip_reasons:
-            if sr in reason:
-                return False, f"skip_reason={sr}"
-
-        # Positive signal: presence of divergence results indicates evaluation
-        if "worst_DW" in audit or "drifts" in audit or "per_metric" in audit:
-            return True, ""
-
-        # Check for minimum evidence if reported
-        base_min_evidence = getattr(self.base, "min_evidence", 16)
-        for key in ("min_evidence_seen", "min_count", "evidence", "n_samples"):
-            val = audit.get(key)
-            if val is not None:
-                try:
-                    if int(val) < base_min_evidence:
-                        return False, f"{key}={val} < min_evidence={base_min_evidence}"
-                except (ValueError, TypeError):
-                    pass
-
-        # Conservative default: if ok=True and no skip reason, assume evaluated
-        return base_result.ok, "assumed_from_ok"
 
     # ---- Main API ----
 
@@ -972,7 +1057,6 @@ class RegimeAnchoredGateEngine:
         # =========================================================================
         audit_base = base_result.audit or {}
         audit: Dict[str, Any] = dict(audit_base)  # shallow copy, never mutate audit_base
-
         base_warn = getattr(base_result, "warn", False)
 
         # =========================================================================
@@ -980,7 +1064,6 @@ class RegimeAnchoredGateEngine:
         # =========================================================================
         reason = str(audit_base.get("reason", "")).strip()
         not_eval = _not_evaluated_from_reason(reason)
-
         evaluated_flag = _as_opt_bool(audit_base.get("evaluated", None))
         base_evaluated = False if not_eval else (evaluated_flag if evaluated_flag is not None else True)
 
@@ -990,7 +1073,6 @@ class RegimeAnchoredGateEngine:
         # =========================================================================
         worst_dw_val: Optional[float] = None
         eps_eff_val: Optional[float] = None
-
         dw_ex = _as_opt_bool(audit_base.get("dw_exceeds_threshold", None))
         if dw_ex is None:
             try:
@@ -1036,7 +1118,6 @@ class RegimeAnchoredGateEngine:
         audit.setdefault("reason", reason or None)
         if audit.get("evaluated", None) is None:
             audit["evaluated"] = bool(base_evaluated)
-
         audit.setdefault("dw_exceeds_threshold", dw_ex)
         audit.setdefault("worst_DW", worst_dw_val)
         audit.setdefault("eps_eff", eps_eff_val)
@@ -1074,6 +1155,31 @@ class RegimeAnchoredGateEngine:
             }
         )
 
+        # =========================================================================
+        # EXPLICIT CHANGE-SIDE FIELDS (ROBUST SOURCING)
+        # Keep these stable regardless of headline disambiguation.
+        # =========================================================================
+        def _first_not_none(*vals: Any) -> Any:
+            for v in vals:
+                if v is not None:
+                    return v
+            return None
+
+        audit["change_worst_DW"] = _first_not_none(audit.get("base_worst_DW"), audit_base.get("worst_DW"), worst_dw_val)
+        audit["change_eps_eff"] = _first_not_none(audit.get("base_eps_eff"), audit_base.get("eps_eff"), eps_eff_val)
+        audit["change_eps"] = _first_not_none(audit.get("base_eps"), audit_base.get("eps"))
+        audit["change_eps_stat"] = _first_not_none(audit.get("base_eps_stat_used"), audit_base.get("eps_stat"))
+        audit["change_gain_bits"] = _first_not_none(audit.get("base_gain_bits"), audit_base.get("gain_bits"))
+        audit["change_gain_thr"] = _first_not_none(audit.get("base_gain_thr"), audit_base.get("gain_thr"))
+
+        # Explicit change-side failure predicates (do NOT use base_result.ok here)
+        _chg_dw_ok = _as_opt_bool(audit.get("change_dw_ok"))
+        _chg_gain_ok = _as_opt_bool(audit.get("change_gain_ok"))
+        change_stability_failed = _chg_dw_ok is False  # exceeded threshold
+        change_gain_failed = _chg_gain_ok is False  # gain below threshold
+        audit["change_stability_failed"] = bool(change_stability_failed)
+        audit["change_gain_failed"] = bool(change_gain_failed)
+
         # If regime detection is disabled, return base result with consistent audit fields
         if not self._enabled_effective:
             audit.update(
@@ -1100,8 +1206,23 @@ class RegimeAnchoredGateEngine:
             # IMPORTANT: Use ref and recent array sizes, NOT counts_by_metric
             recent_counts = self._get_per_metric_counts(recent)
             ref_counts = self._ref.counts
-
             regime_counts = {m: min(ref_counts.get(m, 0), recent_counts.get(m, 0)) for m in self._metrics_tracked}
+
+            # Optional sanity checks (off by default)
+            if os.environ.get("VERISCOPE_REGIME_SANITY", "0").strip() in ("1", "true", "True", "yes", "YES"):
+                bad: List[str] = []
+                for m in self._metrics_tracked:
+                    rc = int(recent_counts.get(m, 0) or 0)
+                    fc = int(ref_counts.get(m, 0) or 0)
+                    gc = int(regime_counts.get(m, 0) or 0)
+                    if gc < 0 or gc > rc or gc > fc:
+                        bad.append(f"{m}: regime={gc}, recent={rc}, ref={fc}")
+                if bad:
+                    _maybe_sanity_warn(
+                        "regime_counts",
+                        "[regime][sanity] regime_counts invariant violated (expected 0 <= regime <= min(recent, ref)) for: "
+                        + ", ".join(bad),
+                    )
 
             # Compute eps_stat for regime check with correct counts
             regime_eps_stat = aggregate_epsilon_stat(
@@ -1213,7 +1334,6 @@ class RegimeAnchoredGateEngine:
                         quality_ok, quality_reason, quality_audit = self._meets_quality_gates(base_result, gain_bits)
                         ref_build_status["quality_gates"] = quality_audit
                         ref_build_status["quality_ok"] = quality_ok
-
                         if not quality_ok:
                             ref_build_status["blocked"] = f"quality_gate: {quality_reason}"
                         else:
@@ -1276,6 +1396,94 @@ class RegimeAnchoredGateEngine:
             audit["ref_just_established"] = True
             audit["ref_build_audit"] = self._ref.build_audit if self._ref else {}
 
+        # =========================================================================
+        # DECISION SOURCE + HEADLINE DISAMBIGUATION (MUST BE LAST)
+        # - decision_source is based on STABILITY predicates, not base_result.ok
+        # - only overwrite headline worst_DW/eps_eff when a STABILITY failure occurred
+        # =========================================================================
+
+        # Regime stability failure is only meaningful when regime is active.
+        regime_active = bool(audit.get("regime_active", False))
+        _reg_ok = _as_opt_bool(audit.get("regime_ok"))
+        regime_stability_failed = (_reg_ok is False) and regime_active
+
+        # Change stability failure predicate (read from audit for safety)
+        _chg_dw_ok2 = _as_opt_bool(audit.get("change_dw_ok"))
+        change_stability_failed = _chg_dw_ok2 is False
+
+        if change_stability_failed and regime_stability_failed:
+            decision_source = "both"
+        elif regime_stability_failed:
+            decision_source = "regime"
+        elif change_stability_failed:
+            decision_source = "change"
+        elif not combined_ok:
+            # combined_ok is False but no stability predicate failed => gain or other
+            decision_source = "gain_or_other"
+        else:
+            decision_source = "none"
+
+        audit["decision_source"] = decision_source
+
+        # Optional sanity checks (off by default)
+        if os.environ.get("VERISCOPE_REGIME_SANITY", "0").strip() in ("1", "true", "True", "yes", "YES"):
+            allowed = {"none", "change", "regime", "both", "gain_or_other"}
+            if decision_source not in allowed:
+                _maybe_sanity_warn(
+                    "decision_source",
+                    f"[regime][sanity] unexpected decision_source={decision_source!r} (allowed={sorted(allowed)})",
+                )
+            # Guard against dtype/truthiness surprises in downstream consumers
+            for k in ("change_dw_ok", "change_gain_ok", "regime_ok"):
+                v = audit.get(k)
+                if v is None:
+                    continue
+                if not isinstance(v, (bool, np.bool_, int, np.integer)):
+                    _maybe_sanity_warn(
+                        "audit_bool_types",
+                        f"[regime][sanity] audit[{k!r}] has unexpected type {type(v).__name__}: {v!r}",
+                    )
+
+        def _as_finite_pair(dw: Any, eps: Any) -> Tuple[Optional[float], Optional[float]]:
+            try:
+                dwf = float(dw)
+                epsf = float(eps)
+                if np.isfinite(dwf) and np.isfinite(epsf) and epsf > 1e-12:
+                    return dwf, epsf
+            except Exception:
+                pass
+            return None, None
+
+        def _exceedance_ratio(dw: Any, eps: Any) -> float:
+            dwf, epsf = _as_finite_pair(dw, eps)
+            if dwf is None or epsf is None:
+                return float("-inf")
+            return dwf / epsf
+
+        # Only disambiguate headline for stability-driven failures
+        if decision_source in ("change", "regime", "both"):
+            if decision_source == "change":
+                dw, eps = _as_finite_pair(audit.get("change_worst_DW"), audit.get("change_eps_eff"))
+                if dw is not None and eps is not None:
+                    audit["worst_DW"] = dw
+                    audit["eps_eff"] = eps
+            elif decision_source == "regime":
+                dw, eps = _as_finite_pair(audit.get("regime_worst_DW"), audit.get("regime_eps_eff"))
+                if dw is not None and eps is not None:
+                    audit["worst_DW"] = dw
+                    audit["eps_eff"] = eps
+            else:
+                # both: choose the larger normalized exceedance for headline
+                r_change = _exceedance_ratio(audit.get("change_worst_DW"), audit.get("change_eps_eff"))
+                r_regime = _exceedance_ratio(audit.get("regime_worst_DW"), audit.get("regime_eps_eff"))
+                if r_regime >= r_change:
+                    dw, eps = _as_finite_pair(audit.get("regime_worst_DW"), audit.get("regime_eps_eff"))
+                else:
+                    dw, eps = _as_finite_pair(audit.get("change_worst_DW"), audit.get("change_eps_eff"))
+                if dw is not None and eps is not None:
+                    audit["worst_DW"] = dw
+                    audit["eps_eff"] = eps
+
         combined_warn = base_warn or regime_warn
         return GateResult(ok=combined_ok, warn=combined_warn, audit=audit)
 
@@ -1316,6 +1524,7 @@ class RegimeAnchoredGateEngine:
             "max_windows": self.config.max_accumulator_windows,
             "samples_per_metric": self._count_accumulated_samples(),
             "min_evidence_per_metric": self.config.min_evidence_per_metric,
+            "min_windows_for_reference": self._min_windows_for_reference_effective,
             "reference_established": self._ref is not None,
             "build_phase": [self._build_min_iter, self._build_max_iter],
             "ref_incomplete_windows_skipped": int(self._ref_incomplete_windows_skipped),
@@ -1335,6 +1544,8 @@ class RegimeAnchoredGateEngine:
             "metrics_tracked": sorted(self._metrics_tracked),
             "eps_sens_used": self._eps_sens_used,
             "eps_sens_from_base": self._eps_sens_from_base,
+            "min_windows_for_reference_config": int(getattr(self.config, "min_windows_for_reference", 0)),
+            "min_windows_for_reference_effective": int(getattr(self, "_min_windows_for_reference_effective", 0)),
             "config": {
                 "enabled": self.config.enabled,
                 "epsilon": self._regime_epsilon,
@@ -1344,5 +1555,6 @@ class RegimeAnchoredGateEngine:
                     "min_gain": self.config.reference_build_min_gain,
                 },
                 "min_evidence_per_metric": self.config.min_evidence_per_metric,
+                "min_windows_for_reference": self._min_windows_for_reference_effective,
             },
         }
