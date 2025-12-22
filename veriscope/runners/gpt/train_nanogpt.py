@@ -337,10 +337,18 @@ class VeriscopeGatedTrainer:
             max_accumulator_windows=20,
         )
 
-        # Optional: newer RegimeConfig supports enforcing a minimum number of gate windows
-        # before establishing the reference (variance reduction). Guard for backward compatibility.
-        if "min_windows_for_reference" in getattr(RegimeConfig, "__annotations__", {}):
-            regime_kwargs["min_windows_for_reference"] = int(getattr(config, "regime_min_windows", 0))
+        # Map CLI regime_min_windows to RegimeConfig.min_windows_for_reference.
+        # IMPORTANT: Only override if user explicitly set a positive value.
+        # Otherwise, preserve RegimeConfig's default (currently 5).
+        # Guard handles both dataclass and non-dataclass RegimeConfig variants.
+        if (
+            hasattr(RegimeConfig, "__dataclass_fields__")
+            and "min_windows_for_reference" in RegimeConfig.__dataclass_fields__
+        ):
+            rmw = int(getattr(config, "regime_min_windows", 0) or 0)
+            if rmw > 0:
+                regime_kwargs["min_windows_for_reference"] = rmw
+            # If rmw <= 0, don't add to kwargs; RegimeConfig default applies
 
         regime_config = RegimeConfig(**regime_kwargs)
 
