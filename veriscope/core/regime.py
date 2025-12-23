@@ -322,6 +322,56 @@ def _as_opt_bool(x: Any) -> Optional[bool]:
     return None
 
 
+def _needs_fill(x: Any) -> bool:
+    """True if a field is missing/None/empty/'None' (string)."""
+    if x is None:
+        return True
+    if isinstance(x, str):
+        s = x.strip()
+        return (s == "") or (s.lower() == "none")
+    # Defensive: some pipelines serialize None as the literal string "None"
+    try:
+        s2 = str(x).strip().lower()
+        return s2 == "none"
+    except Exception:
+        return False
+
+
+def _coerce_float_maybe(v: Any) -> Optional[float]:
+    """Best-effort float conversion; returns None if not finite/convertible."""
+    try:
+        fv = float(v)
+    except Exception:
+        return None
+    return fv if np.isfinite(fv) else None
+
+
+def _pick_worst_metric(per_metric: Any) -> Tuple[Optional[str], Optional[float]]:
+    """Pick the metric with the largest finite TV/drift.
+
+    Tolerates:
+      - {metric: float}
+      - {metric: np.floating}
+      - {metric: {"tv": float}} (structured payload)
+    """
+    if not isinstance(per_metric, dict) or not per_metric:
+        return None, None
+    best_k: Optional[str] = None
+    best_v: Optional[float] = None
+    for k, v in per_metric.items():
+        fv: Optional[float] = None
+        if isinstance(v, dict) and "tv" in v:
+            fv = _coerce_float_maybe(v.get("tv"))
+        else:
+            fv = _coerce_float_maybe(v)
+        if fv is None:
+            continue
+        if best_v is None or fv > best_v:
+            best_v = fv
+            best_k = str(k)
+    return best_k, best_v
+
+
 def compute_build_window(
     config: RegimeConfig,
     gate_warmup: int,
@@ -1424,6 +1474,72 @@ class RegimeAnchoredGateEngine:
             decision_source = "none"
 
         audit["decision_source"] = decision_source
+
+        # =========================================================================
+        # REASON / PROVENANCE HYGIENE (metadata only; does NOT affect decisions)
+        #
+        # IMPORTANT:
+        # - Do NOT use setdefault() here because artifacts can contain keys with value None.
+        # - Only overwrite when the current value "needs fill".
+        # =========================================================================
+        evaluated = bool(audit.get("evaluated", True))
+        ds = str(audit.get("decision_source") or "none").strip().lower() or "none"
+        pfail = bool(audit.get("persistence_fail", False))
+
+        # dw_exceeds_threshold: prefer explicit flag; fall back to worst_DW > eps_eff
+        dw_ex = _as_opt_bool(audit.get("dw_exceeds_threshold", None))
+        if dw_ex is None:
+            dwv = _coerce_float_maybe(audit.get("worst_DW"))
+            epsv = _coerce_float_maybe(audit.get("eps_eff"))
+            if (dwv is not None) and (epsv is not None):
+                dw_ex = bool(dwv > epsv)
+
+        # warn_pending is strictly the "persistence warning" state
+        warn_pending = bool(evaluated and (dw_ex is True) and (not pfail))
+        if _needs_fill(audit.get("warn_pending")):
+            audit["warn_pending"] = bool(warn_pending)
+
+        # base_reason: prefer an existing informative string; else synthesize
+        if _needs_fill(audit.get("base_reason")):
+            # prefer base engine's audited reason if available
+            br = audit_base.get("reason", None)
+            if _needs_fill(br):
+                br = "not_evaluated" if not evaluated else ("base_ok" if base_ok else "base_fail")
+            audit["base_reason"] = br
+
+        # change_reason: describe change detector state (not regime)
+        if _needs_fill(audit.get("change_reason")):
+            if not evaluated:
+                cr = "not_evaluated_change"
+            elif pfail:
+                cr = "change_persistence_fail"
+            elif dw_ex is True:
+                cr = "change_warn_pending"  # (dw_ex True && not pfail)
+            else:
+                cr = "change_ok"
+            audit["change_reason"] = cr
+
+        # top-level reason: preserve if present; else synthesize using ds + persistence state
+        if _needs_fill(audit.get("reason")):
+            if not evaluated:
+                rr = "not_evaluated"
+            elif pfail:
+                rr = f"{ds}_persistence_fail"
+            elif warn_pending:
+                rr = f"{ds}_warn_pending"
+            elif not combined_ok:
+                rr = f"{ds}_fail"
+            else:
+                rr = f"{ds}_ok"
+            audit["reason"] = rr
+
+        # worst_metric attribution (helps diagnose off-spike WARN/FAIL)
+        per_metric = audit.get("per_metric_tv") or audit.get("drifts") or {}
+        wk, wv = _pick_worst_metric(per_metric)
+        if _needs_fill(audit.get("worst_metric")):
+            audit["worst_metric"] = wk
+        if _needs_fill(audit.get("worst_metric_tv")):
+            audit["worst_metric_tv"] = wv
 
         # Optional sanity checks (off by default)
         if os.environ.get("VERISCOPE_REGIME_SANITY", "0").strip() in ("1", "true", "True", "yes", "YES"):
