@@ -698,9 +698,13 @@ class VeriscopeGatedTrainer:
                 "warn": False,
                 "iter": int(self.iter_num),
                 "reason": reason,
+                "base_reason": reason,
+                "change_reason": reason,
                 "audit": {
                     "evaluated": False,
                     "reason": reason,
+                    "base_reason": reason,
+                    "change_reason": reason,
                 },
             }
 
@@ -775,7 +779,32 @@ class VeriscopeGatedTrainer:
             iter_num=self.iter_num,  # Pass iteration for regime reference timing
         )
 
-        audit = result.audit
+        audit = result.audit or {}
+
+        def _needs_fill(x: Any) -> bool:
+            if x is None:
+                return True
+            if isinstance(x, str):
+                s = x.strip()
+                return (s == "") or (s.lower() == "none")
+            try:
+                return str(x).strip().lower() == "none"
+            except Exception:
+                return False
+
+        # Harden runner even if someone swaps gate_engine without regime wrapper.
+        evaluated = bool(audit.get("evaluated", True))
+        row_reason = audit.get("reason", None)
+        if _needs_fill(row_reason):
+            row_reason = "evaluated_unknown" if evaluated else "not_evaluated"
+
+        row_base_reason = audit.get("base_reason", None)
+        if _needs_fill(row_base_reason):
+            row_base_reason = row_reason
+
+        row_change_reason = audit.get("change_reason", None)
+        if _needs_fill(row_change_reason):
+            row_change_reason = row_reason
 
         return {
             "ok": result.ok,
@@ -783,6 +812,9 @@ class VeriscopeGatedTrainer:
             "audit": audit,
             "gain_bits": gain_bits,
             "iter": self.iter_num,
+            "reason": row_reason,
+            "base_reason": row_base_reason,
+            "change_reason": row_change_reason,
             # Regime-specific fields (always present for consistency)
             # Tri-state fields must remain nullable; `change_ok` is back-compat only.
             "change_ok": bool(audit.get("change_ok", True)),
@@ -983,6 +1015,37 @@ class VeriscopeGatedTrainer:
                         f"D_W={worst_dw:.4f} > eps_eff={eps_eff:.4f}, "
                         f"consec={consec_before}->{consec_after}/{pers_k}{regime_status}"
                     )
+                    # Attribution on WARN too (top-k so logs don't explode)
+                    _audit = gate_result.get("audit", {}) or {}
+                    per_metric = _audit.get("per_metric_tv", {}) or {}
+                    if isinstance(per_metric, dict) and per_metric:
+                        items = []
+                        for m, v in per_metric.items():
+                            try:
+                                if isinstance(v, dict) and "tv" in v:
+                                    fv = float(v["tv"])
+                                else:
+                                    fv = float(v)
+                                if np.isfinite(fv):
+                                    items.append((m, fv))
+                            except Exception:
+                                continue
+                        items.sort(key=lambda kv: kv[1], reverse=True)
+                        topk = items[:5]
+                        pm_str = ", ".join(f"{m}={v:.4f}" for (m, v) in topk)
+                        print(f"       per_metric_tv(top5): {pm_str}")
+
+                    wm = _audit.get("worst_metric", None)
+                    wmv = _audit.get("worst_metric_tv", None)
+                    if wm is not None:
+                        try:
+                            fwmv = float(wmv)
+                            if np.isfinite(fwmv):
+                                print(f"       worst_metric: {wm} ({fwmv:.4f})")
+                            else:
+                                print(f"       worst_metric: {wm}")
+                        except Exception:
+                            print(f"       worst_metric: {wm}")
                 elif self.iter_num % (cfg.gate_window * 10) == 0:
                     print(
                         f"[GATE] iter={self.iter_num} OK, "

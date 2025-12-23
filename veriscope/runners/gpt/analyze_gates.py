@@ -290,7 +290,7 @@ def analyze_gates(
                 "ref_just_established": bool(audit.get("ref_just_established", False)),
                 # New: parsed change detector fields
                 "base_reason": parsed.get("base_reason"),
-                "evaluated": bool(parsed.get("evaluated", True)),
+                "evaluated": bool(parsed.get("evaluated", bool((g.get("audit") or {}).get("evaluated", False)))),
                 "change_dw_ok": parsed.get("change_dw_ok", None),
                 "change_ok_bool": parsed.get("change_ok_bool", None),
                 "base_ok": bool(parsed.get("base_ok", True)),
@@ -307,6 +307,19 @@ def analyze_gates(
     precision = tp / (tp + fp) if (tp + fp) > 0 else float("nan")
     recall = tp / (tp + fn) if (tp + fn) > 0 else float("nan")
     specificity = tn / (tn + fp) if (tn + fp) > 0 else float("nan")
+
+    # ---- Union gate confusion matrix (evaluated-only) ----
+    # Prevents ok=True but evaluated=False rows from inflating TN/FN.
+    union_eval = [r for r in per_gate if bool(r.get("evaluated", False))]
+    union_excluded_not_evaluated = int(len(per_gate) - len(union_eval))
+    tp_e = sum(1 for r in union_eval if r["fail"] and r["overlaps_spike"])
+    fp_e = sum(1 for r in union_eval if r["fail"] and not r["overlaps_spike"])
+    fn_e = sum(1 for r in union_eval if r["ok"] and r["overlaps_spike"])
+    tn_e = sum(1 for r in union_eval if r["ok"] and not r["overlaps_spike"])
+
+    precision_e = tp_e / (tp_e + fp_e) if (tp_e + fp_e) > 0 else float("nan")
+    recall_e = tp_e / (tp_e + fn_e) if (tp_e + fn_e) > 0 else float("nan")
+    specificity_e = tn_e / (tn_e + fp_e) if (tn_e + fp_e) > 0 else float("nan")
 
     # ---- Change detection breakdown ----
     change_metrics = _compute_change_metrics(per_gate)
@@ -385,6 +398,13 @@ def analyze_gates(
         "precision": precision,
         "recall": recall,
         "specificity": specificity,
+        "union_evaluated_only": {
+            "excluded_not_evaluated": union_excluded_not_evaluated,
+            "confusion": {"tp": int(tp_e), "fp": int(fp_e), "fn": int(fn_e), "tn": int(tn_e)},
+            "precision": float(precision_e),
+            "recall": float(recall_e),
+            "specificity": float(specificity_e),
+        },
         # Change detection decomposition
         "change_confusion": cc,
         "change_precision": change_precision,
