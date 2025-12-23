@@ -911,40 +911,89 @@ def gate_check(
             # Clamp NaNs to 0 before passing
             if not np.isfinite(eps_stat_value):
                 eps_stat_value = 0.0
+            # Missing κ should mean "not checked" under GateEngine semantics.
+            # GateEngine uses `np.isfinite(kappa_sens)` to decide whether κ is checked.
+            kappa_in = float(kappa_sens) if (kappa_sens is not None) and np.isfinite(kappa_sens) else float("nan")
+
             gr = GE.check(
                 past={m: np.asarray(past.get(m, np.array([], float)), dtype=float) for m in window.weights.keys()},
                 recent={m: np.asarray(recent.get(m, np.array([], float)), dtype=float) for m in window.weights.keys()},
                 counts_by_metric={str(k): int(v) for k, v in (counts_metric or {}).items()},
                 gain_bits=float(gain) if (gain is not None) and np.isfinite(gain) else float("nan"),
-                kappa_sens=float(kappa_sens) if (kappa_sens is not None) and np.isfinite(kappa_sens) else float("inf"),
+                kappa_sens=kappa_in,
                 eps_stat_value=float(eps_stat_value),
             )
-            # Provide evidence metadata and a stable reason string for downstream diagnostics
+
+            aud = getattr(gr, "audit", {}) or {}
+
+            # min_evidence provenance: for FR, prefer GE.min_evidence (env/CFG precedence in init_fr)
             try:
-                _min_evidence_fr = as_int(CFG.get("gate_min_evidence", 16), default=16)
+                _min_evidence_fr = int(getattr(GE, "min_evidence", as_int(CFG.get("gate_min_evidence", 0), default=0)))
             except Exception:
-                _min_evidence_fr = 16
+                _min_evidence_fr = as_int(CFG.get("gate_min_evidence", 0), default=0)
+
+            # total_evidence provenance: prefer GateEngine audit if present, else fallback to counts sum
             try:
-                _total_evidence_fr = int(sum(int(v) for v in (counts_metric or {}).values()))
+                _total_evidence_fr_fallback = int(sum(int(v) for v in (counts_metric or {}).values()))
             except Exception:
-                _total_evidence_fr = 0
-            _reason_fr = "evaluated_fr_ok" if bool(getattr(gr, "ok", False)) else "evaluated_fr_fail"
-            # Map FR audit keys to legacy ones so downstream code remains unchanged
+                _total_evidence_fr_fallback = 0
+            try:
+                _total_evidence_fr = int(
+                    aud.get("total_evidence", aud.get("evidence_total", _total_evidence_fr_fallback))
+                )
+            except Exception:
+                _total_evidence_fr = int(_total_evidence_fr_fallback)
+
+            # Evaluability and pending-warning semantics (critical under persistence):
+            evaluated_fr = bool(aud.get("evaluated", True))
+            # Prefer explicit fields from GateResult and audit (GateEngine commonly emits warn_pending in audit)
+            warn_pending_fr = bool(getattr(gr, "warn", False)) or bool(aud.get("warn_pending", False))
+
+            if not evaluated_fr:
+                # Prefer GateEngine-provided reason if present; keep it stable
+                _reason_fr = str(aud.get("reason", "not_evaluated_fr")) or "not_evaluated_fr"
+            else:
+                _reason_fr = "evaluated_fr_ok" if bool(getattr(gr, "ok", False)) else "evaluated_fr_fail"
+
+            # Map FR audit keys to legacy ones so downstream code remains unchanged,
+            # but ADD missing channels required by persistence policies.
             audit = {
                 "reason": str(_reason_fr),
+                "evaluated": bool(evaluated_fr),
+                "warn_pending": bool(warn_pending_fr),
+                # Lane provenance (lets offline recompute mirror correctly)
+                "gate_lane": "fr",
+                "scar_fr": 1,
+                # Evidence provenance
                 "total_evidence": int(_total_evidence_fr),
                 "min_evidence": int(_min_evidence_fr),
-                "gain_bits": as_float(gr.audit.get("gain_bits", np.nan), default=float("nan")),
-                "worst_tv": as_float(gr.audit.get("worst_DW", np.nan), default=float("nan")),
-                "eps_stat": as_float(gr.audit.get("eps_stat", np.nan), default=float("nan")),
-                "kappa_sens": as_float(gr.audit.get("kappa_sens", np.nan), default=float("nan")),
+                # Core diagnostics
+                "gain_bits": as_float(aud.get("gain_bits", np.nan), default=float("nan")),
+                "worst_tv": as_float(aud.get("worst_DW", np.nan), default=float("nan")),
+                "eps_stat": as_float(aud.get("eps_stat", np.nan), default=float("nan")),
+                "eps_eff": as_float(aud.get("eps_eff", np.nan), default=float("nan")),
+                "kappa_sens": as_float(aud.get("kappa_sens", np.nan), default=float("nan")),
+                # Persistence / counters (names match what offline/analysis expects)
+                "policy": str(aud.get("policy", "")) if aud.get("policy", "") is not None else "",
+                "persistence_k": as_int(aud.get("persistence_k", 0), default=0),
+                "persistence_fail": bool(aud.get("persistence_fail", False)),
+                "consecutive_exceedances": as_int(aud.get("consecutive_exceedances", 0), default=0),
+                "dw_exceeds_threshold": bool(aud.get("dw_exceeds_threshold", False)),
+                # Optional per-component OK bits (if GateEngine emits them)
+                "ok_gain": bool(aud.get("ok_gain", True)),
+                "ok_stab": bool(aud.get("ok_stab", True)),
+                # Existing metadata
                 "counts_by_metric": {k: int(v) for k, v in (counts_metric or {}).items()},
                 "eps_aggregation": "cap_to_frac",
                 "gain_units": CFG.get("gate_gain_units", "bits/sample"),
                 "eps_stat_cap_fraction": float(CFG.get("gate_eps_stat_max_frac", 0.25)),
                 "gain_thresh_used": float(thr),
             }
-            return int(bool(gr.ok)), audit
+
+            # Return value semantics: 1 means PASS/neutral.
+            # If GateEngine says "not evaluated", force neutral PASS.
+            flag = int(bool(getattr(gr, "ok", True))) if evaluated_fr else 1
+            return int(flag), audit
         except Exception as _fr_exc:
             # Fall through to legacy path on any FR error, but make it visible (once)
             global _FR_FALLBACK_WARNED
@@ -991,10 +1040,15 @@ def gate_check(
                 pass
         return 1, {
             "reason": "not_evaluated_insufficient_evidence",
+            "evaluated": False,
+            "warn_pending": False,
+            "gate_lane": "legacy",
+            "scar_fr": 0,
             "total_evidence": int(total_evidence),
             "min_evidence": int(min_evidence),
             "worst_tv": float("nan"),
             "eps_stat": float("nan"),
+            "eps_eff": float("nan"),
             "kappa_sens": float(kappa_sens) if (kappa_sens is not None) and np.isfinite(kappa_sens) else float("nan"),
             "gain_bits": float(gain) if (gain is not None) and np.isfinite(gain) else float("nan"),
             "counts_by_metric": {k: int(v) for k, v in (counts_metric or {}).items()},
@@ -1090,9 +1144,8 @@ def gate_check(
                 pass
 
     # Sensitivity budget κ_sens ≤ ε_sens
-    kappa_sens = float(kappa_sens if np.isfinite(kappa_sens) else np.inf)
-    ok_kappa = kappa_sens <= eps_sens
-
+    kappa_checked = (kappa_sens is not None) and bool(np.isfinite(kappa_sens))
+    ok_kappa = True if (not kappa_checked) else (float(kappa_sens) <= eps_sens)
     ok = bool(ok_gain and ok_stability and ok_kappa)
     reason = (
         "evaluated_ok"
@@ -1110,17 +1163,23 @@ def gate_check(
 
     return int(ok), {
         "reason": str(reason),
+        "evaluated": True,
+        "warn_pending": False,
+        "gate_lane": "legacy",
+        "scar_fr": 0,
         "total_evidence": int(total_evidence),
         "min_evidence": int(min_evidence),
         "gain_bits": float(gain),
         "worst_tv": float(worst),
         "eps_stat": float(eps_stat),
+        "eps_eff": float(eps_eff),
         "eps_base": float(eps_base),
         "eps_scaled": float(eps_scaled),
         "eps_inflation_factor": float(float(eps_scaled) / max(float(eps_base), 1e-12)),
         "min_evidence_full_eps": int(min_full),
         "gate_eps_inflation_max": float(max_infl),
-        "kappa_sens": float(kappa_sens if np.isfinite(kappa_sens) else 0.0),
+        # Missing κ ⇒ unchecked (NaN), NOT 0.0.
+        "kappa_sens": float(kappa_sens) if np.isfinite(kappa_sens) else float("nan"),
         "counts_by_metric": {k: int(v) for k, v in (counts_metric or {}).items()},
         "eps_aggregation": "cap_to_frac",
         "gain_units": CFG.get("gate_gain_units", "bits/sample"),
@@ -3787,6 +3846,27 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
         gate_reason = "not_evaluated"
         gate_counts_json = ""
         gate_exc = ""
+        # --- Additional gate channels (needed for persistence triage) ---
+        gate_ok = 1
+        gate_fail = 0
+        gate_evaluated = 0
+        gate_warn_pending = 0
+        gate_eps_eff = float("nan")
+        gate_consecutive_exceedances = 0
+        gate_dw_exceeds_threshold = 0
+        gate_policy_effective = ""
+        # --- Gate lane provenance (needed for robust offline recompute) ---
+        # Set even if the gate isn't evaluated on this epoch.
+        gate_lane = "fr" if bool(USE_FR) else "legacy"
+        scar_fr = 1 if gate_lane == "fr" else 0
+
+        # Default min-evidence used: under FR the source of truth is GE.min_evidence.
+        gate_min_evidence_used = int(as_int(CFG.get("gate_min_evidence", 0), default=0))
+        try:
+            if bool(USE_FR) and (GE is not None):
+                gate_min_evidence_used = int(getattr(GE, "min_evidence", gate_min_evidence_used))
+        except Exception:
+            pass
         gate_epsilon_eff = as_float(
             getattr(WINDOW_DECL, "epsilon", CFG.get("gate_epsilon", 0.08)),
             default=as_float(CFG.get("gate_epsilon", 0.08), default=0.08),
@@ -3889,13 +3969,44 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
                     counts,
                     gain=gate_gain,
                     gain_thresh=gate_gain_thresh_eff,
-                    kappa_sens=(gate_kappa if np.isfinite(gate_kappa) else 0.0),
+                    # Missing κ should mean "not checked" end-to-end.
+                    # Pass NaN so GateEngine treats it as unchecked.
+                    kappa_sens=(gate_kappa if np.isfinite(gate_kappa) else float("nan")),
                     eps_stat_alpha=float(CFG.get("gate_eps_stat_alpha", 0.05)),
                 )
 
                 gate_warn = int(flag)
                 audit = audit or {}
                 gate_reason = str(audit.get("reason", "evaluated_unknown")) or "evaluated_unknown"
+                # --- Provenance + persistence channels from audit (FR or legacy) ---
+                try:
+                    gate_lane = str(audit.get("gate_lane", gate_lane))
+                except Exception:
+                    pass
+                try:
+                    scar_fr = int(audit.get("scar_fr", scar_fr))
+                except Exception:
+                    pass
+
+                try:
+                    gate_total_evidence = int(audit.get("total_evidence", gate_total_evidence))
+                except Exception:
+                    pass
+                try:
+                    gate_min_evidence_used = int(audit.get("min_evidence", gate_min_evidence_used))
+                except Exception:
+                    pass
+
+                gate_evaluated = int(bool(audit.get("evaluated", gate_reason.startswith("evaluated"))))
+                gate_warn_pending = int(bool(audit.get("warn_pending", False)))
+                gate_eps_eff = as_float(audit.get("eps_eff", np.nan), default=float("nan"))
+                gate_consecutive_exceedances = as_int(audit.get("consecutive_exceedances", 0), default=0)
+                gate_dw_exceeds_threshold = int(bool(audit.get("dw_exceeds_threshold", False)))
+                gate_policy_effective = str(audit.get("policy", "")) if audit.get("policy", "") is not None else ""
+
+                # De-ambiguous aliases (keep gate_warn for backwards compat)
+                gate_ok = int(gate_warn)
+                gate_fail = 1 - int(gate_ok)
 
                 # --- Gate diagnostics for offline analysis ---
                 gate_epsilon_eff = as_float(
@@ -4011,6 +4122,17 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
                 gate_eps_stat=float(gate_eps_stat),
                 gate_kappa=float(gate_kappa),
                 gate_total_evidence=int(gate_total_evidence),
+                gate_lane=str(gate_lane),
+                scar_fr=int(scar_fr),
+                gate_min_evidence_used=int(gate_min_evidence_used),
+                gate_ok=int(gate_ok),
+                gate_fail=int(gate_fail),
+                gate_evaluated=int(gate_evaluated),
+                gate_warn_pending=int(gate_warn_pending),
+                gate_eps_eff=float(gate_eps_eff),
+                gate_consecutive_exceedances=int(gate_consecutive_exceedances),
+                gate_dw_exceeds_threshold=int(gate_dw_exceeds_threshold),
+                gate_policy_effective=str(gate_policy_effective),
                 gate_reason=str(gate_reason),
                 gate_counts=str(gate_counts_json),
                 gate_exc=str(gate_exc),

@@ -729,6 +729,17 @@ def recompute_gate_series_under_decl(
       gate_worst_tv_calib, gate_eps_stat_calib, gate_gain_calib,
       gate_warn_calib, gate_evaluated_calib, gate_reason_calib,
       gate_total_evidence_calib
+
+    Semantics / provenance:
+      - If the ONLINE run used FR (GateEngine via SCAR_FR=1), the deployed gate
+        does NOT apply legacy evidence-scaled epsilon inflation.
+        In that case, the main *_calib columns mirror FR:
+          eps_scaled := eps_base
+          eps_stat cap := max_frac * eps_base
+      - We also compute a clearly labeled legacy-inflated counterfactual into
+        *_legacy_calib columns for comparison (do not silently mix semantics).
+      - FR/legacy detection is derived from training-time provenance columns
+        (gate_lane / scar_fr / gate_min_evidence_used) and is robust to early blank rows.
     """
     try:
         from veriscope.core.ipm import dPi_product_tv  # product-TV under Φ_W
@@ -758,6 +769,19 @@ def recompute_gate_series_under_decl(
     # Debug/parity fields
     df["gate_eps_eff_calib"] = np.nan
     df["gate_eps_scaled_calib"] = np.nan
+
+    # Legacy-inflated (counterfactual under FR unless explicitly enabled)
+    df["gate_eps_scaled_legacy_calib"] = np.nan
+    df["gate_eps_eff_legacy_calib"] = np.nan
+    df["gate_eps_stat_legacy_calib"] = np.nan
+    # Counterfactual parameter capsule (auditable)
+    df["gate_min_evidence_used_legacy_calib"] = np.nan
+    df["gate_min_evidence_full_eps_legacy_calib"] = np.nan
+    df["gate_eps_inflation_max_legacy_calib"] = np.nan
+
+    # Per-row mirror bit (1 if row is treated as FR mirror)
+    df["gate_fr_mirror_calib"] = 0
+
     df["gate_total_evidence_calib"] = 0
     df["gate_kappa_checked_calib"] = 0
     df["gate_kappa_sens_calib"] = np.nan
@@ -775,7 +799,6 @@ def recompute_gate_series_under_decl(
     thr_gain = as_float(cfg.get("gate_gain_thresh", 0.05), default=0.05)
     eps_sens = as_float(cfg.get("gate_epsilon_sens", 0.04), default=0.04)
     alpha = as_float(cfg.get("gate_eps_stat_alpha", 0.05), default=0.05)
-    min_evidence = as_int(cfg.get("gate_min_evidence", 0), default=0)
     ln2 = math.log(2.0)
 
     num_classes = as_int(cfg.get("num_classes", 10), default=10)
@@ -810,9 +833,8 @@ def recompute_gate_series_under_decl(
     #   - identical interpolation form
     gate_eps_inflation_max = as_float(cfg.get("gate_eps_inflation_max", 4.0), default=4.0)
     gate_eps_inflation_max = float(max(1.0, gate_eps_inflation_max))  # clamp >= 1
-    min_evidence_full_eps = as_int(cfg.get("gate_min_evidence_full_eps", min_evidence), default=min_evidence)
-    # Critical guard: ensures inflation applies on first evaluated epoch
-    min_evidence_full_eps = max(min_evidence_full_eps, min_evidence + 1)
+    # NOTE: min_evidence_full_eps becomes per-run/per-row (because min_evidence can be per-run provenance).
+    min_evidence_full_eps_cfg = cfg.get("gate_min_evidence_full_eps", None)
 
     def _evidence_scaled_epsilon_offline(
         eps_base: float,
@@ -904,6 +926,10 @@ def recompute_gate_series_under_decl(
     mets = [m for m in getattr(window_decl, "metrics", []) if m in df.columns]
     agg_fn = AGGREGATE_EPSILON
 
+    # Optional explicit override: allow evidence-scaled epsilon under FR too.
+    # If False, FR rows mirror GateEngine (no inflation).
+    use_evidence_scaled_eps = bool(cfg.get("gate_use_evidence_scaled_epsilon", False))
+
     for _, g in df.groupby(["seed", "factor"], sort=False):
         g = g.sort_values("epoch").copy()
         if len(g) < 2 * W:
@@ -911,6 +937,47 @@ def recompute_gate_series_under_decl(
 
         idxs = list(g.index)
         consec = 0
+
+        # Determine per-run lane provenance (stable across epochs), robust to early blank rows.
+        # Prefer: mode over non-empty gate_lane values; else max(scar_fr).
+        run_is_fr = False
+        try:
+            if "gate_lane" in g.columns:
+                s = g["gate_lane"].fillna("").astype(str).str.strip().str.lower()
+                s = s[s != ""]
+                if len(s) > 0:
+                    # mode() is robust to a few stray values; take the first mode.
+                    run_is_fr = str(s.mode().iloc[0]) == "fr"
+                else:
+                    run_is_fr = False
+            elif "scar_fr" in g.columns:
+                v = pd.to_numeric(g["scar_fr"], errors="coerce").fillna(0.0)
+                run_is_fr = bool(float(v.max()) >= 0.5)
+        except Exception:
+            run_is_fr = False
+
+        # Set gate_fr_mirror_calib for ALL rows in this run for clarity (even pre-2W).
+        mirror_fr_run = bool(run_is_fr and (not use_evidence_scaled_eps))
+        try:
+            df.loc[idxs, "gate_fr_mirror_calib"] = int(mirror_fr_run)
+        except Exception:
+            pass
+
+        # min_evidence used online (per run): prefer logged value if present, else cfg
+        min_evidence_run = as_int(cfg.get("gate_min_evidence", 0), default=0)
+        try:
+            if "gate_min_evidence_used" in g.columns:
+                vv = pd.to_numeric(g["gate_min_evidence_used"], errors="coerce").to_numpy(dtype=float)
+                vv = vv[np.isfinite(vv)]
+                if vv.size > 0:
+                    min_evidence_run = int(np.max(vv))
+        except Exception:
+            pass
+        # Record for audit clarity: this is the evidence floor used to decide evaluability.
+        try:
+            df.loc[idxs, "gate_min_evidence_used_legacy_calib"] = int(min_evidence_run)
+        except Exception:
+            pass
 
         for pos, idx in enumerate(idxs):
             # Align with ONLINE semantics:
@@ -938,17 +1005,40 @@ def recompute_gate_series_under_decl(
                 total_evidence = int(evidence_n)
             df.loc[idx, "gate_total_evidence_calib"] = int(total_evidence)
 
-            # Compute inflated epsilon for audit parity (even if not evaluated due to evidence).
+            # Per-row mirror flag: FR rows mirror GateEngine unless explicitly overridden to use inflation.
+            mirror_fr_row = bool(mirror_fr_run)
+
+            # Legacy counterfactual parameters should be auditable per-row.
             eps_base = float(getattr(window_decl, "epsilon", 0.0))
-            eps_scaled = _evidence_scaled_epsilon_offline(
+            min_full_row = min_evidence_run
+            try:
+                if min_evidence_full_eps_cfg is None:
+                    min_full_row = int(min_evidence_run)
+                else:
+                    min_full_row = as_int(min_evidence_full_eps_cfg, default=int(min_evidence_run))
+            except Exception:
+                min_full_row = int(min_evidence_run)
+            # Guard: inflation should still be active at the first evaluated evidence
+            min_full_row = max(int(min_full_row), int(min_evidence_run) + 1)
+            df.loc[idx, "gate_min_evidence_full_eps_legacy_calib"] = int(min_full_row)
+            df.loc[idx, "gate_eps_inflation_max_legacy_calib"] = float(gate_eps_inflation_max)
+
+            eps_scaled_legacy = _evidence_scaled_epsilon_offline(
                 eps_base=eps_base,
                 total_evidence=int(total_evidence),
-                min_evidence_full=int(min_evidence_full_eps),
+                min_evidence_full=int(min_full_row),
                 max_inflation=float(gate_eps_inflation_max),
             )
+            df.loc[idx, "gate_eps_scaled_legacy_calib"] = float(eps_scaled_legacy)
+
+            # Main eps_scaled used for *_calib columns:
+            #   - mirror FR: eps_scaled == eps_base
+            #   - legacy:   eps_scaled == eps_scaled_legacy
+            eps_scaled = float(eps_base) if mirror_fr_row else float(eps_scaled_legacy)
             df.loc[idx, "gate_eps_scaled_calib"] = float(eps_scaled)
 
-            if int(min_evidence) > 0 and int(total_evidence) < int(min_evidence):
+            # Evidence gate: mirror online semantics using per-run min_evidence_run
+            if int(min_evidence_run) > 0 and int(total_evidence) < int(min_evidence_run):
                 df.loc[idx, "gate_evaluated_calib"] = 0
                 df.loc[idx, "gate_reason_calib"] = "not_evaluated_insufficient_evidence"
                 df.loc[idx, "gate_warn_pending_calib"] = 0
@@ -967,24 +1057,24 @@ def recompute_gate_series_under_decl(
                 df.loc[idx, "gate_consecutive_exceedances_calib"] = int(consec)
                 continue
 
+            # ε_stat: compute raw once, then dual-cap for FR vs legacy from the same eps_stat_raw.
             try:
                 if agg_fn is not None:
-                    eps_stat = float(agg_fn(window_decl, counts_by_metric=counts, alpha=alpha))
+                    eps_stat_raw = float(agg_fn(window_decl, counts_by_metric=counts, alpha=alpha))
                 else:
-                    eps_stat = 0.0
+                    eps_stat_raw = 0.0
             except Exception:
-                eps_stat = 0.0
+                eps_stat_raw = 0.0
+            if not np.isfinite(eps_stat_raw):
+                eps_stat_raw = 0.0
 
-            if not np.isfinite(eps_stat):
-                eps_stat = 0.0
+            eps_stat_fr = float(min(max(0.0, eps_stat_raw), float(max_frac) * float(eps_base)))
+            eps_stat_legacy = float(min(max(0.0, eps_stat_raw), float(max_frac) * float(eps_scaled_legacy)))
+            df.loc[idx, "gate_eps_stat_legacy_calib"] = float(eps_stat_legacy)
 
-            eps_stat = float(
-                min(
-                    max(0.0, eps_stat),
-                    # FIX #1: Cap eps_stat against inflated epsilon (not base) for parity with online
-                    float(max_frac) * float(eps_scaled),
-                )
-            )
+            # Main eps_stat mirrors online lane:
+            eps_stat = float(eps_stat_fr) if mirror_fr_row else float(eps_stat_legacy)
+            df.loc[idx, "gate_eps_stat_calib"] = float(eps_stat)
 
             # Canonical GateEngine stability slack:
             # eps_eff = eps_scaled + eps_sens - eps_stat_capped
@@ -993,6 +1083,16 @@ def recompute_gate_series_under_decl(
                 float(eps_scaled) + float(eps_sens) - float(eps_stat),
             )
             df.loc[idx, "gate_eps_eff_calib"] = float(eps_eff)
+
+            # Legacy eps_eff for explicit comparison
+            try:
+                eps_eff_legacy = max(
+                    0.0,
+                    float(eps_scaled_legacy) + float(eps_sens) - float(eps_stat_legacy),
+                )
+                df.loc[idx, "gate_eps_eff_legacy_calib"] = float(eps_eff_legacy)
+            except Exception:
+                pass
 
             try:
                 s_train = series_or_empty(g.get("train_loss"))
@@ -1087,7 +1187,6 @@ def recompute_gate_series_under_decl(
                     reason = "evaluated_fail_kappa"
 
             df.loc[idx, "gate_worst_tv_calib"] = float(tv)
-            df.loc[idx, "gate_eps_stat_calib"] = float(eps_stat)
             df.loc[idx, "gate_gain_calib"] = float(gain_bits) if np.isfinite(gain_bits) else np.nan
             df.loc[idx, "gate_warn_calib"] = int(flag)
             df.loc[idx, "gate_evaluated_calib"] = 1
