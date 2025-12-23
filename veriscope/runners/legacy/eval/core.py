@@ -1163,7 +1163,8 @@ def recompute_gate_series_under_decl(
                     reason = "evaluated_fail_stability"
 
             elif policy == "either":
-                ok = bool(ok_kappa and (ok_gain or ok_tv))
+                # Match GateEngine: "either" is strict (fail if gain OR stability fails)
+                ok = bool(ok_kappa and ok_gain and ok_tv)
                 flag = int(ok)
                 if flag == 1:
                     reason = "evaluated_ok"
