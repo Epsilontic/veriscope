@@ -556,6 +556,7 @@ def create_gpt_gate_engine(
         min_evidence=int(cfg.get("gate_min_evidence", 16)),
         policy=str(cfg.get("gate_policy", "either")),
         persistence_k=int(cfg.get("gate_persistence_k", 2)),
+        min_metrics_exceeding=int(cfg.get("gate_min_metrics_exceeding", 1)),
     )
 
     return fr_win, ge

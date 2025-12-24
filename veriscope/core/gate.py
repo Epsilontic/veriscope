@@ -71,6 +71,7 @@ class GateEngine:
         min_evidence: int = 0,
         policy: str = "either",
         persistence_k: int = 2,
+        min_metrics_exceeding: int = 1,
     ):
         self.win = frwin
         self.gain_thr = float(gain_thresh)
@@ -78,6 +79,13 @@ class GateEngine:
         self.cap_frac = float(eps_stat_max_frac)
         self.eps_sens = float(eps_sens)
         self.min_evidence = int(max(0, min_evidence))
+
+        # Multi-metric consensus: require >=K metrics with per-metric TV > eps_eff
+        # before treating stability exceedance as "real". Applied BEFORE persistence bookkeeping.
+        try:
+            self.min_metrics_exceeding = max(1, int(min_metrics_exceeding))
+        except Exception:
+            self.min_metrics_exceeding = 1
 
         # Parse policy (string -> enum, normalize aliases; conservative default on invalid)
         policy_in = policy  # preserve original for audit/debug
@@ -159,6 +167,14 @@ class GateEngine:
                     per_metric_n={},
                     drifts={},
                     dw_exceeds_threshold=False,
+                    # Multi-metric consensus fields (schema-stable)
+                    min_metrics_exceeding=int(getattr(self, "min_metrics_exceeding", 1) or 1),
+                    min_metrics_exceeding_effective=int(getattr(self, "min_metrics_exceeding", 1) or 1),
+                    n_metrics_exceeding=0,
+                    metrics_exceeding=[],
+                    multi_metric_filtered=False,
+                    dw_exceeds_threshold_raw=False,
+                    ok_stab_raw=True,
                     gain_below_threshold=bool(gain_below),
                 ),
             )
@@ -249,6 +265,14 @@ class GateEngine:
                     per_metric_tv={},
                     per_metric_n={},
                     drifts={},
+                    # Multi-metric consensus fields (schema-stable)
+                    min_metrics_exceeding=int(getattr(self, "min_metrics_exceeding", 1) or 1),
+                    min_metrics_exceeding_effective=int(getattr(self, "min_metrics_exceeding", 1) or 1),
+                    n_metrics_exceeding=0,
+                    metrics_exceeding=[],
+                    multi_metric_filtered=False,
+                    dw_exceeds_threshold_raw=False,
+                    ok_stab_raw=True,
                 ),
             )
 
@@ -265,6 +289,51 @@ class GateEngine:
 
         # "Evaluated" means we computed at least one finite metric
         evaluated = worst_any
+
+        # ============================================================
+        # Multi-metric consensus filter (MUST run before persistence)
+        # ============================================================
+        min_m_req = int(getattr(self, "min_metrics_exceeding", 1) or 1)
+        min_m_req = max(1, min_m_req)
+
+        # Clamp-to-total-metrics: prefer the metrics we actually computed TVs for.
+        # Priority: wd.weights (computed loop) → wd.metrics (declared) → worst_per_metric_tv (fallback).
+        weights_dict = getattr(wd, "weights", None) or {}
+        if isinstance(weights_dict, dict) and len(weights_dict) > 0:
+            n_metrics_total = len(weights_dict)
+        else:
+            metrics_list = getattr(wd, "metrics", None) or []
+            n_metrics_total = len(metrics_list) if isinstance(metrics_list, (list, tuple)) else 0
+            if n_metrics_total <= 0 and isinstance(worst_per_metric_tv, dict):
+                n_metrics_total = len(worst_per_metric_tv)
+        n_metrics_total = max(1, int(n_metrics_total))
+
+        min_m_eff = min(min_m_req, n_metrics_total)
+
+        exceeding: list[str] = []
+        if (min_m_eff > 1) and np.isfinite(eps_eff) and isinstance(worst_per_metric_tv, dict):
+            for m, v in worst_per_metric_tv.items():
+                try:
+                    # tolerate structured payloads like {"tv": ...}
+                    if isinstance(v, dict) and "tv" in v:
+                        tv = float(v["tv"])
+                    else:
+                        tv = float(v)
+                except Exception:
+                    continue
+                if np.isfinite(tv) and (tv > float(eps_eff)):
+                    exceeding.append(str(m))
+
+        # Preserve raw exceedance for debugging/auditing
+        dw_exceeds_raw = bool(dw_exceeds)
+        ok_stab_raw = bool(ok_stab)
+
+        multi_metric_filtered = False
+        if dw_exceeds_raw and (min_m_eff > 1) and (len(exceeding) < min_m_eff):
+            # Crucial: override BEFORE persistence updates / policy logic
+            dw_exceeds = False
+            ok_stab = True
+            multi_metric_filtered = True
 
         # Policy-based decision
         warn = False
@@ -356,8 +425,16 @@ class GateEngine:
                 evaluated=evaluated,
                 policy=self.policy.value,
                 dw_exceeds_threshold=bool(dw_exceeds),
+                dw_exceeds_threshold_raw=bool(dw_exceeds_raw),
                 gain_below_threshold=bool(gain_below),
                 ok_stab=bool(ok_stab),
+                ok_stab_raw=bool(ok_stab_raw),
+                # Multi-metric consensus audit
+                min_metrics_exceeding=int(min_m_req),
+                min_metrics_exceeding_effective=int(min_m_eff),
+                n_metrics_exceeding=int(len(exceeding)),
+                metrics_exceeding=sorted(exceeding),
+                multi_metric_filtered=bool(multi_metric_filtered),
                 persistence_fail=bool(persistence_fail_flag),
                 consecutive_exceedances=consecutive_after,
                 consecutive_exceedances_before=consecutive_before,

@@ -177,6 +177,9 @@ class TrainConfig:
     gate_epsilon: float = 0.12
     gate_gain_thresh: float = 0.0  # stability-only by default; tune upward if you want "learning+stability"
     gate_min_evidence: int = 16
+    # Multi-metric consensus: require >=K metrics with per-metric TV > eps_eff
+    # before stability exceedance engages WARN/FAIL/persistence. 1 = legacy behavior.
+    gate_min_metrics_exceeding: int = 1
     gate_eps_stat_max_frac: float = 0.25  # cap eps_stat as fraction of epsilon
 
     # Gate policy: controls when gate FAILs
@@ -270,6 +273,7 @@ class VeriscopeGatedTrainer:
             {
                 "gate_gain_thresh": config.gate_gain_thresh,
                 "gate_min_evidence": config.gate_min_evidence,
+                "gate_min_metrics_exceeding": int(config.gate_min_metrics_exceeding),
                 "gate_eps_stat_max_frac": float(config.gate_eps_stat_max_frac),
                 "gate_epsilon_sens": 0.04,
                 "gate_policy": config.gate_policy,
@@ -1224,6 +1228,12 @@ if __name__ == "__main__":
     parser.add_argument("--gate_gain_thresh", type=float, default=0.0)
     parser.add_argument("--gate_min_evidence", type=int, default=16)
     parser.add_argument(
+        "--gate_min_metrics_exceeding",
+        type=int,
+        default=1,
+        help="Require >=K metrics exceeding eps_eff before stability WARN/FAIL/persistence engages (1=legacy).",
+    )
+    parser.add_argument(
         "--regime_min_windows",
         type=int,
         default=5,
@@ -1416,6 +1426,8 @@ if __name__ == "__main__":
             "gate_min_evidence": 75,
             "gate_gain_thresh": -0.002,
             "gate_policy": "persistence_stability",
+            # Optional but recommended for your “var_out_k heavy-tail nuisance WARNs” case:
+            "gate_min_metrics_exceeding": 2,
         }
         for k, v in spike_v1.items():
             flag = "--" + k
@@ -1456,6 +1468,7 @@ if __name__ == "__main__":
         gate_epsilon=args.gate_epsilon,
         gate_gain_thresh=args.gate_gain_thresh,
         gate_min_evidence=args.gate_min_evidence,
+        gate_min_metrics_exceeding=int(getattr(args, "gate_min_metrics_exceeding", 1)),
         gate_eps_stat_max_frac=args.gate_eps_stat_max_frac,
         gate_policy=args.gate_policy,
         gate_persistence_k=args.gate_persistence_k,
@@ -1581,6 +1594,7 @@ if __name__ == "__main__":
             "gate_policy": config.gate_policy,
             "gate_persistence_k": config.gate_persistence_k,
             "gate_min_evidence": config.gate_min_evidence,
+            "gate_min_metrics_exceeding": int(config.gate_min_metrics_exceeding),
             "gate_eps_stat_max_frac": config.gate_eps_stat_max_frac,
             "gate_gain_thresh": config.gate_gain_thresh,
         },
