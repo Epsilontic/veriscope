@@ -76,6 +76,12 @@ def _effective_min_lead() -> int:
     return max(0, int(lead))
 
 
+# Small truthy-env helper.
+def _env_truthy(name: str, default: str = "0") -> bool:
+    v = os.environ.get(name, default)
+    return str(v).strip().lower() in ("1", "true", "t", "yes", "y", "on")
+
+
 # Numeric / config / IO shims.
 # Prefer the shared helpers in legacy.utils; fall back to local definitions if missing.
 try:
@@ -444,7 +450,15 @@ def bootstrap_stratified(
 
         ncol = len(trig)
         lead_min = int(_effective_min_lead())
-        succ = int(((trig["t_warn"].notna()) & ((trig["t_collapse"] - trig["t_warn"]) >= lead_min)).sum())
+
+        # Optional diagnostic policy: count late warnings as detections.
+        # When enabled, any finite t_warn on a triggered run counts as success.
+        allow_late = _env_truthy("SCAR_ALLOW_LATE_WARN", default="0")
+        if allow_late:
+            succ = int(trig["t_warn"].notna().sum())
+        else:
+            succ = int(((trig["t_warn"].notna()) & ((trig["t_collapse"] - trig["t_warn"]) >= lead_min)).sum())
+
         vals_detect.append(float(succ / max(1, ncol)))
 
         non_trig = boot[boot["collapse_tag"] == "none"]
@@ -550,7 +564,14 @@ def summarize_detection(rows: pd.DataFrame, warm_idx: int) -> pd.DataFrame:
     _tw = to_numeric_series(trig["t_warn"], errors="coerce")
     _tc = to_numeric_series(trig["t_collapse"], errors="coerce")
     lead_min = int(_effective_min_lead())
-    mask = (_tw.notna()) & ((_tc - _tw) >= lead_min)
+
+    # Optional diagnostic policy: count late warnings as detections.
+    # When enabled, any finite t_warn on a triggered run counts as success.
+    allow_late = _env_truthy("SCAR_ALLOW_LATE_WARN", default="0")
+    if allow_late:
+        mask = _tw.notna()
+    else:
+        mask = (_tw.notna()) & ((_tc - _tw) >= lead_min)
 
     successes = int(np.count_nonzero(mask.to_numpy(dtype=bool)))
     detect_rate = successes / max(1, n_collapse)
