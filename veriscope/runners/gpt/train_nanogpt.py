@@ -78,7 +78,7 @@ def _ensure_nanogpt_on_path(nanogpt_dir: str) -> None:
 def compute_window_spans(
     gate_window_iters: int,
     metric_interval_iters: int,
-) -> tuple[int, int, int]:
+) -> Tuple[int, int, int]:
     """Compute window spans with correct unit handling.
 
     All inputs and outputs are in iteration units unless noted.
@@ -170,6 +170,13 @@ class TrainConfig:
     metric_interval: int = 5  # compute veriscope metrics every N iterations
     eval_iters: int = 200
 
+    # --- Logit diagnostics (diagnostic-only; NOT gated) ---
+    log_logit_norm: bool = False
+    logit_norm_stride: int = 0  # 0 => use metric_interval
+    logit_norm_max_tokens: int = 256  # 0 => use all tokens (B*T); order stats are guarded below
+    logit_norm_order_stats_max_tokens: int = 4096  # compute median/p95 only when N <= this
+    log_logit_std: bool = True  # std across vocab per token (optional)
+
     # Veriscope gating
     gate_enabled: bool = True
     gate_window: int = 50  # iterations, not epochs
@@ -260,6 +267,7 @@ class VeriscopeGatedTrainer:
                 epsilon=config.gate_epsilon,
                 bins=16,
                 eff_dim_max=float(self.metric_config.geom_rp_dim),
+                rankme_max=float(self.metric_config.geom_rp_dim),
                 cos_disp_max=float(config.cos_disp_max),
             )
         except TypeError:
@@ -446,6 +454,9 @@ class VeriscopeGatedTrainer:
 
         # Previous JL-projected features for SW2 (avoid re-projecting each metric step)
         self._prev_H_jl: Optional[torch.Tensor] = None
+
+        # Pending extra diagnostics to merge into the next metric snapshot (keeps _log_metrics signature stable)
+        self._pending_logit_diag: Optional[Dict[str, Any]] = None
 
         # Training state
         self.iter_num = 0
@@ -839,6 +850,103 @@ class VeriscopeGatedTrainer:
             "spike_any_overlap": spike_any_overlap,
         }
 
+    def _compute_logit_diagnostics(self, logits: torch.Tensor) -> Dict[str, Any]:
+        """
+        Diagnostics computed from *training-step pre-softmax logits*.
+
+        Assumes logits L has shape (B, T, V).
+        Per token:
+          - l2 norm over vocab: ||L_{b,t}||_2
+          - optional std over vocab: std(L_{b,t,:})
+
+        Aggregation is over tokens (b,t). To bound overhead deterministically,
+        optionally subsample tokens using evenly spaced indices (no RNG).
+        Order stats (median/p95) are computed on CPU for determinism insurance.
+        """
+        cfg = self.config
+        out: Dict[str, Any] = {}
+
+        with torch.no_grad():
+            if logits is None or logits.ndim != 3:
+                return out
+
+            # Keep native dtype until we've subsampled; avoids a full-size float32 copy.
+            L = logits.detach()
+            B, T, V = L.shape
+            flat = L.reshape(B * T, V)  # (N_total, V)
+            N_total = int(flat.shape[0])
+
+            # Deterministic subsample (better coverage than flat[:K], no RNG).
+            K = int(getattr(cfg, "logit_norm_max_tokens", 0) or 0)
+            if K > 0 and N_total > K:
+                if K == 1:
+                    idx = torch.tensor([N_total // 2], device=flat.device, dtype=torch.long)
+                else:
+                    # Evenly spaced indices in [0, N_total-1], integer arithmetic.
+                    idx = (torch.arange(K, device=flat.device, dtype=torch.long) * (N_total - 1)) // (K - 1)
+                flat = flat.index_select(0, idx)
+
+            # Now cast the (N_used, V) slice only.
+            flat = flat.float()
+
+            N = int(flat.shape[0])
+            out["logit_diag_tokens_total"] = int(N_total)
+            out["logit_diag_tokens_used"] = int(N)
+            out["logit_has_nonfinite"] = 0
+            out["logit_nonfinite_count"] = 0
+
+            if N == 0:
+                return out
+
+            # Finiteness guard on the tensor we will reduce over.
+            # Log count for extra signal; sanitize so aggregates remain usable.
+            nonfinite_mask = ~torch.isfinite(flat)
+            n_bad = int(nonfinite_mask.sum().item())
+            out["logit_nonfinite_count"] = n_bad
+            if n_bad > 0:
+                out["logit_has_nonfinite"] = 1
+                flat = torch.nan_to_num(flat, nan=0.0, posinf=0.0, neginf=0.0)
+
+            # Per-token L2 norm over vocab
+            token_l2 = torch.linalg.norm(flat, dim=-1)  # (N,)
+            out["logit_l2_mean"] = float(token_l2.mean().item())
+
+            # Variance over tokens of the per-token L2 (heteroskedasticity/spikiness)
+            if N > 1:
+                out["logit_l2_var_token"] = float(token_l2.var(unbiased=False).item())
+            else:
+                out["logit_l2_var_token"] = 0.0
+
+            # Guard expensive order stats; compute them on CPU for determinism insurance.
+            order_stats_limit = int(getattr(cfg, "logit_norm_order_stats_max_tokens", 4096) or 4096)
+            if N <= order_stats_limit:
+                t_cpu = token_l2.detach().cpu()
+                out["logit_l2_median"] = float(t_cpu.median().item())
+                out["logit_l2_p95"] = float(torch.quantile(t_cpu, 0.95).item()) if N > 1 else float(t_cpu.item())
+            else:
+                out["logit_l2_median"] = float("nan")
+                out["logit_l2_p95"] = float("nan")
+
+            # Optional: vocab-std per token
+            if bool(getattr(cfg, "log_logit_std", True)):
+                token_std = flat.std(dim=-1, unbiased=False)  # (N,)
+                out["logit_std_mean"] = float(token_std.mean().item())
+
+                if N > 1:
+                    out["logit_std_var_token"] = float(token_std.var(unbiased=False).item())
+                else:
+                    out["logit_std_var_token"] = 0.0
+
+                if N <= order_stats_limit:
+                    s_cpu = token_std.detach().cpu()
+                    out["logit_std_median"] = float(s_cpu.median().item())
+                    out["logit_std_p95"] = float(torch.quantile(s_cpu, 0.95).item()) if N > 1 else float(s_cpu.item())
+                else:
+                    out["logit_std_median"] = float("nan")
+                    out["logit_std_p95"] = float("nan")
+
+        return out
+
     def _log_metrics(self, loss: float, input_ids: torch.Tensor):
         """Compute and log metrics for this iteration."""
         # Update EWMA baseline
@@ -894,6 +1002,11 @@ class VeriscopeGatedTrainer:
             metrics["iter"] = self.iter_num
             metrics["lr"] = self._effective_lr(self.iter_num)
 
+            # Merge diagnostic-only extra metrics (e.g., logit norms) if present
+            if isinstance(self._pending_logit_diag, dict) and self._pending_logit_diag:
+                metrics.update(self._pending_logit_diag)
+            self._pending_logit_diag = None
+
             cfg = self.config
             active = (
                 cfg.data_corrupt_at >= 0
@@ -943,6 +1056,20 @@ class VeriscopeGatedTrainer:
         with self.ctx:
             logits, loss = self.model(X, Y)
 
+        # Logit diagnostics (diagnostic-only): compute from training-step logits
+        # only on iterations where we will also take a metric snapshot.
+        if bool(cfg.log_logit_norm):
+            metric_stride = max(1, int(cfg.metric_interval))
+            logit_stride = int(getattr(cfg, "logit_norm_stride", 0) or 0)
+            logit_stride = metric_stride if logit_stride <= 0 else max(1, logit_stride)
+
+            if (self.iter_num % metric_stride == 0) and (self.iter_num % logit_stride == 0):
+                self._pending_logit_diag = self._compute_logit_diagnostics(logits)
+            else:
+                self._pending_logit_diag = None
+        else:
+            self._pending_logit_diag = None
+
         # Backward pass
         self.scaler.scale(loss).backward()
 
@@ -960,6 +1087,9 @@ class VeriscopeGatedTrainer:
 
         # Log metrics
         self._log_metrics(loss_val, X)
+
+        # Belt-and-suspenders: prevent any stale diag leaking across iterations
+        self._pending_logit_diag = None
 
         # Gate check (after warmup)
         if cfg.gate_enabled and self.iter_num >= cfg.gate_warmup:
@@ -1179,6 +1309,36 @@ if __name__ == "__main__":
         type=int,
         default=5,
         help="Compute veriscope metrics every N iterations (controls evidence density).",
+    )
+
+    # Logit diagnostics (diagnostic-only; NOT gated)
+    parser.add_argument(
+        "--log_logit_norm",
+        action="store_true",
+        help="Log diagnostics from training-step pre-softmax logits (L2 norm, etc.).",
+    )
+    parser.add_argument(
+        "--logit_norm_stride",
+        type=int,
+        default=0,
+        help="Compute logit diagnostics every N iters (0 => metric_interval).",
+    )
+    parser.add_argument(
+        "--logit_norm_max_tokens",
+        type=int,
+        default=256,
+        help="Max tokens (B*T) used per snapshot (0 => all tokens; median/p95 are guarded).",
+    )
+    parser.add_argument(
+        "--logit_norm_order_stats_max_tokens",
+        type=int,
+        default=4096,
+        help="Compute median/p95 only when the number of tokens used is <= this threshold (computed on CPU).",
+    )
+    parser.add_argument(
+        "--no_logit_std",
+        action="store_true",
+        help="Disable vocab-std diagnostics from logits.",
     )
 
     # Output
@@ -1453,6 +1613,12 @@ if __name__ == "__main__":
         log_interval=10,
         device=args.device,
         metric_interval=args.metric_interval,
+        # Logit diagnostics
+        log_logit_norm=bool(args.log_logit_norm),
+        logit_norm_stride=int(args.logit_norm_stride),
+        logit_norm_max_tokens=int(args.logit_norm_max_tokens),
+        logit_norm_order_stats_max_tokens=int(args.logit_norm_order_stats_max_tokens),
+        log_logit_std=not bool(args.no_logit_std),
         lr_spike_at=args.lr_spike_at,
         lr_spike_len=args.lr_spike_len,
         lr_spike_mult=args.lr_spike_mult,
