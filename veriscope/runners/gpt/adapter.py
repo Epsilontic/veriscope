@@ -9,17 +9,20 @@ to the existing metric/gate infrastructure with minimal changes.
 from __future__ import annotations
 
 import math
+import os
+import warnings
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
 import torch.nn as nn
 
-# ---- Your existing core imports (unchanged) ----
-from veriscope.core.window import WindowDecl, FRWindow
-from veriscope.core.transport import DeclTransport
 from veriscope.core.gate import GateEngine
+from veriscope.core.transport import DeclTransport
+from veriscope.core.window import FRWindow, WindowDecl
+
+_RANKME_SANITY_WARNED: bool = False
 
 # NOTE: Do NOT import veriscope.runners.legacy.features here.
 # That module pulls in veriscope.runners.legacy.model which imports torchvision.
@@ -61,56 +64,186 @@ def cosine_dispersion(H: torch.Tensor, seed: int = 0, epoch: int = 0, n_pairs: i
     return float(torch.mean(torch.abs(cos)).item())
 
 
+# Helper: covariance eigenspectrum from activations
 @torch.no_grad()
-def variance_outside_k(H: torch.Tensor, k: Optional[int] = None) -> Tuple[float, float, int, float, int, int]:
-    """Geometry summary metrics.
+def _cov_eigs_sorted_from_activations(
+    H: torch.Tensor,
+    method: str = "auto",
+) -> Tuple[Optional[torch.Tensor], float]:
+    """
+    Compute covariance-spectrum eigenvalues from centered activations H (N,D).
 
     Returns:
-      (var_out_k, eff_dim, k_used, tail_mass, v_ok, neg_eigs)
+      (eig_sorted_desc, total_variance)
 
-    This is a lightweight replacement for the legacy implementation and is
-    designed to be dependency-minimal (no torchvision).
+    Notes:
+      - For JL dims (d ~ 64), forming covariance and using eigvalsh is often faster
+        than SVD when N is large.
+      - method:
+          * "auto": use covariance eigvalsh for d <= 256, else SVD
+          * "cov":  force covariance eigvalsh
+          * "svd":  force SVD->(s^2)/(n-1)
     """
     X = H.float()
     n, d = int(X.shape[0]), int(X.shape[1])
     if n < 2 or d < 1:
-        return float("nan"), float("nan"), 0, float("nan"), 0, 0
+        return None, float("nan")
 
     X = X - X.mean(dim=0, keepdim=True)
-    # Use SVD (stable) to obtain spectrum of covariance
-    # cov eigenvalues are (s^2)/(n-1)
-    try:
-        # full_matrices=False keeps it efficient
-        s = torch.linalg.svdvals(X)
-    except Exception:
-        s = torch.linalg.svdvals(X.cpu())
-    eig = (s * s) / max(1.0, float(n - 1))
 
-    total = float(eig.sum().item())
-    if not np.isfinite(total) or total <= 0.0:
-        return float("nan"), float("nan"), 0, float("nan"), 0, 0
-
-    # Effective dimension: (sum λ)^2 / sum λ^2
-    denom = float((eig * eig).sum().item())
-    eff_dim = (total * total) / denom if denom > 0.0 else float("nan")
-
-    # Choose k if not provided: sqrt(d) clipped to [1, d]
-    if k is None:
-        k_used = int(max(1, min(d, round(math.sqrt(d)))))
+    m = str(method).lower().strip()
+    if m == "cov":
+        use_cov = True
+    elif m == "svd":
+        use_cov = False
     else:
-        k_used = int(max(1, min(d, int(k))))
+        use_cov = d <= 256
 
-    # Sort descending
-    eig_sorted, _ = torch.sort(eig, descending=True)
+    try:
+        if use_cov:
+            C = (X.T @ X) / max(1.0, float(n - 1))
+            # Numerical hygiene: enforce symmetry to reduce spurious negative eigenvalues.
+            C = 0.5 * (C + C.T)
+            w = torch.linalg.eigvalsh(C)  # ascending
+            w = torch.clamp(w, min=0.0)
+            eig_sorted = torch.flip(w, dims=[0])  # descending
+        else:
+            # SVD fallback: eig_i = s_i^2/(n-1)
+            try:
+                s = torch.linalg.svdvals(X)
+            except Exception:
+                s = torch.linalg.svdvals(X.cpu())
+            eig = (s * s) / max(1.0, float(n - 1))
+            eig_sorted, _ = torch.sort(eig, descending=True)
+
+        # Guard before sum() to keep empty-spectrum semantics robust.
+        if eig_sorted is None or eig_sorted.numel() == 0:
+            return None, float("nan")
+        total = float(eig_sorted.sum().item())
+        if (not np.isfinite(total)) or total <= 0.0:
+            return None, float("nan")
+        return eig_sorted, total
+    except Exception:
+        return None, float("nan")
+
+
+@torch.no_grad()
+def rankme_cov_from_eigs(
+    eig_sorted: Optional[torch.Tensor],
+    total: float,
+    eps: float = 1e-12,
+) -> float:
+    """
+    RankMe / effective rank via spectral entropy of the covariance spectrum.
+
+      p_i = λ_i / Σλ_i
+      rankme = exp( - Σ p_i log(p_i) )
+
+    This is the covariance-spectrum variant, matching eff_dim semantics here.
+    """
+    if eig_sorted is None or eig_sorted.numel() == 0:
+        return float("nan")
+
+    tot = float(total)
+    if (not np.isfinite(tot)) or tot <= 0.0:
+        return float("nan")
+
+    p = eig_sorted / tot
+    p = torch.clamp(p, min=float(eps))
+    p = p / torch.clamp(p.sum(), min=float(eps))  # renormalize after clamp
+
+    ent = -torch.sum(p * torch.log(p))
+    r = torch.exp(ent)
+    return float(r.item())
+
+
+@torch.no_grad()
+def _geom_metrics_from_eigs(
+    eig_sorted: Optional[torch.Tensor],
+    total: float,
+    k: Optional[int] = None,
+) -> Dict[str, Any]:
+    """
+    Derive geometry scalar metrics from covariance eigenvalues.
+
+    Returns dict containing:
+      - var_out_k: fraction of variance outside top-k
+      - eff_dim: participation ratio (sum λ)^2 / sum λ^2  (denom-clamped)
+      - rankme: exp(entropy(p)), p = λ / sum λ
+      - k_used: k actually used
+      - var_out_k_valid: 1 if computed, else 0
+    """
+    if eig_sorted is None or eig_sorted.numel() == 0:
+        return {
+            "var_out_k": float("nan"),
+            "eff_dim": float("nan"),
+            "rankme": float("nan"),
+            "k_used": 0,
+            "var_out_k_valid": 0,
+        }
+
+    tot = float(total)
+    if (not np.isfinite(tot)) or tot <= 0.0:
+        return {
+            "var_out_k": float("nan"),
+            "eff_dim": float("nan"),
+            "rankme": float("nan"),
+            "k_used": 0,
+            "var_out_k_valid": 0,
+        }
+
+    # eff_dim (participation ratio) with denom clamp to avoid numeric spikes without
+    # turning rare issues into NaNs (important for consensus sensitivity).
+    denom = float((eig_sorted * eig_sorted).sum().item())
+    denom_floor = 1e-20  # float32-scale guard
+    denom = denom if denom > denom_floor else denom_floor
+    eff_dim = (tot * tot) / denom
+
+    # k selection: sqrt(#eigs) is stable for JL dims; clamp to [1, #eigs]
+    d_eigs = int(eig_sorted.numel())
+    if k is None:
+        k_used = int(max(1, min(d_eigs, round(math.sqrt(d_eigs)))))
+    else:
+        k_used = int(max(1, min(d_eigs, int(k))))
+
     top = float(eig_sorted[:k_used].sum().item())
-    tail = max(0.0, total - top)
-    var_out_k = float(tail / total)
+    tail = max(0.0, tot - top)
+    var_out_k = float(tail / tot)
 
-    # tail_mass is kept for compatibility; here equal to variance fraction outside k
-    tail_mass = var_out_k
-    v_ok = 1
+    rme = rankme_cov_from_eigs(eig_sorted, tot)
+
+    return {
+        "var_out_k": float(var_out_k),
+        "eff_dim": float(eff_dim),
+        "rankme": float(rme),
+        "k_used": int(k_used),
+        "var_out_k_valid": 1,
+    }
+
+
+@torch.no_grad()
+def variance_outside_k(H: torch.Tensor, k: Optional[int] = None) -> Tuple[float, float, int, float, int, int]:
+    """
+    Geometry summary metrics (covariance spectrum).
+
+    Returns:
+      (var_out_k, eff_dim, k_used, tail_frac, v_ok, neg_eigs)
+
+    NOTE:
+      - tail_frac is the FRACTION of variance outside top-k (same as var_out_k).
+      - neg_eigs is always 0 here because covariance eigs are clamped nonnegative.
+    """
+    eig_sorted, total = _cov_eigs_sorted_from_activations(H, method="auto")
+    out = _geom_metrics_from_eigs(eig_sorted, total, k=k)
+
+    var_out_k = float(out["var_out_k"])
+    eff_dim = float(out["eff_dim"])
+    k_used = int(out["k_used"])
+    v_ok = int(out["var_out_k_valid"])
+
+    tail_frac = var_out_k
     neg_eigs = 0
-    return var_out_k, float(eff_dim), int(k_used), float(tail_mass), int(v_ok), int(neg_eigs)
+    return var_out_k, eff_dim, k_used, float(tail_frac), v_ok, neg_eigs
 
 
 # Heavy metrics are optional; import lazily and fail closed if unavailable.
@@ -129,7 +262,7 @@ class GPTMetricConfig:
     """Configuration for GPT metric extraction."""
 
     # Which transformer layers to probe (indices or 'last', 'middle', 'all')
-    probe_layers: List[int] | str = "last"
+    probe_layers: Union[List[int], str] = "last"
     # Max tokens to sample per batch for metric computation
     max_tokens_per_batch: int = 2048
     # JL projection dimension for geometry metrics
@@ -228,6 +361,8 @@ class GPTFeatureExtractor:
 
         Returns: (N, D) tensor where N = batch * seq positions, D = hidden_dim
         """
+        # Kept for API compatibility (e.g., HF-style callers); intentionally unused.
+        del attention_mask
         self._activations.clear()
 
         # Save and restore training mode (metric extraction must not change training semantics)
@@ -327,14 +462,20 @@ class GPTMetricComputer:
         self.device = device
 
         # JL projection cache
-        self._jl_cache: Dict[Tuple[int, int], torch.Tensor] = {}
+        self._jl_cache: Dict[Tuple[int, int, int], torch.Tensor] = {}
 
     def _get_jl_matrix(self, d_in: int, d_out: int, seed: int = 42) -> torch.Tensor:
         """Get or create JL projection matrix."""
-        key = (d_in, d_out)
+        key = (d_in, d_out, int(seed))
         if key not in self._jl_cache:
             g = torch.Generator().manual_seed(seed + d_in + 31 * d_out)
-            A = torch.randn(d_in, d_out, generator=g) / math.sqrt(d_out)
+            A = torch.randn(
+                d_in,
+                d_out,
+                generator=g,
+                device=torch.device("cpu"),
+                dtype=torch.float32,
+            ) / math.sqrt(d_out)
             self._jl_cache[key] = A
         return self._jl_cache[key]
 
@@ -359,7 +500,8 @@ class GPTMetricComputer:
         # Extract hidden states
         H_raw = self.extractor.extract_features(input_ids, seed=int(run_key))
 
-        # Normalize using the previous reference frame, then update it.
+        # Prequential semantics: normalize using the *previous* reference frame,
+        # then update the reference from raw features for the *next* step.
         H_norm = self.extractor.normalize(H_raw)
         self.extractor.update_reference_frame(H_raw)
 
@@ -371,22 +513,42 @@ class GPTMetricComputer:
 
         metrics: Dict[str, Any] = {}
 
-        # ---- Geometry metrics (reuse your existing functions) ----
+        # ---- Geometry metrics (single spectrum; derived metrics are centralized) ----
         try:
-            var_out, eff_dim, k_used, tail_mass, v_ok, neg_eigs = variance_outside_k(H_jl)
+            eig_sorted, total = _cov_eigs_sorted_from_activations(H_jl, method="auto")
+            geom = _geom_metrics_from_eigs(eig_sorted, total, k=None)
+
             metrics.update(
                 {
-                    "var_out_k": float(var_out),
-                    "eff_dim": float(eff_dim),
-                    "k_used": int(k_used),
-                    "var_out_k_valid": int(v_ok),
+                    "var_out_k": float(geom["var_out_k"]),
+                    "eff_dim": float(geom["eff_dim"]),
+                    "rankme": float(geom["rankme"]),
+                    "k_used": int(geom["k_used"]),
+                    "var_out_k_valid": int(geom["var_out_k_valid"]),
                 }
             )
+
+            # Dev-only sanity check (rate-limited): rankme should be finite if eff_dim is finite
+            if os.environ.get("VERISCOPE_RANKME_SANITY", "0").strip().lower() in {"1", "true", "yes", "on"}:
+                global _RANKME_SANITY_WARNED
+                if not _RANKME_SANITY_WARNED:
+                    ed = metrics["eff_dim"]
+                    rm = metrics["rankme"]
+                    if np.isfinite(ed) and (not np.isfinite(rm)):
+                        _RANKME_SANITY_WARNED = True
+                        warnings.warn(
+                            f"[rankme_sanity] eff_dim finite but rankme non-finite. "
+                            f"shape(H_jl)={tuple(H_jl.shape)}, total={float(total):.6g}",
+                            RuntimeWarning,
+                            stacklevel=2,
+                        )
+
         except Exception:
             metrics.update(
                 {
                     "var_out_k": float("nan"),
                     "eff_dim": float("nan"),
+                    "rankme": float("nan"),
                     "k_used": 0,
                     "var_out_k_valid": 0,
                 }
@@ -436,6 +598,8 @@ class GPTMetricComputer:
             )
 
         # ---- Distribution shift (SW2) ----
+        # Policy 1: metrics are CPU. This requires H_norm/H_jl/A (and prev_* tensors) to be CPU.
+        # Do not partially migrate to GPU without switching fully to Policy 2.
         if (
             self.config.compute_sw2
             and sliced_w2_gpu_budget is not None
@@ -443,12 +607,19 @@ class GPTMetricComputer:
         ):
             try:
                 prev_for_sw2 = prev_H_jl if prev_H_jl is not None else (prev_H_norm @ A)
+                if prev_for_sw2.ndim != 2 or H_jl.ndim != 2 or prev_for_sw2.shape[1] != H_jl.shape[1]:
+                    raise RuntimeError(f"SW2 dim mismatch: prev={tuple(prev_for_sw2.shape)} cur={tuple(H_jl.shape)}")
+
+                # Low-cost hardening: ensure expected dtype/layout for SW2 implementations.
+                prev_for_sw2 = prev_for_sw2.contiguous().float()
+                cur_for_sw2 = H_jl.contiguous().float()
+
                 sw2, sw2_ms, n_proj, ok = sliced_w2_gpu_budget(
                     prev_for_sw2,
-                    H_jl,
+                    cur_for_sw2,
                     n_proj=64,
                     seed=run_key + epoch,
-                    device=self.device,
+                    device=torch.device("cpu"),
                     budget_ms=200,
                 )
                 metrics.update(
@@ -486,44 +657,42 @@ def create_gpt_window_decl(
     epsilon: float = 0.12,
     bins: int = 16,
     eff_dim_max: float = 64.0,
-    cos_disp_max: float = 1.0,  # ← FIXED: was 0.5, caused transport saturation
+    rankme_max: Optional[float] = None,
+    cos_disp_max: float = 1.0,
 ) -> WindowDecl:
-    """Create a WindowDecl appropriate for GPT training.
+    """
+    Create a WindowDecl appropriate for GPT training.
 
-    IMPORTANT:
-    - `eff_dim` is computed on the JL-projected representation (H_jl),
-      so eff_dim_max should match the projection dimension (default 64).
-    - `cos_disp` is bounded in [0, 1] by definition. The cal_range must
-      cover the full range to avoid transport saturation artifacts.
-    - `var_out_k` is bounded in [0, 1] by construction.
-
-    The weights are intentionally set to downweight cos_disp (0.2) relative
-    to var_out_k and eff_dim (0.4 each), since cos_disp can drift during
-    healthy learning.
+    Notes on calibration bounds:
+      - eff_dim is computed on JL-projected representation (H_jl), so eff_dim_max
+        should typically be geom_rp_dim.
+      - rankme (cov-spectrum) is in [1, min(d, n-1)] for centered data; calibrate
+        on [1, rankme_max] for better histogram resolution.
+      - cos_disp is bounded in [0, 1] by definition.
     """
     eff_dim_max = float(max(4.0, eff_dim_max))
+    if rankme_max is None:
+        rankme_max = eff_dim_max
+    rankme_max = float(max(2.0, rankme_max))
+
     cos_disp_max = float(max(0.1, min(1.0, cos_disp_max)))
-
-    # One-time warning for tight cos_disp range (common misconfiguration)
-    if cos_disp_max < 0.9:
-        try:
-            import multiprocessing as mp
-
-            if mp.current_process().name == "MainProcess":
-                print(f"[WARN] cos_disp_max={cos_disp_max:.2f} is tight; consider 1.0 to avoid transport saturation")
-        except Exception:
-            pass
 
     return WindowDecl(
         epsilon=float(epsilon),
-        metrics=["var_out_k", "eff_dim", "cos_disp"],
-        weights={"var_out_k": 0.4, "eff_dim": 0.4, "cos_disp": 0.2},
+        metrics=["var_out_k", "eff_dim", "rankme", "cos_disp"],
+        weights={
+            "var_out_k": 0.35,
+            "eff_dim": 0.35,
+            "rankme": 0.20,
+            "cos_disp": 0.10,
+        },
         bins=int(bins),
         interventions=(lambda x: x,),
         cal_ranges={
             "var_out_k": (0.0, 1.0),
             "eff_dim": (0.0, eff_dim_max),
-            "cos_disp": (0.0, cos_disp_max),  # ← THE FIX: full [0,1] range
+            "rankme": (1.0, rankme_max),
+            "cos_disp": (0.0, cos_disp_max),
         },
     )
 
