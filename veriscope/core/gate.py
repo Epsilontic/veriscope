@@ -1,9 +1,10 @@
 # veriscope/core/gate.py
 from __future__ import annotations
 
+from collections import deque
 from enum import Enum
 from dataclasses import dataclass
-from typing import Any, Dict, Sequence, Tuple, TYPE_CHECKING
+from typing import Any, Deque, Dict, Iterable, Optional, Sequence, Tuple, TYPE_CHECKING
 import warnings
 
 import numpy as np
@@ -15,6 +16,9 @@ if TYPE_CHECKING:
 
 
 _POLICY_PARSE_WARNED: bool = False
+_REGIME_STATE_PARSE_WARNED: bool = False
+_REGIME_STATE_ALLOWED: frozenset[str] = frozenset({"disabled", "building", "established", "active"})
+_REGIME_STATE_ALLOWED_SORTED: tuple[str, ...] = tuple(sorted(_REGIME_STATE_ALLOWED))
 
 
 def _warn_policy_parse_once(msg: str) -> None:
@@ -23,6 +27,54 @@ def _warn_policy_parse_once(msg: str) -> None:
         return
     _POLICY_PARSE_WARNED = True
     warnings.warn(msg, RuntimeWarning, stacklevel=2)
+
+
+def _warn_regime_state_parse_once(msg: str) -> None:
+    global _REGIME_STATE_PARSE_WARNED
+    if _REGIME_STATE_PARSE_WARNED:
+        return
+    _REGIME_STATE_PARSE_WARNED = True
+    warnings.warn(msg, RuntimeWarning, stacklevel=2)
+
+
+def _trend_slope_pairs(pairs: Iterable[Tuple[int, float]]) -> float:
+    """Slope using true indices (avoids time compression when margins intermittently NaN)."""
+    xs: list[float] = []
+    ys: list[float] = []
+    for t, v in pairs:
+        try:
+            fv = float(v)
+        except Exception:
+            continue
+        if np.isfinite(fv):
+            xs.append(float(t))
+            ys.append(float(fv))
+    if len(xs) < 2:
+        return float("nan")
+    dt = xs[-1] - xs[0]
+    if dt <= 0:
+        return float("nan")
+    return float((ys[-1] - ys[0]) / dt)
+
+
+def _normalize_regime_state(rs_in: Any) -> str:
+    """Normalize regime_state to canonical string; canonical enum lives elsewhere."""
+    if rs_in is None:
+        return "disabled"
+    # Handle enum instances directly (avoids Enum.__str__ differences across versions)
+    if isinstance(rs_in, Enum):
+        rs_in = rs_in.value
+    s = str(rs_in).strip()
+    if "." in s:
+        s = s.split(".")[-1]
+    s = s.lower()
+    if s in _REGIME_STATE_ALLOWED:
+        return s
+    _warn_regime_state_parse_once(
+        f"Unknown regime_state input={rs_in!r}. Treating as 'disabled'. "
+        f"Valid values={list(_REGIME_STATE_ALLOWED_SORTED)}."
+    )
+    return "disabled"
 
 
 def _gain_flags(gain_bits: Any, gain_thr: float) -> tuple[bool, bool, bool, float]:
@@ -72,6 +124,7 @@ class GateEngine:
         policy: str = "either",
         persistence_k: int = 2,
         min_metrics_exceeding: int = 1,
+        trend_n: int = 8,
     ):
         self.win = frwin
         self.gain_thr = float(gain_thresh)
@@ -112,6 +165,12 @@ class GateEngine:
         # State for persistence policy (only updated on evaluated checks)
         self._consecutive_exceedances: int = 0
 
+        # Trend tracking with proper indices
+        self._trend_n = max(2, int(trend_n))
+        self._margins_change: Deque[Tuple[int, float]] = deque(maxlen=self._trend_n)
+        # _trend_idx always increments on check(); used as fallback when iter_num not provided
+        self._trend_idx: int = 0
+
     def check(
         self,
         past: Dict[str, np.ndarray],
@@ -120,8 +179,24 @@ class GateEngine:
         gain_bits: float,
         kappa_sens: float,
         eps_stat_value: float,
+        *,
+        regime_state: Any = None,
+        iter_num: Optional[int] = None,
     ) -> GateResult:
         wd = self.win.decl
+
+        # Regime state normalization (string only; canonical enum lives elsewhere)
+        rs = _normalize_regime_state(regime_state)
+
+        # Monotone trend index tracking
+        self._trend_idx += 1  # check count (always increments)
+        check_idx = self._trend_idx
+        if iter_num is not None:
+            t_idx = int(iter_num)  # use provided iteration number for trend slope
+            t_idx_source = "iter_num"
+        else:
+            t_idx = check_idx  # fallback to check count
+            t_idx_source = "check_idx"
 
         gain_is_finite, ok_gain, gain_below, gain_bits_f = _gain_flags(gain_bits, self.gain_thr)
         persistence_fail_flag = False  # always emitted in audit
@@ -167,6 +242,7 @@ class GateEngine:
                     per_metric_n={},
                     drifts={},
                     dw_exceeds_threshold=False,
+                    ok_stab=True,
                     # Multi-metric consensus fields (schema-stable)
                     min_metrics_exceeding=int(getattr(self, "min_metrics_exceeding", 1) or 1),
                     min_metrics_exceeding_effective=int(getattr(self, "min_metrics_exceeding", 1) or 1),
@@ -176,11 +252,25 @@ class GateEngine:
                     dw_exceeds_threshold_raw=False,
                     ok_stab_raw=True,
                     gain_below_threshold=bool(gain_below),
+                    # Trend/margin schema (placeholders for unevaluated check)
+                    trend_x=int(t_idx),
+                    trend_x_source=t_idx_source,
+                    trend_n=int(self._trend_n),
+                    check_idx=int(check_idx),
+                    margin_change_raw=float("nan"),
+                    margin_change_eff=float("nan"),
+                    margin_change_slope_eff=float("nan"),
+                    margin_change=float("nan"),  # legacy alias
+                    margin_change_slope=float("nan"),  # legacy alias
+                    margin_change_rel_raw=float("nan"),
+                    margin_change_rel_eff=float("nan"),
+                    # Regime state (string); margin_regime* injected by regime engine
+                    regime_state=rs,
                 ),
             )
 
         # Interventions (default to identity)
-        intervs: Sequence = tuple(getattr(wd, "interventions", ()) or (lambda x: x,))
+        intervs: Sequence = tuple(getattr(wd, "interventions", None) or (lambda x: x,))
 
         # Safe transport apply hook: prefer self.win.transport.apply, fall back to identity
         _transport = getattr(self.win, "transport", None)
@@ -265,14 +355,32 @@ class GateEngine:
                     per_metric_tv={},
                     per_metric_n={},
                     drifts={},
+                    # Schema-stable threshold fields
+                    dw_exceeds_threshold=False,
+                    dw_exceeds_threshold_raw=False,
+                    ok_stab=True,
+                    ok_stab_raw=True,
+                    gain_below_threshold=bool(gain_below),
                     # Multi-metric consensus fields (schema-stable)
                     min_metrics_exceeding=int(getattr(self, "min_metrics_exceeding", 1) or 1),
                     min_metrics_exceeding_effective=int(getattr(self, "min_metrics_exceeding", 1) or 1),
                     n_metrics_exceeding=0,
                     metrics_exceeding=[],
                     multi_metric_filtered=False,
-                    dw_exceeds_threshold_raw=False,
-                    ok_stab_raw=True,
+                    # Trend/margin schema (placeholders for unevaluated check)
+                    trend_x=int(t_idx),
+                    trend_x_source=t_idx_source,
+                    trend_n=int(self._trend_n),
+                    check_idx=int(check_idx),
+                    margin_change_raw=float("nan"),
+                    margin_change_eff=float("nan"),
+                    margin_change_slope_eff=float("nan"),
+                    margin_change=float("nan"),  # legacy alias
+                    margin_change_slope=float("nan"),  # legacy alias
+                    margin_change_rel_raw=float("nan"),
+                    margin_change_rel_eff=float("nan"),
+                    # Regime state (string); margin_regime* injected by regime engine
+                    regime_state=rs,
                 ),
             )
 
@@ -280,6 +388,13 @@ class GateEngine:
         eps_stat = float(min(max(0.0, eps_stat_value), eps_cap))
         # Legacy semantics: eps_eff = epsilon + eps_sens - eps_stat_capped
         eps_eff = max(0.0, float(wd.epsilon) + float(self.eps_sens) - eps_stat)
+
+        # --- margin (CHANGE, raw pre-consensus) ---
+        margin_change_raw = float(worst - eps_eff) if (np.isfinite(worst) and np.isfinite(eps_eff)) else float("nan")
+        if np.isfinite(worst) and np.isfinite(eps_eff) and float(eps_eff) > 0.0:
+            margin_change_rel_raw = float(worst / eps_eff - 1.0)
+        else:
+            margin_change_rel_raw = float("nan")
 
         # Threshold checks
         ok_stab = np.isfinite(worst) and (worst <= eps_eff)
@@ -334,6 +449,30 @@ class GateEngine:
             dw_exceeds = False
             ok_stab = True
             multi_metric_filtered = True
+
+        # --- margin (CHANGE, effective post-consensus) ---
+        # Semantics:
+        #   - When exceeding (dw_exceeds=True): positive margin shows exceedance magnitude
+        #   - When filtered (worst > eps_eff but dw_exceeds=False): margin collapses to 0
+        #   - When below threshold (worst < eps_eff): negative margin preserves safety headroom
+        if np.isfinite(worst) and np.isfinite(eps_eff):
+            if bool(dw_exceeds):
+                worst_eff = float(worst)  # preserve positive exceedance magnitude
+            else:
+                # Filtered exceedances collapse to 0; otherwise preserves negative headroom
+                worst_eff = float(min(float(worst), float(eps_eff)))
+            margin_change_eff = float(worst_eff - eps_eff)
+        else:
+            worst_eff = float("nan")
+            margin_change_eff = float("nan")
+
+        if np.isfinite(worst_eff) and np.isfinite(eps_eff) and float(eps_eff) > 0.0:
+            margin_change_rel_eff = float(worst_eff / eps_eff - 1.0)
+        else:
+            margin_change_rel_eff = float("nan")
+
+        self._margins_change.append((t_idx, margin_change_eff))
+        margin_change_slope_eff = _trend_slope_pairs(self._margins_change)
 
         # Policy-based decision
         warn = False
@@ -440,6 +579,20 @@ class GateEngine:
                 consecutive_exceedances_before=consecutive_before,
                 consecutive_exceedances_after=consecutive_after,
                 persistence_k=self.persistence_k,
+                # Margin/trend (explicit naming + legacy aliases)
+                trend_x=int(t_idx),
+                trend_x_source=t_idx_source,
+                trend_n=int(self._trend_n),
+                check_idx=int(check_idx),
+                margin_change_raw=float(margin_change_raw),
+                margin_change_eff=float(margin_change_eff),
+                margin_change_slope_eff=float(margin_change_slope_eff),
+                margin_change=float(margin_change_eff),  # legacy alias
+                margin_change_slope=float(margin_change_slope_eff),  # legacy alias
+                margin_change_rel_raw=float(margin_change_rel_raw),
+                margin_change_rel_eff=float(margin_change_rel_eff),
+                # Regime state (string); margin_regime* injected by regime engine
+                regime_state=rs,
             ),
         )
 
