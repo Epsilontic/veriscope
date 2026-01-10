@@ -221,6 +221,16 @@ class TrainConfig:
     dtype: str = "bfloat16"
     compile: bool = False
 
+    # Calibration recorder (optional)
+    calibration_enabled: bool = False
+    calibration_output_path: str = ""
+    calibration_buffer_size: int = 100
+    calibration_include_per_metric: bool = False
+    calibration_only_evaluated: bool = True
+    calibration_only_healthy: bool = False
+    calibration_main_process_only: bool = True
+    calibration_fail_on_schema_mismatch: bool = True
+
 
 class VeriscopeGatedTrainer:
     """
@@ -374,6 +384,32 @@ class VeriscopeGatedTrainer:
             pathology_start=pathology_start,
             default_gap_iters=int(default_gap_iters),
         )
+
+        # ---------------------------------------------------------------------
+        # Optional calibration recorder attachment
+        # ---------------------------------------------------------------------
+        from veriscope.core.calibration_recorder import CalibrationRecorder, CalibrationRecorderConfig
+
+        self._calibration_recorder: Optional[CalibrationRecorder] = None
+        if (
+            bool(getattr(config, "calibration_enabled", False))
+            and str(getattr(config, "calibration_output_path", "")).strip()
+        ):
+            rec_cfg = CalibrationRecorderConfig(
+                enabled=True,
+                output_path=str(config.calibration_output_path),
+                buffer_size=int(getattr(config, "calibration_buffer_size", 100)),
+                include_per_metric=bool(getattr(config, "calibration_include_per_metric", False)),
+                only_evaluated=bool(getattr(config, "calibration_only_evaluated", True)),
+                only_healthy=bool(getattr(config, "calibration_only_healthy", False)),
+                main_process_only=bool(getattr(config, "calibration_main_process_only", True)),
+                fail_on_schema_mismatch=bool(getattr(config, "calibration_fail_on_schema_mismatch", True)),
+            )
+            self._calibration_recorder = CalibrationRecorder(rec_cfg)
+            self.gate_engine.set_calibration_recorder(self._calibration_recorder)
+
+            if getattr(self._calibration_recorder, "is_active", False):
+                print(f"[CAL] calibration recorder enabled -> {rec_cfg.output_path}")
 
         # Metric gauge freezing (optional): freeze before reference is built.
         self._freeze_gauge_at_iter: Optional[int] = None
@@ -721,6 +757,26 @@ class VeriscopeGatedTrainer:
                     "base_reason": reason,
                     "change_reason": reason,
                 },
+                # keep schema stable
+                "gain_bits": float("nan"),
+                "change_ok": True,
+                "regime_ok": True,
+                "change_ok_tri": None,
+                "regime_ok_tri": None,
+                "change_dw_ok": None,
+                "change_gain_ok": None,
+                "change_warn": False,
+                "change_evaluated": False,
+                "regime_warn": False,
+                "regime_active": False,
+                "regime_enabled": bool(getattr(self.config, "regime_enabled", False)),
+                "ref_established_at": None,
+                "ref_just_established": False,
+                # spike attribution fields (schema stability)
+                "spike_active": False,
+                "spike_overlap_past": False,
+                "spike_overlap_recent": False,
+                "spike_any_overlap": False,
             }
 
         # Get past and recent windows (in metric snapshots)
@@ -796,6 +852,16 @@ class VeriscopeGatedTrainer:
 
         audit = result.audit or {}
 
+        # Tri-state exports: represent "not evaluated" as None.
+        # Regime checks may be enabled but not run on a given check.
+        regime_check_ran = bool(audit.get("regime_check_ran", False))
+
+        # Change tri-state: prefer the nullable per-check indicators.
+        change_ok_tri = audit.get("change_dw_ok", None)  # Optional[bool]
+
+        # Regime tri-state: only meaningful if the regime check actually ran.
+        regime_ok_tri = audit.get("regime_ok", None) if regime_check_ran else None
+
         def _needs_fill(x: Any) -> bool:
             if x is None:
                 return True
@@ -821,6 +887,13 @@ class VeriscopeGatedTrainer:
         if _needs_fill(row_change_reason):
             row_change_reason = row_reason
 
+        # Legacy compatibility: treat explicit None as pass/OK (matches old "default True" semantics).
+        v_change_ok = audit.get("change_ok", True)
+        legacy_change_ok = True if v_change_ok is None else bool(v_change_ok)
+
+        v_regime_ok = audit.get("regime_ok", True)
+        legacy_regime_ok = True if v_regime_ok is None else bool(v_regime_ok)
+
         return {
             "ok": result.ok,
             "warn": getattr(result, "warn", False),
@@ -832,12 +905,15 @@ class VeriscopeGatedTrainer:
             "change_reason": row_change_reason,
             # Regime-specific fields (always present for consistency)
             # Tri-state fields must remain nullable; `change_ok` is back-compat only.
-            "change_ok": bool(audit.get("change_ok", True)),
+            "change_ok": legacy_change_ok,
             "change_dw_ok": audit.get("change_dw_ok", None),
             "change_gain_ok": audit.get("change_gain_ok", None),
             "change_warn": audit.get("change_warn", False),
             "change_evaluated": audit.get("change_evaluated", True),
-            "regime_ok": audit.get("regime_ok", True),
+            "regime_ok": legacy_regime_ok,
+            # Tri-state exports for calibration/provenance (None => not evaluated)
+            "change_ok_tri": change_ok_tri,
+            "regime_ok_tri": regime_ok_tri,
             "regime_warn": audit.get("regime_warn", False),
             "regime_active": audit.get("regime_active", False),
             "regime_enabled": audit.get("regime_enabled", False),
@@ -1197,44 +1273,54 @@ class VeriscopeGatedTrainer:
         t0 = time.time()
         running_loss = 0.0
 
-        while self.iter_num < cfg.max_iters:
-            # Get batch
-            X, Y = get_batch_fn("train")
-            X, Y = X.to(self.device), Y.to(self.device)
+        try:
+            while self.iter_num < cfg.max_iters:
+                # Get batch
+                X, Y = get_batch_fn("train")
+                X, Y = X.to(self.device), Y.to(self.device)
 
-            # Train step
-            loss = self.train_step(X, Y)
-            running_loss += loss
+                # Train step
+                loss = self.train_step(X, Y)
+                running_loss += loss
 
-            # Logging
-            if self.iter_num % cfg.log_interval == 0:
-                dt = time.time() - t0
-                avg_loss = running_loss / cfg.log_interval
-                print(f"iter {self.iter_num}: loss {avg_loss:.4f}, time {dt * 1000:.2f}ms")
-                running_loss = 0.0
-                t0 = time.time()
+                # Logging
+                if self.iter_num % cfg.log_interval == 0:
+                    dt = time.time() - t0
+                    avg_loss = running_loss / cfg.log_interval
+                    print(f"iter {self.iter_num}: loss {avg_loss:.4f}, time {dt * 1000:.2f}ms")
+                    running_loss = 0.0
+                    t0 = time.time()
 
-            # Evaluation
-            if self.iter_num % cfg.eval_interval == 0:
-                self._evaluate(get_batch_fn)
+                # Evaluation
+                if self.iter_num % cfg.eval_interval == 0:
+                    self._evaluate(get_batch_fn)
 
-        # Optional LR spike verification summary
-        if cfg.lr_spike_verify and cfg.lr_spike_at >= 0 and cfg.lr_spike_len > 0 and self._lr_trace:
-            spike_start = int(cfg.lr_spike_at)
-            spike_end = int(cfg.lr_spike_at + cfg.lr_spike_len)
-            in_spike = [lr for (it, lr) in self._lr_trace if spike_start <= it < spike_end]
-            nearby = [
-                lr
-                for (it, lr) in self._lr_trace
-                if (abs(it - spike_start) <= 100 and not (spike_start <= it < spike_end))
-            ]
-            if in_spike and nearby:
-                ratio = float(np.mean(in_spike) / np.mean(nearby))
-                print(f"[SPIKE VERIFY] effective_lr ratio={ratio:.2f}x (expected {cfg.lr_spike_mult:.2f}x)")
-            else:
-                print("[SPIKE VERIFY] insufficient trace samples to compute ratio")
-        print("Training complete!")
-        return self.metric_history, self.gate_history
+            # Optional LR spike verification summary
+            if cfg.lr_spike_verify and cfg.lr_spike_at >= 0 and cfg.lr_spike_len > 0 and self._lr_trace:
+                spike_start = int(cfg.lr_spike_at)
+                spike_end = int(cfg.lr_spike_at + cfg.lr_spike_len)
+                in_spike = [lr for (it, lr) in self._lr_trace if spike_start <= it < spike_end]
+                nearby = [
+                    lr
+                    for (it, lr) in self._lr_trace
+                    if (abs(it - spike_start) <= 100 and not (spike_start <= it < spike_end))
+                ]
+                if in_spike and nearby:
+                    ratio = float(np.mean(in_spike) / np.mean(nearby))
+                    print(f"[SPIKE VERIFY] effective_lr ratio={ratio:.2f}x (expected {cfg.lr_spike_mult:.2f}x)")
+                else:
+                    print("[SPIKE VERIFY] insufficient trace samples to compute ratio")
+            print("Training complete!")
+            return self.metric_history, self.gate_history
+        finally:
+            if getattr(self, "_calibration_recorder", None) is not None:
+                try:
+                    self._calibration_recorder.close()
+                    print(
+                        f"[CAL] calibration recorder closed (records_written={self._calibration_recorder.records_written})"
+                    )
+                except Exception:
+                    pass
 
     @torch.no_grad()
     def _evaluate(self, get_batch_fn):
@@ -1367,6 +1453,24 @@ if __name__ == "__main__":
             "If set, write all metric snapshots to the output JSON. "
             "By default only the last 100 snapshots are written to keep files small."
         ),
+    )
+
+    # Calibration recorder (optional)
+    parser.add_argument(
+        "--calibration_csv",
+        type=str,
+        default="",
+        help="If set, append per-gate calibration records to this CSV path.",
+    )
+    parser.add_argument(
+        "--calibration_include_per_metric",
+        action="store_true",
+        help="Include per-metric TV JSON in calibration CSV (larger files).",
+    )
+    parser.add_argument(
+        "--calibration_only_healthy",
+        action="store_true",
+        help="Only record calibration rows when combined_ok=True.",
     )
 
     # Gate configuration
@@ -1654,6 +1758,15 @@ if __name__ == "__main__":
         freeze_metric_gauge_on_ref=bool(args.freeze_metric_gauge_on_ref),
         # Safer default for initial hook validation
         compile=False,
+        # Calibration recorder
+        calibration_enabled=bool(str(args.calibration_csv).strip()),
+        calibration_output_path=str(args.calibration_csv).strip(),
+        calibration_buffer_size=100,
+        calibration_include_per_metric=bool(args.calibration_include_per_metric),
+        calibration_only_evaluated=True,
+        calibration_only_healthy=bool(args.calibration_only_healthy),
+        calibration_main_process_only=True,
+        calibration_fail_on_schema_mismatch=True,
     )
 
     data_dir = os.path.join(args.nanogpt_dir, "data", args.dataset)

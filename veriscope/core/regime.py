@@ -32,7 +32,7 @@ import hashlib
 import os
 import warnings
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
 
 import numpy as np
 import multiprocessing as _mp
@@ -41,6 +41,9 @@ from veriscope.core.window import WindowDecl, FRWindow
 from veriscope.core.transport import DeclTransport
 from veriscope.core.gate import GateEngine, GateResult  # GatePolicy not needed here
 from veriscope.core.calibration import aggregate_epsilon_stat
+
+if TYPE_CHECKING:
+    from veriscope.core.calibration_recorder import CalibrationRecorder
 
 
 # --- Transport saturation diagnostic (rate-limited) ---
@@ -187,6 +190,17 @@ class RegimeReference:
     # Audit: which quality gates were checked
     build_audit: Dict[str, Any] = field(default_factory=dict)
 
+    # Regime identification (immutable after creation)
+    regime_id: str = ""
+
+    # Monotonic insertion order for deterministic eviction
+    # Set by the engine when storing; not user-provided
+    insertion_order: int = 0
+
+    # Calibration snapshot at establishment time (filled by calibrator if present)
+    eps_change_at_establishment: Optional[float] = None
+    eps_regime_at_establishment: Optional[float] = None
+
 
 @dataclass
 class RegimeConfig:
@@ -309,6 +323,18 @@ class RegimeConfig:
     # Regime decision policy. "inherit" = use base GateEngine policy/persistence_k.
     policy: str = "inherit"
     persistence_k: int = 2
+
+    # ---- Multi-regime support ----
+    # If False (default), single-regime behavior (existing self._ref)
+    # If True, use self._regimes dict with self._active_regime_id
+    enable_multi_regime: bool = False
+
+    # Maximum stored regimes (oldest evicted when exceeded)
+    # Clamped to >= 1 at runtime if multi-regime enabled
+    max_stored_regimes: int = 5
+
+    # Auto-generate regime_id format: f"{prefix}_{established_at}" if not specified
+    regime_id_prefix: str = "regime"
 
 
 def _policy_to_str(x: Any) -> str:
@@ -682,6 +708,31 @@ class RegimeAnchoredGateEngine:
         self._n_checks: int = 0
         self._n_ref_attempts: int = 0
 
+        # ---- Multi-regime state ----
+        self._enable_multi_regime = bool(getattr(self.config, "enable_multi_regime", False))
+        self._regime_id_prefix = str(getattr(self.config, "regime_id_prefix", "regime"))
+
+        # Clamp max_stored_regimes to >= 1 if multi-regime enabled
+        _max_cfg = int(getattr(self.config, "max_stored_regimes", 5))
+        if self._enable_multi_regime and _max_cfg < 1:
+            warnings.warn(
+                f"max_stored_regimes={_max_cfg} is invalid for multi-regime mode. Clamping to 1.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            _max_cfg = 1
+        self._max_stored_regimes = _max_cfg
+
+        # Storage for multi-regime mode
+        self._regimes: Dict[str, RegimeReference] = {}
+        self._active_regime_id: Optional[str] = None
+        self._regime_insertion_counter: int = 0  # Monotonic for deterministic eviction
+
+        # Single-regime mode uses existing self._ref (unchanged)
+
+        # ---- Calibration recorder (optional) ----
+        self._calibration_recorder: Optional["CalibrationRecorder"] = None
+
     @staticmethod
     def _clone_decl_with_epsilon(decl: WindowDecl, new_epsilon: float) -> WindowDecl:
         """
@@ -782,8 +833,17 @@ class RegimeAnchoredGateEngine:
 
     @property
     def reference_established(self) -> bool:
-        """True if a frozen reference has been established."""
-        return self._ref is not None
+        """True if a frozen reference has been established (single or multi-regime)."""
+        return self.current_reference is not None
+
+    @property
+    def current_reference(self) -> Optional[RegimeReference]:
+        """Get the current active reference (handles single vs multi-regime mode)."""
+        if not self._enable_multi_regime:
+            return self._ref
+        if self._active_regime_id is None:
+            return None
+        return self._regimes.get(self._active_regime_id)
 
     @property
     def regime_epsilon(self) -> float:
@@ -810,6 +870,10 @@ class RegimeAnchoredGateEngine:
         """The computed reference build window [min_iter, max_iter)."""
         return (self._build_min_iter, self._build_max_iter)
 
+    def set_calibration_recorder(self, recorder: Optional["CalibrationRecorder"]) -> None:
+        """Attach or detach an optional calibration recorder."""
+        self._calibration_recorder = recorder
+
     # ---- Internal helpers ----
 
     def _get_per_metric_counts(self, data: Dict[str, np.ndarray]) -> Dict[str, int]:
@@ -826,6 +890,83 @@ class RegimeAnchoredGateEngine:
                 continue
             counts[m] = int(np.isfinite(x).sum())
         return counts
+
+    def _store_reference(self, ref: RegimeReference) -> RegimeReference:
+        """
+        Store a reference and make it active. Returns the stored reference.
+
+        IMPORTANT: Does not mutate `ref` in-place. Returns a new RegimeReference
+        with regime_id and insertion_order set if needed.
+
+        In single-regime mode: sets self._ref directly.
+        In multi-regime mode: adds to self._regimes and sets active.
+        """
+        import dataclasses
+
+        # Generate regime_id if not set
+        rid = ref.regime_id
+        if not rid:
+            rid = f"{self._regime_id_prefix}_{ref.established_at}"
+
+        if not self._enable_multi_regime:
+            # Single-regime mode: just set self._ref
+            stored_ref = dataclasses.replace(ref, regime_id=rid)
+            self._ref = stored_ref
+            return stored_ref
+
+        # Multi-regime mode
+
+        # Assign insertion order for deterministic eviction
+        self._regime_insertion_counter += 1
+
+        # Create new reference with assigned fields (never mutate input)
+        stored_ref = dataclasses.replace(
+            ref,
+            regime_id=rid,
+            insertion_order=self._regime_insertion_counter,
+        )
+
+        # Evict oldest if at capacity (before adding new)
+        if len(self._regimes) >= self._max_stored_regimes and rid not in self._regimes:
+            # Evict by (established_at, insertion_order) for determinism
+            oldest_id = min(
+                self._regimes.keys(),
+                key=lambda k: (self._regimes[k].established_at, self._regimes[k].insertion_order),
+            )
+            del self._regimes[oldest_id]
+
+        self._regimes[rid] = stored_ref
+        self._active_regime_id = rid
+        return stored_ref
+
+    def _clear_current_reference(self) -> Optional[RegimeReference]:
+        """
+        Clear the current reference from storage. Returns the cleared reference (if any).
+
+        In single-regime mode: sets self._ref = None.
+        In multi-regime mode: removes from self._regimes and falls back to newest remaining.
+        """
+        if not self._enable_multi_regime:
+            prev = self._ref
+            self._ref = None
+            return prev
+
+        if self._active_regime_id is None:
+            return None
+
+        prev = self._regimes.pop(self._active_regime_id, None)
+
+        # Fall back to most recent remaining regime (by insertion_order)
+        if self._regimes:
+            newest_id = max(
+                self._regimes.keys(),
+                key=lambda k: self._regimes[k].insertion_order,
+            )
+            self._active_regime_id = newest_id
+        else:
+            self._active_regime_id = None
+
+        return prev
 
     def _all_metrics_have_min_evidence(
         self,
@@ -921,6 +1062,13 @@ class RegimeAnchoredGateEngine:
         worst_dw = audit.get("worst_DW")
         gate_values["worst_DW"] = worst_dw
         gate_values["max_dw_threshold"] = cfg.reference_build_max_dw
+
+        # Capture epsilon metadata at establishment time (for calibration / forensics)
+        # eps_sens source-of-truth is the base engine attribute (audit schema may change).
+        gate_values["eps_eff"] = audit.get("eps_eff")
+        gate_values["eps_stat"] = audit.get("eps_stat")
+        gate_values["eps"] = audit.get("eps")
+        gate_values["eps_sens"] = getattr(self.base, "eps_sens", None)
 
         # Gate 1: worst_DW must be present, finite, and below threshold
         if worst_dw is None:
@@ -1064,7 +1212,25 @@ class RegimeAnchoredGateEngine:
 
         ref_counts = {k: int(v.size) for k, v in bounded_metrics.items()}
 
-        self._ref = RegimeReference(
+        # Create the reference (regime_id will be assigned by _store_reference)
+        # Store epsilon metadata at establishment time if available/finite.
+        eps_change_est: Optional[float] = None
+        try:
+            x = float(quality_audit.get("eps_eff"))
+            if np.isfinite(x):
+                eps_change_est = x
+        except Exception:
+            eps_change_est = None
+
+        eps_regime_est: Optional[float] = None
+        try:
+            x = float(self._regime_epsilon)
+            if np.isfinite(x):
+                eps_regime_est = x
+        except Exception:
+            eps_regime_est = None
+
+        new_ref = RegimeReference(
             metrics=bounded_metrics,
             counts=ref_counts,
             established_at=int(iter_num),
@@ -1078,11 +1244,103 @@ class RegimeAnchoredGateEngine:
                 "incomplete_windows_skipped": int(self._ref_incomplete_windows_skipped),
                 "last_incomplete_missing": list(self._ref_last_incomplete_missing),
             },
+            eps_change_at_establishment=eps_change_est,
+            eps_regime_at_establishment=eps_regime_est,
+            # regime_id and insertion_order assigned by _store_reference
         )
+
+        # Store and activate (handles single vs multi-regime mode internally)
+        # CRITICAL: Do NOT assign result to self._ref here - _store_reference handles
+        # the appropriate storage (self._ref for single-regime, self._regimes for multi)
+        self._store_reference(new_ref)
 
         # Clear accumulator
         self._accumulating = []
         return True, ""
+
+    def set_regime(
+        self,
+        regime_id: str,
+        *,
+        reset_accumulator: bool = True,
+        keep_reference: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Switch to a different regime (multi-regime mode only).
+
+        Args:
+            regime_id: ID of regime to activate (must exist in store)
+            reset_accumulator: Clear accumulating windows for new reference build
+            keep_reference: If False and regime doesn't exist, clear current ref
+
+        Returns:
+            Summary dict with previous/new regime info
+        """
+        if not self._enable_multi_regime:
+            return {"error": "multi_regime_disabled", "enable_multi_regime": False}
+
+        prev_id = self._active_regime_id
+        summary: Dict[str, Any] = {
+            "previous_regime_id": prev_id,
+            "requested_regime_id": regime_id,
+            "regime_exists": regime_id in self._regimes,
+        }
+
+        if regime_id in self._regimes:
+            self._active_regime_id = regime_id
+            summary["new_regime_id"] = regime_id
+            summary["established_at"] = self._regimes[regime_id].established_at
+        elif not keep_reference:
+            self._active_regime_id = None
+            summary["new_regime_id"] = None
+            summary["cleared"] = True
+        else:
+            summary["error"] = f"regime_id={regime_id!r} not found"
+            summary["available_regimes"] = list(self._regimes.keys())
+
+        if reset_accumulator:
+            self._accumulating = []
+            self._ref_incomplete_windows_skipped = 0
+            self._ref_last_incomplete_missing = []
+            summary["accumulator_reset"] = True
+
+        return summary
+
+    def get_regime_ids(self) -> List[str]:
+        """Return list of stored regime IDs (sorted for determinism)."""
+        if not self._enable_multi_regime:
+            ref = self._ref
+            return [ref.regime_id] if (ref and ref.regime_id) else []
+        return sorted(self._regimes.keys())
+
+    def get_regime_stats(self, regime_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """
+        Get stats for a specific regime or the active regime.
+
+        Args:
+            regime_id: Specific regime to query, or None for active regime
+        """
+        if not self._enable_multi_regime:
+            # Single-regime mode: ignore regime_id, return current ref stats
+            return self.get_reference_stats()
+
+        rid = regime_id or self._active_regime_id
+        if rid is None or rid not in self._regimes:
+            return None
+
+        ref = self._regimes[rid]
+        return {
+            "regime_id": rid,
+            "established_at": ref.established_at,
+            "insertion_order": ref.insertion_order,
+            "n_samples_per_metric": dict(ref.n_samples_per_metric),
+            "metrics_tracked": sorted(self._metrics_tracked),
+            "regime_epsilon": self._regime_epsilon,
+            "eps_change_at_establishment": ref.eps_change_at_establishment,
+            "eps_regime_at_establishment": ref.eps_regime_at_establishment,
+            "is_active": (rid == self._active_regime_id),
+            "build_audit": ref.build_audit,
+        }
 
     # ---- Main API ----
 
@@ -1103,7 +1361,7 @@ class RegimeAnchoredGateEngine:
         - Change (past vs recent) exceeds threshold, OR
         - Regime (ref vs recent) exceeds threshold (once ref established AND eligible)
 
-        In shadow_mode, regime failures are logged but do not affect combined_ok.
+        In shadow_mode, regime failures are logged but do NOT affect combined_ok.
 
         Args:
             past: Past window metrics {metric_name: values_array}
@@ -1121,6 +1379,11 @@ class RegimeAnchoredGateEngine:
         iter_num = int(iter_num)
 
         # =========================================================================
+        # GET CURRENT REFERENCE (handles single vs multi-regime)
+        # =========================================================================
+        current_ref = self.current_reference
+
+        # =========================================================================
         # COMPUTE ELIGIBILITY FIRST (needed for regime_state_str)
         # =========================================================================
         shadow_mode = bool(getattr(self.config, "shadow_mode", False))
@@ -1132,8 +1395,8 @@ class RegimeAnchoredGateEngine:
             regime_eligible = False
             regime_eligible_reason = "disabled"
         elif bool(getattr(self.config, "use_eligibility", True)):
-            # Require reference by default
-            if bool(getattr(self.config, "eligible_requires_reference", True)) and (self._ref is None):
+            # Require reference by default - use current_ref
+            if bool(getattr(self.config, "eligible_requires_reference", True)) and (current_ref is None):
                 regime_eligible = False
                 regime_eligible_reason = "no_reference"
 
@@ -1141,7 +1404,7 @@ class RegimeAnchoredGateEngine:
             if regime_eligible:
                 min_iter_eligible = int(getattr(self.config, "eligible_min_iter", -1))
                 if min_iter_eligible < 0:
-                    min_iter_eligible = int(self._build_min_iter)  # sensible default
+                    min_iter_eligible = int(self._build_min_iter)
                 if iter_num < min_iter_eligible:
                     regime_eligible = False
                     regime_eligible_reason = f"iter={iter_num} < eligible_min_iter={min_iter_eligible}"
@@ -1149,15 +1412,9 @@ class RegimeAnchoredGateEngine:
         # =========================================================================
         # DETERMINE REGIME STATE STRING FOR GATE ENGINE AUDIT
         # =========================================================================
-        # Semantics: "active" means "check ran" (regardless of shadow mode)
-        # - "disabled": regime detection not enabled
-        # - "building": enabled but reference not yet established
-        # - "established": reference exists but regime is ineligible (check won't run)
-        # - "active": reference exists and eligible (check will run, even if shadowed)
-        # Gating semantics are captured separately by regime_active_effective.
         if not self._enabled_effective:
             regime_state_str = "disabled"
-        elif self._ref is None:
+        elif current_ref is None:
             regime_state_str = "building"
         elif not regime_eligible:
             regime_state_str = "established"
@@ -1165,7 +1422,6 @@ class RegimeAnchoredGateEngine:
             regime_state_str = "active"
 
         # 1. Base change detection (existing behavior, unchanged)
-        # NOW: pass iter_num and regime_state for proper trend tracking
         base_result = self.base.check(
             past=past,
             recent=recent,
@@ -1181,8 +1437,44 @@ class RegimeAnchoredGateEngine:
         # WRAPPER AUDIT: shallow copy preserves all base keys for schema compat
         # =========================================================================
         audit_base = base_result.audit or {}
-        audit: Dict[str, Any] = dict(audit_base)  # shallow copy, never mutate audit_base
+        audit: Dict[str, Any] = dict(audit_base)
         base_warn = getattr(base_result, "warn", False)
+
+        # =========================================================================
+        # SET REGIME_STATE IMMEDIATELY (required for calibration recorder)
+        # This MUST be set in ALL code paths, including early returns
+        # =========================================================================
+        audit["regime_state"] = regime_state_str
+
+        # =========================================================================
+        # STABLE BASE METADATA KEYS (for calibration/meta_json)
+        # Do NOT rely on audit_base schema; prefer engine attributes.
+        # Preserve "missing" as None (do NOT collapse to 0).
+        # =========================================================================
+        try:
+            audit.setdefault("base_policy", _policy_to_str(getattr(self.base, "policy", None)))
+        except Exception:
+            audit.setdefault("base_policy", None)
+
+        pk = getattr(self.base, "persistence_k", None)
+        try:
+            audit.setdefault("base_persistence_k", int(pk) if pk is not None else None)
+        except Exception:
+            audit.setdefault("base_persistence_k", None)
+
+        # Source-of-truth for eps_sens: engine attribute
+        audit.setdefault("base_eps_sens", getattr(self.base, "eps_sens", None))
+
+        # Useful for interpreting the consensus filter behavior:
+        # Prefer per-check effective value from GateEngine audit (may be clamped).
+        mm_eff = audit_base.get("min_metrics_exceeding_effective", None)
+        if mm_eff is None:
+            mm_eff = getattr(self.base, "min_metrics_exceeding", None)
+
+        try:
+            audit.setdefault("base_min_metrics_exceeding_effective", int(mm_eff) if mm_eff is not None else None)
+        except Exception:
+            audit.setdefault("base_min_metrics_exceeding_effective", None)
 
         # =========================================================================
         # DETERMINE EVALUATION STATUS
@@ -1254,9 +1546,8 @@ class RegimeAnchoredGateEngine:
             {
                 "base_ok": base_ok,
                 "base_evaluated": bool(base_evaluated),
-                "change_dw_ok": change_dw_ok,  # Optional[bool]
-                "change_gain_ok": change_gain_ok,  # Optional[bool]
-                # Back-compat only: unknown -> False (never use to regenerate tri-state)
+                "change_dw_ok": change_dw_ok,
+                "change_gain_ok": change_gain_ok,
                 "change_ok": bool(change_dw_ok is True),
             }
         )
@@ -1282,7 +1573,6 @@ class RegimeAnchoredGateEngine:
 
         # =========================================================================
         # EXPLICIT CHANGE-SIDE FIELDS (ROBUST SOURCING)
-        # Keep these stable regardless of headline disambiguation.
         # =========================================================================
         def _first_not_none(*vals: Any) -> Any:
             for v in vals:
@@ -1310,15 +1600,16 @@ class RegimeAnchoredGateEngine:
         audit["change_trend_n"] = audit_base.get("trend_n")
         audit["change_check_idx"] = audit_base.get("check_idx")
 
-        # Explicit change-side failure predicates (do NOT use base_result.ok here)
         _chg_dw_ok = _as_opt_bool(audit.get("change_dw_ok"))
         _chg_gain_ok = _as_opt_bool(audit.get("change_gain_ok"))
-        change_stability_failed = _chg_dw_ok is False  # exceeded threshold
-        change_gain_failed = _chg_gain_ok is False  # gain below threshold
+        change_stability_failed = _chg_dw_ok is False
+        change_gain_failed = _chg_gain_ok is False
         audit["change_stability_failed"] = bool(change_stability_failed)
         audit["change_gain_failed"] = bool(change_gain_failed)
 
-        # If regime detection is disabled, return base result with consistent audit fields
+        # =========================================================================
+        # EARLY RETURN IF REGIME DISABLED (regime_state already set above)
+        # =========================================================================
         if not self._enabled_effective:
             audit.update(
                 {
@@ -1335,6 +1626,7 @@ class RegimeAnchoredGateEngine:
                     "regime_eligible_reason": "disabled",
                     "regime_shadow_mode": shadow_mode,
                     "regime_check_ran": False,
+                    "regime_id": None,
                     # Placeholder regime margin fields for schema stability
                     "regime_margin_raw": None,
                     "regime_margin_eff": None,
@@ -1361,7 +1653,6 @@ class RegimeAnchoredGateEngine:
         regime_warn = False
         regime_check_ran = False
 
-        # Schema-stable placeholders (will be overwritten if regime check runs)
         regime_audit: Dict[str, Any] = {
             "regime_worst_DW": None,
             "regime_eps_eff": None,
@@ -1381,16 +1672,15 @@ class RegimeAnchoredGateEngine:
         }
 
         # CRITICAL: Only run regime check if reference exists AND eligible
-        if (self._ref is not None) and bool(regime_eligible):
+        # Use current_ref (not self._ref)
+        if (current_ref is not None) and bool(regime_eligible):
             regime_check_ran = True
 
-            # Compute counts for ref vs recent comparison
-            # IMPORTANT: Use ref and recent array sizes, NOT counts_by_metric
             recent_counts = self._get_per_metric_counts(recent)
-            ref_counts = self._ref.counts
+            ref_counts = current_ref.counts
             regime_counts = {m: min(ref_counts.get(m, 0), recent_counts.get(m, 0)) for m in self._metrics_tracked}
 
-            # Optional sanity checks (off by default)
+            # Optional sanity checks
             if os.environ.get("VERISCOPE_REGIME_SANITY", "0").strip() in ("1", "true", "True", "yes", "YES"):
                 bad: List[str] = []
                 for m in self._metrics_tracked:
@@ -1402,26 +1692,21 @@ class RegimeAnchoredGateEngine:
                 if bad:
                     _maybe_sanity_warn(
                         "regime_counts",
-                        "[regime][sanity] regime_counts invariant violated (expected 0 <= regime <= min(recent, ref)) for: "
-                        + ", ".join(bad),
+                        "[regime][sanity] regime_counts invariant violated: " + ", ".join(bad),
                     )
 
-            # Compute eps_stat for regime check with correct counts
             regime_eps_stat = aggregate_epsilon_stat(
                 self._regime_decl,
                 regime_counts,
                 alpha=float(self.config.eps_stat_alpha),
             )
 
-            # Call regime engine: ref as "past", recent as "recent"
-            # This reuses EXACTLY the same D_W calculation as base engine
-            # NOW: pass iter_num and regime_state for proper trend tracking
             regime_result = self.regime_engine.check(
-                past=self._ref.metrics,
+                past=current_ref.metrics,
                 recent=recent,
                 counts_by_metric=regime_counts,
-                gain_bits=0.0,  # Ignored (gain_thresh=-1e9)
-                kappa_sens=0.0,  # Ignored for regime (drift-only)
+                gain_bits=0.0,
+                kappa_sens=0.0,
                 eps_stat_value=regime_eps_stat,
                 iter_num=iter_num,
                 regime_state="active",
@@ -1430,8 +1715,7 @@ class RegimeAnchoredGateEngine:
             regime_ok = regime_result.ok
             regime_warn = getattr(regime_result, "warn", False)
 
-            # Diagnostic: check for transport saturation when regime fails.
-            # Use the EXACT gauge the regime engine uses (self._regime_decl, self._metrics_tracked).
+            # Diagnostic: transport saturation
             if (not regime_ok) and self.config.enabled:
                 cal_ranges = getattr(self._regime_decl, "cal_ranges", {})
                 for m in self._metrics_tracked:
@@ -1447,8 +1731,7 @@ class RegimeAnchoredGateEngine:
                     diag = diagnose_transport_saturation(arr, lo, hi, name=m)
                     _maybe_warn_saturation(m, diag, threshold=0.10)
 
-            # Optional: clipping diagnostics for cal_ranges mismatch.
-            # Only compute when divergence is large to avoid bloating the audit.
+            # Clipping diagnostics
             clip_diag_recent: Dict[str, Any] = {}
             clip_diag_ref: Dict[str, Any] = {}
             try:
@@ -1466,15 +1749,11 @@ class RegimeAnchoredGateEngine:
                         except Exception:
                             clip_diag_recent[m] = {"error": "clip_diag_failed"}
                         try:
-                            clip_diag_ref[m] = _clip(m, self._ref.metrics.get(m, np.array([], float)))
+                            clip_diag_ref[m] = _clip(m, current_ref.metrics.get(m, np.array([], float)))
                         except Exception:
                             clip_diag_ref[m] = {"error": "clip_diag_failed"}
 
-            # Extract regime audit from regime_result
             ra = regime_result.audit or {}
-
-            # Capture regime audit details
-            # Prefer per_metric_tv (new), fall back to drifts (legacy), else empty
             _per_metric = ra.get("per_metric_tv") or ra.get("drifts") or {}
             regime_audit = {
                 "regime_worst_DW": ra.get("worst_DW"),
@@ -1483,7 +1762,6 @@ class RegimeAnchoredGateEngine:
                 "regime_per_metric": _per_metric,
                 "regime_per_metric_n": ra.get("per_metric_n", {}),
                 "regime_counts": regime_counts,
-                # ---- REGIME margin/trend (namespaced from regime GateEngine) ----
                 "regime_margin_raw": ra.get("margin_change_raw"),
                 "regime_margin_eff": ra.get("margin_change_eff"),
                 "regime_margin_slope_eff": ra.get("margin_change_slope_eff"),
@@ -1495,28 +1773,22 @@ class RegimeAnchoredGateEngine:
                 "regime_check_idx": ra.get("check_idx"),
             }
 
-            # Attach clipping diagnostics only when computed.
             if clip_diag_recent:
                 regime_audit["regime_clip_diag_threshold"] = 0.5
                 regime_audit["regime_clip_diag_recent"] = clip_diag_recent
                 regime_audit["regime_clip_diag_ref"] = clip_diag_ref
 
-        # else: regime_ok=True, regime_warn=False, regime_audit has placeholders
-        # 3. Combined decision: fail if EITHER fails
-        # SHADOW MODE: regime failures are logged but do NOT affect combined_ok
+        # 3. Combined decision
         if shadow_mode:
             combined_ok = bool(base_result.ok)
         else:
             combined_ok = bool(base_result.ok and regime_ok)
 
-        # 4. Reference establishment (only when all conditions met)
+        # 4. Reference establishment (only when no current reference)
         ref_newly_established = False
         ref_build_status: Dict[str, Any] = {}
 
-        if self._ref is None:
-            # =========================================================================
-            # REFERENCE BUILD GATING
-            # =========================================================================
+        if current_ref is None:
             if getattr(self, "_ref_build_forced_block", None) is not None:
                 ref_build_status["blocked"] = str(self._ref_build_forced_block)
             else:
@@ -1528,7 +1800,6 @@ class RegimeAnchoredGateEngine:
                 elif change_dw_ok is not True:
                     ref_build_status["blocked"] = "base_stability_not_ok_or_not_evaluated"
                 else:
-                    # Preserve existing safety checks (conservative)
                     if not bool(base_evaluated):
                         ref_build_status["blocked"] = "base_not_evaluated"
                     elif not bool(base_ok):
@@ -1547,7 +1818,6 @@ class RegimeAnchoredGateEngine:
                             if not established:
                                 ref_build_status["blocked"] = establish_reason
 
-            # Explicit window semantics in status
             ref_build_status.update(
                 {
                     "build_window_min_iter": int(self._build_min_iter),
@@ -1561,14 +1831,13 @@ class RegimeAnchoredGateEngine:
         # =========================================================================
         # 5. BUILD COMPREHENSIVE AUDIT TRAIL
         # =========================================================================
-        # Compute effective active state
-        regime_has_reference = self._ref is not None
-        # regime_active_effective: True only if ref exists AND eligible AND not shadowed (actually gating)
+        # CRITICAL: Refresh current_ref in case it was just established
+        current_ref = self.current_reference
+        regime_has_reference = current_ref is not None
         regime_active_effective = bool(regime_has_reference and regime_eligible and (not shadow_mode))
 
         audit.update(
             {
-                # Add regime-specific fields (always present for consistency)
                 "change_warn": base_warn,
                 "change_evaluated": bool(base_evaluated),
                 "regime_ok": regime_ok,
@@ -1576,33 +1845,35 @@ class RegimeAnchoredGateEngine:
                 "regime_check_ran": regime_check_ran,
                 "regime_enabled": self._enabled_effective,
                 "regime_has_reference": regime_has_reference,
-                "regime_active": regime_has_reference,  # Legacy: True if ref exists
-                "regime_active_effective": regime_active_effective,  # True only if actually gating
+                "regime_active": regime_has_reference,
+                "regime_active_effective": regime_active_effective,
                 "regime_epsilon": self._regime_epsilon,
                 "regime_policy": getattr(self, "_regime_policy", ""),
                 "regime_persistence_k": int(getattr(self, "_regime_persistence_k", 2)),
                 "regime_eps_sens_used": self._eps_sens_used,
                 "regime_eps_sens_from_base": self._eps_sens_from_base,
-                # Eligibility and shadow mode
                 "regime_eligible": bool(regime_eligible),
                 "regime_eligible_reason": regime_eligible_reason,
                 "regime_shadow_mode": shadow_mode,
+                # regime_id: always present for schema stability
+                "regime_id": current_ref.regime_id if current_ref else None,
             }
         )
 
-        # Add regime-specific audit
+        # Debug-only: expose available regime IDs
+        if os.environ.get("VERISCOPE_REGIME_DEBUG", "0").strip() in ("1", "true", "True"):
+            audit["regime_ids_available"] = self.get_regime_ids()
+
         audit.update(regime_audit)
 
-        # Add reference state info
-        if self._ref is not None:
+        if current_ref is not None:
             audit.update(
                 {
-                    "ref_established_at": self._ref.established_at,
-                    "ref_n_samples": self._ref.n_samples_per_metric,
+                    "ref_established_at": current_ref.established_at,
+                    "ref_n_samples": current_ref.n_samples_per_metric,
                 }
             )
         else:
-            # Report accumulation progress and build status
             accum_counts = self._count_accumulated_samples()
             audit["ref_accumulating"] = accum_counts
             audit["ref_windows_accumulated"] = len(self._accumulating)
@@ -1611,23 +1882,17 @@ class RegimeAnchoredGateEngine:
 
         if ref_newly_established:
             audit["ref_just_established"] = True
-            audit["ref_build_audit"] = self._ref.build_audit if self._ref else {}
+            audit["ref_build_audit"] = current_ref.build_audit if current_ref else {}
 
         # =========================================================================
-        # DECISION SOURCE + HEADLINE DISAMBIGUATION (MUST BE LAST)
-        # - decision_source_stability: what failed from stability perspective
-        # - decision_source_gate: what actually caused ok=False (respects shadow mode)
+        # DECISION SOURCE + HEADLINE DISAMBIGUATION
         # =========================================================================
-
-        # Regime stability failure is only meaningful when regime check actually ran
         _reg_ok = _as_opt_bool(audit.get("regime_ok"))
         regime_stability_failed = (_reg_ok is False) and regime_check_ran
 
-        # Change stability failure predicate (read from audit for safety)
         _chg_dw_ok2 = _as_opt_bool(audit.get("change_dw_ok"))
         change_stability_failed = _chg_dw_ok2 is False
 
-        # decision_source_stability: pure stability attribution (ignores shadow mode)
         if change_stability_failed and regime_stability_failed:
             decision_source_stability = "both"
         elif regime_stability_failed:
@@ -1635,14 +1900,11 @@ class RegimeAnchoredGateEngine:
         elif change_stability_failed:
             decision_source_stability = "change"
         elif not bool(combined_ok):
-            # combined_ok is False but no stability predicate failed => gain or other
             decision_source_stability = "gain_or_other"
         else:
             decision_source_stability = "none"
 
-        # decision_source_gate: what actually caused ok=False (respects shadow mode)
         if shadow_mode:
-            # In shadow mode, regime cannot cause gate failure
             if change_stability_failed:
                 decision_source_gate = "change"
             elif not base_result.ok:
@@ -1652,7 +1914,6 @@ class RegimeAnchoredGateEngine:
         else:
             decision_source_gate = decision_source_stability
 
-        # Legacy field for compatibility
         decision_source = decision_source_gate
 
         audit["decision_source"] = decision_source
@@ -1660,45 +1921,40 @@ class RegimeAnchoredGateEngine:
         audit["decision_source_gate"] = decision_source_gate
 
         # =========================================================================
-        # REASON / PROVENANCE HYGIENE (metadata only; does NOT affect decisions)
+        # REASON / PROVENANCE HYGIENE
         # =========================================================================
         evaluated = bool(audit.get("evaluated", True))
         ds = str(audit.get("decision_source") or "none").strip().lower() or "none"
         pfail = bool(audit.get("persistence_fail", False))
 
-        # dw_exceeds_threshold: prefer explicit flag; fall back to worst_DW > eps_eff
-        dw_ex = _as_opt_bool(audit.get("dw_exceeds_threshold", None))
-        if dw_ex is None:
+        dw_ex_final = _as_opt_bool(audit.get("dw_exceeds_threshold", None))
+        if dw_ex_final is None:
             dwv = _coerce_float_maybe(audit.get("worst_DW"))
             epsv = _coerce_float_maybe(audit.get("eps_eff"))
             if (dwv is not None) and (epsv is not None):
-                dw_ex = bool(dwv > epsv)
+                dw_ex_final = bool(dwv > epsv)
 
-        # warn_pending is strictly the "persistence warning" state
-        warn_pending = bool(evaluated and (dw_ex is True) and (not pfail))
+        warn_pending = bool(evaluated and (dw_ex_final is True) and (not pfail))
         if _needs_fill(audit.get("warn_pending")):
             audit["warn_pending"] = bool(warn_pending)
 
-        # base_reason: prefer an existing informative string; else synthesize
         if _needs_fill(audit.get("base_reason")):
             br = audit_base.get("reason", None)
             if _needs_fill(br):
                 br = "not_evaluated" if not evaluated else ("base_ok" if base_ok else "base_fail")
             audit["base_reason"] = br
 
-        # change_reason: describe change detector state (not regime)
         if _needs_fill(audit.get("change_reason")):
             if not evaluated:
                 cr = "not_evaluated_change"
             elif pfail:
                 cr = "change_persistence_fail"
-            elif dw_ex is True:
+            elif dw_ex_final is True:
                 cr = "change_warn_pending"
             else:
                 cr = "change_ok"
             audit["change_reason"] = cr
 
-        # top-level reason: preserve if present; else synthesize using ds + persistence state
         if _needs_fill(audit.get("reason")):
             if not evaluated:
                 rr = "not_evaluated"
@@ -1712,7 +1968,6 @@ class RegimeAnchoredGateEngine:
                 rr = f"{ds}_ok"
             audit["reason"] = rr
 
-        # worst_metric attribution (helps diagnose off-spike WARN/FAIL)
         per_metric = audit.get("per_metric_tv") or audit.get("drifts") or {}
         wk, wv = _pick_worst_metric(per_metric)
         if _needs_fill(audit.get("worst_metric")):
@@ -1720,147 +1975,169 @@ class RegimeAnchoredGateEngine:
         if _needs_fill(audit.get("worst_metric_tv")):
             audit["worst_metric_tv"] = wv
 
-        # Optional sanity checks (off by default)
+        # Sanity checks
         if os.environ.get("VERISCOPE_REGIME_SANITY", "0").strip() in ("1", "true", "True", "yes", "YES"):
             allowed = {"none", "change", "regime", "both", "gain_or_other"}
             if decision_source not in allowed:
                 _maybe_sanity_warn(
                     "decision_source",
-                    f"[regime][sanity] unexpected decision_source={decision_source!r} (allowed={sorted(allowed)})",
+                    f"[regime][sanity] unexpected decision_source={decision_source!r}",
                 )
-
             for k in ("change_dw_ok", "change_gain_ok", "regime_ok"):
                 v = audit.get(k)
-                if v is None:
-                    continue
-                if not isinstance(v, (bool, np.bool_, int, np.integer)):
+                if v is not None and not isinstance(v, (bool, np.bool_, int, np.integer)):
                     _maybe_sanity_warn(
                         "audit_bool_types",
-                        f"[regime][sanity] audit[{k!r}] has unexpected type {type(v).__name__}: {v!r}",
+                        f"[regime][sanity] audit[{k!r}] has unexpected type {type(v).__name__}",
                     )
 
-            def _as_finite_pair(dw: Any, eps: Any) -> Tuple[Optional[float], Optional[float]]:
-                try:
-                    dwf = float(dw)
-                    epsf = float(eps)
-                    if np.isfinite(dwf) and np.isfinite(epsf) and epsf > 1e-12:
-                        return dwf, epsf
-                except Exception:
-                    pass
-                return None, None
+        # Headline disambiguation helpers
+        def _as_finite_pair(dw: Any, eps: Any) -> Tuple[Optional[float], Optional[float]]:
+            try:
+                dwf = float(dw)
+                epsf = float(eps)
+                if np.isfinite(dwf) and np.isfinite(epsf) and epsf > 1e-12:
+                    return dwf, epsf
+            except Exception:
+                pass
+            return None, None
 
-            def _exceedance_ratio(dw: Any, eps: Any) -> float:
-                dwf, epsf = _as_finite_pair(dw, eps)
-                if dwf is None or epsf is None:
-                    return float("-inf")
-                return dwf / epsf
+        def _exceedance_ratio(dw: Any, eps: Any) -> float:
+            dwf, epsf = _as_finite_pair(dw, eps)
+            if dwf is None or epsf is None:
+                return float("-inf")
+            return dwf / epsf
 
-            # =========================================================================
-            # HEADLINE DISAMBIGUATION: worst_DW, eps_eff, AND margin fields
-            # Uses decision_source_stability for attribution (even in shadow mode)
-            # =========================================================================
-            ds_stability = str(audit.get("decision_source_stability", "none")).strip().lower()
+        ds_stability = str(audit.get("decision_source_stability", "none")).strip().lower()
 
-            if ds_stability in ("change", "regime", "both"):
-                if ds_stability == "change":
-                    dw, eps = _as_finite_pair(audit.get("change_worst_DW"), audit.get("change_eps_eff"))
-                    if dw is not None and eps is not None:
-                        audit["worst_DW"] = dw
-                        audit["eps_eff"] = eps
-                    # Headline margin fields for change
-                    audit["margin_raw"] = audit.get("change_margin_raw")
-                    audit["margin_eff"] = audit.get("change_margin_eff")
-                    audit["margin_slope_eff"] = audit.get("change_margin_slope_eff")
+        if ds_stability in ("change", "regime", "both"):
+            if ds_stability == "change":
+                dw, eps = _as_finite_pair(audit.get("change_worst_DW"), audit.get("change_eps_eff"))
+                if dw is not None and eps is not None:
+                    audit["worst_DW"] = dw
+                    audit["eps_eff"] = eps
+                audit["margin_raw"] = audit.get("change_margin_raw")
+                audit["margin_eff"] = audit.get("change_margin_eff")
+                audit["margin_slope_eff"] = audit.get("change_margin_slope_eff")
 
-                elif ds_stability == "regime":
+            elif ds_stability == "regime":
+                dw, eps = _as_finite_pair(audit.get("regime_worst_DW"), audit.get("regime_eps_eff"))
+                if dw is not None and eps is not None:
+                    audit["worst_DW"] = dw
+                    audit["eps_eff"] = eps
+                audit["margin_raw"] = audit.get("regime_margin_raw")
+                audit["margin_eff"] = audit.get("regime_margin_eff")
+                audit["margin_slope_eff"] = audit.get("regime_margin_slope_eff")
+
+            else:  # both
+                r_change = _exceedance_ratio(audit.get("change_worst_DW"), audit.get("change_eps_eff"))
+                r_regime = _exceedance_ratio(audit.get("regime_worst_DW"), audit.get("regime_eps_eff"))
+                mc = _coerce_float_maybe(audit.get("change_margin_rel_eff"))
+                mr = _coerce_float_maybe(audit.get("regime_margin_rel_eff"))
+
+                if mr is not None and mc is not None:
+                    src = "regime" if mr >= mc else "change"
+                elif r_regime >= r_change:
+                    src = "regime"
+                else:
+                    src = "change"
+
+                if src == "regime":
                     dw, eps = _as_finite_pair(audit.get("regime_worst_DW"), audit.get("regime_eps_eff"))
-                    if dw is not None and eps is not None:
-                        audit["worst_DW"] = dw
-                        audit["eps_eff"] = eps
-                    # Headline margin fields for regime
-                    audit["margin_raw"] = audit.get("regime_margin_raw")
-                    audit["margin_eff"] = audit.get("regime_margin_eff")
-                    audit["margin_slope_eff"] = audit.get("regime_margin_slope_eff")
+                else:
+                    dw, eps = _as_finite_pair(audit.get("change_worst_DW"), audit.get("change_eps_eff"))
 
-                else:  # ds_stability == "both"
-                    # Pick the larger normalized exceedance for headline
-                    r_change = _exceedance_ratio(audit.get("change_worst_DW"), audit.get("change_eps_eff"))
-                    r_regime = _exceedance_ratio(audit.get("regime_worst_DW"), audit.get("regime_eps_eff"))
+                if dw is not None and eps is not None:
+                    audit["worst_DW"] = dw
+                    audit["eps_eff"] = eps
 
-                    # Also consider margin_rel_eff if available for more robust selection
-                    mc = _coerce_float_maybe(audit.get("change_margin_rel_eff"))
-                    mr = _coerce_float_maybe(audit.get("regime_margin_rel_eff"))
+                audit["margin_raw"] = audit.get(f"{src}_margin_raw")
+                audit["margin_eff"] = audit.get(f"{src}_margin_eff")
+                audit["margin_slope_eff"] = audit.get(f"{src}_margin_slope_eff")
+        else:
+            audit.setdefault("margin_raw", audit.get("change_margin_raw"))
+            audit.setdefault("margin_eff", audit.get("change_margin_eff"))
+            audit.setdefault("margin_slope_eff", audit.get("change_margin_slope_eff"))
 
-                    # Prefer margin-based selection if both are available; else use ratio
-                    if mr is not None and mc is not None:
-                        src = "regime" if mr >= mc else "change"
-                    elif r_regime >= r_change:
-                        src = "regime"
-                    else:
-                        src = "change"
+        # =========================================================================
+        # CALIBRATION RECORDING (no decision impact)
+        # =========================================================================
+        if self._calibration_recorder is not None:
+            cal_record = self._calibration_recorder.extract_record(
+                iter_num=iter_num,
+                audit=audit,
+                combined_ok=combined_ok,
+            )
+            if cal_record is not None:
+                self._calibration_recorder.write(cal_record)
 
-                    if src == "regime":
-                        dw, eps = _as_finite_pair(audit.get("regime_worst_DW"), audit.get("regime_eps_eff"))
-                    else:
-                        dw, eps = _as_finite_pair(audit.get("change_worst_DW"), audit.get("change_eps_eff"))
+        combined_warn = base_warn or (regime_warn if regime_check_ran else False)
+        return GateResult(ok=combined_ok, warn=combined_warn, audit=audit)
 
-                    if dw is not None and eps is not None:
-                        audit["worst_DW"] = dw
-                        audit["eps_eff"] = eps
-
-                    # Headline margin fields from the chosen source
-                    audit["margin_raw"] = audit.get(f"{src}_margin_raw")
-                    audit["margin_eff"] = audit.get(f"{src}_margin_eff")
-                    audit["margin_slope_eff"] = audit.get(f"{src}_margin_slope_eff")
-            else:
-                # No stability failure: provide change-based defaults for schema stability
-                audit.setdefault("margin_raw", audit.get("change_margin_raw"))
-                audit.setdefault("margin_eff", audit.get("change_margin_eff"))
-                audit.setdefault("margin_slope_eff", audit.get("change_margin_slope_eff"))
-
-            # CRITICAL: combined_warn only includes regime_warn if regime check actually ran
-            combined_warn = base_warn or (regime_warn if regime_check_ran else False)
-            return GateResult(ok=combined_ok, warn=combined_warn, audit=audit)
-
-    def reset_reference(self) -> Dict[str, Any]:
+    def reset_reference(self, *, clear_all_regimes: bool = False) -> Dict[str, Any]:
         """
         Manual reset - call after recovery intervention or intentional regime change.
 
-        Returns summary of what was cleared.
+        Args:
+            clear_all_regimes: If True and multi-regime enabled, clear all stored regimes.
+                              If False, only clear the current/active regime.
+
+        Returns:
+            Summary of what was cleared.
         """
-        summary = {
-            "had_reference": self._ref is not None,
-            "ref_established_at": self._ref.established_at if self._ref else None,
+        current_ref = self.current_reference
+        summary: Dict[str, Any] = {
+            "had_reference": current_ref is not None,
+            "ref_established_at": current_ref.established_at if current_ref else None,
+            "regime_id_cleared": current_ref.regime_id if current_ref else None,
             "accumulated_windows_cleared": len(self._accumulating),
+            "multi_regime_enabled": self._enable_multi_regime,
         }
-        self._ref = None
+
+        if self._enable_multi_regime:
+            if clear_all_regimes:
+                summary["regimes_cleared"] = list(self._regimes.keys())
+                self._regimes = {}
+                self._active_regime_id = None
+            else:
+                self._clear_current_reference()
+                # Report fallback if one was activated
+                if self._active_regime_id is not None:
+                    summary["fallback_regime_id"] = self._active_regime_id
+        else:
+            self._ref = None
+
         self._accumulating = []
-        # Reset starvation diagnostics
         self._ref_incomplete_windows_skipped = 0
         self._ref_last_incomplete_missing = []
         return summary
 
     def get_reference_stats(self) -> Optional[Dict[str, Any]]:
-        """Return summary stats about the current reference (if established)."""
-        if self._ref is None:
+        """Return summary stats about the current reference (single or multi-regime)."""
+        ref = self.current_reference
+        if ref is None:
             return None
         return {
-            "established_at": self._ref.established_at,
-            "n_samples_per_metric": dict(self._ref.n_samples_per_metric),
+            "established_at": ref.established_at,
+            "n_samples_per_metric": dict(ref.n_samples_per_metric),
             "metrics_tracked": sorted(self._metrics_tracked),
             "regime_epsilon": self._regime_epsilon,
-            "build_audit": self._ref.build_audit,
+            "build_audit": ref.build_audit,
+            "regime_id": getattr(ref, "regime_id", None),
+            "eps_change_at_establishment": getattr(ref, "eps_change_at_establishment", None),
+            "eps_regime_at_establishment": getattr(ref, "eps_regime_at_establishment", None),
         }
 
     def get_accumulator_stats(self) -> Dict[str, Any]:
         """Return stats about the current accumulator state."""
+        ref = self.current_reference
         return {
             "windows_accumulated": len(self._accumulating),
             "max_windows": self.config.max_accumulator_windows,
             "samples_per_metric": self._count_accumulated_samples(),
             "min_evidence_per_metric": self.config.min_evidence_per_metric,
             "min_windows_for_reference": self._min_windows_for_reference_effective,
-            "reference_established": self._ref is not None,
+            "reference_established": ref is not None,
             "build_phase": [self._build_min_iter, self._build_max_iter],
             "ref_incomplete_windows_skipped": int(self._ref_incomplete_windows_skipped),
             "ref_last_incomplete_missing": list(self._ref_last_incomplete_missing),
@@ -1868,10 +2145,11 @@ class RegimeAnchoredGateEngine:
 
     def get_diagnostics(self) -> Dict[str, Any]:
         """Return comprehensive diagnostics for debugging."""
+        ref = self.current_reference
         return {
             "n_checks": self._n_checks,
             "n_ref_attempts": self._n_ref_attempts,
-            "reference_established": self._ref is not None,
+            "reference_established": ref is not None,
             "reference_stats": self.get_reference_stats(),
             "accumulator_stats": self.get_accumulator_stats(),
             "enabled_effective": self._enabled_effective,
