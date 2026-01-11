@@ -1391,6 +1391,12 @@ if __name__ == "__main__":
     parser.add_argument("--nanogpt_dir", default="./nanoGPT")
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
+        "--max_iters",
+        type=int,
+        default=5000,
+        help="Max training iterations (default 5000).",
+    )
+    parser.add_argument(
         "--metric_interval",
         type=int,
         default=5,
@@ -1712,7 +1718,7 @@ if __name__ == "__main__":
         n_embd=384,
         batch_size=64,
         block_size=256,
-        max_iters=5000,
+        max_iters=int(args.max_iters),
         eval_interval=500,
         log_interval=10,
         device=args.device,
