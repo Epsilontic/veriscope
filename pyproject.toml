@@ -24,8 +24,9 @@ classifiers = ["License :: Other/Proprietary License"]
 [project.optional-dependencies]
 topo = ["ripser>=0.6.4"]
 
-[project.scripts]
-veriscope = "veriscope.fr_integration:main"
+[project.scripts]  
+veriscope = "veriscope.cli.main:main"  
+veriscope-legacy = "veriscope.fr_integration:main"  
 
 [tool.setuptools.packages.find]
 include = ["veriscope*"]
