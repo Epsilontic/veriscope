@@ -3851,6 +3851,7 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
         gate_fail = 0
         gate_evaluated = 0
         gate_warn_pending = 0
+        gate_warn = 0  # explicit init: 0 = no warning, 1 = warning triggered
         gate_eps_eff = float("nan")
         gate_consecutive_exceedances = 0
         gate_dw_exceeds_threshold = 0
@@ -3997,16 +3998,28 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
                 except Exception:
                     pass
 
-                gate_evaluated = int(bool(audit.get("evaluated", gate_reason.startswith("evaluated"))))
+                # Robust evaluated flag: handle None explicitly to avoid silent unevaluated
+                ev = audit.get("evaluated", None)
+                if ev is None:
+                    gate_evaluated = int(bool(gate_reason.startswith("evaluated")))
+                else:
+                    gate_evaluated = int(bool(ev))
+
                 gate_warn_pending = int(bool(audit.get("warn_pending", False)))
                 gate_eps_eff = as_float(audit.get("eps_eff", np.nan), default=float("nan"))
                 gate_consecutive_exceedances = as_int(audit.get("consecutive_exceedances", 0), default=0)
                 gate_dw_exceeds_threshold = int(bool(audit.get("dw_exceeds_threshold", False)))
                 gate_policy_effective = str(audit.get("policy", "")) if audit.get("policy", "") is not None else ""
 
-                # De-ambiguous aliases (keep gate_warn for backwards compat)
-                gate_ok = int(gate_warn)
-                gate_fail = 1 - int(gate_ok)
+                # gate_ok/gate_fail come from audit["ok"], NOT from gate_warn or flag
+                # Default to OK=True if audit doesn't provide it (fail-closed would be annoying)
+                gate_ok_val = audit.get("ok", True)
+                gate_ok = int(bool(gate_ok_val)) if gate_evaluated else 1
+                gate_fail = int((not bool(gate_ok_val)) and gate_evaluated)
+
+                # gate_warn represents a *warning state* (threshold exceeded or persistence pending)
+                # Only meaningful once evaluated; 1 = warning triggered, 0 = no warning
+                gate_warn = int(gate_evaluated and (gate_warn_pending == 1 or gate_dw_exceeds_threshold == 1))
 
                 # --- Gate diagnostics for offline analysis ---
                 gate_epsilon_eff = as_float(
