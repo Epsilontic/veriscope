@@ -746,10 +746,12 @@ def recompute_gate_series_under_decl(
     """
     Offline recompute of gate diagnostics under a fixed WindowDecl.
 
-    Returns a COPY of df_eval with:
-      gate_worst_tv_calib, gate_eps_stat_calib, gate_gain_calib,
-      gate_warn_calib, gate_evaluated_calib, gate_reason_calib,
-      gate_total_evidence_calib
+    Returns a COPY of df_eval with calibrated gate diagnostics:
+      - Core scalars: gate_worst_tv_calib, gate_eps_stat_calib, gate_gain_calib,
+        gate_eps_eff_calib, gate_eps_scaled_calib, gate_total_evidence_calib
+      - Pass/fail channels: gate_ok_calib, gate_fail_calib, gate_evaluated_calib, gate_reason_calib
+      - Warning channels: gate_warn_calib (warning-trigger bit), gate_warn_pending_calib,
+        gate_dw_exceeds_threshold_calib, gate_consecutive_exceedances_calib
 
     Semantics / provenance:
       - If the ONLINE run used FR (GateEngine via SCAR_FR=1), the deployed gate
@@ -807,13 +809,20 @@ def recompute_gate_series_under_decl(
     df["gate_kappa_checked_calib"] = 0
     df["gate_kappa_sens_calib"] = np.nan
 
-    # IMPORTANT: non-evaluated epochs (e.g., insufficient history) must be neutral.
-    # gate_warn==1 means PASS; gate_warn==0 means FAIL.
-    df["gate_warn_calib"] = 1
+    # Calibrated gate channels (neutral defaults for non-evaluated epochs)
+    # Semantics:
+    #   gate_ok_calib=1: pass OR not evaluated (neutral)
+    #   gate_fail_calib=1: evaluated AND failed
+    #   gate_warn_calib=1: evaluated AND warning condition triggered (pending or exceeded threshold)
+    df["gate_ok_calib"] = 1
+    df["gate_fail_calib"] = 0
     df["gate_evaluated_calib"] = 0
     df["gate_reason_calib"] = "insufficient_history"
-    # WARN-but-not-fail channel (persistence pre-trigger); keep separate from PASS/FAIL
+
+    # Warning channels (1 means warning triggered)
+    df["gate_warn_calib"] = 0
     df["gate_warn_pending_calib"] = 0
+    df["gate_dw_exceeds_threshold_calib"] = 0
     df["gate_consecutive_exceedances_calib"] = 0
 
     max_frac = as_float(cfg.get("gate_eps_stat_max_frac", 0.25), default=0.25)
@@ -1060,9 +1069,13 @@ def recompute_gate_series_under_decl(
 
             # Evidence gate: mirror online semantics using per-run min_evidence_run
             if int(min_evidence_run) > 0 and int(total_evidence) < int(min_evidence_run):
+                df.loc[idx, "gate_ok_calib"] = 1
+                df.loc[idx, "gate_fail_calib"] = 0
+                df.loc[idx, "gate_warn_calib"] = 0
                 df.loc[idx, "gate_evaluated_calib"] = 0
                 df.loc[idx, "gate_reason_calib"] = "not_evaluated_insufficient_evidence"
                 df.loc[idx, "gate_warn_pending_calib"] = 0
+                df.loc[idx, "gate_dw_exceeds_threshold_calib"] = 0
                 df.loc[idx, "gate_consecutive_exceedances_calib"] = int(consec)
                 continue
 
@@ -1073,8 +1086,13 @@ def recompute_gate_series_under_decl(
 
             # If TV is not finite, treat as not evaluated (prevents NaN-propagation into events).
             if not np.isfinite(tv):
+                df.loc[idx, "gate_ok_calib"] = 1
+                df.loc[idx, "gate_fail_calib"] = 0
+                df.loc[idx, "gate_warn_calib"] = 0
+                df.loc[idx, "gate_evaluated_calib"] = 0
                 df.loc[idx, "gate_reason_calib"] = "not_evaluated_nan_tv"
                 df.loc[idx, "gate_warn_pending_calib"] = 0
+                df.loc[idx, "gate_dw_exceeds_threshold_calib"] = 0
                 df.loc[idx, "gate_consecutive_exceedances_calib"] = int(consec)
                 continue
 
@@ -1210,12 +1228,28 @@ def recompute_gate_series_under_decl(
 
             df.loc[idx, "gate_worst_tv_calib"] = float(tv)
             df.loc[idx, "gate_gain_calib"] = float(gain_bits) if np.isfinite(gain_bits) else np.nan
-            df.loc[idx, "gate_warn_calib"] = int(flag)
-            df.loc[idx, "gate_evaluated_calib"] = 1
-            df.loc[idx, "gate_reason_calib"] = str(reason)
+
+            # PASS/FAIL
+            df.loc[idx, "gate_ok_calib"] = int(flag)
+            df.loc[idx, "gate_fail_calib"] = int(1 - int(flag))
+
+            # Warning channels
+            df.loc[idx, "gate_dw_exceeds_threshold_calib"] = int(bool(dw_exceeds))
             df.loc[idx, "gate_warn_pending_calib"] = int(bool(warn_pending))
             df.loc[idx, "gate_consecutive_exceedances_calib"] = int(consec)
 
+            # Warning bit used by event extraction
+            df.loc[idx, "gate_warn_calib"] = int(bool(dw_exceeds) or bool(warn_pending))
+
+            df.loc[idx, "gate_evaluated_calib"] = 1
+            df.loc[idx, "gate_reason_calib"] = str(reason)
+
+    # Optional explicit alias to reduce semantic confusion downstream.
+    # gate_pass_calib is identical to gate_ok_calib.
+    try:
+        df["gate_pass_calib"] = df["gate_ok_calib"]
+    except Exception:
+        pass
     return df
 
 
