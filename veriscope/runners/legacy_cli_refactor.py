@@ -990,6 +990,21 @@ def gate_check(
                 "gain_thresh_used": float(thr),
             }
 
+            # --- Harden FR audit contract: always emit ok + derived dw_exceeds_threshold ---
+            try:
+                audit["ok"] = bool(getattr(gr, "ok", True)) if bool(audit.get("evaluated", True)) else True
+            except Exception:
+                audit["ok"] = True
+
+            # Prefer exceedance derived from the floats we are returning (stable even if upstream audit keys drift)
+            try:
+                _tv = float(audit.get("worst_tv", np.nan))
+                _eps = float(audit.get("eps_eff", np.nan))
+                if np.isfinite(_tv) and np.isfinite(_eps):
+                    audit["dw_exceeds_threshold"] = bool(_tv > _eps)
+            except Exception:
+                pass
+
             # Return value semantics: 1 means PASS/neutral.
             # If GateEngine says "not evaluated", force neutral PASS.
             flag = int(bool(getattr(gr, "ok", True))) if evaluated_fr else 1
@@ -1042,6 +1057,13 @@ def gate_check(
             "reason": "not_evaluated_insufficient_evidence",
             "evaluated": False,
             "warn_pending": False,
+            # --- ADDED: downstream contract ---
+            "ok": True,  # neutral pass when not evaluated
+            "dw_exceeds_threshold": False,  # cannot exceed if not evaluated
+            "consecutive_exceedances": 0,
+            "policy": "legacy_no_persistence",
+            "persistence_k": 0,
+            "persistence_fail": False,
             "gate_lane": "legacy",
             "scar_fr": 0,
             "total_evidence": int(total_evidence),
@@ -1161,10 +1183,20 @@ def gate_check(
         )
     )
 
+    # --- ADDED: stable exceedance bit derived from the floats you already computed ---
+    dw_exceeds = bool(np.isfinite(worst) and np.isfinite(eps_eff) and (float(worst) > float(eps_eff)))
+
     return int(ok), {
         "reason": str(reason),
         "evaluated": True,
         "warn_pending": False,
+        # --- ADDED: downstream contract ---
+        "ok": bool(ok),
+        "dw_exceeds_threshold": bool(dw_exceeds),
+        "consecutive_exceedances": int(dw_exceeds),  # legacy has no persistence => 0/1 is fine
+        "policy": "legacy_no_persistence",
+        "persistence_k": 0,
+        "persistence_fail": False,
         "gate_lane": "legacy",
         "scar_fr": 0,
         "total_evidence": int(total_evidence),
@@ -4040,18 +4072,26 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
 
                 gate_warn_pending = int(bool(audit.get("warn_pending", False)))
                 gate_eps_eff = as_float(audit.get("eps_eff", np.nan), default=float("nan"))
-                gate_consecutive_exceedances = as_int(audit.get("consecutive_exceedances", 0), default=0)
+
+                # Prefer audit counter if present; otherwise fill later from derived exceedance.
+                gate_consecutive_exceedances = as_int(audit.get("consecutive_exceedances", np.nan), default=-1)
+
+                # TEMP: keep whatever audit says for now; we will overwrite it from floats after worst_tv is read.
                 gate_dw_exceeds_threshold = int(bool(audit.get("dw_exceeds_threshold", False)))
+
                 gate_policy_effective = str(audit.get("policy", "")) if audit.get("policy", "") is not None else ""
 
-                # gate_ok/gate_fail come from audit["ok"], NOT from gate_warn or flag
-                # Default to OK=True if audit doesn't provide it (fail-closed would be annoying)
-                gate_ok_val = audit.get("ok", True)
-                gate_ok = int(bool(gate_ok_val)) if gate_evaluated else 1
-                gate_fail = int((not bool(gate_ok_val)) and gate_evaluated)
+                # gate_ok/gate_fail must not default to True on evaluated fails.
+                # If audit doesn't provide ok, fall back to gate_check's return flag when evaluated.
+                gate_ok_val = audit.get("ok", None)
+                if gate_ok_val is None:
+                    gate_ok_val = bool(flag) if gate_evaluated else True
 
-                # gate_warn represents a *warning state* (threshold exceeded or persistence pending)
-                # Only meaningful once evaluated; 1 = warning triggered, 0 = no warning
+                gate_ok = int(bool(gate_ok_val)) if gate_evaluated else 1
+                gate_fail = int(gate_evaluated and (not bool(gate_ok_val)))
+
+                # gate_warn remains a warning-state bit (pending OR threshold exceed), NOT "fail".
+                # We'll re-set this after we derive dw_exceeds from floats below.
                 gate_warn = int(gate_evaluated and (gate_warn_pending == 1 or gate_dw_exceeds_threshold == 1))
 
                 # --- Gate diagnostics for offline analysis ---
@@ -4059,10 +4099,30 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
                     getattr(WINDOW_DECL, "epsilon", CFG.get("gate_epsilon", 0.08)),
                     default=as_float(CFG.get("gate_epsilon", 0.08), default=0.08),
                 )
-                gate_worst_tv = as_float(audit.get("worst_tv", np.nan), default=float("nan"))
+                gate_worst_tv = as_float(
+                    audit.get("worst_tv", audit.get("worst_DW", audit.get("worst_dw", np.nan))),
+                    default=float("nan"),
+                )
                 gate_eps_stat = as_float(audit.get("eps_stat", np.nan), default=float("nan"))
                 gate_gain = as_float(audit.get("gain_bits", gate_gain), default=float("nan"))
                 gate_kappa = as_float(audit.get("kappa_sens", gate_kappa), default=float("nan"))
+
+                # --- Truth source: derive exceedance from the floats we log ---
+                if gate_evaluated:
+                    gate_dw_exceeds_threshold = int(
+                        np.isfinite(gate_worst_tv)
+                        and np.isfinite(gate_eps_eff)
+                        and (float(gate_worst_tv) > float(gate_eps_eff))
+                    )
+                else:
+                    gate_dw_exceeds_threshold = 0
+
+                # If audit didn't provide a counter, use the derived exceedance as a sane legacy default (0/1).
+                if gate_consecutive_exceedances < 0:
+                    gate_consecutive_exceedances = int(gate_dw_exceeds_threshold)
+
+                # Recompute warning-state bit from the derived exceedance.
+                gate_warn = int(gate_evaluated and (gate_warn_pending == 1 or gate_dw_exceeds_threshold == 1))
 
                 # effective parameters actually used for this check
                 gate_gain_thresh_eff = as_float(CFG.get("gate_gain_thresh", 0.05), default=0.05)
