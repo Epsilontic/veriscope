@@ -5436,19 +5436,13 @@ def _compute_gate_warn_time(
     if j_end is None or int(j_end) < 0:
         return None
 
-    try:
-        # FIX: Return the FIRST epoch of the K-consecutive run, not the LAST.
-        # _first_run_end returns an index (into hit_idx) for the last element of the first length-K run.
-        j_start = int(j_end) - int(K_warn) + 1
-        # Safety clamp (should be unnecessary if _first_run_end is correct, but harmless).
-        if j_start < 0:
-            j_start = 0
+    j_start = int(j_end) - int(K_warn) + 1
+    if j_start < 0:
+        j_start = 0
 
-        ep_out = gg.iloc[int(hit_idx[int(j_start)])]["epoch"]
-        ep_i = as_int(ep_out, default=-1)
-        return ep_i if ep_i >= 0 else None
-    except Exception:
-        return None
+    row_i = int(hit_idx[j_start])
+    t0 = as_int(gg.iloc[row_i]["epoch"], default=-1)
+    return None if t0 < 0 else int(t0)
 
 
 def evaluate(df_all: pd.DataFrame, tag: str):
