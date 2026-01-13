@@ -2272,6 +2272,27 @@ try:
             except Exception as _e:
                 if mp.current_process().name == "MainProcess":
                     print(f"[WARN] bad SCAR_GATE_EPSILON={v!r}: {_e}")
+
+        v = os.environ.get("SCAR_GATE_EPS_INFLATION_MAX")
+        if v is not None:
+            try:
+                CFG["gate_eps_inflation_max"] = float(max(1.0, float(v)))
+                if mp.current_process().name == "MainProcess":
+                    print(f"[env] gate_eps_inflation_max={CFG['gate_eps_inflation_max']:.6f}")
+            except Exception as _e:
+                if mp.current_process().name == "MainProcess":
+                    print(f"[WARN] bad SCAR_GATE_EPS_INFLATION_MAX={v!r}: {_e}")
+
+        v = os.environ.get("SCAR_GATE_MIN_EVIDENCE_FULL_EPS")
+        if v is not None:
+            try:
+                CFG["gate_min_evidence_full_eps"] = int(v)
+                if mp.current_process().name == "MainProcess":
+                    print(f"[env] gate_min_evidence_full_eps={CFG['gate_min_evidence_full_eps']}")
+            except Exception as _e:
+                if mp.current_process().name == "MainProcess":
+                    print(f"[WARN] bad SCAR_GATE_MIN_EVIDENCE_FULL_EPS={v!r}: {_e}")
+
         v = os.environ.get("SCAR_GATE_HALT")
         if v is not None:
             try:
@@ -2299,6 +2320,8 @@ try:
                 "SCAR_GATE_MIN_EVIDENCE": os.environ.get("SCAR_GATE_MIN_EVIDENCE", ""),
                 "SCAR_GATE_GAIN_THRESH": os.environ.get("SCAR_GATE_GAIN_THRESH", ""),
                 "SCAR_GATE_GAIN_UNITS": os.environ.get("SCAR_GATE_GAIN_UNITS", ""),
+                "SCAR_GATE_EPS_INFLATION_MAX": os.environ.get("SCAR_GATE_EPS_INFLATION_MAX", ""),
+                "SCAR_GATE_MIN_EVIDENCE_FULL_EPS": os.environ.get("SCAR_GATE_MIN_EVIDENCE_FULL_EPS", ""),
                 "SCAR_GATE_HALT": os.environ.get("SCAR_GATE_HALT", ""),
             },
             "final": {
@@ -7336,6 +7359,26 @@ def main():
                 except Exception as _e:
                     if mp.current_process().name == "MainProcess":
                         print(f"[WARN] bad SCAR_GATE_EPSILON={v!r}: {_e}")
+
+            v = os.environ.get("SCAR_GATE_EPS_INFLATION_MAX")
+            if v is not None:
+                try:
+                    CFG["gate_eps_inflation_max"] = float(max(1.0, float(v)))
+                    if mp.current_process().name == "MainProcess":
+                        print(f"[env] gate_eps_inflation_max={CFG['gate_eps_inflation_max']:.6f}")
+                except Exception as _e:
+                    if mp.current_process().name == "MainProcess":
+                        print(f"[WARN] bad SCAR_GATE_EPS_INFLATION_MAX={v!r}: {_e}")
+
+            v = os.environ.get("SCAR_GATE_MIN_EVIDENCE_FULL_EPS")
+            if v is not None:
+                try:
+                    CFG["gate_min_evidence_full_eps"] = int(v)
+                    if mp.current_process().name == "MainProcess":
+                        print(f"[env] gate_min_evidence_full_eps={CFG['gate_min_evidence_full_eps']}")
+                except Exception as _e:
+                    if mp.current_process().name == "MainProcess":
+                        print(f"[WARN] bad SCAR_GATE_MIN_EVIDENCE_FULL_EPS={v!r}: {_e}")
 
             v = os.environ.get("SCAR_GATE_HALT")
             if v is not None:
