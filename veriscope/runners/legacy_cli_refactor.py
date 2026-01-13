@@ -3835,9 +3835,10 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
 
         # --- fixed-partition gate (Φ_W) with ε_stat and κ_sens ---
         # Defaults for logging even when the gate is NOT evaluated.
-        # Semantics: gate_warn=1 means PASS/neutral; gate_warn=0 means FAIL.
-        # Therefore any non-evaluated epoch must be neutral to avoid false failures.
-        gate_warn = 1
+        # Semantics:
+        #   gate_ok=1: pass OR not evaluated (neutral)
+        #   gate_fail=1: evaluated AND failed
+        #   gate_warn=1: evaluated AND warning condition triggered (pending or exceeded threshold)
         gate_gain = float("nan")
         gate_worst_tv = float("nan")
         gate_eps_stat = float("nan")
@@ -3879,12 +3880,22 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
         # Explicit non-eval reasons (avoid silent fallthrough / swallowed exceptions)
         if WINDOW_DECL is None:
             gate_reason = "no_window_decl"
-            gate_warn = 1
+            gate_ok = 1
+            gate_fail = 0
+            gate_evaluated = 0
+            gate_warn_pending = 0
+            gate_dw_exceeds_threshold = 0
+            gate_warn = 0
             gate_total_evidence = 0
             gate_counts_json = ""
         elif len(logs) < 2 * int(W_gate):
             gate_reason = "insufficient_history"
-            gate_warn = 1
+            gate_ok = 1
+            gate_fail = 0
+            gate_evaluated = 0
+            gate_warn_pending = 0
+            gate_dw_exceeds_threshold = 0
+            gate_warn = 0
             gate_total_evidence = 0
             gate_counts_json = ""
         else:
@@ -3976,7 +3987,6 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
                     eps_stat_alpha=float(CFG.get("gate_eps_stat_alpha", 0.05)),
                 )
 
-                gate_warn = int(flag)
                 audit = audit or {}
                 gate_reason = str(audit.get("reason", "evaluated_unknown")) or "evaluated_unknown"
                 # --- Provenance + persistence channels from audit (FR or legacy) ---
@@ -4039,7 +4049,12 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
                 gate_reason = (
                     "not_evaluated_exception"  # not "evaluated" so reason-prefix checks don't treat it as evaluated
                 )
-                gate_warn = 1  # neutral PASS — won't trigger early-exit
+                gate_ok = 1
+                gate_fail = 0
+                gate_evaluated = 0
+                gate_warn_pending = 0
+                gate_dw_exceeds_threshold = 0
+                gate_warn = 0
                 # Log once per process for visibility
                 try:
                     if mp.current_process().name == "MainProcess":
@@ -4167,7 +4182,7 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
                 # gate_check() returns 1 when the gate PASSES (stable) and 0 when it FAILS (instability).
                 # Only count consecutive FAILs, and only when the gate was actually evaluated (not "insufficient_history", etc.).
                 reason_eval = isinstance(gate_reason, str) and gate_reason.startswith("evaluated")
-                if reason_eval and int(gate_warn) == 0:
+                if reason_eval and int(gate_fail) == 1:
                     gate_hits_consec += 1
                 else:
                     gate_hits_consec = 0
@@ -4199,7 +4214,7 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
                 return str(r.get("gate_reason", "")).startswith("evaluated")
 
             eval_ct = 0
-            eval_warn_ok = 0
+            eval_ok = 0
             not_eval_ct = 0
             insuff_ct = 0
             reason_counts: Dict[str, int] = {}
@@ -4209,9 +4224,9 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
                 reason_counts[reason] = reason_counts.get(reason, 0) + 1
                 if _is_eval(r):
                     eval_ct += 1
-                    # gate_warn==1 means PASS among evaluated epochs
-                    if int(r.get("gate_warn", 0) or 0) == 1:
-                        eval_warn_ok += 1
+                    # gate_ok==1 means PASS among evaluated epochs
+                    if int(r.get("gate_ok", 0) or 0) == 1:
+                        eval_ok += 1
                 else:
                     not_eval_ct += 1
                     if "insufficient" in reason.lower():
@@ -4223,7 +4238,7 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
 
             line = (
                 f"[run] seed={seed} factor={str(factor.get('name', ''))} epochs={len(logs)} "
-                f"gate_evaluated={eval_ct} gate_eval_ok={eval_warn_ok} "
+                f"gate_evaluated={eval_ct} gate_eval_ok={eval_ok} "
                 f"gate_not_eval={not_eval_ct} gate_insufficient={insuff_ct} "
                 f"reasons=[{reason_summary}]"
             )
@@ -5255,7 +5270,7 @@ def _compute_gate_warn_time(
     """Compute first post-warm epoch where gate fails for K consecutive evaluated epochs.
 
     Semantics:
-      - gate_warn == 1: PASS; gate_warn == 0: FAIL
+      - gate_warn == 1: warning triggered; gate_warn == 0: no warning
       - Non-evaluated epochs are treated as neutral (PASS) and do not contribute to runs.
       - If an evidence column exists, enforce CFG['gate_min_evidence'] as an additional guard.
 
@@ -5328,8 +5343,8 @@ def _compute_gate_warn_time(
     # Non-evaluated epochs are neutral (PASS)
     gw = np.where(eval_mask, gw, 1.0)
 
-    fail_mask = (gw < 0.5) & eval_mask & np.isfinite(gw)
-    hit_idx = np.where((epn >= float(warm_i)) & fail_mask)[0]
+    warn_mask = (gw >= 0.5) & eval_mask & np.isfinite(gw)
+    hit_idx = np.where((epn >= float(warm_i)) & warn_mask)[0]
     if hit_idx.size == 0:
         return None
 
@@ -6836,7 +6851,13 @@ def evaluate(df_all: pd.DataFrame, tag: str):
             else:
                 use_calib = True
 
-        warn_col = "gate_warn_calib" if use_calib else "gate_warn"
+        warn_col = (
+            "gate_dw_exceeds_threshold_calib"
+            if use_calib and "gate_dw_exceeds_threshold_calib" in gg.columns
+            else "gate_dw_exceeds_threshold"
+            if "gate_dw_exceeds_threshold" in gg.columns
+            else ("gate_warn_calib" if use_calib else "gate_warn")
+        )
         reason_col = None
         if use_calib and "gate_reason_calib" in gg.columns:
             reason_col = "gate_reason_calib"
@@ -6854,7 +6875,6 @@ def evaluate(df_all: pd.DataFrame, tag: str):
         try:
             if reason_col is not None and reason_col in gg.columns:
                 epn = pd.to_numeric(gg["epoch"], errors="coerce").to_numpy(dtype=float)
-                gw = pd.to_numeric(gg[warn_col], errors="coerce").to_numpy(dtype=float)
                 rs = gg[reason_col].fillna("").astype(str).to_numpy()
 
                 # Only consider evaluated epochs.
@@ -6863,7 +6883,7 @@ def evaluate(df_all: pd.DataFrame, tag: str):
                 # Allowed drift reasons (exclude evaluated_fail_gain by construction).
                 allowed = (rs == "evaluated_fail_stability") | (rs == "evaluated_fail_kappa")
 
-                fail_mask = (gw < 0.5) & eval_mask & allowed & (epn >= float(warm_idx_local))
+                fail_mask = eval_mask & allowed & (epn >= float(warm_idx_local))
                 hit_idx = np.where(fail_mask)[0]
 
                 K_warn = as_int(CFG.get("warn_consec", 3), default=3)
