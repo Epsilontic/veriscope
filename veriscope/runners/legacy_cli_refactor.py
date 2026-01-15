@@ -25,8 +25,30 @@ if os.environ.get("VS_FAULTHANDLER", "0") == "1":
 from typing import Any, Optional, Dict, cast
 from pathlib import Path
 
+
 # Central mutable configuration dict (single declaration for type-checkers)
-CFG: Dict[str, Any] = {}
+# NOTE: Dict subclass so config merges cannot clobber existing values with None.
+class _CfgDict(dict):
+    """Dict with merge hygiene: updates do not overwrite existing keys with None."""
+
+    def update(self, other=None, /, **kwargs) -> None:  # type: ignore[override]
+        if other is not None:
+            if hasattr(other, "items"):
+                items = other.items()
+            else:
+                items = other  # iterable of (k, v)
+            for k, v in items:
+                if v is None:
+                    continue
+                dict.__setitem__(self, k, v)
+
+        for k, v in kwargs.items():
+            if v is None:
+                continue
+            dict.__setitem__(self, k, v)
+
+
+CFG: Dict[str, Any] = _CfgDict()
 
 # ---- Moved mid-file imports ----
 import hashlib
@@ -1723,6 +1745,7 @@ CFG.setdefault("gate_min_evidence", 16)
 CFG.setdefault("gate_min_evidence_full_eps", 16)  # evidence at which ε inflation fully turns off
 CFG.setdefault("gate_eps_inflation_max", 4.0)  # max multiplier for ε when evidence is low
 CFG.setdefault("gate_gain_units", "bits/sample")
+CFG.setdefault("family_window", 1)  # set to 2 if you prefer a small neighborhood
 
 # NEWMA baseline: calibration + guards
 CFG.setdefault("newma_lambda", None)  # None => calibrate from controls
@@ -5141,6 +5164,10 @@ def _has_terminal_done(seed: int, tag: str):
 
 
 def run_sweep(tag: str):
+    # --- smoke calibration stability: pin monitor source to avoid external/fallback mixture ---
+    # Rationale: smoke calibrations should be distribution-stable across runs.
+    if env_truthy("SCAR_SMOKE"):
+        CFG["monitor_source"] = "clean_val"
     monitor_ds = None
     if CFG["monitor_source"] == "external":
         # ---- P1: dataset preflight / fallback ----
@@ -5183,6 +5210,13 @@ def run_sweep(tag: str):
     paths = []
     fail_count = 0
 
+    # --- smoke integrity: prevent selection bias from resume/terminal skipping ---
+    smoke = bool(env_truthy("SCAR_SMOKE"))
+    force_rerun_smoke = smoke  # simplest: in smoke, always rerun seeds deterministically
+
+    # Audit trail for any skip decisions (should be empty when force_rerun_smoke=True)
+    skipped: list[dict[str, Any]] = []
+
     for seed in all_seeds:
         parq = OUTDIR / f"runs_seed{seed}_{tag}.parquet"
         csvp = parq.with_suffix(".csv")
@@ -5208,7 +5242,8 @@ def run_sweep(tag: str):
             )
 
             # CSV fallback completeness: if parquet probe incomplete but CSV exists and is complete, resume from CSV
-            if (not complete) and (probe.suffix != ".csv") and csvp.exists():
+            # Disabled in smoke rerun mode to avoid selection bias.
+            if (not force_rerun_smoke) and (not complete) and (probe.suffix != ".csv") and csvp.exists():
                 emin_csv, emax_csv, nrows_csv = _epoch_bounds_csv(csvp)
                 complete_csv = (
                     (emax_csv is not None)
@@ -5217,28 +5252,64 @@ def run_sweep(tag: str):
                     and (emax_csv == as_int(CFG.get("epochs", 1), default=1) - 1)
                 )
                 if complete_csv:
-                    print(f"[resume] skipping seed={seed} (csv complete: emax={emax_csv}, rows={nrows_csv})")
+                    msg = f"[resume] skipping seed={seed} (csv complete: emax={emax_csv}, rows={nrows_csv})"
+                    print(msg)
+                    skipped.append(
+                        {
+                            "seed": int(seed),
+                            "tag": str(tag),
+                            "reason": "csv_complete",
+                            "probe": str(csvp.name),
+                            "emin": emin_csv,
+                            "emax": emax_csv,
+                            "nrows": nrows_csv,
+                        }
+                    )
                     paths.append(csvp)  # aggregator now handles CSV directly
                     continue
 
-            # Terminal marker: skip if present
+            # Terminal marker: skip if present (disabled in smoke rerun mode)
             done, info = _has_terminal_done(seed, tag)
-            if done:
-                print(f"[resume] skipping seed={seed} (terminal: {info.get('reason', 'unknown')})")
+            if done and (not force_rerun_smoke):
+                msg = f"[resume] skipping seed={seed} (terminal: {info.get('reason', 'unknown')})"
+                print(msg)
+                skipped.append(
+                    {
+                        "seed": int(seed),
+                        "tag": str(tag),
+                        "reason": "terminal_done",
+                        "info": dict(info or {}),
+                    }
+                )
                 if parq.exists():
                     paths.append(parq)
                 elif csvp.exists():
                     paths.append(csvp)
                 continue
 
-            if complete:
-                print(f"[resume] skipping seed={seed} ({probe.suffix[1:]} complete: emax={emax}, rows={nrows})")
+            if complete and (not force_rerun_smoke):
+                msg = f"[resume] skipping seed={seed} ({probe.suffix[1:]} complete: emax={emax}, rows={nrows})"
+                print(msg)
+                skipped.append(
+                    {
+                        "seed": int(seed),
+                        "tag": str(tag),
+                        "reason": "probe_complete",
+                        "probe": str(probe.name),
+                        "emin": emin,
+                        "emax": emax,
+                        "nrows": nrows,
+                    }
+                )
                 paths.append(parq)  # always append the parquet basename for parquet case
                 continue
             else:
-                print(
-                    f"[resume] redoing seed={seed} ({probe.suffix[1:]} incomplete: emin={emin}, emax={emax}, rows={nrows})"
-                )
+                if not complete:
+                    print(
+                        f"[resume] redoing seed={seed} ({probe.suffix[1:]} incomplete: emin={emin}, emax={emax}, rows={nrows})"
+                    )
+                else:
+                    print(f"[smoke] forcing rerun seed={seed} despite existing artifact")
                 # fall through to run_one
 
         f = mapping_all[seed]
@@ -5341,6 +5412,20 @@ def run_sweep(tag: str):
         except Exception:
             pass
 
+    # --- provenance: record any skip decisions (expected empty in smoke rerun mode) ---
+    try:
+        save_json(
+            {
+                "tag": str(tag),
+                "smoke": bool(env_truthy("SCAR_SMOKE")),
+                "force_rerun_smoke": bool(force_rerun_smoke),
+                "skipped": skipped,
+                "n_skipped": int(len(skipped)),
+            },
+            OUTDIR / f"skipped_seeds_{tag}.json",
+        )
+    except Exception:
+        pass
     return df_all
 
 
@@ -5367,39 +5452,32 @@ def _compute_gate_warn_time(
     warm_i = as_int(warm_idx, default=0)
 
     # ---- Build evaluation mask ----
+    # Evidence/evaluated guard: prefer per-row truth over global CFG.
+    if col == "gate_warn_calib":
+        ev_col = "gate_evaluated_calib"
+        te_col = "gate_total_evidence_calib"
+        me_col = "gate_min_evidence_used_calib"
+    else:
+        ev_col = "gate_evaluated"
+        te_col = "gate_total_evidence"
+        me_col = "gate_min_evidence_used"
+
+    # Keep a stable name for downstream debug print.
+    evidence_col: Optional[str] = te_col if te_col in gg.columns else None
+
     eval_mask = np.ones(len(gg), dtype=bool)
 
-    # Prefer explicit evaluated bit when present for calibrated stream
-    if col == "gate_warn_calib" and "gate_evaluated_calib" in gg.columns:
-        ev = pd.to_numeric(gg["gate_evaluated_calib"], errors="coerce").fillna(0).to_numpy(dtype=float)
+    # 1) If we have an explicit evaluated bit, use it (this is the ground truth).
+    if ev_col in gg.columns:
+        ev = pd.to_numeric(gg[ev_col], errors="coerce").fillna(0).to_numpy(dtype=float)
         eval_mask = eval_mask & (ev >= 0.5)
 
-    # Infer a reason column if not provided
-    if reason_col is None:
-        if col == "gate_warn_calib" and "gate_reason_calib" in gg.columns:
-            reason_col = "gate_reason_calib"
-        elif "gate_reason" in gg.columns:
-            reason_col = "gate_reason"
-
-    # Reason prefix guard (aligns with existing conventions)
-    # IMPORTANT: fill NaNs BEFORE astype(str). Otherwise NaN becomes the literal string "nan"
-    # and silently fails the evaluated-prefix check, suppressing warnings.
-    if reason_col is not None and reason_col in gg.columns:
-        reason_arr = gg[reason_col].fillna("").astype(str).to_numpy()
-        eval_mask = eval_mask & np.array([s.startswith("evaluated") for s in reason_arr], dtype=bool)
-
-    # Evidence guard (if present)
-    evidence_col: Optional[str] = None
-    if col == "gate_warn_calib" and "gate_total_evidence_calib" in gg.columns:
-        evidence_col = "gate_total_evidence_calib"
-    elif "gate_total_evidence" in gg.columns:
-        evidence_col = "gate_total_evidence"
-
-    if evidence_col is not None and evidence_col in gg.columns:
-        te = pd.to_numeric(gg[evidence_col], errors="coerce").fillna(0).to_numpy(dtype=float)
-        min_ev = float(as_int(CFG.get("gate_min_evidence", 16), default=16))
-        if np.isfinite(min_ev) and min_ev > 0:
-            eval_mask = eval_mask & (te >= min_ev)
+    # 2) If we also have per-row evidence + per-row min-evidence, enforce consistency.
+    #    This prevents “evaluated==1 but evidence < required” from counting as evaluable.
+    if (te_col in gg.columns) and (me_col in gg.columns):
+        te = pd.to_numeric(gg[te_col], errors="coerce").fillna(0).to_numpy(dtype=float)
+        me = pd.to_numeric(gg[me_col], errors="coerce").fillna(0).to_numpy(dtype=float)
+        eval_mask = eval_mask & (te >= me)
 
     # ---- Debug: audit why warnings might be getting suppressed ----
     try:
@@ -6455,8 +6533,14 @@ def evaluate(df_all: pd.DataFrame, tag: str):
         K_warn = as_int(CFG.get("warn_consec", 3), default=3)
         j_end = _first_run_end(hit_idx, K_warn)
         t_warn = None
-        if j_end >= 0:
-            i = hit_idx[j_end]
+
+        if (j_end is not None) and int(j_end) >= 0:
+            # _first_run_end returns an index INTO hit_idx (not a row index in gg).
+            j_start = int(j_end) - int(K_warn) + 1
+            if j_start < 0:
+                j_start = 0
+
+            i = int(hit_idx[int(j_start)])  # row index in gg at START of the first K-run
             geom_ok = _fam_alarm(i, geom_cols)
             dyn_ok = _fam_alarm(i, dyn_cols)
             gate_ok = dyn_ok if rp_under else (geom_ok or dyn_ok)
@@ -7304,9 +7388,7 @@ def main():
         save_json(env, OUTDIR / "env.json")
         # --- defaults & units notes ---
         # Provide a sensible default for the family neighborhood size (used by family gate)
-        CFG.setdefault("family_window", 1)  # set to 2 if you prefer a small neighborhood
         # Evidence floor for the family gate (avoid acting on extremely sparse TV windows)
-        CFG.setdefault("gate_min_evidence", 16)
         # Optional env override (SCAR_GATE_MIN_EVIDENCE) to tune evidence floor per run
         try:
             CFG["gate_min_evidence"] = int(os.environ.get("SCAR_GATE_MIN_EVIDENCE", CFG.get("gate_min_evidence", 16)))
@@ -7315,7 +7397,6 @@ def main():
         except Exception as e:
             print(f"[WARN] bad SCAR_GATE_MIN_EVIDENCE={os.environ.get('SCAR_GATE_MIN_EVIDENCE')!r}: {e}")
         # Clarify units for gate gain everywhere we log/save config
-        CFG.setdefault("gate_gain_units", "bits/sample")
 
         # Clamp var_k_max to avoid degenerate k (NEW)
         CFG["var_k_max"] = max(1, int(CFG.get("var_k_max", 32)))
@@ -7504,6 +7585,13 @@ def main():
             runtime.install_runtime(cfg=CFG, outdir=OUTDIR, budget=BUDGET)
         except Exception:
             pass
+
+    # --- Write a truthful resolved config snapshot (post-reconcile) ---
+    try:
+        resolved = {k: CFG.get(k) for k in sorted(CFG.keys())}
+        save_json(resolved, OUTDIR / "run_config_resolved.json")
+    except Exception:
+        pass
 
     # Step 2b: Gate evaluability check (warn always; fail-fast when policy requires)
     if require_gate_eval(CFG):
