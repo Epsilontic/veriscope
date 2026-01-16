@@ -4055,51 +4055,93 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
                 except Exception:
                     gate_kappa = 0.0
 
-                # --- Local recompute of worst_tv (debug/probe) ---
-                # Enabled by default in smoke/debug; can be forced with SCAR_DEBUG_GATE_TV=1
-                debug_tv = env_truthy("SCAR_DEBUG_GATE_TV") or env_truthy("SCAR_SMOKE") or env_truthy("SCAR_DEBUG_GATE")
+                # --- Warmup hard-skip (must run BEFORE any expensive debug recompute / gate_check) ---
+                warm = int(CFG.get("warmup", 0) or 0)
 
-                if debug_tv:
-                    worst_tv_local = float("nan")
-                    try:
-                        intervs = getattr(WINDOW_DECL, "interventions", None) or (lambda x: x,)
-
-                        # Prefer FR transport if FR lane is active; else use the decl transport.
-                        base_apply = _apply
-                        try:
-                            if bool(USE_FR) and (FR_WIN is not None) and getattr(FR_WIN, "transport", None) is not None:
-                                base_apply = FR_WIN.transport.apply
-                        except Exception:
-                            pass
-
-                        tvs = []
-                        for T in intervs:
-
-                            def _apply_T_local(name: str, arr: np.ndarray, _T=T) -> np.ndarray:
-                                return np.asarray(_T(base_apply(name, arr)), dtype=float)
-
-                            # NOTE: requires you to have imported dPi_product_tv_robust
-                            tv = dPi_product_tv_robust(WINDOW_DECL, past_dict, recent_dict, apply=_apply_T_local)
-                            if np.isfinite(tv):
-                                tvs.append(float(tv))
-
-                        if tvs:
-                            worst_tv_local = float(max(tvs))
-                    except Exception:
-                        worst_tv_local = float("nan")
-
-                flag, audit = gate_check(
-                    WINDOW_DECL,
-                    past_dict,
-                    recent_dict,
-                    counts,
-                    gain=gate_gain,
-                    gain_thresh=gate_gain_thresh_eff,
-                    # Missing κ should mean "not checked" end-to-end.
-                    # Pass NaN so GateEngine treats it as unchecked.
-                    kappa_sens=(gate_kappa if np.isfinite(gate_kappa) else float("nan")),
-                    eps_stat_alpha=float(CFG.get("gate_eps_stat_alpha", 0.05)),
+                # Ensure these exist for the warmup stub (avoid NameError if upstream branches skipped).
+                gate_total_evidence = int(gate_total_evidence) if ("gate_total_evidence" in locals()) else 0
+                gate_min_evidence_used = (
+                    int(gate_min_evidence_used)
+                    if ("gate_min_evidence_used" in locals())
+                    else int(as_int(CFG.get("gate_min_evidence", 0), default=0))
                 )
+
+                # Always define worst_tv_local so downstream uses cannot NameError when debug_tv is false.
+                worst_tv_local = float("nan")
+
+                if int(epoch) < warm:
+                    # Hard skip: nothing before warmup can warn/fail.
+                    flag, audit = (
+                        True,
+                        {
+                            "evaluated": False,
+                            "ok": True,
+                            "reason": "not_evaluated_warmup",
+                            "warn_pending": False,
+                            "dw_exceeds_threshold": False,
+                            "total_evidence": int(gate_total_evidence),
+                            "min_evidence": int(gate_min_evidence_used),
+                            # Optional schema-stability (keeps downstream numeric reads harmless)
+                            "eps_eff": float("nan"),
+                            "eps_stat": float("nan"),
+                            "worst_tv": float("nan"),
+                            "gain_bits": float("nan"),
+                            "kappa_sens": float("nan"),
+                            "policy": str(CFG.get("gate_policy", "")),
+                            "consecutive_exceedances": 0,
+                        },
+                    )
+                else:
+                    # --- Local recompute of worst_tv (debug/probe) ---
+                    # Enabled by default in smoke/debug; can be forced with SCAR_DEBUG_GATE_TV=1
+                    debug_tv = (
+                        env_truthy("SCAR_DEBUG_GATE_TV") or env_truthy("SCAR_SMOKE") or env_truthy("SCAR_DEBUG_GATE")
+                    )
+
+                    if debug_tv:
+                        try:
+                            intervs = getattr(WINDOW_DECL, "interventions", None) or (lambda x: x,)
+
+                            # Prefer FR transport if FR lane is active; else use the decl transport.
+                            base_apply = _apply
+                            try:
+                                if (
+                                    bool(USE_FR)
+                                    and (FR_WIN is not None)
+                                    and getattr(FR_WIN, "transport", None) is not None
+                                ):
+                                    base_apply = FR_WIN.transport.apply
+                            except Exception:
+                                pass
+
+                            tvs = []
+                            for T in intervs:
+
+                                def _apply_T_local(name: str, arr: np.ndarray, _T=T) -> np.ndarray:
+                                    return np.asarray(_T(base_apply(name, arr)), dtype=float)
+
+                                # NOTE: requires you to have imported dPi_product_tv_robust
+                                tv = dPi_product_tv_robust(WINDOW_DECL, past_dict, recent_dict, apply=_apply_T_local)
+                                if np.isfinite(tv):
+                                    tvs.append(float(tv))
+
+                            if tvs:
+                                worst_tv_local = float(max(tvs))
+                        except Exception:
+                            worst_tv_local = float("nan")
+
+                    flag, audit = gate_check(
+                        WINDOW_DECL,
+                        past_dict,
+                        recent_dict,
+                        counts,
+                        gain=gate_gain,
+                        gain_thresh=gate_gain_thresh_eff,
+                        # Missing κ should mean "not checked" end-to-end.
+                        # Pass NaN so GateEngine treats it as unchecked.
+                        kappa_sens=(gate_kappa if np.isfinite(gate_kappa) else float("nan")),
+                        eps_stat_alpha=float(CFG.get("gate_eps_stat_alpha", 0.05)),
+                    )
 
                 audit = audit or {}
                 gate_reason = str(audit.get("reason", "evaluated_unknown")) or "evaluated_unknown"
