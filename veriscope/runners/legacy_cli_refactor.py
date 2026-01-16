@@ -3152,23 +3152,20 @@ def gt_collapse_time(run_df: pd.DataFrame, grad_cutoff: float) -> Tuple[Optional
     # SOFT: rank-only (native eff_dim below threshold) with patience
     eff = g["eff_dim_gt"].to_numpy() if "eff_dim_gt" in g.columns else g["eff_dim"].to_numpy()
     consec = 0
-    t_first: Optional[int] = None
     for t in range(len(ep)):
         if ep[t] < soft_min_epoch:
             consec = 0
-            t_first = None
             continue
 
         cond_rank = np.isfinite(eff[t]) and (eff[t] <= CFG["gt_rank_min"])
         if cond_rank:
             consec += 1
-            if consec == 1:
-                t_first = int(ep[t])
             if consec >= patience:
-                return t_first, "soft"
+                # Return confirmation epoch (causal), not onset.
+                return int(ep[t]), "soft"
         else:
             consec = 0
-            t_first = None
+
     return None, "none"
 
 
