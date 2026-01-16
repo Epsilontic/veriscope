@@ -765,9 +765,10 @@ def recompute_gate_series_under_decl(
         (gate_lane / scar_fr / gate_min_evidence_used) and is robust to early blank rows.
     """
     try:
-        from veriscope.core.ipm import dPi_product_tv  # product-TV under Φ_W
+        # GateEngine-consistent product-TV (ignores NaN per-metric TVs; abs-weight normalization)
+        from veriscope.core.ipm import dPi_product_tv_robust
     except Exception as e:
-        raise RuntimeError("dPi_product_tv unavailable; core.ipm import failed.") from e
+        raise RuntimeError("dPi_product_tv_robust unavailable; core.ipm import failed.") from e
 
     try:
         from veriscope.core.calibration import aggregate_epsilon_stat as AGGREGATE_EPSILON
@@ -1079,8 +1080,21 @@ def recompute_gate_series_under_decl(
                 df.loc[idx, "gate_consecutive_exceedances_calib"] = int(consec)
                 continue
 
+            # GateEngine-consistent: worst over interventions, robust product-TV semantics
+            tv = float("nan")
             try:
-                tv = dPi_product_tv(window_decl, past, recent, apply=apply)
+                intervs = getattr(window_decl, "interventions", None) or (lambda x: x,)
+                tvs: List[float] = []
+                for T in intervs:
+
+                    def _apply_T(ctx: str, arr: np.ndarray, _T=T) -> np.ndarray:
+                        return np.asarray(_T(apply(ctx, arr)), dtype=float)
+
+                    tvi = dPi_product_tv_robust(window_decl, past, recent, apply=_apply_T)
+                    if np.isfinite(tvi):
+                        tvs.append(float(tvi))
+                if tvs:
+                    tv = float(max(tvs))
             except Exception:
                 tv = float("nan")
 
@@ -1182,24 +1196,37 @@ def recompute_gate_series_under_decl(
                     consec += 1
                 else:
                     consec = 0
+
                 persistence_fail = bool(consec >= int(persistence_k))
                 warn_pending = bool(dw_exceeds and (not persistence_fail))
 
                 if policy == "persistence":
-                    # Match GateEngine: reset streak only if gain is finite and below threshold.
+                    # Gain is an immediate veto in GateEngine.PERSISTENCE.
                     if gain_checked and gain_below:
                         consec = 0
                         persistence_fail = False
                         warn_pending = False
 
-                ok = bool(ok_kappa and (not persistence_fail))
-                flag = int(ok)
-                if flag == 1:
-                    reason = "evaluated_ok"
-                elif not ok_kappa:
-                    reason = "evaluated_fail_kappa"
+                    ok = bool(ok_kappa and ok_gain and (not persistence_fail))
+                    if not ok_kappa:
+                        reason = "evaluated_fail_kappa"
+                    elif gain_checked and gain_below:
+                        reason = "evaluated_fail_gain"
+                    elif persistence_fail:
+                        reason = "evaluated_fail_stability"
+                    else:
+                        reason = "evaluated_ok"
                 else:
-                    reason = "evaluated_fail_stability"
+                    # persistence_stability: gain is audited but does not veto ok/warn/fail
+                    ok = bool(ok_kappa and (not persistence_fail))
+                    if not ok_kappa:
+                        reason = "evaluated_fail_kappa"
+                    elif persistence_fail:
+                        reason = "evaluated_fail_stability"
+                    else:
+                        reason = "evaluated_ok"
+
+                flag = int(ok)
 
             elif policy == "either":
                 # Match GateEngine: "either" is strict (fail if gain OR stability fails)
@@ -1214,17 +1241,22 @@ def recompute_gate_series_under_decl(
                 else:
                     reason = "evaluated_fail_stability"
 
-            else:  # conjunction (default)
-                ok = bool(ok_kappa and ok_gain and ok_tv)
+            elif policy == "conjunction":
+                # GateEngine.CONJUNCTION: fail only if BOTH gain AND stability fail (kappa veto stays)
+                ok = bool(ok_kappa and (ok_gain or ok_tv))
                 flag = int(ok)
+
+                # GateEngine warns when stability exceeds but gain is OK and overall ok holds.
+                warn_pending = bool(dw_exceeds and ok_gain and ok)
+
                 if flag == 1:
                     reason = "evaluated_ok"
-                elif not ok_gain:
-                    reason = "evaluated_fail_gain"
-                elif not ok_tv:
-                    reason = "evaluated_fail_stability"
-                else:
+                elif not ok_kappa:
                     reason = "evaluated_fail_kappa"
+                else:
+                    # Here ok_kappa==True and (ok_gain or ok_tv)==False => BOTH failed.
+                    # Prefer stability label for drift-only analysis lanes.
+                    reason = "evaluated_fail_stability"
 
             df.loc[idx, "gate_worst_tv_calib"] = float(tv)
             df.loc[idx, "gate_gain_calib"] = float(gain_bits) if np.isfinite(gain_bits) else np.nan

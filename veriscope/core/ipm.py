@@ -7,7 +7,7 @@ import numpy as np
 
 from .window import FRWindow, WindowDecl
 
-__all__ = ["tv_hist_fixed", "d_hyb", "dPi_product_tv", "d_Pi", "D_W"]
+__all__ = ["tv_hist_fixed", "d_hyb", "dPi_product_tv", "dPi_product_tv_robust", "d_Pi", "D_W"]
 
 
 def tv_hist_fixed(z0: Any, z1: Any, bins: int) -> float:
@@ -69,6 +69,35 @@ def dPi_product_tv(
     This is an alias of `d_Pi` to keep a stable import surface across the repo.
     """
     return d_Pi(decl, P, Q, apply)
+
+
+def dPi_product_tv_robust(
+    decl: WindowDecl,
+    P: Dict[str, np.ndarray],
+    Q: Dict[str, np.ndarray],
+    apply: Callable[[str, np.ndarray], np.ndarray],
+) -> float:
+    """
+    GateEngine-consistent product-TV:
+      - ignores non-finite per-metric TVs (tv_hist_fixed may return NaN on empties)
+      - normalizes by sum(abs(weights)) (matches GateEngine)
+      - returns NaN if no finite metric TVs exist (=> not evaluated)
+    """
+    weights = getattr(decl, "weights", {}) or {}
+    w_sum = float(sum(abs(float(w)) for w in weights.values())) or 1.0
+
+    s = 0.0
+    n_finite = 0
+    for m, w in weights.items():
+        if (m in P) and (m in Q):
+            p = apply(m, P[m])
+            q = apply(m, Q[m])
+            tv = tv_hist_fixed(p, q, int(decl.bins))
+            if np.isfinite(tv):
+                s += (abs(float(w)) / w_sum) * float(tv)
+                n_finite += 1
+
+    return float(s) if n_finite > 0 else float("nan")
 
 
 def D_W(frwin: FRWindow, P: Dict[str, np.ndarray], Q: Dict[str, np.ndarray]) -> float:
