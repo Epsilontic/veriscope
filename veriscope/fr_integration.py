@@ -251,8 +251,10 @@ def gate_step_fr(
         eps_stat_value=eps_stat_value,
     )
 
+    evaluated = bool((gr.audit or {}).get("evaluated", True))
+    warn_flag = bool(getattr(gr, "warn", False)) or (not bool(getattr(gr, "ok", True)))
     return {
-        "gate_warn": float(int(bool(getattr(gr, "ok", False)))),
+        "gate_warn": float(int(evaluated and warn_flag)),
         "gate_worst_tv": float(gr.audit.get("worst_DW", np.nan)),
         "gate_eps_stat": float(gr.audit.get("eps_stat", np.nan)),
         "gate_gain": float(gr.audit.get("gain_bits", np.nan)),

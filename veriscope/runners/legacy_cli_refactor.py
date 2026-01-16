@@ -386,7 +386,7 @@ from veriscope.runners.legacy.detectors.learned import (
     _first_run_end,
 )
 
-from veriscope.core.ipm import dPi_product_tv
+from veriscope.core.ipm import dPi_product_tv, dPi_product_tv_robust
 
 # ---- Legacy eval core (moved out of CLI) ----
 from veriscope.runners.legacy.eval.core import (
@@ -1146,7 +1146,7 @@ def gate_check(
             return np.asarray(_T(_apply(name, arr)), dtype=float)
 
         try:
-            tv_sum = float(dPi_product_tv(window, past, recent, apply=_apply_T))
+            tv_sum = float(dPi_product_tv_robust(window, past, recent, apply=_apply_T))
         except Exception:
             tv_sum = float("nan")
 
@@ -3920,6 +3920,12 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
         gate_gain = float("nan")
         gate_worst_tv = float("nan")
         gate_eps_stat = float("nan")
+
+        # --- TV instrumentation / provenance (always defined) ---
+        gate_worst_tv_audit = float("nan")  # raw from audit (GateEngine / gate_check)
+        worst_tv_local = float("nan")  # local recompute (truth probe)
+        gate_worst_tv_delta = float("nan")  # local - audit
+        gate_tv_source = "audit"  # {"audit","local"}
         gate_kappa = float("nan")
         gate_total_evidence = 0
         gate_reason = "not_evaluated"
@@ -4052,6 +4058,39 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
                 except Exception:
                     gate_kappa = 0.0
 
+                # --- Local recompute of worst_tv (debug/probe) ---
+                # Enabled by default in smoke/debug; can be forced with SCAR_DEBUG_GATE_TV=1
+                debug_tv = env_truthy("SCAR_DEBUG_GATE_TV") or env_truthy("SCAR_SMOKE") or env_truthy("SCAR_DEBUG_GATE")
+
+                if debug_tv:
+                    worst_tv_local = float("nan")
+                    try:
+                        intervs = getattr(WINDOW_DECL, "interventions", None) or (lambda x: x,)
+
+                        # Prefer FR transport if FR lane is active; else use the decl transport.
+                        base_apply = _apply
+                        try:
+                            if bool(USE_FR) and (FR_WIN is not None) and getattr(FR_WIN, "transport", None) is not None:
+                                base_apply = FR_WIN.transport.apply
+                        except Exception:
+                            pass
+
+                        tvs = []
+                        for T in intervs:
+
+                            def _apply_T_local(name: str, arr: np.ndarray, _T=T) -> np.ndarray:
+                                return np.asarray(_T(base_apply(name, arr)), dtype=float)
+
+                            # NOTE: requires you to have imported dPi_product_tv_robust
+                            tv = dPi_product_tv_robust(WINDOW_DECL, past_dict, recent_dict, apply=_apply_T_local)
+                            if np.isfinite(tv):
+                                tvs.append(float(tv))
+
+                        if tvs:
+                            worst_tv_local = float(max(tvs))
+                    except Exception:
+                        worst_tv_local = float("nan")
+
                 flag, audit = gate_check(
                     WINDOW_DECL,
                     past_dict,
@@ -4122,10 +4161,25 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
                     getattr(WINDOW_DECL, "epsilon", CFG.get("gate_epsilon", 0.08)),
                     default=as_float(CFG.get("gate_epsilon", 0.08), default=0.08),
                 )
-                gate_worst_tv = as_float(
+                gate_worst_tv_audit = as_float(
                     audit.get("worst_tv", audit.get("worst_DW", audit.get("worst_dw", np.nan))),
                     default=float("nan"),
                 )
+
+                # Default to audit value; optionally override with local probe if finite
+                gate_worst_tv = float(gate_worst_tv_audit)
+                if np.isfinite(worst_tv_local):
+                    gate_worst_tv = float(worst_tv_local)
+                    gate_tv_source = "local"
+                else:
+                    gate_tv_source = "audit"
+
+                # Delta is defined only when both are finite
+                if np.isfinite(worst_tv_local) and np.isfinite(gate_worst_tv_audit):
+                    gate_worst_tv_delta = float(worst_tv_local) - float(gate_worst_tv_audit)
+                else:
+                    gate_worst_tv_delta = float("nan")
+
                 gate_eps_stat = as_float(audit.get("eps_stat", np.nan), default=float("nan"))
                 gate_gain = as_float(audit.get("gain_bits", gate_gain), default=float("nan"))
                 gate_kappa = as_float(audit.get("kappa_sens", gate_kappa), default=float("nan"))
@@ -4146,6 +4200,36 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
 
                 # Recompute warning-state bit from the derived exceedance.
                 gate_warn = int(gate_evaluated and (gate_warn_pending == 1 or gate_dw_exceeds_threshold == 1))
+
+                # --- TV mismatch warning (rate-limited) ---
+                try:
+                    debug_tv = (
+                        env_truthy("SCAR_DEBUG_GATE_TV") or env_truthy("SCAR_SMOKE") or env_truthy("SCAR_DEBUG_GATE")
+                    )
+                except Exception:
+                    debug_tv = False
+
+                try:
+                    every = int(os.environ.get("SCAR_DEBUG_GATE_TV_EVERY", "4"))
+                    every = max(1, every)
+                except Exception:
+                    every = 4
+
+                try:
+                    if debug_tv and gate_evaluated and np.isfinite(worst_tv_local) and np.isfinite(gate_worst_tv_audit):
+                        delta = float(worst_tv_local) - float(gate_worst_tv_audit)
+                        if abs(delta) > 0.20 and (epoch % every == 0) and mp.current_process().name == "MainProcess":
+                            print(
+                                "[gate][tv-mismatch] "
+                                f"seed={seed} factor={str(factor.get('name', ''))} ep={epoch} "
+                                f"lane={gate_lane} fr={scar_fr} "
+                                f"audit={float(gate_worst_tv_audit):.3f} local={float(worst_tv_local):.3f} "
+                                f"delta={delta:+.3f} eps_eff={float(gate_eps_eff):.3f} "
+                                f"bins={int(getattr(WINDOW_DECL, 'bins', 0) if WINDOW_DECL is not None else 0)} "
+                                f"evidence={int(gate_total_evidence)}"
+                            )
+                except Exception:
+                    pass
 
                 # effective parameters actually used for this check
                 gate_gain_thresh_eff = as_float(CFG.get("gate_gain_thresh", 0.05), default=0.05)
@@ -4270,6 +4354,10 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
                 gate_reason=str(gate_reason),
                 gate_counts=str(gate_counts_json),
                 gate_exc=str(gate_exc),
+                gate_worst_tv_audit=float(gate_worst_tv_audit),
+                gate_worst_tv_local=float(worst_tv_local),
+                gate_worst_tv_delta=float(gate_worst_tv_delta),
+                gate_tv_source=str(gate_tv_source),
                 # WindowDecl identity for offline comparability
                 window_decl_hash=(
                     window_decl_identity_hash(WINDOW_DECL)
