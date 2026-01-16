@@ -1017,6 +1017,26 @@ def recompute_gate_series_under_decl(
             if pos < (2 * W):
                 continue
 
+            # Warmup guard: mirror ONLINE runner semantics (no evaluation/warn/fail before warmup).
+            try:
+                warm = int(cfg.get("warmup", 0) or 0)
+            except Exception:
+                warm = 0
+
+            try:
+                ep_i = as_int(g.loc[idx, "epoch"], default=-1)
+            except Exception:
+                ep_i = -1
+
+            if (ep_i >= 0) and (ep_i < warm):
+                df.loc[idx, "gate_reason_calib"] = "not_evaluated_warmup"
+                df.loc[idx, "gate_evaluated_calib"] = 0
+                df.loc[idx, "gate_warn_calib"] = 0
+                df.loc[idx, "gate_fail_calib"] = 0
+                df.loc[idx, "gate_ok_calib"] = 1
+                # leave other *_calib scalars as initialized (NaN/0)
+                continue
+
             # Exclude current epoch from both windows:
             # past   = epochs [pos-2W, pos-W)
             # recent = epochs [pos-W,  pos)
