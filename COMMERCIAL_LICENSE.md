@@ -1,20 +1,33 @@
 # Commercial License for Veriscope
 
-This software is dual-licensed under:
+Veriscope is dual-licensed:
 
-1. GNU Affero General Public License v3.0 (AGPL-3.0-only), or  
-2. A commercial license with terms negotiated directly with the author.
+- **GNU Affero General Public License v3.0 (AGPL-3.0-only)**, or  
+- **A commercial license** negotiated directly with the author.
 
-If you wish to use this software without the obligations of AGPL-3.0 (for example, proprietary/internal deployment, SaaS use without source distribution, or with additional support/warranty terms), you may obtain a commercial license.
+If your intended use case is not compatible with AGPL obligations (for example: proprietary distribution, hosted/network-accessible deployments, or internal use where you do not want to provide corresponding source to users as required under AGPL), you can obtain a commercial license.
 
-**Contact:** Craig Holmander  
-Email: craig.holm@protonmail.com
-URL: https://github.com/Epsilontic/veriscope/
+## Contact
 
-Commercial license terms are customized for each organization and may include:
-- Proprietary use without AGPL obligations  
-- Warranty and indemnification  
-- Priority support or feature development  
-- Trademark or branding permissions  
+**Craig Holmander**  
+Email: craig.holm@protonmail.com  
+Project: https://github.com/Epsilontic/veriscope/
 
-Please reference the project name and version when inquiring.
+## Commercial license scope (as negotiated)
+
+Commercial licensing is customized per organization and may include:
+
+- Permission to use, modify, and distribute Veriscope **without AGPL obligations**
+- Support, maintenance, or priority feature development
+- Warranty terms (if any) and service-level commitments (if any)
+- Trademark/branding permissions (if any)
+- Optional legal terms such as **limited IP indemnity**, if agreed in writing
+
+## What to include in an inquiry
+
+Please include the following when contacting us:
+
+- Organization name
+- Intended deployment model (**internal / distributed / hosted**)
+- Whether you need support or custom feature work
+- Veriscope version/tag or commit hash

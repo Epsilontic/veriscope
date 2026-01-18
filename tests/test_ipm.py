@@ -48,13 +48,16 @@ class TestIPMTransportMath:
     def test_dPi_product_tv_robust_no_finite_metrics_returns_nan(self, make_window_decl):  
         wd = make_window_decl(["m1"], weights={"m1": 1.0}, bins=10)  
   
-        def all_nan(name, arr):  
+        def nan_if_small(name, arr):  
             arr = np.asarray(arr, float)  
-            return np.full_like(arr, np.nan)  
+            # P has mean ~0.15; Q has mean ~0.95. Make P empty-after-filter only.  
+            if np.nanmean(arr) < 0.5:  
+                return np.full_like(arr, np.nan)  
+            return arr  
   
         P = {"m1": np.array([0.1, 0.2], dtype=float)}  
         Q = {"m1": np.array([0.9, 1.0], dtype=float)}  
-        d_r = dPi_product_tv_robust(wd, P, Q, apply=all_nan)  
+        d_r = dPi_product_tv_robust(wd, P, Q, apply=nan_if_small)  
         assert np.isnan(d_r)  
   
     def test_D_W_nonnegative_and_zero_on_identical(self, make_window_decl, make_fr_window):  

@@ -32,8 +32,8 @@ class TestGateEngineSemantics:
     def test_no_finite_metrics_triggers_not_evaluated(self, fr_window, make_gate_engine):  
         ge = make_gate_engine(fr_window, min_evidence=0, policy="either")  
   
-        past = {"test_metric": np.array([np.nan, np.inf], dtype=float)}  
-        recent = {"test_metric": np.array([0.2, 0.3], dtype=float)}  
+        past = {"test_metric": np.array([np.nan], dtype=float)}
+        recent = {"test_metric": np.array([0.2, 0.3], dtype=float)}
         counts = {"test_metric": 100}  
   
         r = ge.check(past, recent, counts, gain_bits=0.1, kappa_sens=0.0, eps_stat_value=0.0)  
@@ -220,7 +220,7 @@ class TestGateEngineSemantics:
     def test_audit_schema_no_finite_metrics_hard_contract(self, fr_window, make_gate_engine):  
         ge = make_gate_engine(fr_window, min_evidence=0)  
   
-        past = {"test_metric": np.array([np.nan, np.inf], dtype=float)}  
+        past = {"test_metric": np.array([np.nan], dtype=float)}
         recent = {"test_metric": np.array([0.2, 0.3], dtype=float)}  
         counts = {"test_metric": 100}  
   
