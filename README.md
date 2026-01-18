@@ -11,7 +11,7 @@
 
 *Detect representation collapse before it's too late.*
 
-[Quick Start](#quick-start) • [Gate Semantics](#gate-semantics) • [Core API](#core-api) • [Output Artifacts](#output-artifacts) • [Citation](#citation)
+[Quick Start](#quick-start) • [Pilot / Design Partner Use](#pilot--design-partner-use) • [Gate Semantics](#gate-semantics) • [Core API](#core-api) • [Output Artifacts](#output-artifacts) • [Contributing](#contributing) • [Citation](#citation)
 
 </div>
 
@@ -54,7 +54,7 @@ At a high level, Veriscope turns training-time monitoring into a reproducible de
 
 ## Gate Semantics
 
-GateEngine evaluates stability by computing worst_DW (a windowed divergence across tracked metrics, reduced as “worst over interventions”) and comparing it to an effective threshold eps_eff.
+`GateEngine` evaluates stability by computing `worst_DW` (a windowed divergence across tracked metrics, reduced as “worst over interventions”) and comparing it to an effective threshold `eps_eff`.
 
 ### Windowed divergence
 
@@ -95,7 +95,7 @@ For exact decision logic, rely on `GateEngine.check(...).audit` and/or the calib
 ## Requirements
 
 - Python 3.9+
-- PyTorch ≥ 2.1 (2.x recommended)
+- PyTorch ≥ 2.1
 - Optional GPU with CUDA 11/12 (CPU supported; heavy metrics slower)
 - `numpy`, `pandas`, `matplotlib`
 - Optional:
@@ -132,15 +132,15 @@ Note: dependencies are declared in `pyproject.toml`, so you normally do not need
 
 ## Quick Start
 
-After installation, run Veriscope via CLI:
+After installation, run Veriscope via the CLI entrypoint (recommended):
 
-- Using the installed command (if available):
+- Using the installed command:
 
   ```bash
   veriscope [OPTIONS]
   ```
 
-- Or via Python module:
+- If the console script is not available in your environment:
 
   ```bash
   python -m veriscope [OPTIONS]
@@ -153,7 +153,8 @@ export SCAR_SMOKE=1
 export SCAR_OUTDIR=./out_scar_smoke
 export SCAR_DATA=./data
 veriscope
-# python -m veriscope.runners.legacy_cli
+# If the console script is not available:
+# python -m veriscope
 ```
 
 Runs a small sweep (few seeds, short epochs), writing artifacts to `SCAR_OUTDIR`.
@@ -167,7 +168,20 @@ export SCAR_DATA=./data
 veriscope
 ```
 
+
 > Note: a full sweep can take hours depending on hardware.
+
+---
+
+## Pilot / Design Partner Use
+
+If you want to pilot Veriscope on a training run, start with the GPT runner and a known preset:
+
+```bash
+veriscope run gpt --outdir OUTDIR --gate_preset tuned -- <your training args>
+```
+
+For operational semantics (exit codes, schemas, artifact contracts, and validation), see `docs/productization.md`.
 
 ---
 
@@ -296,12 +310,24 @@ Writes are atomic where possible; parquet falls back to CSV automatically.
 
 ---
 
+---
+
+## Contributing
+
+Contributions are welcome. For non-trivial changes, please open an issue first to discuss scope and design.
+
+**CLA required:** All contributions require signing the Contributor License Agreement. See `INDIVIDUAL_CLA.md`.
+
+---
+
 ## License
 
 This project is dual-licensed:
 
 - **GNU Affero General Public License v3.0 (AGPL-3.0-only)**
 - **Commercial license** (for organizations preferring not to comply with AGPL terms)
+
+Use AGPL-3.0-only for open-source compliance; obtain a commercial license if you prefer not to comply with AGPL obligations for proprietary or hosted deployments.
 
 See `LICENSE` and `COMMERCIAL_LICENSE.md` for details.
 
@@ -323,4 +349,3 @@ Use the repository’s `CITATION.cff` (GitHub: “Cite this repository”) and i
 📧 craig.holm@protonmail.com  
 🌐 ORCID: https://orcid.org/0009-0002-3145-8498
 
-</file>
