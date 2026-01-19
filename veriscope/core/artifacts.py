@@ -3,7 +3,12 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from types import MappingProxyType
-from typing import Any, Annotated, Final, Literal, Optional, TypeAlias
+from typing import Any, Annotated, Final, Literal, Optional
+
+try:
+    from typing import TypeAlias  # py>=3.10
+except ImportError:  # pragma: no cover
+    from typing_extensions import TypeAlias  # py3.9
 from collections.abc import Mapping
 
 from pydantic import (
