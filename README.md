@@ -8,6 +8,7 @@
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.1+-ee4c2c.svg)](https://pytorch.org/)
 [![License: Dual](https://img.shields.io/badge/License-Dual-brightgreen.svg)](./COMMERCIAL_LICENSE.md)
+[![CI](https://github.com/Epsilontic/veriscope/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Epsilontic/veriscope/actions/workflows/ci.yml)
 
 *Detect representation collapse before it's too late.*
 
