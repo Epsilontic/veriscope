@@ -35,10 +35,14 @@ def canonical_dumps(obj: Any) -> str:
             ensure_ascii=False,
             allow_nan=False,
         )
-    except (TypeError, ValueError) as e:
+    except TypeError as e:
+        # Non-serializable object (e.g., Path, datetime, numpy scalar) -> TypeError.
         raise TypeError(
-            "canonical_dumps() requires a JSON-serializable object (no NaN/Infinity; normalize Paths/datetimes/numpy scalars, etc.)"
+            "canonical_dumps() requires a JSON-serializable object (normalize Paths/datetimes/numpy scalars, etc.)"
         ) from e
+    except ValueError:
+        # With allow_nan=False, NaN/Infinity raise ValueError; preserve that signal.
+        raise
 
 
 def canonical_bytes(obj: Any) -> bytes:
