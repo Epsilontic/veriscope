@@ -16,6 +16,7 @@ dependencies = [
   "matplotlib>=3.5",
   "filelock>=3.7",
   "pyarrow>=14.0",
+  "pydantic>=2.0,<3",
   "torch>=2.1",
   "torchvision>=0.16",
 ]
