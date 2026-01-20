@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 import time
 import math
@@ -115,6 +116,8 @@ from veriscope.runners.gpt.adapter import (
     create_gpt_gate_engine,
 )
 from veriscope.core.calibration import aggregate_epsilon_stat
+from veriscope.runners.gpt.emit_artifacts import emit_gpt_artifacts_v1
+from veriscope.core.jsonutil import atomic_write_json, canonical_json_sha256
 
 # Regime-anchored detection imports
 from veriscope.core.regime import (
@@ -1663,6 +1666,24 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+    # ----------------------------
+    # Resolve output paths up-front
+    # (needed so artifacts can be emitted even if training errors)
+    # ----------------------------
+    out_path = Path(str(args.out_json))
+    out_dir = str(args.out_dir).strip()
+    if out_dir and not out_path.is_absolute():
+        out_path = Path(out_dir) / out_path
+    out_path = out_path.expanduser()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Canonical artifacts directory: colocate with legacy out_json
+    artifacts_outdir = out_path.parent
+
+    started_ts_utc = datetime.utcnow()
+    run_status = "success"
+    _train_exc: BaseException | None = None
+
     def _flag_present(name: str) -> bool:
         """Return True if a flag (or flag=value) is explicitly present in argv."""
         for a in sys.argv[1:]:
@@ -1783,16 +1804,105 @@ if __name__ == "__main__":
         device=config.device,
     )
 
-    trainer = VeriscopeGatedTrainer(config)
-    metrics, gates = trainer.train(get_batch)
+    trainer: VeriscopeGatedTrainer | None = None
+    metrics: List[Dict[str, Any]] = []
+    gates: List[Dict[str, Any]] = []
+    try:
+        trainer = VeriscopeGatedTrainer(config)
+        metrics, gates = trainer.train(get_batch)
+    except BaseException as e:
+        run_status = "error"
+        _train_exc = e
+        # Preserve whatever we have so far, if any
+        try:
+            if trainer is not None:
+                gates = list(getattr(trainer, "gate_history", []) or [])
+                metrics = list(getattr(trainer, "metric_history", []) or [])
+        except Exception:
+            pass
+    finally:
+        ended_ts_utc = datetime.utcnow()
 
-    # Resolve output path
-    out_path = Path(str(args.out_json))
-    out_dir = str(args.out_dir).strip()
-    if out_dir and not out_path.is_absolute():
-        out_path = Path(out_dir) / out_path
-    out_path = out_path.expanduser()
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+        # Build a resolved gate config dict for the artifact signature.
+        resolved_gate_cfg: Dict[str, Any] = {
+            "metric_interval": int(config.metric_interval),
+            "gate_window": int(config.gate_window),
+            "gate_warmup": int(config.gate_warmup),
+            "gate_epsilon": float(config.gate_epsilon),
+            "gate_policy": str(config.gate_policy),
+            "gate_persistence_k": int(config.gate_persistence_k),
+            "gate_min_evidence": int(config.gate_min_evidence),
+            "gate_min_metrics_exceeding": int(config.gate_min_metrics_exceeding),
+            "gate_eps_stat_max_frac": float(config.gate_eps_stat_max_frac),
+            "gate_gain_thresh": float(config.gate_gain_thresh),
+            "regime_enabled": bool(config.regime_enabled),
+        }
+
+        gate_history_for_emit: List[Dict[str, Any]] = []
+        if trainer is not None:
+            try:
+                gate_history_for_emit = list(getattr(trainer, "gate_history", []) or [])
+            except Exception:
+                gate_history_for_emit = []
+        else:
+            gate_history_for_emit = list(gates or [])
+
+        # Emit canonical artifacts (V1). This is intentionally CPU-light.
+        emitted = emit_gpt_artifacts_v1(
+            outdir=artifacts_outdir,
+            run_id=out_path.stem,
+            started_ts_utc=started_ts_utc,
+            ended_ts_utc=ended_ts_utc,
+            gate_preset=str(args.gate_preset),
+            overrides=None,
+            resolved_gate_cfg=resolved_gate_cfg,
+            metric_interval=int(config.metric_interval),
+            metric_pipeline={"transport": "nanoGPT"},
+            gate_history=gate_history_for_emit,
+            run_status=run_status,
+        )
+
+        # --- Resolved run config artifact (canonical, stable) ---
+        run_cfg_obj: Dict[str, Any] = {
+            "schema_version": 1,
+            "run_id": str(out_path.stem),
+            "run_status": str(run_status),
+            "started_ts_utc": started_ts_utc,
+            "ended_ts_utc": ended_ts_utc,
+            "out_json": str(out_path),
+            "artifacts_outdir": str(artifacts_outdir),
+            "argv": list(sys.argv),
+            "gate_preset": str(args.gate_preset),
+            "resolved_gate_cfg": dict(resolved_gate_cfg),
+            "metric_pipeline": {"transport": "nanoGPT"},
+            "window_signature_ref": {
+                "hash": emitted.window_signature_hash,
+                "path": "window_signature.json",
+            },
+        }
+
+        if _train_exc is not None:
+            run_cfg_obj["error"] = {
+                "type": type(_train_exc).__name__,
+                "message": str(_train_exc),
+            }
+
+        run_cfg_path = artifacts_outdir / "run_config_resolved.json"
+
+        # Write once to normalize serialization (datetimes -> ISO strings, etc.), then hash what is on disk.
+        # The stored hash authenticates the *content without the hash field itself*.
+        atomic_write_json(run_cfg_path, run_cfg_obj)
+        try:
+            run_cfg_on_disk = json.loads(run_cfg_path.read_text(encoding="utf-8"))
+            run_cfg_on_disk.pop("run_config_resolved_hash", None)
+            run_cfg_obj["run_config_resolved_hash"] = canonical_json_sha256(run_cfg_on_disk)
+            atomic_write_json(run_cfg_path, run_cfg_obj)
+        except Exception:
+            # Non-fatal: if hashing fails for any reason, keep the base artifact.
+            pass
+
+        if _train_exc is not None:
+            raise _train_exc
 
     # --- select a compact but relevant metric subset for JSON output ---
     def _select_metrics_for_output(

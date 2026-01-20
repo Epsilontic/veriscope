@@ -1,0 +1,409 @@
+from __future__ import annotations
+
+import json
+import logging
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Mapping, Optional, Sequence
+
+import veriscope
+from veriscope.core.artifacts import (
+    AuditV1,
+    CountsV1,
+    GateRecordV1,
+    ProfileV1,
+    ResultsSummaryV1,
+    ResultsV1,
+    WindowSignatureRefV1,
+    derive_final_decision,
+)
+from veriscope.core.jsonutil import atomic_write_json, atomic_write_pydantic_json, canonical_json_sha256
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class EmittedArtifactsV1:
+    window_signature_path: Path
+    results_path: Path
+    results_summary_path: Path
+    window_signature_hash: str
+
+
+def _iso_z(dt: datetime) -> str:
+    """
+    Serialize datetime as a stable ISO-8601 UTC string (Z-suffixed, no microseconds).
+
+    Policy:
+      - naive datetime => treated as UTC (internal convention)
+      - tz-aware datetime => converted to UTC
+    """
+    if dt.tzinfo is None:
+        dt_utc = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt_utc = dt.astimezone(timezone.utc)
+    dt_utc = dt_utc.replace(microsecond=0)
+    return dt_utc.isoformat().replace("+00:00", "Z")
+
+
+def _needs_fill(x: Any) -> bool:
+    """True if value is None, empty string, or the string 'none' (case-insensitive)."""
+    if x is None:
+        return True
+    if isinstance(x, str):
+        s = x.strip()
+        return (s == "") or (s.lower() == "none")
+    if isinstance(x, (int, float, bool)):
+        return False
+    try:
+        return str(x).strip().lower() == "none"
+    except Exception:
+        return False
+
+
+def _coerce_int(val: Any, *, field: str) -> int:
+    """
+    Coerce a messy iteration value to int with clear errors.
+    Accepts:
+      - int
+      - float that is integral (e.g., 10.0)
+      - str of int (e.g., "0010")
+      - str of integral float (e.g., "10.0")
+    """
+    if isinstance(val, bool):
+        # avoid bool subclass-of-int footgun
+        raise ValueError(f"{field} must be an integer-like value, got bool={val!r}")
+
+    if isinstance(val, int):
+        return val
+
+    if isinstance(val, float):
+        if val.is_integer():
+            return int(val)
+        raise ValueError(f"{field} must be an integer-like value, got float={val!r}")
+
+    if isinstance(val, str):
+        s = val.strip()
+        if s == "":
+            raise ValueError(f"{field} must be an integer-like value, got empty string")
+        # "10" or "0010"
+        if s.isdigit() or (s.startswith("-") and s[1:].isdigit()):
+            return int(s)
+        # "10.0"
+        try:
+            f = float(s)
+        except Exception as e:
+            raise ValueError(f"{field} must be an integer-like value, got str={val!r}") from e
+        if f.is_integer():
+            return int(f)
+        raise ValueError(f"{field} must be an integer-like value, got str(float)={val!r}")
+
+    raise ValueError(f"{field} must be an integer-like value, got {type(val).__name__}={val!r}")
+
+
+def _get_event_iter(ev: Mapping[str, Any]) -> int:
+    """Extract iteration number from varied keys with contextual errors."""
+    for k in ("iter", "iter_num", "it", "step", "t"):
+        if k in ev and ev.get(k) is not None:
+            try:
+                return _coerce_int(ev.get(k), field=f"gate_history.{k}")
+            except Exception as e:
+                snippet = repr(dict(ev))[:200]
+                raise ValueError(f"Invalid iteration value for key '{k}': {ev.get(k)!r}. snippet={snippet}") from e
+
+    snippet = repr(dict(ev))[:200]
+    raise KeyError(f"gate_history event missing iteration key. keys={list(ev.keys())} snippet={snippet}")
+
+
+def _normalize_policy(policy_val: Any) -> str:
+    """
+    Policy normalization:
+      - accept non-empty strings
+      - None/empty/'none' => 'unknown'
+      - non-strings => error (avoid str(dict) instability)
+    """
+    if _needs_fill(policy_val):
+        return "unknown"
+    if isinstance(policy_val, str):
+        s = policy_val.strip()
+        return s if s else "unknown"
+    raise ValueError(f"audit.policy must be a string (or missing); got {type(policy_val).__name__}={policy_val!r}")
+
+
+def _normalize_audit_dict(ev: Mapping[str, Any]) -> Dict[str, Any]:
+    """
+    Build an audit dict compatible with AuditV1.
+
+    Hardening:
+      - do NOT mutate source event
+      - ensure per_metric_tv exists
+      - evaluated default True
+      - policy: only accept str; None/empty => 'unknown'
+      - reason fallback: audit.reason -> event.reason -> derived string
+      - normalize worst_dw -> worst_DW
+      - evidence defaults
+    """
+    a: Dict[str, Any] = dict(ev.get("audit") or {})
+
+    # Required by artifact contract
+    a.setdefault("per_metric_tv", {})
+
+    # evaluated
+    if "evaluated" not in a:
+        a["evaluated"] = True
+    else:
+        a["evaluated"] = bool(a["evaluated"])
+
+    # policy
+    policy_val = a.get("policy", ev.get("policy"))
+    a["policy"] = _normalize_policy(policy_val)
+
+    # reason fallback (CRITICAL: runner may place row_reason at event root)
+    if _needs_fill(a.get("reason")):
+        parent_reason = ev.get("reason")
+        if not _needs_fill(parent_reason):
+            a["reason"] = str(parent_reason)
+        else:
+            a["reason"] = "evaluated_unknown" if bool(a.get("evaluated", True)) else "not_evaluated"
+
+    # Optional extras copied from event root if audit missing them
+    for k in ("base_reason", "change_reason"):
+        if k in ev and _needs_fill(a.get(k)):
+            a[k] = ev.get(k)
+
+    # Legacy key normalization
+    if "worst_DW" not in a and "worst_dw" in a:
+        a["worst_DW"] = a.get("worst_dw")
+
+    # Evidence defaults
+    for k in ("evidence_total", "min_evidence"):
+        if k not in a:
+            a[k] = ev.get(k, 0)
+
+    return a
+
+
+def _derive_decision(ev: Mapping[str, Any], audit: AuditV1) -> str:
+    """
+    Deterministic gate decision derivation.
+
+    Contract:
+      - if audit.evaluated == False => skip
+      - prefer explicit ev["decision"] if present
+      - else fallback to legacy booleans: warn > ok > fail
+
+    Observability:
+      - warn once per event when legacy booleans are used (no explicit decision).
+    """
+    if audit.evaluated is False:
+        return "skip"
+
+    explicit = ev.get("decision")
+    if explicit is not None:
+        return str(explicit)
+
+    warn = bool(ev.get("warn", False))
+    ok = bool(ev.get("ok", False))
+
+    # Legacy path used: surface it so we can migrate producers toward explicit `decision`.
+    if ("warn" in ev) or ("ok" in ev):
+        logger.debug(
+            "Gate decision derived from legacy booleans (ok=%r warn=%r) at iter_hint=%r",
+            ev.get("ok", None),
+            ev.get("warn", None),
+            ev.get("iter", ev.get("iter_num", None)),
+        )
+
+    if warn:
+        return "warn"
+    if ok:
+        return "pass"
+    return "fail"
+
+
+def _counts_from_gate_records(gates: Sequence[GateRecordV1]) -> CountsV1:
+    """
+    CountsV1 semantics: evaluated excludes skip.
+    We also enforce that decisions are from the canonical set.
+    """
+    skip = 0
+    warn = 0
+    fail = 0
+    pass_n = 0
+
+    for r in gates:
+        d = r.decision
+        if d == "skip":
+            skip += 1
+        elif d == "warn":
+            warn += 1
+        elif d == "fail":
+            fail += 1
+        elif d == "pass":
+            pass_n += 1
+        else:
+            raise ValueError(f"Unexpected gate decision={d!r} at iter={getattr(r, 'iter', None)!r}")
+
+    evaluated = len(gates) - skip
+    # CountsV1 requires pass_ (aliased to "pass" in JSON) and enforces pass_+warn+fail==evaluated.
+    return CountsV1(evaluated=evaluated, skip=skip, pass_=pass_n, warn=warn, fail=fail)
+
+
+def _read_json_obj(path: Path) -> Dict[str, Any]:
+    """Read JSON file and parse to an object, with a tighter error message."""
+    try:
+        txt = path.read_text(encoding="utf-8")
+        return json.loads(txt)
+    except Exception as e:
+        raise ValueError(f"Failed to read/parse JSON at {path}") from e
+
+
+def emit_gpt_artifacts_v1(
+    *,
+    outdir: Path,
+    run_id: str,
+    started_ts_utc: datetime,
+    ended_ts_utc: Optional[datetime],
+    gate_preset: str,
+    overrides: Optional[Dict[str, Any]],
+    resolved_gate_cfg: Dict[str, Any],
+    gate_history: Sequence[Mapping[str, Any]],
+    metric_interval: Optional[int] = None,
+    metric_pipeline: Optional[Dict[str, Any]] = None,
+    run_status: str = "success",
+    runner_exit_code: Optional[int] = None,
+    runner_signal: Optional[str] = None,
+) -> EmittedArtifactsV1:
+    """
+    Emit standardized Veriscope artifacts (V1):
+      - window_signature.json
+      - results.json
+      - results_summary.json
+
+    This function is intentionally CPU-light and does not import nanoGPT/torch.
+    """
+    outdir = Path(outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    logger.info("Emitting GPT artifacts to %s (run_id=%s)", outdir, run_id)
+
+    # --- 1) window_signature.json ---
+    code_identity: Dict[str, Any] = {"package_version": veriscope.__version__}
+
+    git_sha = (metric_pipeline or {}).get("git_sha") if metric_pipeline else None
+    if not _needs_fill(git_sha):
+        code_identity["git_sha"] = str(git_sha)
+
+    window_sig: Dict[str, Any] = {
+        "schema_version": 1,
+        "code_identity": code_identity,
+        "gate_preset": gate_preset,
+        "gate_controls": dict(resolved_gate_cfg),
+    }
+    if metric_interval is not None:
+        window_sig["metric_interval"] = int(metric_interval)
+    if metric_pipeline is not None:
+        window_sig["metric_pipeline"] = dict(metric_pipeline)
+
+    window_signature_path = outdir / "window_signature.json"
+    atomic_write_json(window_signature_path, window_sig)
+
+    # Hash consistency: hash what is actually on disk (parsed object), not the in-memory dict.
+    window_sig_on_disk = _read_json_obj(window_signature_path)
+    ws_hash = canonical_json_sha256(window_sig_on_disk)
+    ws_ref = WindowSignatureRefV1(hash=ws_hash, path="window_signature.json")
+
+    # --- 2) gate_history -> GateRecordV1 ---
+    n_events = len(gate_history)
+    logger.debug("Processing %d gate_history events", n_events)
+
+    gate_records: List[GateRecordV1] = []
+    for i, ev in enumerate(gate_history):
+        try:
+            it = _get_event_iter(ev)
+            audit_dict = _normalize_audit_dict(ev)
+
+            # Validation boundary (Pydantic)
+            audit = AuditV1(**audit_dict)
+            decision = _derive_decision(ev, audit)
+
+            rec_kwargs: Dict[str, Any] = {"iter": it, "decision": decision, "audit": audit}
+            if "ok" in ev:
+                rec_kwargs["ok"] = bool(ev.get("ok"))
+            if "warn" in ev:
+                rec_kwargs["warn"] = bool(ev.get("warn"))
+
+            gate_records.append(GateRecordV1(**rec_kwargs))
+
+        except Exception as e:
+            iter_hint = ev.get("iter", ev.get("iter_num", "MISSING"))
+            snippet = repr(dict(ev))[:400]
+            # includes stack trace in logs:
+            logger.exception(
+                "Failed to process gate_history event index=%d iter_hint=%r snippet=%s",
+                i,
+                iter_hint,
+                snippet,
+            )
+            raise ValueError(
+                f"Artifact generation failed at gate_history index={i} iter_hint={iter_hint!r}: {e}"
+            ) from e
+
+    # Optional: ensure monotonic order (if desired). We preserve input order unless it’s clearly out-of-order.
+    # If you want hard enforcement, switch this to a ValueError on any inversion.
+    # gate_records.sort(key=lambda r: int(r.iter))
+
+    # --- 3) Aggregate Results ---
+    # ProfileV1.overrides is a mapping with a default_factory; do not pass None.
+    profile = ProfileV1(gate_preset=gate_preset, overrides=(overrides or {}))
+
+    results = ResultsV1(
+        schema_version=1,
+        run_id=run_id,
+        window_signature_ref=ws_ref,
+        profile=profile,
+        run_status=run_status,
+        runner_exit_code=runner_exit_code,
+        runner_signal=runner_signal,
+        started_ts_utc=_iso_z(started_ts_utc),
+        ended_ts_utc=_iso_z(ended_ts_utc) if ended_ts_utc is not None else None,
+        gates=gate_records,  # list is the natural JSON shape
+        metrics=[],  # Phase 1.5: gates-first
+    )
+
+    counts = _counts_from_gate_records(gate_records)
+    final_decision = derive_final_decision(counts)
+
+    summary = ResultsSummaryV1(
+        schema_version=1,
+        run_id=run_id,
+        window_signature_ref=ws_ref,
+        profile=profile,
+        run_status=run_status,
+        runner_exit_code=runner_exit_code,
+        runner_signal=runner_signal,
+        started_ts_utc=_iso_z(started_ts_utc),
+        ended_ts_utc=_iso_z(ended_ts_utc) if ended_ts_utc is not None else None,
+        counts=counts,
+        final_decision=final_decision,
+    )
+
+    # --- 4) Write output ---
+    results_path = outdir / "results.json"
+    results_summary_path = outdir / "results_summary.json"
+
+    logger.debug("Writing %s", results_path)
+    atomic_write_pydantic_json(results_path, results, by_alias=True, exclude_none=True)
+
+    logger.debug("Writing %s", results_summary_path)
+    atomic_write_pydantic_json(results_summary_path, summary, by_alias=True, exclude_none=True)
+
+    logger.info("Artifacts generated successfully (final_decision=%s)", final_decision)
+
+    return EmittedArtifactsV1(
+        window_signature_path=window_signature_path,
+        results_path=results_path,
+        results_summary_path=results_summary_path,
+        window_signature_hash=ws_hash,
+    )
