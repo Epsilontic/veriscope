@@ -5218,9 +5218,28 @@ def _ffill_scheduled(df_in: pd.DataFrame) -> pd.DataFrame:
     for key, g in df.groupby(["seed", "factor"]):
         seed, factor = cast(tuple[Any, Any], key)
         idx = g.index
+
         for m in SCHEDULED_METRICS:
-            if m in df.columns:
-                df.loc[idx, m] = g[m].ffill()
+            if m not in df.columns:
+                continue
+
+            # Freshness: 1 only at epochs where the metric was actually computed.
+            fresh_col = f"{m}_fresh"
+            try:
+                raw = pd.to_numeric(g[m], errors="coerce").to_numpy(dtype=float)
+                fresh = (np.isfinite(raw)).astype(int)
+                if fresh_col not in df.columns:
+                    df[fresh_col] = 0
+                df.loc[idx, fresh_col] = fresh
+            except Exception:
+                # If anything goes wrong, default to "never fresh" rather than lying.
+                if fresh_col not in df.columns:
+                    df[fresh_col] = 0
+                df.loc[idx, fresh_col] = 0
+
+            # Forward-fill for visualization / continuity only.
+            df.loc[idx, m] = g[m].ffill()
+
     return df
 
 
@@ -6374,7 +6393,18 @@ def evaluate(df_all: pd.DataFrame, tag: str):
     )
 
     # ---- Baselines (PH on various pools) using unified GT ----
-    tr_vote_ev, _ = compute_events(df_eval_raw, metrics_for_ph=VOTE_METRICS, dir_map=dir_map)
+    # Vote baseline: scheduled metrics must abstain on epochs where they were not freshly computed.
+    df_vote = df_eval_raw.copy()
+    try:
+        for m in SCHEDULED_METRICS:
+            fc = f"{m}_fresh"
+            if (m in df_vote.columns) and (fc in df_vote.columns):
+                df_vote.loc[pd.to_numeric(df_vote[fc], errors="coerce").fillna(0).astype(int) != 1, m] = np.nan
+    except Exception:
+        # If freshness columns are unavailable, fall back to the raw frame.
+        df_vote = df_eval_raw
+
+    tr_vote_ev, _ = compute_events(df_vote, metrics_for_ph=VOTE_METRICS, dir_map=dir_map)
 
     dir_ewma = calibrate_ph_directions(soft_cal, ["ewma_loss"])
     dir_sma = calibrate_ph_directions(soft_cal, ["sma_loss"])
