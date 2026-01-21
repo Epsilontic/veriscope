@@ -319,6 +319,98 @@ def _append_sweep_log(msg: str) -> None:
         pass  # Never let logging failures break the pipeline
 
 
+# --- phase + registry helpers (calib/eval hygiene) ---
+
+
+def _seed_phase(seed: Any, cfg: Dict[str, Any]) -> str:
+    """
+    Persisted phase label for every row.
+
+    Policy:
+      - If seed is in both seeds_calib and seeds_eval => 'both'
+      - Else if seed in seeds_calib => 'calib'
+      - Else if seed in seeds_eval => 'eval'
+      - Else 'unknown'
+
+    Use 'unknown' only if seed is unparseable or not present in either list.
+
+    This explicitly supports smoke overlap (e.g., seed 512) without creating
+    split-bundle / events-table mismatches.
+    """
+    try:
+        s = int(seed)
+    except Exception:
+        return "unknown"
+
+    try:
+        calib = set(int(x) for x in (cfg.get("seeds_calib", []) or []))
+    except Exception:
+        calib = set()
+
+    try:
+        evals = set(int(x) for x in (cfg.get("seeds_eval", []) or []))
+    except Exception:
+        evals = set()
+
+    in_cal = s in calib
+    in_ev = s in evals
+    if in_cal and in_ev:
+        return "both"
+    if in_cal:
+        return "calib"
+    if in_ev:
+        return "eval"
+    return "unknown"
+
+
+def _assert_events_cover_exact_registry(
+    *,
+    df_registry: pd.DataFrame,
+    df_events: pd.DataFrame,
+    label: str,
+) -> None:
+    """
+    Hard guardrail: df_events must cover exactly the (seed,factor) registry.
+    This prevents silent mixing: combined bundle (calib+eval) joined with eval-only events.
+    """
+    if df_registry is None or df_registry.empty:
+        return
+
+    if df_events is None or df_events.empty:
+        raise RuntimeError(f"[events-registry] {label}: events empty but registry non-empty")
+
+    need = {"seed", "factor"}
+    if not need.issubset(df_registry.columns) or not need.issubset(df_events.columns):
+        raise RuntimeError(f"[events-registry] {label}: missing seed/factor columns")
+
+    reg = df_registry[["seed", "factor"]].copy()
+    evp = df_events[["seed", "factor"]].copy()
+
+    reg["seed"] = pd.to_numeric(reg["seed"], errors="coerce").fillna(-1).astype(int)
+    evp["seed"] = pd.to_numeric(evp["seed"], errors="coerce").fillna(-1).astype(int)
+    reg["factor"] = reg["factor"].astype(str)
+    evp["factor"] = evp["factor"].astype(str)
+
+    reg = reg.drop_duplicates()
+    evp = evp.drop_duplicates()
+
+    m1 = reg.merge(evp, on=["seed", "factor"], how="left", indicator=True)
+    m2 = evp.merge(reg, on=["seed", "factor"], how="left", indicator=True)
+
+    missing = m1[m1["_merge"] == "left_only"][["seed", "factor"]]
+    extra = m2[m2["_merge"] == "left_only"][["seed", "factor"]]
+
+    if len(missing) or len(extra):
+        print(f"[events-registry][ERROR] {label}: pair mismatch", flush=True)
+        if len(missing):
+            print("[events-registry] Missing pairs (first 25):", flush=True)
+            print(missing.head(25).to_string(index=False), flush=True)
+        if len(extra):
+            print("[events-registry] Extra pairs (first 25):", flush=True)
+            print(extra.head(25).to_string(index=False), flush=True)
+        raise RuntimeError(f"{label}: events pairs != registry pairs")
+
+
 from veriscope.runners.legacy.determinism import (
     seed_all,
     new_gen,
@@ -3270,6 +3362,7 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
         data_root=DATA_ROOT,
     )
     run_id = f"s{seed}-{factor['name']}"
+    run_phase = _seed_phase(seed, CFG)
     tr_ds = FactorisedTrainDataset(tr_aug, tr_take, factor=factor, seed=seed)
     sampler = DropoutAwareSampler(tr_ds, CFG["batch"], seed=seed) if factor["name"] == "class_dropout_window" else None
 
@@ -4296,6 +4389,7 @@ def run_one(seed: int, tag: str, monitor_ds, factor: Dict) -> pd.DataFrame:
                 run_id=run_id,
                 seed=seed,
                 factor=factor["name"],
+                run_phase=run_phase,
                 epoch=epoch,
                 lr=lr,
                 momentum=mom,
@@ -5506,8 +5600,48 @@ def run_sweep(tag: str):
 
     df_all = pd.concat(frames, ignore_index=True)
 
+    # Backfill run_phase if some shards were produced before run_phase existed
+    if "run_phase" not in df_all.columns:
+        if "seed" in df_all.columns:
+            seed_s = pd.to_numeric(df_all["seed"], errors="coerce").fillna(-1).astype(int)
+            df_all["run_phase"] = seed_s.map(lambda s: _seed_phase(int(s), CFG))
+        else:
+            df_all["run_phase"] = "unknown"
+
+    # Backward-compatible combined bundle (calib + eval)
     out_path = OUTDIR / f"bundle_runs_{tag}.parquet"
     safe_write_parquet(df_all, out_path)
+
+    # Phase-split bundles (recommended safe defaults)
+    try:
+        df_eval = df_all[df_all["run_phase"].isin(["eval", "both"])].copy()
+        df_calib = df_all[df_all["run_phase"].isin(["calib", "both"])].copy()
+
+        if len(df_eval) > 0:
+            safe_write_parquet(df_eval, OUTDIR / f"bundle_runs_eval_{tag}.parquet")
+        if len(df_calib) > 0:
+            safe_write_parquet(df_calib, OUTDIR / f"bundle_runs_calib_{tag}.parquet")
+
+        # Evaluation-set bundle (matches evaluate() seed selection semantics)
+        # Especially important in smoke where seeds_for_eval_from_env() may default to "both".
+        try:
+            eval_seeds = seeds_for_eval_from_env(CFG)
+
+            # Normalize to int for robust membership (df seeds may be str/float/object).
+            try:
+                eval_seeds_set = set(int(s) for s in (eval_seeds or []))
+            except Exception:
+                eval_seeds_set = set()
+
+            if "seed" in df_all.columns and eval_seeds_set:
+                seed_s = pd.to_numeric(df_all["seed"], errors="coerce").fillna(-1).astype(int)
+                df_evalset = df_all[seed_s.isin(list(eval_seeds_set))].copy()
+                if len(df_evalset) > 0:
+                    safe_write_parquet(df_evalset, OUTDIR / f"bundle_runs_evalset_{tag}.parquet")
+        except Exception:
+            pass
+    except Exception:
+        pass
 
     # Compute checksum for whichever file actually exists (parquet or CSV fallback)
     target = out_path if out_path.exists() else out_path.with_suffix(".csv")
@@ -6548,6 +6682,9 @@ def evaluate(df_all: pd.DataFrame, tag: str):
             pass
         return
 
+    # Canonical registry: all events tables must cover exactly these (seed,factor) pairs.
+    eval_registry = df_eval_raw[["seed", "factor"]].drop_duplicates().copy()
+
     # --- Invariant (smoke/debug): emitted event times must be in the run's observed epoch set ---
     def _assert_events_in_epoch_set(df_events: pd.DataFrame, df_source: pd.DataFrame, label: str) -> None:
         # Cheap, high-value regression guard: only run in smoke or debug.
@@ -6603,8 +6740,11 @@ def evaluate(df_all: pd.DataFrame, tag: str):
                 except Exception:
                     pass
                 raise AssertionError(msg)
+        except AssertionError:
+            # Real invariant violation: fail loudly.
+            raise
         except Exception:
-            # If the checker itself fails (not a detected mismatch), do not break the sweep.
+            # Checker implementation error should not crash the sweep.
             return
 
     # ---- Apply learned detector to evaluation runs ----
@@ -6709,6 +6849,11 @@ def evaluate(df_all: pd.DataFrame, tag: str):
         )
     det_rows = pd.DataFrame(rows)
     _assert_events_in_epoch_set(det_rows, df_eval_raw, label=f"detector_events_{tag}")
+    _assert_events_cover_exact_registry(
+        df_registry=eval_registry,
+        df_events=det_rows,
+        label=f"detector_events_{tag}",
+    )
     det_rows.to_csv(OUTDIR / f"detector_events_{tag}.csv", index=False)
 
     # ---- Baseline postprocess (PH tables → canonical columns) ----
@@ -6770,8 +6915,25 @@ def evaluate(df_all: pd.DataFrame, tag: str):
         return out
 
     base_ewma = postprocess(tr_ewma, "ewma")
+    _assert_events_cover_exact_registry(
+        df_registry=eval_registry,
+        df_events=base_ewma,
+        label=f"baseline_events_ewma_{tag}",
+    )
+
     base_sma = postprocess(tr_sma, "sma")
+    _assert_events_cover_exact_registry(
+        df_registry=eval_registry,
+        df_events=base_sma,
+        label=f"baseline_events_sma_{tag}",
+    )
+
     base_vote = postprocess(tr_vote_ev, "vote")
+    _assert_events_cover_exact_registry(
+        df_registry=eval_registry,
+        df_events=base_vote,
+        label=f"baseline_events_vote_{tag}",
+    )
 
     # ---- Sequential PH + rank-drop vote baseline ('seq') ----
     lam_cfg = CFG.get("seq_cusum_lambda", CFG["ph_lambda"])
@@ -6878,6 +7040,11 @@ def evaluate(df_all: pd.DataFrame, tag: str):
         )
     seq_events = pd.DataFrame(seq_rows)
     _assert_events_in_epoch_set(seq_events, df_eval_raw, label=f"baseline_events_seq_{tag}")
+    _assert_events_cover_exact_registry(
+        df_registry=eval_registry,
+        df_events=seq_events,
+        label=f"baseline_events_seq_{tag}",
+    )
     seq_events.to_csv(OUTDIR / f"baseline_events_seq_{tag}.csv", index=False)
 
     # ---- NEWMA: calibrate lambda from controls (runner-proof) ----
@@ -7118,6 +7285,11 @@ def evaluate(df_all: pd.DataFrame, tag: str):
         )
     base_newma = pd.DataFrame(newma_rows)
     _assert_events_in_epoch_set(base_newma, df_eval_raw, label=f"baseline_events_newma_{tag}")
+    _assert_events_cover_exact_registry(
+        df_registry=eval_registry,
+        df_events=base_newma,
+        label=f"baseline_events_newma_{tag}",
+    )
     base_newma.to_csv(OUTDIR / f"baseline_events_newma_{tag}.csv", index=False)
 
     # ---- Gate-only baseline (AUDIT lane): primary uses ONLINE gate_warn ----
@@ -7303,16 +7475,31 @@ def evaluate(df_all: pd.DataFrame, tag: str):
             )
     base_gate = pd.DataFrame(gate_rows)
     _assert_events_in_epoch_set(base_gate, df_eval_raw, label=f"baseline_events_gate_{tag}")
+    _assert_events_cover_exact_registry(
+        df_registry=eval_registry,
+        df_events=base_gate,
+        label=f"baseline_events_gate_{tag}",
+    )
     base_gate.to_csv(OUTDIR / f"baseline_events_gate_{tag}.csv", index=False)
     if gate_rows_drift_only:
         base_gate_drift = pd.DataFrame(gate_rows_drift_only)
         _assert_events_in_epoch_set(base_gate_drift, df_eval_raw, label=f"baseline_events_gate_drift_only_{tag}")
+        _assert_events_cover_exact_registry(
+            df_registry=eval_registry,
+            df_events=base_gate_drift,
+            label=f"baseline_events_gate_drift_only_{tag}",
+        )
         base_gate_drift.to_csv(OUTDIR / f"baseline_events_gate_drift_only_{tag}.csv", index=False)
 
     # Write counterfactual separately for analysis (never overwrites primary audit lane)
     if gate_calib_rows:
         base_gate_cf = pd.DataFrame(gate_calib_rows)
         _assert_events_in_epoch_set(base_gate_cf, df_eval_raw, label=f"baseline_events_gate_counterfactual_{tag}")
+        _assert_events_cover_exact_registry(
+            df_registry=eval_registry,
+            df_events=base_gate_cf,
+            label=f"baseline_events_gate_counterfactual_{tag}",
+        )
         base_gate_cf.to_csv(OUTDIR / f"baseline_events_gate_counterfactual_{tag}.csv", index=False)
 
     # ---- Summaries ----
@@ -7808,6 +7995,18 @@ def main():
         print(f"[WARN] pipeline import failed ({e!r}); falling back to local run_sweep/evaluate")
         pipeline_run_sweep = run_sweep
         pipeline_evaluate = evaluate
+
+    try:
+        print(
+            f"[runner] using pipeline_run_sweep={pipeline_run_sweep.__module__}.{pipeline_run_sweep.__name__}",
+            flush=True,
+        )
+        print(
+            f"[runner] using pipeline_evaluate={pipeline_evaluate.__module__}.{pipeline_evaluate.__name__}",
+            flush=True,
+        )
+    except Exception:
+        pass
 
     tag = RUN_TAG
     # or, if you want to respect RUN_TAG overrides:
