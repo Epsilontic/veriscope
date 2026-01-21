@@ -2201,26 +2201,7 @@ try:
 except Exception:
     pass
 
-
-def seeds_for_eval_from_env(CFG_dict):
-    """Return seeds for evaluation based on SCAR_EVAL_SPLIT.
-
-    SCAR_EVAL_SPLIT: "eval" (default) | "calib" | "both".
-
-    Smoke-mode hardening: if SCAR_SMOKE is truthy and SCAR_EVAL_SPLIT is not set,
-    default to "both" so FP denominators exist in smoke evaluation.
-    """
-    raw = os.environ.get("SCAR_EVAL_SPLIT")
-    if raw is None and env_truthy("SCAR_SMOKE"):
-        mode = "both"
-    else:
-        mode = (raw or "eval").lower().strip()
-
-    if mode == "both":
-        return list(CFG_dict.get("seeds_calib", [])) + list(CFG_dict.get("seeds_eval", []))
-    if mode == "calib":
-        return list(CFG_dict.get("seeds_calib", []))
-    return list(CFG_dict.get("seeds_eval", []))
+from veriscope.runners.seed_policy import seeds_for_eval_from_env
 
 
 # ---------------------------
@@ -5798,9 +5779,35 @@ def evaluate(df_all: pd.DataFrame, tag: str):
     except Exception:
         pass
     warm_idx = warm_idx_from_cfg(CFG)
-    cal_mask = df_all["seed"].isin(CFG["seeds_calib"])
-    eval_seeds = seeds_for_eval_from_env(CFG)
-    ev_mask = df_all["seed"].isin(eval_seeds)
+
+    # Normalize seeds to int to avoid pandas .isin(None) and dtype mismatch hazards.
+    seed_s = pd.to_numeric(df_all["seed"], errors="coerce").fillna(-1).astype(int)
+
+    try:
+        calib_set = {int(s) for s in (CFG.get("seeds_calib") or [])}
+    except Exception:
+        calib_set = set()
+
+    eval_seeds_raw = seeds_for_eval_from_env(CFG)
+    try:
+        eval_seeds_set = {int(s) for s in (eval_seeds_raw or [])}
+    except Exception:
+        eval_seeds_set = set()
+
+    # Stable, deterministic ordering for downstream artifacts.
+    eval_seeds = sorted(eval_seeds_set)
+
+    try:
+        save_json(
+            {"eval_seeds_effective": eval_seeds},
+            OUTDIR / f"eval_seeds_effective_{tag}.json",
+        )
+    except Exception:
+        pass
+
+    cal_mask = seed_s.isin(calib_set) if calib_set else seed_s.isin([])
+    ev_mask = seed_s.isin(eval_seeds) if eval_seeds else seed_s.isin([])
+
     df_cal_raw = df_all[cal_mask].copy()
     df_eval_raw = df_all[ev_mask].copy()
     no_eval = (df_eval_raw is None) or getattr(df_eval_raw, "empty", True)
@@ -6687,8 +6694,10 @@ def evaluate(df_all: pd.DataFrame, tag: str):
 
     # --- Invariant (smoke/debug): emitted event times must be in the run's observed epoch set ---
     def _assert_events_in_epoch_set(df_events: pd.DataFrame, df_source: pd.DataFrame, label: str) -> None:
-        # Cheap, high-value regression guard: only run in smoke or debug.
-        if not (env_truthy("SCAR_SMOKE") or env_truthy("SCAR_DEBUG") or env_truthy("SCAR_DEBUG_GATE")):
+        strict = bool(CFG.get("strict_events", False)) or env_truthy("SCAR_STRICT_EVENTS")
+        cheap = bool(env_truthy("SCAR_SMOKE") or env_truthy("SCAR_DEBUG") or env_truthy("SCAR_DEBUG_GATE"))
+        # Cheap, high-value regression guard: run in smoke/debug, or when strict mode is requested.
+        if not (cheap or strict):
             return
         if df_events is None or (not isinstance(df_events, pd.DataFrame)) or df_events.empty:
             return
@@ -7903,10 +7912,12 @@ def main():
     # --- Write a truthful resolved config snapshot (post-reconcile) ---
     try:
         resolved = {k: CFG.get(k) for k in sorted(CFG.keys())}
+        # Provenance: make smoke/eval policy explicit, not inferred.
+        resolved["smoke_mode"] = bool(env_truthy("SCAR_SMOKE"))
+        resolved["eval_split_mode"] = (os.environ.get("SCAR_EVAL_SPLIT") or "eval").lower().strip()
         save_json(resolved, OUTDIR / "run_config_resolved.json")
     except Exception:
         pass
-
     # Step 2b: Gate evaluability check (warn always; fail-fast when policy requires)
     if require_gate_eval(CFG):
         require_gate_eval_or_die(CFG, context="main:post_calibration")
