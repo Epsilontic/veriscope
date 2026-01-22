@@ -1592,6 +1592,7 @@ try:
         ("SCAR_NEWMA_MIN_POINTS", "newma_min_points", int),
         ("SCAR_NEWMA_MIN_AGREEMENT", "newma_min_agreement", int),
         ("SCAR_NEWMA_CALIB_Q", "newma_calib_q", float),
+        ("SCAR_WARN_VOTE", "warn_vote", int),
     ):
         _v = os.environ.get(_env_name)
         if _v is None:
@@ -1914,6 +1915,7 @@ SMOKE_ENV_BYPASS: Dict[str, str] = {
     "gate_epsilon": "SCAR_GATE_EPSILON",
     "gate_epsilon_floor": "SCAR_GATE_EPSILON_FLOOR",
     "warn_consec": "SCAR_WARN_CONSEC",
+    "warn_vote": "SCAR_WARN_VOTE",
     "family_window": "SCAR_FAMILY_WINDOW",
     "gate_gain_q": "SCAR_GATE_GAIN_Q",
     "gate_gain_thresh": "SCAR_GATE_GAIN_THRESH",
