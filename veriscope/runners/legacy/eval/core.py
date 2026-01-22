@@ -223,7 +223,7 @@ def compute_events(
         t_map: Dict[str, Optional[int]] = {}
 
         for m in metrics_for_ph:
-            xs = _prep_series_for_ph(g0, m)
+            xs = _prep_series_for_ph(g0, m, ffill_scheduled=False)
             win_m = (
                 as_int(cfg.get("ph_win_short"), default=win_default) if (m in SCHEDULED_METRICS) else int(win_default)
             )

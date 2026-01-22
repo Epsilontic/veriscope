@@ -40,9 +40,13 @@ SCHEDULED_METRICS: List[str] = ["sw2", "pers_H0", "mon_entropy", "avg_max_prob"]
 # ---------------------------
 # PH series preprocessing helper (centralized)
 # ---------------------------
-def _prep_series_for_ph(g: pd.DataFrame, metric: str) -> List[float]:
-    """Prepare a metric series for PH detection: ffill scheduled metrics, apply validity masks,
-    and gate pers_H0 by min repeats and time budget. Returns a Python list with NaNs for invalid epochs.
+def _prep_series_for_ph(g: pd.DataFrame, metric: str, *, ffill_scheduled: bool = False) -> List[float]:
+    """Prepare a metric series for PH detection.
+
+    CRITICAL DETECTOR CONTRACT:
+      - By default we DO NOT forward-fill scheduled metrics.
+        Missing epochs must remain NaN so detectors cannot use stale values as evidence.
+      - Optional ffill_scheduled=True exists only for plotting/debug convenience and applies a TTL.
     """
     # Guard: return all-NaN if metric column is missing
     if metric not in g.columns:
@@ -51,18 +55,23 @@ def _prep_series_for_ph(g: pd.DataFrame, metric: str) -> List[float]:
     s = g[metric].copy()
     if metric in SCHEDULED_METRICS:
         raw_arr = s.to_numpy(dtype=float)
-        s = s.ffill()
-        # apply TTL to scheduled metrics to avoid stale carry-over
-        arr = s.to_numpy(dtype=float)
-        age = np.full_like(arr, np.inf, dtype=float)
-        last = -1
-        for i, v in enumerate(raw_arr):
-            if np.isfinite(v):
-                last = i
-            age[i] = (i - last) if last >= 0 else np.inf
-        # scheduled_ttl may be missing or non-numeric; fall back safely.
-        ttl = as_float(CFG.get("scheduled_ttl"), default=_scheduled_ttl_default())
-        arr = np.where(age <= ttl, arr, np.nan)
+        if ffill_scheduled:
+            # Forward-fill is allowed ONLY when explicitly requested (plots/debug).
+            # Still apply TTL to prevent unbounded staleness.
+            s_ff = s.ffill()
+            arr = s_ff.to_numpy(dtype=float)
+            age = np.full_like(arr, np.inf, dtype=float)
+            last = -1
+            for i, v in enumerate(raw_arr):
+                if np.isfinite(v):
+                    last = i
+                age[i] = (i - last) if last >= 0 else np.inf
+            # scheduled_ttl may be missing or non-numeric; fall back safely.
+            ttl = as_float(CFG.get("scheduled_ttl"), default=_scheduled_ttl_default())
+            arr = np.where(age <= ttl, arr, np.nan)
+        else:
+            # Detector-safe: keep the series sparse; DO NOT manufacture observations.
+            arr = raw_arr
     else:
         arr = s.to_numpy(dtype=float)
 
@@ -325,7 +334,7 @@ def calibrate_ph_directions(df_cal: pd.DataFrame, metrics: List[str]) -> Dict[st
                 t_c_i = as_int(t_c_raw, default=-1)
                 if (t_c_i < 0) or ctag != "soft":
                     continue
-                xs_all = _prep_series_for_ph(g, m)
+                xs_all = _prep_series_for_ph(g, m, ffill_scheduled=False)
                 pre = g["epoch"].to_numpy(dtype=int) < t_c_i
                 xs = np.where(pre, np.array(xs_all, dtype=float), np.nan).tolist()
                 t, _, _ = ph_window_sparse(
