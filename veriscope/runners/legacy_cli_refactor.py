@@ -6913,12 +6913,48 @@ def evaluate(df_all: pd.DataFrame, tag: str):
                 return t
         return None
 
+    def quorum_time_with_persistence(r: pd.Series, metrics: List[str], k: int, consec: int) -> Optional[int]:
+        """
+        Vote-baseline persistence semantics.
+        We only have *first-hit times* t_m per metric, not epochwise hit traces.
+        Under the (standard) absorbing-alarm assumption ("once hit, stays hit"),
+        requiring `consec` consecutive epochs is equivalent to shifting the earliest
+        quorum-achievement time forward by (consec - 1).
+        """
+        t0 = quorum_time(r, metrics, k)
+        if t0 is None:
+            return None
+        c = as_int(consec, default=1)
+        c = 1 if c < 1 else c
+        return int(t0) + (c - 1)
+
     def postprocess(tr_df, name):
         tcol = _first_t_column(tr_df)
         rows = []
+        vote_audit_rows = []
         for _, r in tr_df.iterrows():
             if name == "vote":
-                t_warn = quorum_time(r, VOTE_METRICS, as_int(CFG.get("warn_vote", 2), default=2))
+                k_vote = as_int(CFG.get("warn_vote", 2), default=2)
+                c_consec = as_int(CFG.get("warn_consec", 1), default=1)
+                t_quorum = quorum_time(r, VOTE_METRICS, k_vote)
+                t_warn = quorum_time_with_persistence(r, VOTE_METRICS, k_vote, c_consec)
+
+                # Per-run audit: record each metric's first-hit time and the derived times.
+                try:
+                    ar = {
+                        "run_id": r.get("run_id", ""),
+                        "seed": as_int(r.get("seed"), default=0),
+                        "factor": str(r.get("factor", "")),
+                        "warn_vote": int(k_vote),
+                        "warn_consec": int(c_consec),
+                        "t_quorum_raw": t_quorum,
+                        "t_warn_persisted": t_warn,
+                    }
+                    for m in VOTE_METRICS:
+                        ar[f"t_{m}"] = as_int(r.get(f"t_{m}"), default=-1)
+                    vote_audit_rows.append(ar)
+                except Exception:
+                    pass
             else:
                 t_cand = r.get(tcol) if tcol else None
                 tw = as_int(t_cand, default=-1)
@@ -6953,6 +6989,13 @@ def evaluate(df_all: pd.DataFrame, tag: str):
         out = pd.DataFrame(rows)
         _assert_events_in_epoch_set(out, df_eval_raw, label=f"baseline_events_{name}_{tag}")
         out.to_csv(OUTDIR / f"baseline_events_{name}_{tag}.csv", index=False)
+
+        # Emit vote audit table (best-effort; never fail the sweep)
+        if name == "vote":
+            try:
+                pd.DataFrame(vote_audit_rows).to_csv(OUTDIR / f"baseline_vote_audit_{tag}.csv", index=False)
+            except Exception:
+                pass
         return out
 
     base_ewma = postprocess(tr_ewma, "ewma")
