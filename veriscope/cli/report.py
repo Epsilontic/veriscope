@@ -77,12 +77,14 @@ def render_report_md(outdir: Path, *, fmt: str = "md") -> str:
     """
     outdir = Path(outdir)
 
-    v = validate_outdir(outdir)
+    # Report is best-effort; allow partial artifact capsules by default.
+    v = validate_outdir(outdir, allow_partial=True)
     if not v.ok:
         raise ValueError(f"Cannot report: {v.message}")
 
     # Validation passed; re-load for reporting.
-    res = ResultsV1.model_validate_json((outdir / "results.json").read_text("utf-8"))
+    res_path = outdir / "results.json"
+    res = ResultsV1.model_validate_json(res_path.read_text("utf-8")) if res_path.exists() else None
     summ = ResultsSummaryV1.model_validate_json((outdir / "results_summary.json").read_text("utf-8"))
     manual_path = outdir / "manual_judgement.json"
     manual = ManualJudgementV1.model_validate_json(manual_path.read_text("utf-8")) if manual_path.exists() else None
@@ -102,7 +104,7 @@ def render_report_md(outdir: Path, *, fmt: str = "md") -> str:
 
     wrapper_exit = run_cfg.get("wrapper_exit_code") if isinstance(run_cfg, dict) else None
     runner_exit = getattr(summ, "runner_exit_code", None)
-    ws_hash = v.window_signature_hash or res.window_signature_ref.hash
+    ws_hash = v.window_signature_hash or (res.window_signature_ref.hash if res else summ.window_signature_ref.hash)
 
     c = summ.counts
     evaluated = _safe_int(getattr(c, "evaluated", None))
@@ -112,19 +114,23 @@ def render_report_md(outdir: Path, *, fmt: str = "md") -> str:
     passed = _extract_pass_count(c)
     total = max(0, evaluated + skip)
     final_status = f"MANUAL {manual.status.upper()}" if manual is not None else str(summ.final_decision).upper()
+    run_id = res.run_id if res is not None else summ.run_id
+    gate_preset = res.profile.gate_preset if res is not None else summ.profile.gate_preset
+    started_ts = res.started_ts_utc if res is not None else summ.started_ts_utc
+    ended_ts = res.ended_ts_utc if res is not None else summ.ended_ts_utc
 
     if fmt == "text":
         lines: List[str] = []
         lines.append(f"Veriscope Report: {outdir}")
         lines.append("")
-        lines.append(f"Run ID: {res.run_id}")
+        lines.append(f"Run ID: {run_id}")
         lines.append(f"Status: {str(summ.run_status).upper()}")
         lines.append(f"Final Status: {final_status}")
         lines.append(f"Wrapper Exit: {wrapper_exit if wrapper_exit is not None else '-'}")
         lines.append(f"Runner Exit: {runner_exit if runner_exit is not None else '-'}")
-        lines.append(f"Gate Preset: {res.profile.gate_preset}")
-        lines.append(f"Started: {_fmt_dt(res.started_ts_utc)}")
-        lines.append(f"Ended: {_fmt_dt(res.ended_ts_utc)}")
+        lines.append(f"Gate Preset: {gate_preset}")
+        lines.append(f"Started: {_fmt_dt(started_ts)}")
+        lines.append(f"Ended: {_fmt_dt(ended_ts)}")
         lines.append(f"Window Signature: {ws_hash}")
         lines.append("")
         if manual is not None:
@@ -162,14 +168,14 @@ def render_report_md(outdir: Path, *, fmt: str = "md") -> str:
     lines.append("")
     lines.append("| Field | Value |")
     lines.append("|---|---|")
-    lines.append(f"| Run ID | `{res.run_id}` |")
+    lines.append(f"| Run ID | `{run_id}` |")
     lines.append(f"| Status | **{str(summ.run_status).upper()}** |")
     lines.append(f"| Final Status | **{final_status}** |")
     lines.append(f"| Wrapper Exit | {wrapper_exit if wrapper_exit is not None else '-'} |")
     lines.append(f"| Runner Exit | {runner_exit if runner_exit is not None else '-'} |")
-    lines.append(f"| Gate Preset | `{res.profile.gate_preset}` |")
-    lines.append(f"| Started | {_fmt_dt(res.started_ts_utc)} |")
-    lines.append(f"| Ended | {_fmt_dt(res.ended_ts_utc)} |")
+    lines.append(f"| Gate Preset | `{gate_preset}` |")
+    lines.append(f"| Started | {_fmt_dt(started_ts)} |")
+    lines.append(f"| Ended | {_fmt_dt(ended_ts)} |")
     lines.append(f"| Window Signature | `{ws_hash}` |")
     lines.append("")
 

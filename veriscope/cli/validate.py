@@ -27,6 +27,7 @@ class ValidationResult:
     ok: bool
     message: str
     window_signature_hash: Optional[str] = None
+    partial: bool = False
 
 
 def _read_text_utf8(path: Path) -> str:
@@ -76,17 +77,23 @@ def _format_pydantic_error(e: Exception) -> str:
     return str(e)
 
 
-def validate_outdir(outdir: Path, *, strict_version: bool = False) -> ValidationResult:
+def validate_outdir(
+    outdir: Path,
+    *,
+    strict_version: bool = False,
+    allow_partial: bool = False,
+) -> ValidationResult:
     """
     Validate the canonical artifact set in OUTDIR.
 
     Requirements:
-      - window_signature.json, results.json, results_summary.json exist
-      - Pydantic schema validation succeeds for results + summary
+      - allow_partial=False: window_signature.json, results.json, results_summary.json exist
+      - allow_partial=True: window_signature.json, results_summary.json exist (results.json optional)
+      - Pydantic schema validation succeeds for results (if present) + summary
       - manual_judgement.json is optional but must validate if present
-      - window_signature_ref.hash matches hash(window_signature.json) in both results + summary
-      - window_signature_ref.path equals "window_signature.json" in both results + summary
-      - run_id matches across results + summary
+      - window_signature_ref.hash matches hash(window_signature.json) in results (if present) + summary
+      - window_signature_ref.path equals "window_signature.json" in results (if present) + summary
+      - run_id matches across results (if present) + summary
       - schema_version == 1 (v0 contract)
     """
     _ = strict_version  # forward-compat placeholder
@@ -98,14 +105,15 @@ def validate_outdir(outdir: Path, *, strict_version: bool = False) -> Validation
     manual_path = outdir / "manual_judgement.json"
 
     # 1) Existence check
-    missing = [p.name for p in (ws_path, res_path, summ_path) if not p.exists()]
+    required = (ws_path, summ_path) if allow_partial else (ws_path, res_path, summ_path)
+    missing = [p.name for p in required if not p.exists()]
     if missing:
         return ValidationResult(False, f"Missing required artifacts: {', '.join(missing)}")
 
     # 2) Read raw inputs (separate IO/parse errors from schema validation errors)
     try:
         ws_obj = _read_json_dict(ws_path)
-        res_text = _read_text_utf8(res_path)
+        res_text = _read_text_utf8(res_path) if res_path.exists() else None
         summ_text = _read_text_utf8(summ_path)
         manual_text = _read_text_utf8(manual_path) if manual_path.exists() else None
     except (OSError, ValueError, TypeError) as e:
@@ -115,7 +123,7 @@ def validate_outdir(outdir: Path, *, strict_version: bool = False) -> Validation
 
     # 3) Pydantic parse/validate
     try:
-        res = ResultsV1.model_validate_json(res_text)
+        res = ResultsV1.model_validate_json(res_text) if res_text is not None else None
         summ = ResultsSummaryV1.model_validate_json(summ_text)
         manual = ManualJudgementV1.model_validate_json(manual_text) if manual_text is not None else None
     except (PydanticValidationError, PydanticCoreValidationError) as e:
@@ -131,10 +139,10 @@ def validate_outdir(outdir: Path, *, strict_version: bool = False) -> Validation
 
     # 5) Cross-artifact invariants
     expected_ws_ref_path = "window_signature.json"
-    res_ref = res.window_signature_ref
+    res_ref = res.window_signature_ref if res is not None else None
     summ_ref = summ.window_signature_ref
 
-    if getattr(res_ref, "path", None) != expected_ws_ref_path:
+    if res_ref is not None and getattr(res_ref, "path", None) != expected_ws_ref_path:
         return ValidationResult(
             False,
             f"window_signature_ref.path mismatch in results.json: {getattr(res_ref, 'path', None)!r} != {expected_ws_ref_path!r}",
@@ -147,7 +155,7 @@ def validate_outdir(outdir: Path, *, strict_version: bool = False) -> Validation
             window_signature_hash=ws_hash,
         )
 
-    if res_ref.hash != ws_hash:
+    if res_ref is not None and res_ref.hash != ws_hash:
         return ValidationResult(
             False,
             f"window_signature_ref.hash mismatch in results.json: {res_ref.hash} != {ws_hash}",
@@ -160,36 +168,49 @@ def validate_outdir(outdir: Path, *, strict_version: bool = False) -> Validation
             window_signature_hash=ws_hash,
         )
 
-    if res.run_id != summ.run_id:
+    if res is not None and res.run_id != summ.run_id:
         return ValidationResult(
             False,
             f"run_id mismatch: results={res.run_id!r} summary={summ.run_id!r}",
             window_signature_hash=ws_hash,
         )
-    if manual is not None and manual.run_id != res.run_id:
+    if manual is not None and res is not None and manual.run_id != res.run_id:
         return ValidationResult(
             False,
             f"run_id mismatch: manual_judgement={manual.run_id!r} results={res.run_id!r}",
             window_signature_hash=ws_hash,
         )
+    if manual is not None and res is None and manual.run_id != summ.run_id:
+        return ValidationResult(
+            False,
+            f"run_id mismatch: manual_judgement={manual.run_id!r} summary={summ.run_id!r}",
+            window_signature_hash=ws_hash,
+        )
 
     # v0 compatibility: only schema_version=1 accepted
     try:
-        res_ver = int(res.schema_version)
+        res_ver = int(res.schema_version) if res is not None else 1
         summ_ver = int(summ.schema_version)
     except Exception:
         return ValidationResult(
             False,
-            f"Unsupported schema_version (not an int): results={res.schema_version!r} summary={summ.schema_version!r}",
+            "Unsupported schema_version (not an int): "
+            f"results={getattr(res, 'schema_version', None)!r} summary={summ.schema_version!r}",
             window_signature_hash=ws_hash,
         )
 
     if res_ver != 1 or summ_ver != 1:
         return ValidationResult(
             False,
-            f"Unsupported schema_version: results={res.schema_version} summary={summ.schema_version}",
+            f"Unsupported schema_version: results={getattr(res, 'schema_version', None)} summary={summ.schema_version}",
             window_signature_hash=ws_hash,
         )
 
     # Return the derived truth (the computed hash), not just the referenced one.
-    return ValidationResult(True, "OK", window_signature_hash=ws_hash)
+    summary_partial = bool(getattr(summ, "partial", False))
+    return ValidationResult(
+        True,
+        "OK",
+        window_signature_hash=ws_hash,
+        partial=(res is None or summary_partial),
+    )
