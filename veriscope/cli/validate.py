@@ -18,7 +18,7 @@ try:
 except Exception:  # pragma: no cover
     PydanticCoreValidationError = PydanticValidationError  # type: ignore
 
-from veriscope.core.artifacts import ResultsSummaryV1, ResultsV1
+from veriscope.core.artifacts import ManualJudgementV1, ResultsSummaryV1, ResultsV1
 from veriscope.core.jsonutil import canonical_json_sha256
 
 
@@ -83,6 +83,7 @@ def validate_outdir(outdir: Path, *, strict_version: bool = False) -> Validation
     Requirements:
       - window_signature.json, results.json, results_summary.json exist
       - Pydantic schema validation succeeds for results + summary
+      - manual_judgement.json is optional but must validate if present
       - window_signature_ref.hash matches hash(window_signature.json) in both results + summary
       - window_signature_ref.path equals "window_signature.json" in both results + summary
       - run_id matches across results + summary
@@ -94,6 +95,7 @@ def validate_outdir(outdir: Path, *, strict_version: bool = False) -> Validation
     ws_path = outdir / "window_signature.json"
     res_path = outdir / "results.json"
     summ_path = outdir / "results_summary.json"
+    manual_path = outdir / "manual_judgement.json"
 
     # 1) Existence check
     missing = [p.name for p in (ws_path, res_path, summ_path) if not p.exists()]
@@ -105,6 +107,7 @@ def validate_outdir(outdir: Path, *, strict_version: bool = False) -> Validation
         ws_obj = _read_json_dict(ws_path)
         res_text = _read_text_utf8(res_path)
         summ_text = _read_text_utf8(summ_path)
+        manual_text = _read_text_utf8(manual_path) if manual_path.exists() else None
     except (OSError, ValueError, TypeError) as e:
         return ValidationResult(False, str(e))
     except Exception as e:
@@ -114,6 +117,7 @@ def validate_outdir(outdir: Path, *, strict_version: bool = False) -> Validation
     try:
         res = ResultsV1.model_validate_json(res_text)
         summ = ResultsSummaryV1.model_validate_json(summ_text)
+        manual = ManualJudgementV1.model_validate_json(manual_text) if manual_text is not None else None
     except (PydanticValidationError, PydanticCoreValidationError) as e:
         return ValidationResult(False, f"Schema validation failed: {_format_pydantic_error(e)}")
     except Exception as e:
@@ -160,6 +164,12 @@ def validate_outdir(outdir: Path, *, strict_version: bool = False) -> Validation
         return ValidationResult(
             False,
             f"run_id mismatch: results={res.run_id!r} summary={summ.run_id!r}",
+            window_signature_hash=ws_hash,
+        )
+    if manual is not None and manual.run_id != res.run_id:
+        return ValidationResult(
+            False,
+            f"run_id mismatch: manual_judgement={manual.run_id!r} results={res.run_id!r}",
             window_signature_hash=ws_hash,
         )
 

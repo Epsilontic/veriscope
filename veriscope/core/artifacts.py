@@ -62,8 +62,8 @@ SchemaVersion = Literal[1]
 Decision = Literal["pass", "warn", "fail", "skip"]
 RunStatus = Literal["success", "user_code_failure", "veriscope_failure"]
 
-# Manual judgements are intentionally binary (distinct from Decision).
-JudgementStatus = Literal["pass", "fail"]
+# Manual judgements intentionally allow an explicit override state (distinct from Decision).
+JudgementStatus = Literal["pass", "fail", "override"]
 
 # JSON-compatible values (artifact hygiene for external-facing contracts).
 # Use Pydantic's named-recursive JsonValue to avoid schema-generation recursion.
