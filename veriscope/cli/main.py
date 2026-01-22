@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -12,6 +13,10 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+from veriscope.core.artifacts import CountsV1, ProfileV1, ResultsSummaryV1, RunStatus, WindowSignatureRefV1
+from veriscope.core.jsonutil import atomic_write_json, canonical_json_sha256
+from veriscope.core.lifecycle import RunLifecycle, map_status_and_exit
 
 
 def _now_utc_iso() -> str:
@@ -69,7 +74,120 @@ def _legacy_default_cifar_outdir() -> Path:
 def _write_resolved_config(outdir: Path, payload: Dict[str, Any]) -> None:
     outdir.mkdir(parents=True, exist_ok=True)
     p = outdir / "run_config_resolved.json"
-    p.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    atomic_write_json(p, payload)
+
+
+def _read_json_obj(path: Path) -> Dict[str, Any]:
+    obj = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(obj, dict):
+        raise TypeError(f"{path.name} must be a JSON object")
+    return obj
+
+
+def _write_run_config_merge(outdir: Path, update: Dict[str, Any]) -> None:
+    path = outdir / "run_config_resolved.json"
+    if path.exists():
+        try:
+            existing = _read_json_obj(path)
+        except Exception:
+            existing = {}
+    else:
+        existing = {}
+    merged = dict(existing)
+    merged.update(update)
+    _write_resolved_config(outdir, merged)
+
+
+def _truncate_message(message: str, *, limit: int = 400) -> str:
+    if len(message) <= limit:
+        return message
+    return message[: limit - 3] + "..."
+
+
+def _ensure_window_signature(outdir: Path, *, reason: str, run_kind: str) -> WindowSignatureRefV1:
+    ws_path = outdir / "window_signature.json"
+    placeholder = {
+        "schema_version": 1,
+        "placeholder": True,
+        "reason": reason,
+        "run_kind": run_kind,
+    }
+    if not ws_path.exists():
+        atomic_write_json(ws_path, placeholder)
+    try:
+        ws_obj = _read_json_obj(ws_path)
+    except Exception as exc:
+        placeholder_with_error = dict(placeholder)
+        err = _truncate_message(f"Invalid window_signature.json: {exc}")
+        placeholder_with_error["error"] = {"message": err}
+        atomic_write_json(ws_path, placeholder_with_error)
+        ws_obj = placeholder_with_error
+    ws_hash = canonical_json_sha256(ws_obj)
+    return WindowSignatureRefV1(hash=ws_hash, path="window_signature.json")
+
+
+def _extract_gate_preset(args: List[str]) -> str:
+    for idx, arg in enumerate(args):
+        if arg.startswith("--gate_preset="):
+            return arg.split("=", 1)[1] or "unknown"
+        if arg == "--gate_preset" and idx + 1 < len(args):
+            return args[idx + 1]
+    return "unknown"
+
+
+def _write_partial_summary(
+    *,
+    outdir: Path,
+    run_id: str,
+    ws_ref: WindowSignatureRefV1,
+    gate_preset: str,
+    started_ts_utc: datetime,
+    ended_ts_utc: datetime,
+    run_status: RunStatus,
+    runner_exit_code: Optional[int],
+    runner_signal: Optional[str],
+    note: str,
+) -> None:
+    profile = ProfileV1(gate_preset=gate_preset, overrides={})
+    counts = CountsV1(evaluated=0, skip=0, pass_=0, warn=0, fail=0)
+    summary = ResultsSummaryV1(
+        run_id=run_id,
+        window_signature_ref=ws_ref,
+        profile=profile,
+        run_status=run_status,
+        runner_exit_code=runner_exit_code,
+        runner_signal=runner_signal,
+        started_ts_utc=started_ts_utc,
+        ended_ts_utc=ended_ts_utc,
+        counts=counts,
+        final_decision="skip",
+    )
+    payload = summary.model_dump(mode="json", by_alias=True, exclude_none=True)
+    payload["partial"] = True
+    payload["note"] = note
+    atomic_write_json(outdir / "results_summary.json", payload)
+
+
+def _summary_wrapper_exit_code(outdir: Path) -> Optional[int]:
+    summary_path = outdir / "results_summary.json"
+    if not summary_path.exists():
+        return None
+    try:
+        summary = ResultsSummaryV1.model_validate_json(summary_path.read_text("utf-8"))
+    except Exception:
+        return None
+    if summary.runner_exit_code not in (None, 0):
+        return 2
+    if summary.final_decision == "fail":
+        return 1
+    return 0
+
+
+def _signal_child(proc: subprocess.Popen, signum: int) -> None:
+    if hasattr(os, "killpg"):
+        os.killpg(proc.pid, signum)
+    else:
+        proc.send_signal(signum)
 
 
 def _acquire_gpu_lock(force: bool) -> Optional[Any]:
@@ -142,6 +260,7 @@ def _cmd_run_cifar(args: argparse.Namespace) -> int:
         legacy_args = legacy_args[1:]
 
     run_id = uuid.uuid4().hex[:12]
+    lifecycle = RunLifecycle(run_id=run_id, run_kind="cifar")
     resolved = {
         "schema_version": 1,
         "ts_utc": _now_utc_iso(),
@@ -157,14 +276,91 @@ def _cmd_run_cifar(args: argparse.Namespace) -> int:
             "legacy_entrypoint": "veriscope-legacy (console script)",
         },
         "env": _relevant_env(env),
+        "wrapper_exit_code": None,
+        "runner_exit_code": None,
+        "runner_signal": None,
+        "run_status": "running",
+        "lifecycle_state": lifecycle.state,
+        "started_ts_utc": lifecycle.started_ts_utc.isoformat(),
+        "ended_ts_utc": None,
     }
     _write_resolved_config(outdir, resolved)
     print(f"[veriscope] outdir={outdir}")
     print(f"[veriscope] wrote {outdir / 'run_config_resolved.json'}")
 
+    ws_ref = _ensure_window_signature(outdir, reason="wrapper_start", run_kind="cifar")
     lock = _acquire_gpu_lock(force=bool(args.force))
     try:
-        return _run_legacy_subprocess(legacy_args, env=env)
+        try:
+            lifecycle.mark_running()
+            _write_run_config_merge(outdir, {"lifecycle_state": lifecycle.state})
+            legacy_exe = "veriscope-legacy"
+            if shutil.which(legacy_exe) is None:
+                raise SystemExit(
+                    "veriscope-legacy not found on PATH. "
+                    "Run `pip install -e .` (editable install) so the console script is generated."
+                )
+            cmd = [legacy_exe] + list(legacy_args)
+            proc = subprocess.Popen(cmd, env=env, start_new_session=True)
+
+            def _handle_signal(signum: int, _frame: Optional[Any]) -> None:
+                lifecycle.mark_interrupted(signum)
+                try:
+                    _signal_child(proc, signum)
+                except Exception:
+                    pass
+
+            prev_int = signal.signal(signal.SIGINT, _handle_signal)
+            prev_term = signal.signal(signal.SIGTERM, _handle_signal)
+            try:
+                proc.wait()
+            finally:
+                signal.signal(signal.SIGINT, prev_int)
+                signal.signal(signal.SIGTERM, prev_term)
+            lifecycle.mark_runner_exit(proc.returncode)
+
+            summary_exit = _summary_wrapper_exit_code(outdir)
+            run_status, wrapper_exit = map_status_and_exit(
+                runner_exit_code=proc.returncode,
+                runner_signal=lifecycle.runner_signal,
+                internal_error=False,
+            )
+            if summary_exit is not None and run_status == "success":
+                wrapper_exit = summary_exit
+        except Exception as exc:
+            lifecycle.mark_internal_failure(str(exc))
+            run_status, wrapper_exit = map_status_and_exit(
+                runner_exit_code=lifecycle.runner_exit_code,
+                runner_signal=lifecycle.runner_signal,
+                internal_error=True,
+            )
+
+        lifecycle.finalize(run_status=run_status, wrapper_exit_code=wrapper_exit)
+        _write_run_config_merge(
+            outdir,
+            {
+                "wrapper_exit_code": lifecycle.wrapper_exit_code,
+                "runner_exit_code": lifecycle.runner_exit_code,
+                "runner_signal": lifecycle.runner_signal,
+                "run_status": lifecycle.run_status,
+                "lifecycle_state": lifecycle.state,
+                "ended_ts_utc": lifecycle.ended_ts_utc.isoformat() if lifecycle.ended_ts_utc else None,
+            },
+        )
+        if not (outdir / "results_summary.json").exists():
+            _write_partial_summary(
+                outdir=outdir,
+                run_id=run_id,
+                ws_ref=ws_ref,
+                gate_preset="unknown",
+                started_ts_utc=lifecycle.started_ts_utc,
+                ended_ts_utc=lifecycle.ended_ts_utc or datetime.now(timezone.utc),
+                run_status=lifecycle.run_status,
+                runner_exit_code=lifecycle.runner_exit_code,
+                runner_signal=lifecycle.runner_signal,
+                note="results_summary.json missing; emitted wrapper-level partial summary",
+            )
+        return int(lifecycle.wrapper_exit_code or 0)
     finally:
         if lock is not None:
             try:
@@ -180,6 +376,7 @@ def _cmd_run_gpt(args: argparse.Namespace) -> int:
 
     env = os.environ.copy()
     run_id = uuid.uuid4().hex[:12]
+    lifecycle = RunLifecycle(run_id=run_id, run_kind="gpt")
 
     gpt_args = list(args.gpt_args or [])
     if gpt_args and gpt_args[0] == "--":
@@ -195,6 +392,7 @@ def _cmd_run_gpt(args: argparse.Namespace) -> int:
 
     cmd = [sys.executable, "-m", "veriscope.runners.gpt.train_nanogpt"] + gpt_args
 
+    gate_preset = _extract_gate_preset(gpt_args)
     resolved = {
         "schema_version": 1,
         "ts_utc": _now_utc_iso(),
@@ -208,16 +406,85 @@ def _cmd_run_gpt(args: argparse.Namespace) -> int:
             "runner_cmd": cmd,
         },
         "env": _relevant_env(env),
+        "wrapper_exit_code": None,
+        "runner_exit_code": None,
+        "runner_signal": None,
+        "run_status": "running",
+        "lifecycle_state": lifecycle.state,
+        "started_ts_utc": lifecycle.started_ts_utc.isoformat(),
+        "ended_ts_utc": None,
     }
     _write_resolved_config(outdir, resolved)
     print(f"[veriscope] outdir={outdir}")
     print(f"[veriscope] cmd={' '.join(cmd)}")
     print(f"[veriscope] wrote {outdir / 'run_config_resolved.json'}")
 
+    ws_ref = _ensure_window_signature(outdir, reason="wrapper_start", run_kind="gpt")
     lock = _acquire_gpu_lock(force=bool(args.force))
     try:
-        r = subprocess.run(cmd, env=env)
-        return int(r.returncode)
+        try:
+            lifecycle.mark_running()
+            _write_run_config_merge(outdir, {"lifecycle_state": lifecycle.state})
+            proc = subprocess.Popen(cmd, env=env, start_new_session=True)
+
+            def _handle_signal(signum: int, _frame: Optional[Any]) -> None:
+                lifecycle.mark_interrupted(signum)
+                try:
+                    _signal_child(proc, signum)
+                except Exception:
+                    pass
+
+            prev_int = signal.signal(signal.SIGINT, _handle_signal)
+            prev_term = signal.signal(signal.SIGTERM, _handle_signal)
+            try:
+                proc.wait()
+            finally:
+                signal.signal(signal.SIGINT, prev_int)
+                signal.signal(signal.SIGTERM, prev_term)
+            lifecycle.mark_runner_exit(proc.returncode)
+
+            summary_exit = _summary_wrapper_exit_code(outdir)
+            run_status, wrapper_exit = map_status_and_exit(
+                runner_exit_code=proc.returncode,
+                runner_signal=lifecycle.runner_signal,
+                internal_error=False,
+            )
+            if summary_exit is not None and run_status == "success":
+                wrapper_exit = summary_exit
+        except Exception as exc:
+            lifecycle.mark_internal_failure(str(exc))
+            run_status, wrapper_exit = map_status_and_exit(
+                runner_exit_code=lifecycle.runner_exit_code,
+                runner_signal=lifecycle.runner_signal,
+                internal_error=True,
+            )
+
+        lifecycle.finalize(run_status=run_status, wrapper_exit_code=wrapper_exit)
+        _write_run_config_merge(
+            outdir,
+            {
+                "wrapper_exit_code": lifecycle.wrapper_exit_code,
+                "runner_exit_code": lifecycle.runner_exit_code,
+                "runner_signal": lifecycle.runner_signal,
+                "run_status": lifecycle.run_status,
+                "lifecycle_state": lifecycle.state,
+                "ended_ts_utc": lifecycle.ended_ts_utc.isoformat() if lifecycle.ended_ts_utc else None,
+            },
+        )
+        if not (outdir / "results_summary.json").exists():
+            _write_partial_summary(
+                outdir=outdir,
+                run_id=run_id,
+                ws_ref=ws_ref,
+                gate_preset=gate_preset,
+                started_ts_utc=lifecycle.started_ts_utc,
+                ended_ts_utc=lifecycle.ended_ts_utc or datetime.now(timezone.utc),
+                run_status=lifecycle.run_status,
+                runner_exit_code=lifecycle.runner_exit_code,
+                runner_signal=lifecycle.runner_signal,
+                note="results_summary.json missing; emitted wrapper-level partial summary",
+            )
+        return int(lifecycle.wrapper_exit_code or 0)
     finally:
         if lock is not None:
             try:
@@ -295,7 +562,7 @@ def _cmd_inspect(args: argparse.Namespace) -> int:
     from veriscope.cli.report import render_report_md
     from veriscope.cli.validate import validate_outdir
 
-    v = validate_outdir(outdir)
+    v = validate_outdir(outdir, allow_partial=True)
     if not v.ok:
         _eprint(f"INVALID: {v.message}")
         _eprint("")

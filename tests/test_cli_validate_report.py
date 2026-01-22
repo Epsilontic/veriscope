@@ -266,3 +266,23 @@ def test_report_raises_on_invalid_dir_minimal(minimal_artifact_dir: Path) -> Non
     (minimal_artifact_dir / "results_summary.json").unlink()
     with pytest.raises(ValueError, match=r"Cannot report"):
         render_report_md(minimal_artifact_dir)
+
+
+def test_partial_summary_allows_report_without_results(minimal_artifact_dir: Path) -> None:
+    (minimal_artifact_dir / "results.json").unlink()
+    summ_path = minimal_artifact_dir / "results_summary.json"
+    summ_obj = _read_json_dict(summ_path)
+    summ_obj["partial"] = True
+    _write_json(summ_path, summ_obj)
+
+    v = validate_outdir(minimal_artifact_dir, allow_partial=True)
+    assert v.ok, v.message
+    assert v.partial is True
+
+    md = render_report_md(minimal_artifact_dir, fmt="md")
+    assert "# Veriscope Report" in md
+    assert "test_run_fixture" in md
+
+    txt = render_report_md(minimal_artifact_dir, fmt="text")
+    assert "Gate Preset: test" in txt
+    assert "Started:" in txt
