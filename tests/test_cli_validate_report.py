@@ -11,7 +11,7 @@ import pytest
 
 from veriscope.cli.report import render_report_md
 from veriscope.cli.validate import validate_outdir
-from veriscope.core.artifacts import ResultsSummaryV1, ResultsV1
+from veriscope.core.artifacts import ManualJudgementV1, ResultsSummaryV1, ResultsV1
 from veriscope.core.jsonutil import canonical_json_sha256
 
 pytestmark = pytest.mark.unit
@@ -100,6 +100,18 @@ def _make_minimal_artifacts(outdir: Path, *, run_id: str = "test_run_min") -> No
     # Sanity: fixtures must conform to schemas
     ResultsV1.model_validate_json((outdir / "results.json").read_text(encoding="utf-8"))
     ResultsSummaryV1.model_validate_json((outdir / "results_summary.json").read_text(encoding="utf-8"))
+
+
+def _write_manual_judgement(outdir: Path, *, status: str = "fail") -> None:
+    run_id = ResultsV1.model_validate_json((outdir / "results.json").read_text(encoding="utf-8")).run_id
+    judgement = ManualJudgementV1(
+        run_id=run_id,
+        status=status,
+        reason="Model collapsed despite automated PASS.",
+        reviewer="alice",
+        ts_utc=T1,
+    )
+    _write_json(outdir / "manual_judgement.json", judgement.model_dump(by_alias=True, mode="json"))
 
 
 @pytest.fixture
@@ -200,6 +212,54 @@ def test_report_smoke_and_integrity_minimal(minimal_artifact_dir: Path) -> None:
     assert "SKIP: 1" in txt
     assert "WARN: 1" in txt
     assert "FAIL: 1" in txt
+
+
+def test_report_manual_judgement_overlay(minimal_artifact_dir: Path) -> None:
+    _write_manual_judgement(minimal_artifact_dir, status="fail")
+
+    md = render_report_md(minimal_artifact_dir, fmt="md")
+    assert "## ⚠ Manual Judgement" in md
+    assert "Final Status" in md
+    assert "Model collapsed despite automated PASS." in md
+    assert "MANUAL FAIL" in md
+
+    txt = render_report_md(minimal_artifact_dir, fmt="text")
+    assert "MANUAL JUDGEMENT:" in txt
+    assert "Final Status: MANUAL FAIL" in txt
+
+
+def test_validate_rejects_invalid_manual_judgement(minimal_artifact_dir: Path) -> None:
+    _write_json(
+        minimal_artifact_dir / "manual_judgement.json",
+        {
+            "schema_version": 1,
+            "run_id": "test_run_fixture",
+            "status": "invalid",
+            "reason": "bad status",
+            "ts_utc": _iso_z(T1),
+        },
+    )
+
+    v = validate_outdir(minimal_artifact_dir)
+    assert not v.ok
+    assert "Schema validation failed" in v.message
+
+
+def test_validate_rejects_manual_judgement_run_id_mismatch(minimal_artifact_dir: Path) -> None:
+    _write_json(
+        minimal_artifact_dir / "manual_judgement.json",
+        {
+            "schema_version": 1,
+            "run_id": "wrong_run_id",
+            "status": "fail",
+            "reason": "mismatched run id",
+            "ts_utc": _iso_z(T1),
+        },
+    )
+
+    v = validate_outdir(minimal_artifact_dir)
+    assert not v.ok
+    assert "run_id mismatch" in v.message
 
 
 def test_report_raises_on_invalid_dir_minimal(minimal_artifact_dir: Path) -> None:

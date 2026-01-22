@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from veriscope.cli.validate import validate_outdir
-from veriscope.core.artifacts import ResultsSummaryV1, ResultsV1
+from veriscope.core.artifacts import ManualJudgementV1, ResultsSummaryV1, ResultsV1
 
 
 def _read_json_obj(path: Path) -> Any:
@@ -54,12 +54,19 @@ def _extract_pass_count(counts: Any) -> int:
     return max(0, evaluated - warn - fail)
 
 
+def _escape_md_cell(value: Any) -> str:
+    text = "" if value is None else str(value)
+    text = " ".join(text.splitlines())
+    return text.replace("|", r"\|")
+
+
 def _artifact_rows(outdir: Path) -> List[Tuple[str, bool]]:
     names = (
         "run_config_resolved.json",
         "window_signature.json",
         "results.json",
         "results_summary.json",
+        "manual_judgement.json",
     )
     return [(name, (outdir / name).exists()) for name in names]
 
@@ -77,6 +84,8 @@ def render_report_md(outdir: Path, *, fmt: str = "md") -> str:
     # Validation passed; re-load for reporting.
     res = ResultsV1.model_validate_json((outdir / "results.json").read_text("utf-8"))
     summ = ResultsSummaryV1.model_validate_json((outdir / "results_summary.json").read_text("utf-8"))
+    manual_path = outdir / "manual_judgement.json"
+    manual = ManualJudgementV1.model_validate_json(manual_path.read_text("utf-8")) if manual_path.exists() else None
 
     run_cfg_path = outdir / "run_config_resolved.json"
     run_cfg: Optional[Dict[str, Any]] = None
@@ -102,6 +111,7 @@ def render_report_md(outdir: Path, *, fmt: str = "md") -> str:
     fail = _safe_int(getattr(c, "fail", None))
     passed = _extract_pass_count(c)
     total = max(0, evaluated + skip)
+    final_status = f"MANUAL {manual.status.upper()}" if manual is not None else str(summ.final_decision).upper()
 
     if fmt == "text":
         lines: List[str] = []
@@ -109,6 +119,7 @@ def render_report_md(outdir: Path, *, fmt: str = "md") -> str:
         lines.append("")
         lines.append(f"Run ID: {res.run_id}")
         lines.append(f"Status: {str(summ.run_status).upper()}")
+        lines.append(f"Final Status: {final_status}")
         lines.append(f"Wrapper Exit: {wrapper_exit if wrapper_exit is not None else '-'}")
         lines.append(f"Runner Exit: {runner_exit if runner_exit is not None else '-'}")
         lines.append(f"Gate Preset: {res.profile.gate_preset}")
@@ -116,6 +127,13 @@ def render_report_md(outdir: Path, *, fmt: str = "md") -> str:
         lines.append(f"Ended: {_fmt_dt(res.ended_ts_utc)}")
         lines.append(f"Window Signature: {ws_hash}")
         lines.append("")
+        if manual is not None:
+            lines.append("MANUAL JUDGEMENT:")
+            lines.append(f"  Status: {manual.status.upper()}")
+            lines.append(f"  Reason: {manual.reason}")
+            lines.append(f"  Reviewer: {manual.reviewer or '-'}")
+            lines.append(f"  Timestamp: {_fmt_dt(manual.ts_utc)}")
+            lines.append("")
         lines.append("Gate Summary:")
         lines.append(f"  Total: {total}")
         lines.append(f"  Evaluated: {evaluated}")
@@ -146,6 +164,7 @@ def render_report_md(outdir: Path, *, fmt: str = "md") -> str:
     lines.append("|---|---|")
     lines.append(f"| Run ID | `{res.run_id}` |")
     lines.append(f"| Status | **{str(summ.run_status).upper()}** |")
+    lines.append(f"| Final Status | **{final_status}** |")
     lines.append(f"| Wrapper Exit | {wrapper_exit if wrapper_exit is not None else '-'} |")
     lines.append(f"| Runner Exit | {runner_exit if runner_exit is not None else '-'} |")
     lines.append(f"| Gate Preset | `{res.profile.gate_preset}` |")
@@ -153,6 +172,18 @@ def render_report_md(outdir: Path, *, fmt: str = "md") -> str:
     lines.append(f"| Ended | {_fmt_dt(res.ended_ts_utc)} |")
     lines.append(f"| Window Signature | `{ws_hash}` |")
     lines.append("")
+
+    if manual is not None:
+        lines.append("## ⚠ Manual Judgement")
+        lines.append("")
+        lines.append("| Field | Value |")
+        lines.append("|---|---|")
+        lines.append(f"| Status | **{manual.status.upper()}** |")
+        lines.append(f"| Reason | {_escape_md_cell(manual.reason)} |")
+        reviewer = _escape_md_cell(manual.reviewer)
+        lines.append(f"| Reviewer | {reviewer or '-'} |")
+        lines.append(f"| Timestamp | {_fmt_dt(manual.ts_utc)} |")
+        lines.append("")
 
     lines.append("## Gate Summary")
     lines.append("")

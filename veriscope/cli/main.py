@@ -260,6 +260,29 @@ def _cmd_report(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_override(args: argparse.Namespace) -> int:
+    from veriscope.cli.override import write_manual_judgement
+
+    outdir = Path(str(args.outdir)).expanduser()
+    try:
+        path = write_manual_judgement(
+            outdir,
+            status=str(args.status).strip(),
+            reason=str(args.reason),
+            reviewer=(str(args.reviewer).strip() if args.reviewer else None),
+            ts_utc=(str(args.ts_utc).strip() if args.ts_utc else None),
+            force=bool(args.force),
+        )
+    except (FileExistsError, FileNotFoundError) as exc:
+        _eprint(str(exc))
+        return 2
+    except ValueError as exc:
+        _eprint(str(exc))
+        return 2
+    print(f"[veriscope] wrote {path}")
+    return 0
+
+
 def _cmd_inspect(args: argparse.Namespace) -> int:
     """
     Inspect = validate + (optionally) render report.
@@ -282,6 +305,7 @@ def _cmd_inspect(args: argparse.Namespace) -> int:
         _eprint("  - results_summary.json")
         _eprint("Optional:")
         _eprint("  - run_config_resolved.json")
+        _eprint("  - manual_judgement.json")
         return 2
 
     no_report = bool(getattr(args, "no_report", False))
@@ -353,6 +377,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="Only validate; do not render a report.",
     )
     p_inspect.set_defaults(_handler=_cmd_inspect)
+
+    p_override = sub.add_parser("override", help="Write a manual judgement artifact to an OUTDIR")
+    p_override.add_argument("outdir", type=str, help="Artifact directory (OUTDIR)")
+    p_override.add_argument("--status", choices=["pass", "fail", "override"], required=True, help="Manual status")
+    p_override.add_argument("--reason", required=True, help="Human-readable reason for the judgement")
+    p_override.add_argument("--reviewer", default=None, help="Reviewer name/handle")
+    p_override.add_argument("--ts-utc", default=None, help="ISO-8601 timestamp (default: now UTC)")
+    p_override.add_argument("--force", action="store_true", help="Allow overwriting manual_judgement.json")
+    p_override.set_defaults(_handler=_cmd_override)
 
     # IMPORTANT: let argparse manage help exit codes
     ns = parser.parse_args(argv)
