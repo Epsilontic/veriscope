@@ -226,61 +226,81 @@ def _cmd_run_gpt(args: argparse.Namespace) -> int:
                 pass
 
 
+def _eprint(msg: str) -> None:
+    print(msg, file=sys.stderr)
+
+
 def _cmd_validate(args: argparse.Namespace) -> int:
-    """
-    Validate canonical artifacts in an OUTDIR.
-    Must never crash; return nonzero with a clean error message.
-    """
     outdir = Path(str(args.outdir)).expanduser()
+    from veriscope.cli.validate import validate_outdir
+
+    v = validate_outdir(outdir)
+    if v.ok:
+        if v.window_signature_hash:
+            print(f"OK window_signature_hash={v.window_signature_hash}")
+        else:
+            print("OK")
+        return 0
+
+    _eprint(f"INVALID: {v.message}")
+    return 2
+
+
+def _cmd_report(args: argparse.Namespace) -> int:
+    outdir = Path(str(args.outdir)).expanduser()
+    from veriscope.cli.report import render_report_md
+
+    fmt = str(getattr(args, "format", "text")).strip().lower()
     try:
-        # Lazy import keeps CLI wrapper light.
-        from veriscope.cli.validate import validate_outdir
-
-        v = validate_outdir(outdir, strict_version=bool(getattr(args, "strict_version", False)))
-        if v.ok:
-            hs = v.window_signature_hash or ""
-            if hs:
-                print(f"OK  window_signature_hash={hs}")
-            else:
-                print("OK")
-            return 0
-
-        print(f"INVALID  {v.message}", file=sys.stderr)
-        return 2
-    except SystemExit:
-        raise
+        text = render_report_md(outdir, fmt=fmt)
     except Exception as e:
-        print(f"ERROR  validate failed: {e}", file=sys.stderr)
+        _eprint(str(e))
         return 2
+    print(text)
+    return 0
 
 
 def _cmd_inspect(args: argparse.Namespace) -> int:
     """
-    Render a human-facing report for an OUTDIR.
-    Must never splat a traceback for expected failures.
+    Inspect = validate + (optionally) render report.
+
+    Exit codes:
+      0 = valid
+      2 = invalid artifacts / cannot render
     """
     outdir = Path(str(args.outdir)).expanduser()
-    fmt = str(getattr(args, "format", "md") or "md").strip().lower()
-    if fmt not in ("md", "text"):
-        print(f"ERROR  unsupported format: {fmt!r} (expected 'md' or 'text')", file=sys.stderr)
+    from veriscope.cli.report import render_report_md
+    from veriscope.cli.validate import validate_outdir
+
+    v = validate_outdir(outdir)
+    if not v.ok:
+        _eprint(f"INVALID: {v.message}")
+        _eprint("")
+        _eprint("Expected canonical artifacts under OUTDIR:")
+        _eprint("  - window_signature.json")
+        _eprint("  - results.json")
+        _eprint("  - results_summary.json")
+        _eprint("Optional:")
+        _eprint("  - run_config_resolved.json")
         return 2
 
-    try:
-        # Lazy import keeps CLI wrapper light.
-        from veriscope.cli.report import render_report_md
-
-        txt = render_report_md(outdir, fmt=fmt)
-        print(txt)
+    no_report = bool(getattr(args, "no_report", False))
+    if no_report:
+        if v.window_signature_hash:
+            print(f"OK window_signature_hash={v.window_signature_hash}")
+        else:
+            print("OK")
         return 0
-    except ValueError as e:
-        # Expected: invalid artifacts, missing files, etc.
-        print(f"ERROR  {e}", file=sys.stderr)
-        return 2
-    except SystemExit:
-        raise
+
+    fmt = str(getattr(args, "format", "text")).strip().lower()
+    try:
+        text = render_report_md(outdir, fmt=fmt)
     except Exception as e:
-        print(f"ERROR  inspect failed: {e}", file=sys.stderr)
+        _eprint(f"OK (validation passed), but report failed: {e}")
         return 2
+
+    print(text)
+    return 0
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -315,27 +335,24 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_cifar.add_argument("legacy_args", nargs=argparse.REMAINDER, help="Args forwarded to legacy runner")
     p_cifar.set_defaults(_handler=_cmd_run_cifar)
 
-    # New: validate
-    p_val = sub.add_parser("validate", help="Validate canonical artifacts in an output directory")
-    p_val.add_argument("outdir", type=str, help="Output directory containing window_signature/results artifacts")
-    p_val.add_argument(
-        "--strict-version",
-        action="store_true",
-        help="Reserved for future schema version enforcement (currently a no-op).",
-    )
-    p_val.set_defaults(_handler=_cmd_validate)
+    p_validate = sub.add_parser("validate", help="Validate canonical artifacts in an OUTDIR")
+    p_validate.add_argument("outdir", type=str, help="Artifact directory (OUTDIR)")
+    p_validate.set_defaults(_handler=_cmd_validate)
 
-    # New: inspect (report)
-    p_ins = sub.add_parser("inspect", help="Render a report for an output directory")
-    p_ins.add_argument("outdir", type=str, help="Output directory containing window_signature/results artifacts")
-    p_ins.add_argument(
-        "--format",
-        dest="format",
-        choices=["md", "text"],
-        default="md",
-        help="Report output format (default: md).",
+    p_report = sub.add_parser("report", help="Render a human report from an OUTDIR")
+    p_report.add_argument("outdir", type=str, help="Artifact directory (OUTDIR)")
+    p_report.add_argument("--format", choices=["md", "text"], default="text", help="Output format")
+    p_report.set_defaults(_handler=_cmd_report)
+
+    p_inspect = sub.add_parser("inspect", help="Validate and summarize an OUTDIR (validate + report)")
+    p_inspect.add_argument("outdir", type=str, help="Artifact directory (OUTDIR)")
+    p_inspect.add_argument("--format", choices=["md", "text"], default="text", help="Output format")
+    p_inspect.add_argument(
+        "--no-report",
+        action="store_true",
+        help="Only validate; do not render a report.",
     )
-    p_ins.set_defaults(_handler=_cmd_inspect)
+    p_inspect.set_defaults(_handler=_cmd_inspect)
 
     # IMPORTANT: let argparse manage help exit codes
     ns = parser.parse_args(argv)
