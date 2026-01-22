@@ -6926,7 +6926,24 @@ def evaluate(df_all: pd.DataFrame, tag: str):
             return None
         c = as_int(consec, default=1)
         c = 1 if c < 1 else c
-        return int(t0) + (c - 1)
+        tw = int(t0) + (c - 1)
+
+        # Horizon guard: if persistence pushes beyond the run's epoch support,
+        # treat as "no warning" (cannot be observed in this run).
+        # Prefer a row-specific max if available, else fall back to CFG epochs.
+        try:
+            row_max = as_int(r.get("epoch_max"), default=-1)
+        except Exception:
+            row_max = -1
+        if row_max < 0:
+            try:
+                row_max = as_int(CFG.get("epochs", 0), default=0) - 1
+            except Exception:
+                row_max = -1
+
+        if row_max >= 0 and tw > int(row_max):
+            return None
+        return tw
 
     def postprocess(tr_df, name):
         tcol = _first_t_column(tr_df)
@@ -6953,6 +6970,7 @@ def evaluate(df_all: pd.DataFrame, tag: str):
                     for m in VOTE_METRICS:
                         ar[f"t_{m}"] = as_int(r.get(f"t_{m}"), default=-1)
                     vote_audit_rows.append(ar)
+                    # Keep per-run audit aligned with derived quorum/persistence times.
                 except Exception:
                     pass
             else:
