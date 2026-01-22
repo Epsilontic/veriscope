@@ -6987,7 +6987,7 @@ def evaluate(df_all: pd.DataFrame, tag: str):
         seed, factor = cast(tuple[Any, Any], key)
         gg = g.sort_values("epoch").reset_index(drop=True)
         # Unified PH preprocessing for pers_H0
-        xs_full = _prep_series_for_ph(gg, "pers_H0")
+        xs_full = _prep_series_for_ph(gg, "pers_H0", ffill_scheduled=False)
         # Indices eligible for sequential tests: valid finite values at/after warm_idx
         idxs = [
             i
