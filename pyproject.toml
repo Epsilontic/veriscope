@@ -21,7 +21,17 @@ dependencies = [
   "torchvision>=0.16",
   "typing_extensions>=4.0",
 ]
-classifiers = ["License :: Other/Proprietary License"]
+classifiers = [
+  "License :: OSI Approved :: GNU Affero General Public License v3",
+]
+
+[project.urls]
+Source = "https://github.com/Epsilontic/veriscope"
+Documentation = "https://github.com/Epsilontic/veriscope#readme"
+License = "https://github.com/Epsilontic/veriscope/blob/main/LICENSE"
+Commercial-License = "https://github.com/Epsilontic/veriscope/blob/main/COMMERCIAL_LICENSE.md"
+Notice = "https://github.com/Epsilontic/veriscope/blob/main/NOTICE"
+Trademark = "https://github.com/Epsilontic/veriscope/blob/main/TRADEMARK.md"
 
 [project.optional-dependencies]
 topo = ["ripser>=0.6.4"]
