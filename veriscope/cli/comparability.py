@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
-from veriscope.cli.governance import ManualJudgementEffective, resolve_manual_judgement
+from veriscope.cli.governance import ManualJudgementEffective, resolve_manual_overlay
 from veriscope.cli.validate import ValidationResult
 from veriscope.core.artifacts import ResultsSummaryV1, ResultsV1
 
@@ -79,13 +79,14 @@ def load_run_metadata(outdir: Path, validation: ValidationResult, *, prefer_json
     res = ResultsV1.model_validate_json(res_path.read_text("utf-8")) if res_path.exists() else None
     summ = ResultsSummaryV1.model_validate_json((outdir / "results_summary.json").read_text("utf-8"))
     run_cfg = _read_json_obj(outdir / "run_config_resolved.json")
-    manual = resolve_manual_judgement(outdir, prefer_jsonl=prefer_jsonl)
+
     gate_preset = res.profile.gate_preset if res is not None else summ.profile.gate_preset
     schema_version = int(summ.schema_version)
     run_id = res.run_id if res is not None else summ.run_id
-    if manual.judgement is not None and manual.judgement.run_id != run_id:
-        warning = f"WARNING:MANUAL_JUDGEMENT_RUN_ID_MISMATCH expected={run_id} got={manual.judgement.run_id}"
-        manual = ManualJudgementEffective(judgement=None, source=manual.source, warnings=(*manual.warnings, warning))
+
+    # Contract-aware overlay resolution: prefer last matching jsonl entry; fall back to snapshot; else none.
+    manual = resolve_manual_overlay(outdir, run_id=run_id, prefer_jsonl=prefer_jsonl)
+
     return RunMetadata(
         outdir=outdir,
         validation=validation,

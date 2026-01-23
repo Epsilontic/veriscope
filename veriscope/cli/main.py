@@ -595,6 +595,7 @@ def _cmd_inspect(args: argparse.Namespace) -> int:
         _eprint("  - run_config_resolved.json")
         _eprint("  - manual_judgement.json")
         _eprint("  - manual_judgement.jsonl")
+        _eprint("  - governance_log.jsonl")
         return 2
 
     no_report = bool(getattr(args, "no_report", False))
