@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from veriscope.cli.governance import append_manual_judgement_log
+from veriscope.cli.governance import append_governance_log, append_manual_judgement_log
 from veriscope.core.artifacts import ManualJudgementV1, ResultsV1
 from veriscope.core.jsonutil import atomic_write_pydantic_json
 
@@ -62,4 +62,20 @@ def write_manual_judgement(
     )
     atomic_write_pydantic_json(path, judgement, by_alias=True, exclude_none=True)
     _, warnings = append_manual_judgement_log(outdir, judgement)
+    ts_iso = judgement.ts_utc.isoformat().replace("+00:00", "Z")
+    gov_payload = {
+        "status": judgement.status,
+        "reason": judgement.reason,
+        "reviewer": judgement.reviewer,
+        "run_id": judgement.run_id,
+        "source_path": path.name,
+    }
+    _, gov_warnings = append_governance_log(
+        outdir,
+        event_type="manual_judgement_set",
+        payload=gov_payload,
+        ts_utc=ts_iso,
+        actor=judgement.reviewer,
+    )
+    warnings = (*warnings, *gov_warnings)
     return path, warnings

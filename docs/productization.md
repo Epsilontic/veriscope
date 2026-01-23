@@ -192,14 +192,14 @@ veriscope validate
 
 Code	Meaning
 0	valid
-4	validation failed (schema or cross-artifact mismatch)
+2	validation failed (schema or cross-artifact mismatch)
 3	veriscope internal error
 
 veriscope report
 
 Code	Meaning
 0	report generated
-4	cannot report due to invalid/missing artifacts
+2	cannot report due to invalid/missing artifacts
 3	veriscope internal error
 
 
@@ -527,4 +527,3 @@ Appendix A: Sample Markdown report output (golden reference)
 
 ## Manual Judgement
 - None
-

@@ -7,8 +7,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from veriscope.cli.comparability import comparable, load_run_metadata
+from veriscope.cli.governance import resolve_effective_status
 from veriscope.cli.validate import validate_outdir
-from veriscope.core.artifacts import ManualJudgementV1, ResultsSummaryV1, ResultsV1
+from veriscope.core.artifacts import ResultsSummaryV1, ResultsV1
 
 
 def _read_json_obj(path: Path) -> Any:
@@ -70,6 +71,7 @@ def _artifact_rows(outdir: Path) -> List[Tuple[str, bool]]:
         "results_summary.json",
         "manual_judgement.json",
         "manual_judgement.jsonl",
+        "governance_log.jsonl",
     )
     return [(name, (outdir / name).exists()) for name in names]
 
@@ -89,8 +91,13 @@ def render_report_md(outdir: Path, *, fmt: str = "md") -> str:
     res_path = outdir / "results.json"
     res = ResultsV1.model_validate_json(res_path.read_text("utf-8")) if res_path.exists() else None
     summ = ResultsSummaryV1.model_validate_json((outdir / "results_summary.json").read_text("utf-8"))
-    manual_path = outdir / "manual_judgement.json"
-    manual = ManualJudgementV1.model_validate_json(manual_path.read_text("utf-8")) if manual_path.exists() else None
+    run_id = res.run_id if res is not None else summ.run_id
+    manual_status = resolve_effective_status(
+        outdir,
+        run_id=run_id,
+        automated_decision=str(summ.final_decision),
+        prefer_jsonl=True,
+    )
 
     run_cfg_path = outdir / "run_config_resolved.json"
     run_cfg: Optional[Dict[str, Any]] = None
@@ -116,8 +123,11 @@ def render_report_md(outdir: Path, *, fmt: str = "md") -> str:
     fail = _safe_int(getattr(c, "fail", None))
     passed = _extract_pass_count(c)
     total = max(0, evaluated + skip)
-    final_status = f"MANUAL {manual.status.upper()}" if manual is not None else str(summ.final_decision).upper()
-    run_id = res.run_id if res is not None else summ.run_id
+    final_status = (
+        f"MANUAL {manual_status.status.upper()}"
+        if manual_status.source == "manual"
+        else str(summ.final_decision).upper()
+    )
     gate_preset = res.profile.gate_preset if res is not None else summ.profile.gate_preset
     started_ts = res.started_ts_utc if res is not None else summ.started_ts_utc
     ended_ts = res.ended_ts_utc if res is not None else summ.ended_ts_utc
@@ -136,12 +146,12 @@ def render_report_md(outdir: Path, *, fmt: str = "md") -> str:
         lines.append(f"Ended: {_fmt_dt(ended_ts)}")
         lines.append(f"Window Signature: {ws_hash}")
         lines.append("")
-        if manual is not None:
+        if manual_status.manual is not None:
             lines.append("MANUAL JUDGEMENT:")
-            lines.append(f"  Status: {manual.status.upper()}")
-            lines.append(f"  Reason: {manual.reason}")
-            lines.append(f"  Reviewer: {manual.reviewer or '-'}")
-            lines.append(f"  Timestamp: {_fmt_dt(manual.ts_utc)}")
+            lines.append(f"  Status: {manual_status.manual.status.upper()}")
+            lines.append(f"  Reason: {manual_status.manual.reason}")
+            lines.append(f"  Reviewer: {manual_status.manual.reviewer or '-'}")
+            lines.append(f"  Timestamp: {_fmt_dt(manual_status.manual.ts_utc)}")
             lines.append("")
         lines.append("Gate Summary:")
         lines.append(f"  Total: {total}")
@@ -182,16 +192,16 @@ def render_report_md(outdir: Path, *, fmt: str = "md") -> str:
     lines.append(f"| Window Signature | `{ws_hash}` |")
     lines.append("")
 
-    if manual is not None:
+    if manual_status.manual is not None:
         lines.append("## ⚠ Manual Judgement")
         lines.append("")
         lines.append("| Field | Value |")
         lines.append("|---|---|")
-        lines.append(f"| Status | **{manual.status.upper()}** |")
-        lines.append(f"| Reason | {_escape_md_cell(manual.reason)} |")
-        reviewer = _escape_md_cell(manual.reviewer)
+        lines.append(f"| Status | **{manual_status.manual.status.upper()}** |")
+        lines.append(f"| Reason | {_escape_md_cell(manual_status.manual.reason)} |")
+        reviewer = _escape_md_cell(manual_status.manual.reviewer)
         lines.append(f"| Reviewer | {reviewer or '-'} |")
-        lines.append(f"| Timestamp | {_fmt_dt(manual.ts_utc)} |")
+        lines.append(f"| Timestamp | {_fmt_dt(manual_status.manual.ts_utc)} |")
         lines.append("")
 
     lines.append("## Gate Summary")
