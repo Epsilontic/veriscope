@@ -298,7 +298,6 @@ def emit_gpt_artifacts_v1(
     window_sig: Dict[str, Any] = {
         "schema_version": 1,
         "code_identity": code_identity,
-        "gate_preset": gate_preset,
         "gate_controls": dict(resolved_gate_cfg),
     }
     if metric_interval is not None:

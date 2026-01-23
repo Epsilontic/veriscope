@@ -91,6 +91,7 @@ def validate_outdir(
       - allow_partial=True: window_signature.json, results_summary.json exist (results.json optional)
       - Pydantic schema validation succeeds for results (if present) + summary
       - manual_judgement.json is optional but must validate if present
+      - manual_judgement.jsonl is ignored by validation (governance log)
       - window_signature_ref.hash matches hash(window_signature.json) in results (if present) + summary
       - window_signature_ref.path equals "window_signature.json" in results (if present) + summary
       - run_id matches across results (if present) + summary
