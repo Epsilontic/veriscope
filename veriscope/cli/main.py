@@ -514,12 +514,31 @@ def _cmd_validate(args: argparse.Namespace) -> int:
 
 
 def _cmd_report(args: argparse.Namespace) -> int:
-    outdir = Path(str(args.outdir)).expanduser()
-    from veriscope.cli.report import render_report_md
+    from veriscope.cli.report import render_report_compare, render_report_md
 
     fmt = str(getattr(args, "format", "text")).strip().lower()
+    compare = bool(getattr(args, "compare", False))
+    outdirs = [Path(str(p)).expanduser() for p in getattr(args, "outdirs", [])]
+
+    if compare:
+        result = render_report_compare(
+            outdirs,
+            fmt=fmt,
+            allow_incompatible=bool(getattr(args, "allow_incompatible", False)),
+            allow_gate_preset_mismatch=bool(getattr(args, "allow_gate_preset_mismatch", False)),
+        )
+        if result.stdout:
+            print(result.stdout)
+        if result.stderr:
+            _eprint(result.stderr)
+        return int(result.exit_code)
+
+    if len(outdirs) != 1:
+        _eprint("report requires exactly one OUTDIR (or use --compare for multiple)")
+        return 2
+
     try:
-        text = render_report_md(outdir, fmt=fmt)
+        text = render_report_md(outdirs[0], fmt=fmt)
     except Exception as e:
         _eprint(str(e))
         return 2
@@ -532,7 +551,7 @@ def _cmd_override(args: argparse.Namespace) -> int:
 
     outdir = Path(str(args.outdir)).expanduser()
     try:
-        path = write_manual_judgement(
+        path, warnings = write_manual_judgement(
             outdir,
             status=str(args.status).strip(),
             reason=str(args.reason),
@@ -546,6 +565,8 @@ def _cmd_override(args: argparse.Namespace) -> int:
     except ValueError as exc:
         _eprint(str(exc))
         return 2
+    for warning in warnings:
+        _eprint(warning)
     print(f"[veriscope] wrote {path}")
     return 0
 
@@ -573,6 +594,7 @@ def _cmd_inspect(args: argparse.Namespace) -> int:
         _eprint("Optional:")
         _eprint("  - run_config_resolved.json")
         _eprint("  - manual_judgement.json")
+        _eprint("  - manual_judgement.jsonl")
         return 2
 
     no_report = bool(getattr(args, "no_report", False))
@@ -592,6 +614,23 @@ def _cmd_inspect(args: argparse.Namespace) -> int:
 
     print(text)
     return 0
+
+
+def _cmd_diff(args: argparse.Namespace) -> int:
+    from veriscope.cli.diff import diff_outdirs
+
+    outdir_a = Path(str(args.outdir_a)).expanduser()
+    outdir_b = Path(str(args.outdir_b)).expanduser()
+    result = diff_outdirs(
+        outdir_a,
+        outdir_b,
+        allow_gate_preset_mismatch=bool(getattr(args, "allow_gate_preset_mismatch", False)),
+    )
+    if result.stdout:
+        print(result.stdout)
+    if result.stderr:
+        _eprint(result.stderr)
+    return int(result.exit_code)
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -631,8 +670,23 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_validate.set_defaults(_handler=_cmd_validate)
 
     p_report = sub.add_parser("report", help="Render a human report from an OUTDIR")
-    p_report.add_argument("outdir", type=str, help="Artifact directory (OUTDIR)")
+    p_report.add_argument("outdirs", nargs="+", type=str, help="Artifact directory (OUTDIR)")
     p_report.add_argument("--format", choices=["md", "text"], default="text", help="Output format")
+    p_report.add_argument(
+        "--compare",
+        action="store_true",
+        help="Compare multiple OUTDIRs and emit a compact table",
+    )
+    p_report.add_argument(
+        "--allow-incompatible",
+        action="store_true",
+        help="Include incompatible runs in the compare table (marks them as comparable=no)",
+    )
+    p_report.add_argument(
+        "--allow-gate-preset-mismatch",
+        action="store_true",
+        help="Allow comparisons across different gate_preset values",
+    )
     p_report.set_defaults(_handler=_cmd_report)
 
     p_inspect = sub.add_parser("inspect", help="Validate and summarize an OUTDIR (validate + report)")
@@ -645,9 +699,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     p_inspect.set_defaults(_handler=_cmd_inspect)
 
+    p_diff = sub.add_parser("diff", help="Compare two OUTDIRs with contract-aware checks")
+    p_diff.add_argument("outdir_a", type=str, help="First OUTDIR")
+    p_diff.add_argument("outdir_b", type=str, help="Second OUTDIR")
+    p_diff.add_argument(
+        "--allow-gate-preset-mismatch",
+        action="store_true",
+        help="Allow comparisons across different gate_preset values",
+    )
+    p_diff.set_defaults(_handler=_cmd_diff)
+
     p_override = sub.add_parser("override", help="Write a manual judgement artifact to an OUTDIR")
     p_override.add_argument("outdir", type=str, help="Artifact directory (OUTDIR)")
-    p_override.add_argument("--status", choices=["pass", "fail", "override"], required=True, help="Manual status")
+    p_override.add_argument("--status", choices=["pass", "fail"], required=True, help="Manual status")
     p_override.add_argument("--reason", required=True, help="Human-readable reason for the judgement")
     p_override.add_argument("--reviewer", default=None, help="Reviewer name/handle")
     p_override.add_argument("--ts-utc", default=None, help="ISO-8601 timestamp (default: now UTC)")

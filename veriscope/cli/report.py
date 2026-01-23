@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from veriscope.cli.comparability import comparable, load_run_metadata
 from veriscope.cli.validate import validate_outdir
 from veriscope.core.artifacts import ManualJudgementV1, ResultsSummaryV1, ResultsV1
 
@@ -67,6 +69,7 @@ def _artifact_rows(outdir: Path) -> List[Tuple[str, bool]]:
         "results.json",
         "results_summary.json",
         "manual_judgement.json",
+        "manual_judgement.jsonl",
     )
     return [(name, (outdir / name).exists()) for name in names]
 
@@ -215,3 +218,108 @@ def render_report_md(outdir: Path, *, fmt: str = "md") -> str:
         lines.append("")
 
     return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class ReportCompareOutput:
+    exit_code: int
+    stdout: str
+    stderr: str
+
+
+def _short_hash(value: str, *, width: int = 12) -> str:
+    return value[:width] if value else "-"
+
+
+def _fmt_cell(value: Any) -> str:
+    return "-" if value is None else str(value)
+
+
+def render_report_compare(
+    outdirs: List[Path],
+    *,
+    fmt: str = "text",
+    allow_incompatible: bool = False,
+    allow_gate_preset_mismatch: bool = False,
+) -> ReportCompareOutput:
+    if not outdirs:
+        return ReportCompareOutput(exit_code=2, stdout="", stderr="INVALID: no OUTDIRs provided")
+
+    validations = []
+    for outdir in outdirs:
+        v = validate_outdir(Path(outdir), allow_partial=True)
+        if not v.ok:
+            return ReportCompareOutput(exit_code=2, stdout="", stderr=f"INVALID: {v.message}")
+        validations.append(v)
+
+    runs = [load_run_metadata(Path(outdir), v, prefer_jsonl=True) for outdir, v in zip(outdirs, validations)]
+    warnings = [f"run={run.run_id}:{w}" for run in runs for w in run.manual.warnings]
+
+    reference = runs[0]
+    incompatible: List[tuple[int, str]] = []
+    for idx, run in enumerate(runs[1:], start=1):
+        ok, reason = comparable(reference, run, allow_gate_preset_mismatch=allow_gate_preset_mismatch)
+        if not ok:
+            incompatible.append((idx, reason or "INCOMPARABLE"))
+
+    if incompatible and not allow_incompatible:
+        reason = incompatible[0][1]
+        stderr = "\n".join([*warnings, f"INCOMPARABLE: {reason}"]) if warnings else f"INCOMPARABLE: {reason}"
+        return ReportCompareOutput(exit_code=2, stdout="", stderr=stderr)
+
+    header = [
+        "run_id",
+        "run_status",
+        "wrapper_exit_code",
+        "runner_exit_code",
+        "final_decision",
+        "manual_effective_status",
+        "window_signature_hash",
+        "partial",
+    ]
+    if allow_incompatible:
+        header.extend(["comparable", "reason"])
+
+    rows: List[List[str]] = []
+    for idx, run in enumerate(runs):
+        manual_status = run.manual_status or "-"
+        row = [
+            run.run_id,
+            run.run_status,
+            _fmt_cell(run.wrapper_exit_code),
+            _fmt_cell(run.runner_exit_code),
+            run.final_decision,
+            manual_status,
+            _short_hash(run.window_signature_hash),
+            str(run.partial).lower(),
+        ]
+        if allow_incompatible:
+            reason = "-"
+            comparable_flag = "yes"
+            if idx != 0:
+                match = next((r for r in incompatible if r[0] == idx), None)
+                if match:
+                    comparable_flag = "no"
+                    reason = match[1]
+            row.extend([comparable_flag, reason])
+        rows.append(row)
+
+    lines: List[str] = []
+    if fmt == "md":
+        lines.append("| " + " | ".join(header) + " |")
+        lines.append("| " + " | ".join(["---"] * len(header)) + " |")
+        for row in rows:
+            lines.append("| " + " | ".join(row) + " |")
+    else:
+        lines.append("| " + " | ".join(header) + " |")
+        lines.append("| " + " | ".join(["---"] * len(header)) + " |")
+        for row in rows:
+            lines.append("| " + " | ".join(row) + " |")
+
+    group_ok = not incompatible
+    reason = "OK" if group_ok else incompatible[0][1]
+    lines.append("")
+    lines.append(f"Comparable group: {'yes' if group_ok else 'no'}, reason={reason}")
+
+    stderr = "\n".join(warnings)
+    return ReportCompareOutput(exit_code=0, stdout="\n".join(lines), stderr=stderr)

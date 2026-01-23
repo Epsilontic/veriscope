@@ -44,7 +44,6 @@ def _minimal_window_signature() -> dict[str, Any]:
     return {
         "schema_version": 1,
         "code_identity": {"package_version": "test"},
-        "gate_preset": "test",
         "gate_controls": {"gate_window": 16, "gate_epsilon": 0.08, "min_evidence": 16},
         "metric_interval": 16,
         "metric_pipeline": {"transport": "test"},
@@ -156,6 +155,18 @@ def test_validate_happy_path_minimal(minimal_artifact_dir: Path) -> None:
     v = validate_outdir(minimal_artifact_dir)
     assert v.ok, v.message
     assert v.window_signature_hash is not None
+
+
+def test_counts_v1_canonical_json_key_is_pass() -> None:
+    """Lock the public JSON contract: CountsV1 uses `pass` as the canonical JSON key."""
+    from veriscope.core.artifacts import CountsV1
+
+    c = CountsV1.model_validate({"evaluated": 1, "skip": 0, "pass": 1, "warn": 0, "fail": 0})
+    dumped = c.model_dump(by_alias=True, mode="json")
+
+    assert "pass" in dumped
+    assert "pass_" not in dumped
+    assert dumped["pass"] == 1
 
 
 def test_validate_detects_tampering_minimal(minimal_artifact_dir: Path) -> None:

@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from veriscope.cli.governance import append_manual_judgement_log
 from veriscope.core.artifacts import ManualJudgementV1, ResultsV1
 from veriscope.core.jsonutil import atomic_write_pydantic_json
 
@@ -39,7 +40,7 @@ def write_manual_judgement(
     reviewer: Optional[str] = None,
     ts_utc: Optional[str] = None,
     force: bool = False,
-) -> Path:
+) -> tuple[Path, tuple[str, ...]]:
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
 
@@ -60,4 +61,5 @@ def write_manual_judgement(
         ts_utc=_parse_ts_utc(ts_utc),
     )
     atomic_write_pydantic_json(path, judgement, by_alias=True, exclude_none=True)
-    return path
+    _, warnings = append_manual_judgement_log(outdir, judgement)
+    return path, warnings
