@@ -9,7 +9,9 @@ from typing import Any, Callable
 
 import pytest
 
+from veriscope.cli.governance import GOVERNANCE_LOG_SCHEMA_VERSION, append_governance_log
 from veriscope.cli.report import render_report_md
+from veriscope.core.jsonutil import canonical_dumps
 from veriscope.cli.validate import validate_outdir
 from veriscope.core.artifacts import ManualJudgementV1, ResultsSummaryV1, ResultsV1
 from veriscope.core.jsonutil import canonical_json_sha256
@@ -111,6 +113,40 @@ def _write_manual_judgement(outdir: Path, *, status: str = "fail") -> None:
         ts_utc=T1,
     )
     _write_json(outdir / "manual_judgement.json", judgement.model_dump(by_alias=True, mode="json"))
+
+
+def _write_valid_governance_log(outdir: Path) -> None:
+    append_governance_log(
+        outdir,
+        event_type="artifact_note",
+        payload={"run_id": "test_run_fixture", "note": "initial governance entry"},
+        ts_utc=_iso_z(T0),
+        actor="tester",
+    )
+
+
+def _write_legacy_governance_log(outdir: Path) -> None:
+    entry = {
+        "schema_version": GOVERNANCE_LOG_SCHEMA_VERSION,
+        "rev": 1,
+        "ts_utc": _iso_z(T0),
+        "actor": "tester",
+        "event_type": "artifact_note",
+        "payload": {"run_id": "test_run_fixture", "note": "legacy entry"},
+        "prev_hash": None,
+    }
+    (outdir / "governance_log.jsonl").write_text(canonical_dumps(entry) + "\n", encoding="utf-8")
+
+
+def _tamper_governance_log(outdir: Path) -> None:
+    path = outdir / "governance_log.jsonl"
+    lines = path.read_text(encoding="utf-8").splitlines()
+    if not lines:
+        return
+    obj = json.loads(lines[0])
+    obj["payload"]["note"] = "tampered"
+    lines[0] = json.dumps(obj, sort_keys=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 @pytest.fixture
@@ -218,6 +254,35 @@ def test_report_smoke_and_integrity_minimal(minimal_artifact_dir: Path) -> None:
     # Prefer stable text output for numeric assertions
     txt = render_report_md(minimal_artifact_dir, fmt="text")
     assert f"Total: {derived_total}" in txt
+
+
+def test_report_governance_absent(minimal_artifact_dir: Path) -> None:
+    txt = render_report_md(minimal_artifact_dir, fmt="text")
+    assert "GOVERNANCE:" in txt
+    assert "Log: NO" in txt
+
+
+def test_report_governance_valid(minimal_artifact_dir: Path) -> None:
+    _write_valid_governance_log(minimal_artifact_dir)
+    txt = render_report_md(minimal_artifact_dir, fmt="text")
+    assert "Log: YES" in txt
+    assert "Valid: YES" in txt
+    assert "Last Rev: 1" in txt
+
+
+def test_report_governance_invalid_tampered(minimal_artifact_dir: Path) -> None:
+    _write_valid_governance_log(minimal_artifact_dir)
+    _tamper_governance_log(minimal_artifact_dir)
+    txt = render_report_md(minimal_artifact_dir, fmt="text")
+    assert "⚠ Governance log invalid" in txt
+    assert "GOVERNANCE_LOG_HASH_MISMATCH" in txt
+
+
+def test_report_governance_legacy_missing_entry_hash(minimal_artifact_dir: Path) -> None:
+    _write_legacy_governance_log(minimal_artifact_dir)
+    txt = render_report_md(minimal_artifact_dir, fmt="text")
+    assert "Legacy (missing entry_hash): YES" in txt
+    assert "Valid: YES" in txt
     assert "Evaluated: 3" in txt
     assert "PASS: 1" in txt
     assert "SKIP: 1" in txt
