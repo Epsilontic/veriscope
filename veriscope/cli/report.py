@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from veriscope.cli.comparability import comparable, load_run_metadata
-from veriscope.cli.governance import resolve_effective_status
+from veriscope.cli.governance import get_governance_status, resolve_effective_status
 from veriscope.cli.validate import validate_outdir
 from veriscope.core.artifacts import ResultsSummaryV1, ResultsV1
 
@@ -98,6 +98,7 @@ def render_report_md(outdir: Path, *, fmt: str = "md") -> str:
         automated_decision=str(summ.final_decision),
         prefer_jsonl=True,
     )
+    gov_status = get_governance_status(outdir, allow_legacy_governance=True)
 
     run_cfg_path = outdir / "run_config_resolved.json"
     run_cfg: Optional[Dict[str, Any]] = None
@@ -153,6 +154,20 @@ def render_report_md(outdir: Path, *, fmt: str = "md") -> str:
             lines.append(f"  Reviewer: {manual_status.manual.reviewer or '-'}")
             lines.append(f"  Timestamp: {_fmt_dt(manual_status.manual.ts_utc)}")
             lines.append("")
+        lines.append("GOVERNANCE:")
+        lines.append(f"  Log: {'YES' if gov_status.present else 'NO'}")
+        if gov_status.present:
+            lines.append(f"  Valid: {'YES' if gov_status.ok else 'NO'}")
+            lines.append(f"  Last Rev: {gov_status.rev if gov_status.rev is not None else '-'}")
+            lines.append(f"  Last Hash: {_short_hash(gov_status.entry_hash or '')}")
+            lines.append(f"  Legacy (missing entry_hash): {'YES' if gov_status.legacy_missing_entry_hash else 'NO'}")
+            if not gov_status.ok and gov_status.errors:
+                lines.append("  ⚠ Governance log invalid:")
+                for err in gov_status.errors:
+                    lines.append(f"    {err}")
+            if gov_status.warnings:
+                lines.append(f"  Warnings: {len(gov_status.warnings)}")
+        lines.append("")
         lines.append("Gate Summary:")
         lines.append(f"  Total: {total}")
         lines.append(f"  Evaluated: {evaluated}")
@@ -202,6 +217,30 @@ def render_report_md(outdir: Path, *, fmt: str = "md") -> str:
         reviewer = _escape_md_cell(manual_status.manual.reviewer)
         lines.append(f"| Reviewer | {reviewer or '-'} |")
         lines.append(f"| Timestamp | {_fmt_dt(manual_status.manual.ts_utc)} |")
+        lines.append("")
+
+    lines.append("## Governance")
+    lines.append("")
+    if gov_status.present and not gov_status.ok and gov_status.errors:
+        banner = _escape_md_cell(gov_status.errors[0])
+        lines.append(f"> ⚠ **Governance log invalid:** `{banner}`")
+        lines.append("")
+    lines.append("| Field | Value |")
+    lines.append("|---|---|")
+    lines.append(f"| Log | {'YES' if gov_status.present else 'NO'} |")
+    if gov_status.present:
+        lines.append(f"| Valid | {'YES' if gov_status.ok else 'NO'} |")
+        lines.append(f"| Last Rev | {gov_status.rev if gov_status.rev is not None else '-'} |")
+        lines.append(f"| Last Hash | `{_short_hash(gov_status.entry_hash or '')}` |")
+        lines.append(f"| Legacy (missing entry_hash) | {'YES' if gov_status.legacy_missing_entry_hash else 'NO'} |")
+        if gov_status.warnings:
+            lines.append(f"| Warnings | {len(gov_status.warnings)} |")
+    lines.append("")
+    if gov_status.present and not gov_status.ok and gov_status.errors:
+        lines.append("**Errors:**")
+        lines.append("")
+        for err in gov_status.errors:
+            lines.append(f"- `{_escape_md_cell(err)}`")
         lines.append("")
 
     lines.append("## Gate Summary")

@@ -64,6 +64,17 @@ class GovernanceLogValidation:
 
 
 @dataclass(frozen=True)
+class GovernanceStatus:
+    present: bool
+    ok: bool
+    rev: Optional[int]
+    entry_hash: Optional[str]
+    errors: tuple[str, ...]
+    warnings: tuple[str, ...]
+    legacy_missing_entry_hash: bool
+
+
+@dataclass(frozen=True)
 class DisplayStatus:
     status: str
     source: str
@@ -454,6 +465,34 @@ def validate_governance_log(path: Path, *, allow_legacy_governance: bool = False
             errors.append(warning)
     ok = not errors
     return GovernanceLogValidation(ok=ok, warnings=result.warnings, errors=tuple(errors))
+
+
+def get_governance_status(outdir: Path, *, allow_legacy_governance: bool) -> GovernanceStatus:
+    outdir = Path(outdir)
+    gov_path = outdir / "governance_log.jsonl"
+    if not gov_path.exists():
+        return GovernanceStatus(
+            present=False,
+            ok=True,
+            rev=None,
+            entry_hash=None,
+            errors=tuple(),
+            warnings=tuple(),
+            legacy_missing_entry_hash=False,
+        )
+
+    result = read_governance_log(gov_path)
+    validation = validate_governance_log(gov_path, allow_legacy_governance=allow_legacy_governance)
+    legacy_missing_entry_hash = any("GOVERNANCE_LOG_ENTRY_HASH_MISSING" in w for w in result.warnings)
+    return GovernanceStatus(
+        present=True,
+        ok=validation.ok,
+        rev=result.rev,
+        entry_hash=result.entry_hash,
+        errors=validation.errors,
+        warnings=result.warnings,
+        legacy_missing_entry_hash=legacy_missing_entry_hash,
+    )
 
 
 def append_governance_log(
