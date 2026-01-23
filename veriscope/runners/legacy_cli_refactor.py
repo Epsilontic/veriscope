@@ -1553,6 +1553,8 @@ CFG.update(
         detector_cv_folds=5,  # grouped CV over seeds
         warn_vote=2,  # quorum k for vote baseline
         warn_consec=3,  # consecutive-epoch hits required for a warn (env SCAR_WARN_CONSEC overrides)
+        # Vote baseline may need a different persistence than other channels (defaults to warn_consec).
+        warn_consec_vote=3,
         det_use_missing=False,  # do NOT feed missingness indicators to learner
         # baselines over train loss (reported; not used by learner)
         ewma_alpha=0.2,
@@ -1583,6 +1585,7 @@ try:
     for _env_name, _cfg_key, _cast in (
         ("SCAR_WARMUP", "warmup", int),
         ("SCAR_PH_BURN", "ph_burn", int),
+        ("SCAR_WARN_CONSEC_VOTE", "warn_consec_vote", int),
         ("SCAR_GATE_WINDOW", "gate_window", int),
         ("SCAR_FACTOR_START_EPOCH", "factor_start_epoch", int),
         # GT env overrides (so SMOKE_ENV_BYPASS can act as a true override, not just a bypass)
@@ -1894,6 +1897,7 @@ CFG_SMOKE = dict(
     factor_start_epoch=12,  # was 8
     # reduce persistence requirements in short runs
     warn_consec=2,
+    warn_consec_vote=1,
     # NEWMA: conservative settings for smoke to avoid spurious FPs from tiny calibration pool
     newma_min_agreement=2,
     newma_calib_q=0.99,
@@ -1915,6 +1919,7 @@ SMOKE_ENV_BYPASS: Dict[str, str] = {
     "gate_epsilon": "SCAR_GATE_EPSILON",
     "gate_epsilon_floor": "SCAR_GATE_EPSILON_FLOOR",
     "warn_consec": "SCAR_WARN_CONSEC",
+    "warn_consec_vote": "SCAR_WARN_CONSEC_VOTE",
     "warn_vote": "SCAR_WARN_VOTE",
     "family_window": "SCAR_FAMILY_WINDOW",
     "gate_gain_q": "SCAR_GATE_GAIN_Q",
@@ -1957,6 +1962,7 @@ SMOKE_CRITICAL_KEYS: List[str] = [
     "gate_eps_stat_max_frac",
     "gate_early_exit",
     "warn_consec",
+    "warn_consec_vote",
     "family_window",
     "gate_gain_q",
     "gate_gain_thresh",
@@ -1987,6 +1993,7 @@ def _log_smoke_final_cfg(cfg: Dict[str, Any], stage: str = "") -> None:
             f"warmup={cfg.get('warmup')} ph_burn={cfg.get('ph_burn')} "
             f"warm_idx={warm_idx_from_cfg(cfg)} epochs={cfg.get('epochs')} "
             f"warn_consec={cfg.get('warn_consec')} "
+            f"warn_consec_vote={cfg.get('warn_consec_vote')} "
             f"gate_early_exit={cfg.get('gate_early_exit')}"
         )
         print(msg, flush=True)
@@ -6952,9 +6959,10 @@ def evaluate(df_all: pd.DataFrame, tag: str):
         for _, r in tr_df.iterrows():
             if name == "vote":
                 k_vote = as_int(CFG.get("warn_vote", 2), default=2)
-                c_consec = as_int(CFG.get("warn_consec", 1), default=1)
+                # Vote may have its own persistence knob; default to global warn_consec if unset.
+                c_consec_vote = as_int(CFG.get("warn_consec_vote", CFG.get("warn_consec", 1)), default=1)
                 t_quorum = quorum_time(r, VOTE_METRICS, k_vote)
-                t_warn = quorum_time_with_persistence(r, VOTE_METRICS, k_vote, c_consec)
+                t_warn = quorum_time_with_persistence(r, VOTE_METRICS, k_vote, c_consec_vote)
 
                 # Per-run audit: record each metric's first-hit time and the derived times.
                 try:
@@ -6963,7 +6971,9 @@ def evaluate(df_all: pd.DataFrame, tag: str):
                         "seed": as_int(r.get("seed"), default=0),
                         "factor": str(r.get("factor", "")),
                         "warn_vote": int(k_vote),
-                        "warn_consec": int(c_consec),
+                        # Record both: global and vote-specific, plus the effective used value.
+                        "warn_consec": as_int(CFG.get("warn_consec", 1), default=1),
+                        "warn_consec_vote": int(c_consec_vote),
                         "t_quorum_raw": t_quorum,
                         "t_warn_persisted": t_warn,
                     }
@@ -6997,6 +7007,8 @@ def evaluate(df_all: pd.DataFrame, tag: str):
                     ph_lambda=r["ph_lambda"],
                     ph_two_sided=r["ph_two_sided"],
                     warn_vote=CFG["warn_vote"],
+                    warn_consec=as_int(CFG.get("warn_consec", 1), default=1),
+                    warn_consec_vote=as_int(CFG.get("warn_consec_vote", CFG.get("warn_consec", 1)), default=1),
                     heavy_every=CFG["heavy_every"],
                     metric_batches=CFG["metric_batches"],
                     var_k_energy=CFG["var_k_energy"],
@@ -7763,6 +7775,14 @@ def main():
             print(f"[env] warn_consec={CFG['warn_consec']}")
         except Exception as e:
             print(f"[WARN] bad SCAR_WARN_CONSEC={v_wc!r}: {e}")
+
+    v_wcv = os.environ.get("SCAR_WARN_CONSEC_VOTE")
+    if v_wcv is not None:
+        try:
+            CFG["warn_consec_vote"] = int(v_wcv)
+            print(f"[env] warn_consec_vote={CFG['warn_consec_vote']}")
+        except Exception as e:
+            print(f"[WARN] bad SCAR_WARN_CONSEC_VOTE={v_wcv!r}: {e}")
 
     v_fw = os.environ.get("SCAR_FAMILY_WINDOW")
     if v_fw is not None:
