@@ -499,18 +499,42 @@ def _eprint(msg: str) -> None:
 
 def _cmd_validate(args: argparse.Namespace) -> int:
     outdir = Path(str(args.outdir)).expanduser()
+    from veriscope.cli.governance import validate_governance_log
     from veriscope.cli.validate import validate_outdir
 
     v = validate_outdir(outdir)
-    if v.ok:
-        if v.window_signature_hash:
-            print(f"OK window_signature_hash={v.window_signature_hash}")
-        else:
-            print("OK")
-        return 0
+    if not v.ok:
+        _eprint(f"INVALID: {v.message}")
+        return 2
 
-    _eprint(f"INVALID: {v.message}")
-    return 2
+    strict_governance = bool(getattr(args, "strict_governance", False))
+    allow_legacy = bool(getattr(args, "allow_legacy_governance", False))
+    require_governance = bool(getattr(args, "require_governance", False))
+
+    gov_path = outdir / "governance_log.jsonl"
+    if not gov_path.exists():
+        if require_governance:
+            _eprint("INVALID: governance_log.jsonl is required but missing")
+            return 2
+    else:
+        validation = validate_governance_log(gov_path, allow_legacy_governance=allow_legacy)
+        for warning in validation.warnings:
+            _eprint(warning)
+        if strict_governance and not validation.ok:
+            _eprint("INVALID: governance_log.jsonl failed validation:")
+            for err in validation.errors:
+                _eprint(f"  {err}")
+            return 2
+    if strict_governance and not gov_path.exists() and not require_governance:
+        _eprint(
+            "WARNING:GOVERNANCE_LOG_MISSING governance_log.jsonl not present (strict_governance set, but not required)"
+        )
+
+    if v.window_signature_hash:
+        print(f"OK window_signature_hash={v.window_signature_hash}")
+    else:
+        print("OK")
+    return 0
 
 
 def _cmd_report(args: argparse.Namespace) -> int:
@@ -668,6 +692,21 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     p_validate = sub.add_parser("validate", help="Validate canonical artifacts in an OUTDIR")
     p_validate.add_argument("outdir", type=str, help="Artifact directory (OUTDIR)")
+    p_validate.add_argument(
+        "--strict-governance",
+        action="store_true",
+        help="Fail validation if governance_log.jsonl is invalid",
+    )
+    p_validate.add_argument(
+        "--allow-legacy-governance",
+        action="store_true",
+        help="Allow governance_log.jsonl entries missing entry_hash (warn only)",
+    )
+    p_validate.add_argument(
+        "--require-governance",
+        action="store_true",
+        help="Fail validation if governance_log.jsonl is missing",
+    )
     p_validate.set_defaults(_handler=_cmd_validate)
 
     p_report = sub.add_parser("report", help="Render a human report from an OUTDIR")

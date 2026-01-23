@@ -440,7 +440,7 @@ def read_governance_log(path: Path) -> GovernanceLogResult:
     return GovernanceLogResult(entry=last_entry, rev=last_entry.rev, entry_hash=last_hash, warnings=tuple(warnings))
 
 
-def validate_governance_log(path: Path) -> GovernanceLogValidation:
+def validate_governance_log(path: Path, *, allow_legacy_governance: bool = False) -> GovernanceLogValidation:
     result = read_governance_log(path)
     errors: List[str] = []
     for warning in result.warnings:
@@ -448,7 +448,7 @@ def validate_governance_log(path: Path) -> GovernanceLogValidation:
             errors.append(warning)
         if "GOVERNANCE_LOG_INVALID" in warning:
             errors.append(warning)
-        if "GOVERNANCE_LOG_ENTRY_HASH_MISSING" in warning:
+        if "GOVERNANCE_LOG_ENTRY_HASH_MISSING" in warning and not allow_legacy_governance:
             errors.append(warning)
         if "GOVERNANCE_LOG_REV_NONMONOTONE" in warning:
             errors.append(warning)
@@ -475,6 +475,7 @@ def append_governance_log(
     last_hash = None
     warnings: List[str] = []
     if log_path.exists():
+        # Legacy governance logs (missing entry_hash) are invalid for appends.
         validation = validate_governance_log(log_path)
         if not validation.ok:
             raise RuntimeError(f"Cannot append to invalid governance_log.jsonl: {validation.errors}")
