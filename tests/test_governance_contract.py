@@ -170,6 +170,39 @@ def test_governance_log_prev_hash_mismatch_is_invalid(tmp_path: Path) -> None:
     assert any("GOVERNANCE_LOG_PREV_HASH_MISMATCH" in w for w in validation.errors)
 
 
+def test_governance_log_allows_legacy_entry_hash(tmp_path: Path) -> None:
+    outdir = tmp_path / "out"
+    outdir.mkdir()
+    log_path = outdir / "governance_log.jsonl"
+    log_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "rev": 1,
+                        "ts_utc": "2026-01-01T00:00:00Z",
+                        "actor": None,
+                        "event_type": "artifact_note",
+                        "payload": {"run_id": "run", "note": "legacy"},
+                        "prev_hash": None,
+                    }
+                )
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    strict_validation = validate_governance_log(log_path)
+    assert not strict_validation.ok
+    assert any("GOVERNANCE_LOG_ENTRY_HASH_MISSING" in w for w in strict_validation.errors)
+
+    legacy_validation = validate_governance_log(log_path, allow_legacy_governance=True)
+    assert legacy_validation.ok
+    assert any("GOVERNANCE_LOG_ENTRY_HASH_MISSING" in w for w in legacy_validation.warnings)
+
+
 def test_precedence_resolver_prefers_jsonl_and_fallbacks(tmp_path: Path) -> None:
     outdir = tmp_path / "run"
     outdir.mkdir(parents=True, exist_ok=True)
