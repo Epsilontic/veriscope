@@ -541,6 +541,8 @@ def _cmd_report(args: argparse.Namespace) -> int:
     from veriscope.cli.report import render_report_compare, render_report_md
 
     fmt = str(getattr(args, "format", "text")).strip().lower()
+    if bool(getattr(args, "json", False)):
+        fmt = "json"
     compare = bool(getattr(args, "compare", False))
     outdirs = [Path(str(p)).expanduser() for p in getattr(args, "outdirs", [])]
 
@@ -559,6 +561,9 @@ def _cmd_report(args: argparse.Namespace) -> int:
 
     if len(outdirs) != 1:
         _eprint("report requires exactly one OUTDIR (or use --compare for multiple)")
+        return 2
+    if fmt not in ("md", "text"):
+        _eprint("report format must be 'md' or 'text' (use --compare for json output)")
         return 2
 
     try:
@@ -605,6 +610,7 @@ def _cmd_inspect(args: argparse.Namespace) -> int:
     """
     outdir = Path(str(args.outdir)).expanduser()
     from veriscope.cli.report import render_report_md
+    from veriscope.cli.governance import validate_governance_log
     from veriscope.cli.validate import validate_outdir
 
     v = validate_outdir(outdir, allow_partial=True)
@@ -621,6 +627,29 @@ def _cmd_inspect(args: argparse.Namespace) -> int:
         _eprint("  - manual_judgement.jsonl")
         _eprint("  - governance_log.jsonl")
         return 2
+
+    strict_governance = bool(getattr(args, "strict_governance", False))
+    allow_legacy = bool(getattr(args, "allow_legacy_governance", False))
+    require_governance = bool(getattr(args, "require_governance", False))
+
+    gov_path = outdir / "governance_log.jsonl"
+    if not gov_path.exists():
+        if require_governance:
+            _eprint("INVALID: governance_log.jsonl is required but missing")
+            return 2
+    else:
+        validation = validate_governance_log(gov_path, allow_legacy_governance=allow_legacy)
+        for warning in validation.warnings:
+            _eprint(warning)
+        if strict_governance and not validation.ok:
+            _eprint("INVALID: governance_log.jsonl failed validation:")
+            for err in validation.errors:
+                _eprint(f"  {err}")
+            return 2
+    if strict_governance and not gov_path.exists() and not require_governance:
+        _eprint(
+            "WARNING:GOVERNANCE_LOG_MISSING governance_log.jsonl not present (strict_governance set, but not required)"
+        )
 
     no_report = bool(getattr(args, "no_report", False))
     if no_report:
@@ -646,10 +675,12 @@ def _cmd_diff(args: argparse.Namespace) -> int:
 
     outdir_a = Path(str(args.outdir_a)).expanduser()
     outdir_b = Path(str(args.outdir_b)).expanduser()
+    fmt = "json" if bool(getattr(args, "json", False)) else str(getattr(args, "format", "text"))
     result = diff_outdirs(
         outdir_a,
         outdir_b,
         allow_gate_preset_mismatch=bool(getattr(args, "allow_gate_preset_mismatch", False)),
+        fmt=fmt,
     )
     if result.stdout:
         print(result.stdout)
@@ -711,7 +742,13 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     p_report = sub.add_parser("report", help="Render a human report from an OUTDIR")
     p_report.add_argument("outdirs", nargs="+", type=str, help="Artifact directory (OUTDIR)")
-    p_report.add_argument("--format", choices=["md", "text"], default="text", help="Output format")
+    p_report.add_argument(
+        "--format",
+        choices=["md", "text", "json"],
+        default="text",
+        help="Output format (json compare-only)",
+    )
+    p_report.add_argument("--json", action="store_true", help="Shorthand for --format json (compare only)")
     p_report.add_argument(
         "--compare",
         action="store_true",
@@ -737,11 +774,28 @@ def main(argv: Optional[List[str]] = None) -> int:
         action="store_true",
         help="Only validate; do not render a report.",
     )
+    p_inspect.add_argument(
+        "--strict-governance",
+        action="store_true",
+        help="Fail validation if governance_log.jsonl is invalid",
+    )
+    p_inspect.add_argument(
+        "--allow-legacy-governance",
+        action="store_true",
+        help="Allow governance_log.jsonl entries missing entry_hash (warn only)",
+    )
+    p_inspect.add_argument(
+        "--require-governance",
+        action="store_true",
+        help="Fail validation if governance_log.jsonl is missing",
+    )
     p_inspect.set_defaults(_handler=_cmd_inspect)
 
     p_diff = sub.add_parser("diff", help="Compare two OUTDIRs with contract-aware checks")
     p_diff.add_argument("outdir_a", type=str, help="First OUTDIR")
     p_diff.add_argument("outdir_b", type=str, help="Second OUTDIR")
+    p_diff.add_argument("--format", choices=["text", "json"], default="text", help="Output format")
+    p_diff.add_argument("--json", action="store_true", help="Shorthand for --format json")
     p_diff.add_argument(
         "--allow-gate-preset-mismatch",
         action="store_true",

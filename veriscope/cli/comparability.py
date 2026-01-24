@@ -6,9 +6,33 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
-from veriscope.cli.governance import ManualJudgementEffective, resolve_manual_overlay
+from veriscope.cli.governance import (
+    GovernanceStatus,
+    ManualJudgementEffective,
+    get_governance_status,
+    resolve_display_status,
+    resolve_manual_overlay,
+)
 from veriscope.cli.validate import ValidationResult
 from veriscope.core.artifacts import ResultsSummaryV1, ResultsV1
+
+
+@dataclass(frozen=True)
+class ComparableResult:
+    ok: bool
+    reason: Optional[str]
+    details: Dict[str, Dict[str, Any]]
+    warnings: Tuple[str, ...]
+    policy: Optional[Dict[str, Any]]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "ok": self.ok,
+            "reason": self.reason,
+            "details": self.details,
+            "warnings": list(self.warnings),
+            "policy": self.policy,
+        }
 
 
 @dataclass(frozen=True)
@@ -21,6 +45,7 @@ class RunMetadata:
     manual: ManualJudgementEffective
     schema_version: int
     gate_preset: str
+    governance: GovernanceStatus
 
     @property
     def run_id(self) -> str:
@@ -60,6 +85,14 @@ class RunMetadata:
     def manual_status(self) -> Optional[str]:
         return self.manual.judgement.status if self.manual.judgement is not None else None
 
+    @property
+    def display_status(self) -> str:
+        return resolve_display_status(str(self.summary.final_decision), self.manual).status
+
+    @property
+    def decision_source(self) -> str:
+        return resolve_display_status(str(self.summary.final_decision), self.manual).source
+
 
 def _read_json_obj(path: Path) -> Optional[Dict[str, Any]]:
     if not path.exists():
@@ -86,6 +119,7 @@ def load_run_metadata(outdir: Path, validation: ValidationResult, *, prefer_json
 
     # Contract-aware overlay resolution: prefer last matching jsonl entry; fall back to snapshot; else none.
     manual = resolve_manual_overlay(outdir, run_id=run_id, prefer_jsonl=prefer_jsonl)
+    governance = get_governance_status(outdir, allow_legacy_governance=True)
 
     return RunMetadata(
         outdir=outdir,
@@ -96,7 +130,71 @@ def load_run_metadata(outdir: Path, validation: ValidationResult, *, prefer_json
         manual=manual,
         schema_version=schema_version,
         gate_preset=gate_preset,
+        governance=governance,
     )
+
+
+def comparable_explain(
+    a: RunMetadata,
+    b: RunMetadata,
+    *,
+    allow_gate_preset_mismatch: bool = False,
+) -> ComparableResult:
+    policy = {"allow_gate_preset_mismatch": allow_gate_preset_mismatch}
+
+    if not a.window_signature_hash or not b.window_signature_hash:
+        return ComparableResult(
+            ok=False,
+            reason="WINDOW_HASH_MISSING",
+            details={
+                "window_signature_hash": {
+                    "expected": a.window_signature_hash or None,
+                    "got": b.window_signature_hash or None,
+                }
+            },
+            warnings=tuple(),
+            policy=policy,
+        )
+    if int(a.schema_version) != int(b.schema_version):
+        return ComparableResult(
+            ok=False,
+            reason="SCHEMA_MISMATCH",
+            details={
+                "schema_version": {
+                    "expected": int(a.schema_version),
+                    "got": int(b.schema_version),
+                }
+            },
+            warnings=tuple(),
+            policy=policy,
+        )
+    if a.window_signature_hash != b.window_signature_hash:
+        return ComparableResult(
+            ok=False,
+            reason="WINDOW_HASH_MISMATCH",
+            details={
+                "window_signature_hash": {
+                    "expected": a.window_signature_hash,
+                    "got": b.window_signature_hash,
+                }
+            },
+            warnings=tuple(),
+            policy=policy,
+        )
+    if not allow_gate_preset_mismatch and a.gate_preset != b.gate_preset:
+        return ComparableResult(
+            ok=False,
+            reason="GATE_PRESET_MISMATCH",
+            details={
+                "gate_preset": {
+                    "expected": a.gate_preset,
+                    "got": b.gate_preset,
+                }
+            },
+            warnings=tuple(),
+            policy=policy,
+        )
+    return ComparableResult(ok=True, reason=None, details={}, warnings=tuple(), policy=policy)
 
 
 def comparable(
@@ -105,12 +203,5 @@ def comparable(
     *,
     allow_gate_preset_mismatch: bool = False,
 ) -> Tuple[bool, Optional[str]]:
-    if not a.window_signature_hash or not b.window_signature_hash:
-        return False, "WINDOW_HASH_MISSING"
-    if int(a.schema_version) != int(b.schema_version):
-        return False, "SCHEMA_MISMATCH"
-    if a.window_signature_hash != b.window_signature_hash:
-        return False, "WINDOW_HASH_MISMATCH"
-    if not allow_gate_preset_mismatch and a.gate_preset != b.gate_preset:
-        return False, "GATE_PRESET_MISMATCH"
-    return True, None
+    result = comparable_explain(a, b, allow_gate_preset_mismatch=allow_gate_preset_mismatch)
+    return result.ok, result.reason

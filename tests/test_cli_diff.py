@@ -9,7 +9,7 @@ from typing import Any
 
 import pytest
 
-from veriscope.cli.comparability import comparable, load_run_metadata
+from veriscope.cli.comparability import comparable, comparable_explain, load_run_metadata
 from veriscope.cli.diff import diff_outdirs
 from veriscope.cli.validate import validate_outdir
 from veriscope.core.artifacts import ManualJudgementV1, ResultsSummaryV1, ResultsV1
@@ -164,6 +164,45 @@ def test_comparable_rejects_schema_mismatch(tmp_path: Path) -> None:
     assert reason == "SCHEMA_MISMATCH"
 
 
+def test_comparable_explain_window_hash_mismatch_details(tmp_path: Path) -> None:
+    outdir_a = tmp_path / "run_a"
+    outdir_b = tmp_path / "run_b"
+    _make_minimal_artifacts(outdir_a, run_id="run_a")
+    _make_minimal_artifacts(outdir_b, run_id="run_b")
+    _rewrite_window_signature(outdir_b, extra="different")
+
+    v_a = validate_outdir(outdir_a, allow_partial=True)
+    v_b = validate_outdir(outdir_b, allow_partial=True)
+    run_a = load_run_metadata(outdir_a, v_a, prefer_jsonl=True)
+    run_b = load_run_metadata(outdir_b, v_b, prefer_jsonl=True)
+
+    result = comparable_explain(run_a, run_b)
+    assert not result.ok
+    assert result.reason == "WINDOW_HASH_MISMATCH"
+    assert result.details["window_signature_hash"]["expected"] == run_a.window_signature_hash
+    assert result.details["window_signature_hash"]["got"] == run_b.window_signature_hash
+
+
+def test_comparable_explain_gate_preset_policy(tmp_path: Path) -> None:
+    outdir_a = tmp_path / "run_a"
+    outdir_b = tmp_path / "run_b"
+    _make_minimal_artifacts(outdir_a, run_id="run_a", gate_preset="alpha")
+    _make_minimal_artifacts(outdir_b, run_id="run_b", gate_preset="alpha")
+    _rewrite_profile_gate_preset(outdir_b, gate_preset="beta")
+
+    v_a = validate_outdir(outdir_a, allow_partial=True)
+    v_b = validate_outdir(outdir_b, allow_partial=True)
+    run_a = load_run_metadata(outdir_a, v_a, prefer_jsonl=True)
+    run_b = load_run_metadata(outdir_b, v_b, prefer_jsonl=True)
+
+    result = comparable_explain(run_a, run_b)
+    assert not result.ok
+    assert result.reason == "GATE_PRESET_MISMATCH"
+    assert result.details["gate_preset"]["expected"] == "alpha"
+    assert result.details["gate_preset"]["got"] == "beta"
+    assert result.policy == {"allow_gate_preset_mismatch": False}
+
+
 def test_comparable_rejects_missing_window_hash(tmp_path: Path) -> None:
     outdir_a = tmp_path / "run_a"
     outdir_b = tmp_path / "run_b"
@@ -195,7 +234,7 @@ def test_diff_partial_emits_note(tmp_path: Path) -> None:
 
     result = diff_outdirs(outdir_a, outdir_b)
     assert result.exit_code == 0
-    assert "NOTE:PARTIAL_COMPARISON_LIMITED" in result.stdout
+    assert "NOTE:PARTIAL_MODE decision-only" in result.stdout
     assert "counts_differs" not in result.stdout
 
 
@@ -222,6 +261,21 @@ def test_diff_prefers_jsonl_manual_judgement(tmp_path: Path) -> None:
     assert "manual_status: pass" in result.stdout
     assert "manual_status: fail" in result.stdout
     assert "manual_status_differs: yes" in result.stdout
+
+
+def test_diff_json_includes_headers(tmp_path: Path) -> None:
+    outdir_a = tmp_path / "run_a"
+    outdir_b = tmp_path / "run_b"
+    _make_minimal_artifacts(outdir_a, run_id="run_a")
+    _make_minimal_artifacts(outdir_b, run_id="run_b")
+
+    result = diff_outdirs(outdir_a, outdir_b, fmt="json")
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["comparability"]["ok"] is True
+    assert payload["run_a"]["run_id"] == "run_a"
+    assert payload["run_b"]["run_id"] == "run_b"
+    assert payload["partial_mode"] is False
 
 
 def test_diff_skips_invalid_jsonl_lines(tmp_path: Path) -> None:

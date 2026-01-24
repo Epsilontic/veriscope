@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from veriscope.cli.comparability import comparable, load_run_metadata
+from veriscope.cli.comparability import ComparableResult, comparable_explain, load_run_metadata
 from veriscope.cli.governance import get_governance_status, resolve_effective_status
 from veriscope.cli.validate import validate_outdir
 from veriscope.core.artifacts import ResultsSummaryV1, ResultsV1
@@ -284,6 +284,28 @@ def _fmt_cell(value: Any) -> str:
     return "-" if value is None else str(value)
 
 
+def _fmt_bool(value: bool) -> str:
+    return "yes" if value else "no"
+
+
+def _format_comparable(result: ComparableResult) -> List[str]:
+    lines = [
+        f"  ok: {_fmt_bool(result.ok)}",
+        f"  reason: {result.reason or '-'}",
+    ]
+    if result.details:
+        lines.append("  details:")
+        for key, detail in result.details.items():
+            lines.append(f"    {key}: expected={detail.get('expected')} got={detail.get('got')}")
+    else:
+        lines.append("  details: -")
+    if result.policy:
+        lines.append(f"  policy: {result.policy}")
+    if result.warnings:
+        lines.append(f"  warnings: {len(result.warnings)}")
+    return lines
+
+
 def render_report_compare(
     outdirs: List[Path],
     *,
@@ -305,16 +327,42 @@ def render_report_compare(
     warnings = [f"run={run.run_id}:{w}" for run in runs for w in run.manual.warnings]
 
     reference = runs[0]
-    incompatible: List[tuple[int, str]] = []
+    incompatible: List[tuple[int, ComparableResult]] = []
     for idx, run in enumerate(runs[1:], start=1):
-        ok, reason = comparable(reference, run, allow_gate_preset_mismatch=allow_gate_preset_mismatch)
-        if not ok:
-            incompatible.append((idx, reason or "INCOMPARABLE"))
+        result = comparable_explain(reference, run, allow_gate_preset_mismatch=allow_gate_preset_mismatch)
+        if not result.ok:
+            incompatible.append((idx, result))
 
     if incompatible and not allow_incompatible:
-        reason = incompatible[0][1]
-        stderr = "\n".join([*warnings, f"INCOMPARABLE: {reason}"]) if warnings else f"INCOMPARABLE: {reason}"
+        reason = incompatible[0][1].reason or "INCOMPARABLE"
+        detail_lines = _format_comparable(incompatible[0][1])
+        stderr = (
+            "\n".join([*warnings, f"INCOMPARABLE: {reason}", *detail_lines])
+            if warnings
+            else "\n".join([f"INCOMPARABLE: {reason}", *detail_lines])
+        )
         return ReportCompareOutput(exit_code=2, stdout="", stderr=stderr)
+
+    fmt = fmt.strip().lower()
+    if fmt == "json":
+        comparisons = []
+        for idx, run in enumerate(runs):
+            match = next((r for r in incompatible if r[0] == idx), None)
+            result = (
+                match[1]
+                if match
+                else comparable_explain(reference, run, allow_gate_preset_mismatch=allow_gate_preset_mismatch)
+            )
+            comparisons.append({"run_id": run.run_id, "comparability": result.to_dict()})
+        payload = json.dumps(
+            {
+                "reference_run_id": reference.run_id,
+                "comparisons": comparisons,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        return ReportCompareOutput(exit_code=0, stdout=payload, stderr="\n".join(warnings))
 
     header = [
         "run_id",
@@ -322,25 +370,36 @@ def render_report_compare(
         "wrapper_exit_code",
         "runner_exit_code",
         "final_decision",
-        "manual_effective_status",
+        "effective_decision",
+        "decision_source",
         "window_signature_hash",
+        "gate_preset",
         "partial",
+        "gov_present",
+        "gov_ok",
+        "gov_rev",
+        "gov_legacy_missing_hash",
     ]
     if allow_incompatible:
         header.extend(["comparable", "reason"])
 
     rows: List[List[str]] = []
     for idx, run in enumerate(runs):
-        manual_status = run.manual_status or "-"
         row = [
             run.run_id,
             run.run_status,
             _fmt_cell(run.wrapper_exit_code),
             _fmt_cell(run.runner_exit_code),
             run.final_decision,
-            manual_status,
+            run.display_status,
+            run.decision_source,
             _short_hash(run.window_signature_hash),
+            run.gate_preset,
             str(run.partial).lower(),
+            _fmt_bool(run.governance.present),
+            _fmt_bool(run.governance.ok),
+            _fmt_cell(run.governance.rev),
+            _fmt_bool(run.governance.legacy_missing_entry_hash),
         ]
         if allow_incompatible:
             reason = "-"
@@ -349,7 +408,7 @@ def render_report_compare(
                 match = next((r for r in incompatible if r[0] == idx), None)
                 if match:
                     comparable_flag = "no"
-                    reason = match[1]
+                    reason = match[1].reason or "INCOMPARABLE"
             row.extend([comparable_flag, reason])
         rows.append(row)
 
@@ -366,9 +425,15 @@ def render_report_compare(
             lines.append("| " + " | ".join(row) + " |")
 
     group_ok = not incompatible
-    reason = "OK" if group_ok else incompatible[0][1]
+    reason = "OK" if group_ok else (incompatible[0][1].reason or "INCOMPARABLE")
     lines.append("")
     lines.append(f"Comparable group: {'yes' if group_ok else 'no'}, reason={reason}")
+    if incompatible:
+        lines.append("")
+        lines.append("Comparable details:")
+        for idx, result in incompatible:
+            lines.append(f"- run_index={idx}")
+            lines.extend([f"  {line}" for line in _format_comparable(result)])
 
     stderr = "\n".join(warnings)
     return ReportCompareOutput(exit_code=0, stdout="\n".join(lines), stderr=stderr)
