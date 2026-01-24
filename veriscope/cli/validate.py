@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -28,6 +28,8 @@ class ValidationResult:
     message: str
     window_signature_hash: Optional[str] = None
     partial: bool = False
+    warnings: tuple[str, ...] = field(default_factory=tuple)
+    errors: tuple[str, ...] = field(default_factory=tuple)
 
 
 def _read_text_utf8(path: Path) -> str:
@@ -77,11 +79,51 @@ def _format_pydantic_error(e: Exception) -> str:
     return str(e)
 
 
+def _format_identity_token(level: str, field: str, expected: Any, got: Any) -> str:
+    return f"{level}:ARTIFACT_IDENTITY_MISMATCH field={field} expected={expected!r} got={got!r}"
+
+
+def _check_identity_consistency(
+    outdir: Path,
+    results: Optional[ResultsV1],
+    summary: ResultsSummaryV1,
+    *,
+    strict: bool,
+    allow_partial: bool,
+) -> tuple[bool, tuple[str, ...], tuple[str, ...], bool]:
+    _ = outdir
+    if results is None:
+        return True, tuple(), tuple(), False
+
+    warnings: list[str] = []
+    errors: list[str] = []
+    partial = False
+
+    checks = [
+        ("schema_version", summary.schema_version, results.schema_version),
+        ("run_id", summary.run_id, results.run_id),
+        ("window_signature_ref.hash", summary.window_signature_ref.hash, results.window_signature_ref.hash),
+        ("window_signature_ref.path", summary.window_signature_ref.path, results.window_signature_ref.path),
+        ("profile.gate_preset", summary.profile.gate_preset, results.profile.gate_preset),
+    ]
+
+    for field_name, expected, got in checks:
+        if expected != got:
+            if allow_partial and not strict:
+                warnings.append(_format_identity_token("WARNING", field_name, expected, got))
+                partial = True
+            else:
+                errors.append(_format_identity_token("ERROR", field_name, expected, got))
+
+    return not errors, tuple(warnings), tuple(errors), partial
+
+
 def validate_outdir(
     outdir: Path,
     *,
     strict_version: bool = False,
     allow_partial: bool = False,
+    strict_identity: bool = False,
 ) -> ValidationResult:
     """
     Validate the canonical artifact set in OUTDIR.
@@ -95,6 +137,8 @@ def validate_outdir(
       - governance_log.jsonl is ignored by validation (append-only operator log)
       - window_signature_ref.hash matches hash(window_signature.json) in results (if present) + summary
       - window_signature_ref.path equals "window_signature.json" in results (if present) + summary
+      - when results.json exists, identity fields match results_summary.json (run_id, schema_version,
+        window_signature_ref.hash/path, profile.gate_preset)
       - run_id matches across results (if present) + summary
       - schema_version == 1 (v0 contract)
     """
@@ -170,12 +214,6 @@ def validate_outdir(
             window_signature_hash=ws_hash,
         )
 
-    if res is not None and res.run_id != summ.run_id:
-        return ValidationResult(
-            False,
-            f"run_id mismatch: results={res.run_id!r} summary={summ.run_id!r}",
-            window_signature_hash=ws_hash,
-        )
     if manual is not None and res is not None and manual.run_id != res.run_id:
         return ValidationResult(
             False,
@@ -208,11 +246,31 @@ def validate_outdir(
             window_signature_hash=ws_hash,
         )
 
+    identity_ok, identity_warnings, identity_errors, identity_partial = _check_identity_consistency(
+        outdir,
+        res,
+        summ,
+        strict=strict_identity,
+        allow_partial=allow_partial,
+    )
+    if not identity_ok:
+        message = identity_errors[0] if identity_errors else "artifact identity mismatch"
+        return ValidationResult(
+            False,
+            message,
+            window_signature_hash=ws_hash,
+            partial=False,
+            warnings=identity_warnings,
+            errors=identity_errors,
+        )
+
     # Return the derived truth (the computed hash), not just the referenced one.
     summary_partial = bool(getattr(summ, "partial", False))
     return ValidationResult(
         True,
         "OK",
         window_signature_hash=ws_hash,
-        partial=(res is None or summary_partial),
+        partial=(res is None or summary_partial or identity_partial),
+        warnings=identity_warnings,
+        errors=identity_errors,
     )
