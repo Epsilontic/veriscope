@@ -5,9 +5,11 @@ import argparse
 import json
 import os
 import shutil
+import shlex
 import signal
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -147,15 +149,17 @@ def _write_partial_summary(
     runner_exit_code: Optional[int],
     runner_signal: Optional[str],
     note: str,
+    wrapper_emitted: bool = True,
 ) -> None:
     profile = ProfileV1(gate_preset=gate_preset, overrides={})
+    safe_exit_code = runner_exit_code if runner_exit_code is None or runner_exit_code >= 0 else None
     counts = CountsV1(evaluated=0, skip=0, pass_=0, warn=0, fail=0)
     summary = ResultsSummaryV1(
         run_id=run_id,
         window_signature_ref=ws_ref,
         profile=profile,
         run_status=run_status,
-        runner_exit_code=runner_exit_code,
+        runner_exit_code=safe_exit_code,
         runner_signal=runner_signal,
         started_ts_utc=started_ts_utc,
         ended_ts_utc=ended_ts_utc,
@@ -165,7 +169,11 @@ def _write_partial_summary(
     payload = summary.model_dump(mode="json", by_alias=True, exclude_none=True)
     payload["partial"] = True
     payload["note"] = note
+    payload["wrapper_emitted"] = wrapper_emitted
     atomic_write_json(outdir / "results_summary.json", payload)
+
+
+VERISCOPE_FAILURE: RunStatus = "veriscope_failure"
 
 
 def _summary_wrapper_exit_code(outdir: Path) -> Optional[int]:
@@ -176,11 +184,21 @@ def _summary_wrapper_exit_code(outdir: Path) -> Optional[int]:
         summary = ResultsSummaryV1.model_validate_json(summary_path.read_text("utf-8"))
     except Exception:
         return None
-    if summary.runner_exit_code not in (None, 0):
+    if summary.run_status == "success":
+        return 0
+    if summary.run_status == "user_code_failure":
         return 2
-    if summary.final_decision == "fail":
-        return 1
-    return 0
+    if summary.run_status == "veriscope_failure":
+        return 3
+    return None
+
+
+def _summary_is_valid(path: Path) -> bool:
+    try:
+        ResultsSummaryV1.model_validate_json(path.read_text("utf-8"))
+        return True
+    except Exception:
+        return False
 
 
 def _signal_child(proc: subprocess.Popen, signum: int) -> None:
@@ -188,6 +206,88 @@ def _signal_child(proc: subprocess.Popen, signum: int) -> None:
         os.killpg(proc.pid, signum)
     else:
         proc.send_signal(signum)
+
+
+def _relay_stream(stream: Any, target: Any) -> None:
+    try:
+        for line in iter(stream.readline, ""):
+            if not line:
+                break
+            target.write(line)
+            target.flush()
+    except (ValueError, BrokenPipeError, OSError, IOError):
+        pass
+    except Exception as exc:
+        if os.environ.get("VERISCOPE_DEBUG_STREAMS") == "1":
+            try:
+                sys.stderr.write(f"[veriscope] stream relay error: {exc}\n")
+                sys.stderr.flush()
+            except Exception:
+                pass
+    finally:
+        try:
+            stream.close()
+        except Exception:
+            pass
+
+
+def _start_stream_threads(proc: subprocess.Popen) -> List[threading.Thread]:
+    threads: List[threading.Thread] = []
+    if proc.stdout is not None:
+        t = threading.Thread(target=_relay_stream, args=(proc.stdout, sys.stdout))
+        t.daemon = True
+        t.start()
+        threads.append(t)
+    if proc.stderr is not None:
+        t = threading.Thread(target=_relay_stream, args=(proc.stderr, sys.stderr))
+        t.daemon = True
+        t.start()
+        threads.append(t)
+    return threads
+
+
+class _SignalForwarder:
+    def __init__(self, proc: subprocess.Popen, lifecycle: RunLifecycle, *, timeout_s: float = 2.0) -> None:
+        self._proc = proc
+        self._lifecycle = lifecycle
+        self._timeout_s = timeout_s
+        self._interrupts = 0
+        self._deadline: Optional[float] = None
+        self._killed = False
+
+    @property
+    def interrupted(self) -> bool:
+        return self._interrupts > 0
+
+    def handle(self, signum: int, _frame: Optional[Any]) -> None:
+        self._interrupts += 1
+        self._lifecycle.mark_interrupted(signum)
+        try:
+            _signal_child(self._proc, signum)
+        except Exception:
+            pass
+        if self._interrupts >= 2:
+            self._force_kill()
+        else:
+            self._deadline = time.monotonic() + self._timeout_s
+
+    def maybe_escalate(self) -> None:
+        if self._deadline is None or self._killed:
+            return
+        if time.monotonic() >= self._deadline:
+            self._force_kill()
+
+    def _force_kill(self) -> None:
+        if self._killed:
+            return
+        self._killed = True
+        try:
+            _signal_child(self._proc, signal.SIGKILL)
+        except Exception:
+            try:
+                self._proc.kill()
+            except Exception:
+                pass
 
 
 def _acquire_gpu_lock(force: bool) -> Optional[Any]:
@@ -390,7 +490,11 @@ def _cmd_run_gpt(args: argparse.Namespace) -> int:
     if not has_out_json:
         gpt_args = ["--out_json", f"veriscope_gpt_{time.strftime('%Y%m%d_%H%M%S')}.json"] + gpt_args
 
-    cmd = [sys.executable, "-m", "veriscope.runners.gpt.train_nanogpt"] + gpt_args
+    override_cmd = (os.environ.get("VERISCOPE_GPT_RUNNER_CMD") or "").strip()
+    if override_cmd:
+        cmd = shlex.split(override_cmd) + gpt_args
+    else:
+        cmd = [sys.executable, "-m", "veriscope.runners.gpt.train_nanogpt"] + gpt_args
 
     gate_preset = _extract_gate_preset(gpt_args)
     resolved = {
@@ -422,35 +526,69 @@ def _cmd_run_gpt(args: argparse.Namespace) -> int:
     ws_ref = _ensure_window_signature(outdir, reason="wrapper_start", run_kind="gpt")
     lock = _acquire_gpu_lock(force=bool(args.force))
     try:
+        proc: Optional[subprocess.Popen] = None
+        threads: List[threading.Thread] = []
+        prev_int = None
+        prev_term = None
+        runner_launch_error: Optional[Exception] = None
         try:
             lifecycle.mark_running()
             _write_run_config_merge(outdir, {"lifecycle_state": lifecycle.state})
-            proc = subprocess.Popen(cmd, env=env, start_new_session=True)
-
-            def _handle_signal(signum: int, _frame: Optional[Any]) -> None:
-                lifecycle.mark_interrupted(signum)
-                try:
-                    _signal_child(proc, signum)
-                except Exception:
-                    pass
-
-            prev_int = signal.signal(signal.SIGINT, _handle_signal)
-            prev_term = signal.signal(signal.SIGTERM, _handle_signal)
             try:
-                proc.wait()
-            finally:
-                signal.signal(signal.SIGINT, prev_int)
-                signal.signal(signal.SIGTERM, prev_term)
-            lifecycle.mark_runner_exit(proc.returncode)
+                proc = subprocess.Popen(
+                    cmd,
+                    env=env,
+                    start_new_session=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    bufsize=1,
+                )
+            except OSError as exc:
+                runner_launch_error = exc
 
-            summary_exit = _summary_wrapper_exit_code(outdir)
-            run_status, wrapper_exit = map_status_and_exit(
-                runner_exit_code=proc.returncode,
-                runner_signal=lifecycle.runner_signal,
-                internal_error=False,
-            )
-            if summary_exit is not None and run_status == "success":
-                wrapper_exit = summary_exit
+            if runner_launch_error is None and proc is not None:
+                threads = _start_stream_threads(proc)
+                forwarder = _SignalForwarder(proc, lifecycle)
+
+                prev_int = signal.signal(signal.SIGINT, forwarder.handle)
+                prev_term = signal.signal(signal.SIGTERM, forwarder.handle)
+                try:
+                    while proc.poll() is None:
+                        if forwarder.interrupted:
+                            forwarder.maybe_escalate()
+                            time.sleep(0.1)
+                        else:
+                            try:
+                                proc.wait(timeout=0.5)
+                            except subprocess.TimeoutExpired:
+                                pass
+                finally:
+                    signal.signal(signal.SIGINT, prev_int)
+                    signal.signal(signal.SIGTERM, prev_term)
+
+                lifecycle.mark_runner_exit(proc.returncode)
+
+                summary_path = outdir / "results_summary.json"
+                summary_ok = summary_path.exists() and _summary_is_valid(summary_path)
+                run_status, wrapper_exit = map_status_and_exit(
+                    runner_exit_code=proc.returncode,
+                    runner_signal=lifecycle.runner_signal,
+                    internal_error=False,
+                )
+                if not summary_ok:
+                    run_status = VERISCOPE_FAILURE
+                    wrapper_exit = 2
+                else:
+                    summary_exit = _summary_wrapper_exit_code(outdir)
+                    if summary_exit is not None and run_status == "success":
+                        wrapper_exit = summary_exit
+            else:
+                lifecycle.mark_internal_failure(str(runner_launch_error))
+                run_status = VERISCOPE_FAILURE
+                wrapper_exit = 2
         except Exception as exc:
             lifecycle.mark_internal_failure(str(exc))
             run_status, wrapper_exit = map_status_and_exit(
@@ -458,6 +596,9 @@ def _cmd_run_gpt(args: argparse.Namespace) -> int:
                 runner_signal=lifecycle.runner_signal,
                 internal_error=True,
             )
+        finally:
+            for thread in threads:
+                thread.join(timeout=1.0)
 
         lifecycle.finalize(run_status=run_status, wrapper_exit_code=wrapper_exit)
         _write_run_config_merge(
@@ -471,19 +612,35 @@ def _cmd_run_gpt(args: argparse.Namespace) -> int:
                 "ended_ts_utc": lifecycle.ended_ts_utc.isoformat() if lifecycle.ended_ts_utc else None,
             },
         )
-        if not (outdir / "results_summary.json").exists():
-            _write_partial_summary(
-                outdir=outdir,
-                run_id=run_id,
-                ws_ref=ws_ref,
-                gate_preset=gate_preset,
-                started_ts_utc=lifecycle.started_ts_utc,
-                ended_ts_utc=lifecycle.ended_ts_utc or datetime.now(timezone.utc),
-                run_status=lifecycle.run_status,
-                runner_exit_code=lifecycle.runner_exit_code,
-                runner_signal=lifecycle.runner_signal,
-                note="results_summary.json missing; emitted wrapper-level partial summary",
-            )
+        summary_path = outdir / "results_summary.json"
+        if not (summary_path.exists() and _summary_is_valid(summary_path)):
+            try:
+                _write_partial_summary(
+                    outdir=outdir,
+                    run_id=run_id,
+                    ws_ref=ws_ref,
+                    gate_preset=gate_preset,
+                    started_ts_utc=lifecycle.started_ts_utc,
+                    ended_ts_utc=lifecycle.ended_ts_utc or datetime.now(timezone.utc),
+                    run_status=lifecycle.run_status,
+                    runner_exit_code=lifecycle.runner_exit_code,
+                    runner_signal=lifecycle.runner_signal,
+                    note="wrapper-emitted partial summary: results_summary.json missing",
+                )
+            except Exception:
+                lifecycle.wrapper_exit_code = 2
+                try:
+                    _write_run_config_merge(
+                        outdir,
+                        {
+                            "wrapper_exit_code": lifecycle.wrapper_exit_code,
+                            "run_status": lifecycle.run_status,
+                            "lifecycle_state": lifecycle.state,
+                            "ended_ts_utc": lifecycle.ended_ts_utc.isoformat() if lifecycle.ended_ts_utc else None,
+                        },
+                    )
+                except Exception:
+                    pass
         return int(lifecycle.wrapper_exit_code or 0)
     finally:
         if lock is not None:
