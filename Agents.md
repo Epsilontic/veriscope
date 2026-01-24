@@ -1,272 +1,548 @@
-# Agents.md — veriscope
-
-> **Purpose of this document**
->
-> This file defines the *conceptual and architectural contract* of veriscope. It is not a tutorial and not a full API reference. Read this document before modifying core behavior, adding metrics, or changing gating semantics.
-
-## Project Overview
-
-**veriscope** is a research framework for **early warning detection of neural network training pathologies** (soft/hard collapse, mode collapse, gradient explosion). It implements a mathematically rigorous "Finite Realism" (FR) gating system based on information-theoretic divergence bounds, with applications to both vision models (ResNet/CIFAR-10) and language models (nanoGPT).
-
-### Core Mission  
-Detect training instabilities **before** catastrophic collapse by monitoring geometric, topological, and dynamical properties of the learned representation space, then making pass/fail gating decisions based on calibrated divergence thresholds.
-
-### Why Gates (Pass/Fail) Instead of Scores
-veriscope frames early warning as a *decision problem*, not a ranking or alerting problem. Binary gates are intentional: they support calibrated intervention (pause, rollback, adjust) under finite evidence budgets. Continuous anomaly scores are useful diagnostically, but gating decisions are made only when divergence bounds, statistical uncertainty (ε_stat), and sensitivity budgets jointly certify unacceptable risk.
-
----
-
-## Architecture Overview
-
+# Agents.md — veriscope (agent-facing contract)  
+  
+This file is the **agent-facing contract** for `veriscope`: invariants, boundary rules, canonical schemas, and golden-path commands. It is optimized for automated agents (Codex-style) so changes can be made safely without repo archaeology.  
+  
+If this document disagrees with repository behavior/tests, **update this file and the tests together**. Do not let “tribal knowledge” live only in code.  
+  
+---  
+  
+## 0) PR safety checklist (run before/after changes)  
+  
+1) **CLI import boundary check (must stay thin)**  
+```bash  
+python -c "import veriscope.cli.main; print('cli import ok')"  
 ```  
-veriscope/  
-├── config.py                    # Central configuration with env overrides  
-├── core/                        # FR mathematical framework  
-│   ├── window.py               # WindowDecl, FRWindow definitions  
-│   ├── transport.py            # DeclTransport (metric normalization)  
-│   ├── gate.py                 # GateEngine (stability checking)  
-│   ├── regime.py               # RegimeAnchoredGateEngine (drift detection)  
-│   ├── calibration.py          # ε-statistics and epsilon resolution  
-│   └── ipm.py                  # IPM distances (TV, product-TV)  
-├── fr_integration.py           # FR wiring, window installation  
-├── pipeline.py                 # High-level run_one/run_sweep/evaluate  
-├── detectors/  
-│   ├── baselines.py            # PH/CUSUM baseline facades  
-│   └── learned.py              # Learned detector facade  
-└── runners/  
-    ├── legacy/                 # CIFAR-10/STL-10 runner (full implementation)  
-    │   ├── legacy_cli_refactor.py  # Main CLI entry point (~4000 lines)  
-    │   ├── data.py             # Data loading, splits, corruption  
-    │   ├── model.py            # ResNet-18 for CIFAR  
-    │   ├── features.py         # Feature extraction, JL projection  
-    │   ├── metrics_heavy.py    # SW2, H0 persistence (budgeted)  
-    │   ├── monitors.py         # Entropy, confidence monitors  
-    │   ├── probes.py           # κ_sens sensitivity probes  
-    │   ├── budget.py           # Heavy metric budget ledger  
-    │   ├── runtime.py          # Global CFG/OUTDIR/BUDGET state  
-    │   ├── determinism.py      # Seeding, strict determinism  
-    │   ├── eval/core.py        # Evaluation, events, summaries  
-    │   └── detectors/          # Baseline and learned implementations  
-    └── gpt/  
-        ├── adapter.py          # nanoGPT → veriscope adapter  
-        ├── train_nanogpt.py    # GPT training with FR gating  
-        └── analyze_gates.py    # Gate recall/precision analysis  
-        # GPT runners are used for hypothesis validation and transfer tests, not as the primary development regime
-```
-
-## Lifecycle Overview
-
-1. **Calibration** — Run control experiments (factor='none') to establish normalization ranges and ε-statistics.
-2. **Window Installation** — Declare `WindowDecl` and install it via FR integration.
-3. **Build Phase** — Accumulate healthy reference statistics (no gating failures allowed).
-4. **Live Gating** — Evaluate gain, stability, and sensitivity during training.
-5. **Post-hoc Evaluation** — Compute detection rates, lead times, and false positives.
-
----
-
-## Key Concepts
-
-### 1. WindowDecl (Window Declaration)  
-Declares the observable metric space Φ_W:  
-```python  
-WindowDecl(  
-    epsilon=0.12,                    # Divergence tolerance  
-    metrics=["var_out_k", "eff_dim"], # Tracked metrics  
-    weights={"var_out_k": 0.5, "eff_dim": 0.5},  
-    bins=16,                          # Histogram bins for TV  
-    cal_ranges={"var_out_k": (0, 1), "eff_dim": (0, 64)},  # Normalization ranges  
-    interventions=(lambda x: x,),     # Test functions  
+If that becomes slow or imports heavyweight ML deps, you violated the boundary (see §4).  
+  
+2) **Golden-path smoke**  
+```bash  
+bash scripts/run_gpt_smoke.sh  
+veriscope validate ./out/gpt_smoke_YYYYMMDD_HHMMSS  
+veriscope report   ./out/gpt_smoke_YYYYMMDD_HHMMSS > report.md  
+```  
+  
+3) **Schema + cross-artifact consistency**  
+- `veriscope validate OUTDIR` must be read-only and deterministic.  
+- `results_summary.json` must remain stable and pipeline-safe.  
+  
+---  
+  
+## 1) What veriscope is (operationally)  
+  
+`veriscope` is a **CLI-first training reliability gate**. It observes training-derived evidence (metrics → distributions → divergence checks) and emits **decisions** at a fixed cadence.  
+  
+**Inputs**  
+- Training run telemetry (runner-specific; e.g. nanoGPT metrics/logs)  
+- Gate preset + window identity (defines the admissible evidence space)  
+  
+**Outputs**  
+- An **artifact capsule**: a directory containing machine-readable JSON artifacts  
+- A **deterministic decision surface**: `pass | warn | fail | skip`  
+  
+**Posture**  
+- This is a *decision system*, not a dashboard.  
+- Every decision must be explainable via emitted audit fields and schemas below.  
+  
+---  
+  
+## 2) Capsule directory contract (what an OUTDIR is)  
+  
+A “capsule” is a directory containing artifacts for a single run.  
+  
+### 2.1 Required files (MUST)  
+- `results_summary.json` (authoritative pipeline contract)  
+- `window_signature.json` (comparability root; hash defines identity)  
+  
+### 2.2 Optional files (MAY)  
+- `results.json` (detailed per-cadence audit)  
+- `manual_judgement.json` (overlay; does not mutate raw artifacts)  
+- `governance_log.jsonl` (append-only journal)  
+- provenance files (runner logs, configs, stdout/stderr captures, etc.)  
+  
+### 2.3 Example layout  
+```text  
+OUTDIR/  
+  window_signature.json  
+  results_summary.json  
+  results.json                      (optional but typical)  
+  manual_judgement.json             (optional)  
+  governance_log.jsonl              (optional)  
+  provenance/                       (optional)  
+    runner_stdout.txt  
+    runner_stderr.txt  
+    runner_config.json  
+```  
+  
+### 2.4 Cross-artifact invariants (validator MUST enforce)  
+If a referenced file exists, it MUST be consistent:  
+  
+- `results_summary.run_id` MUST match `results.run_id` (if `results.json` exists)  
+- `results_summary.window_signature_ref.hash` MUST equal the recomputed hash of `window_signature.json` (i.e. `sha256(canonical_json(window_signature.json))` per §7)  
+- `results.window_signature_ref.hash` MUST equal the recomputed hash of `window_signature.json` (i.e. `sha256(canonical_json(window_signature.json))` per §7) (if `results.json` exists)  
+- `counts.evaluated == counts.pass + counts.warn + counts.fail`  
+- Gate emitters MUST emit one `GateRecord` per cadence; non-evaluated cadences MUST be emitted with `decision="skip"` so summary counts match `len(results.gates)`.  
+- If `results.json` exists:    
+  `counts.evaluated + counts.skip == len(results.gates)`  
+- `final_decision` MUST match the derivation rule in §6.5  
+- All timestamps MUST be ISO8601 UTC `...Z` (seconds precision recommended)  
+  
+---  
+  
+## 3) Golden path (copy/paste)  
+  
+### 3.1 GPT smoke (recommended)  
+```bash  
+bash scripts/run_gpt_smoke.sh  
+# or choose an explicit outdir:  
+bash scripts/run_gpt_smoke.sh ./out/gpt_smoke_manual  
+```  
+  
+The outdir SHOULD contain at least:  
+- `window_signature.json`  
+- `results_summary.json`  
+(and typically also `results.json`, plus provenance artifacts when available)  
+  
+Validate + report:  
+```bash  
+veriscope validate ./out/gpt_smoke_YYYYMMDD_HHMMSS  
+veriscope report   ./out/gpt_smoke_YYYYMMDD_HHMMSS > report.md  
+```  
+  
+### 3.2 CIFAR smoke (legacy / out-of-scope for v0 semantics)  
+```bash  
+bash scripts/run_cifar_smoke.sh  
+# or choose an explicit outdir:  
+bash scripts/run_cifar_smoke.sh ./out/cifar_smoke_manual  
+```  
+  
+---  
+  
+## 4) Repository layers and hard boundaries  
+  
+### 4.1 Layers  
+- `veriscope/cli/*`    
+  User-facing commands, I/O, formatting, subprocess orchestration. **Must remain fast to import.**  
+- `veriscope/core/*`    
+  Pure logic and contracts: Pydantic models, hashing, decision derivation, gate math. **Avoid side effects.**  
+- `veriscope/runners/*`    
+  Side-effectful execution (training, log parsing, heavy deps). **May import GPU frameworks.**  
+  
+### 4.2 Lazy-import and dependency boundary (explicit)  
+At import time, `veriscope.cli.main` MUST NOT drag heavyweight ML deps.  
+  
+**Forbidden at top-level in `veriscope/cli/*.py` (must be lazy or subprocess-only):**  
+- `import torch`, `import torchvision`  
+- `from veriscope.runners... import ...`  
+- legacy CIFAR modules  
+  
+**Allowed patterns**  
+- Import runners inside command handlers (function scope)  
+- Spawn subprocesses for heavy work  
+- Keep CLI import graph limited to `veriscope.core.*` + standard library  
+  
+**Why this matters**  
+- Keeps `veriscope --help` fast/reliable  
+- Prevents CI and packaging regressions  
+- Preserves “thin wrapper” product invariant  
+  
+---  
+  
+## 5) Non-negotiables (agent constraints)  
+  
+1) **Decisions are enums (canonical contract)**  
+- Always use `decision` (per gate) or `final_decision` (summary).  
+- Do not infer from legacy `ok` / `warn` booleans.  
+  
+2) **`skip` is real and neutral**  
+- `decision="skip"` means “not evaluated” (insufficient evidence / missing metrics / policy prevented evaluation).  
+- Treating `skip` as pass corrupts accounting and masks broken emitters.  
+  
+3) **Hashes define comparability**  
+- Comparisons/diffs are meaningful only when window identity matches.  
+- If `window_signature_ref.hash` differs, runs are incomparable unless an explicit override policy is used.  
+  
+4) **Governance is append-only**  
+- Overlays may affect displayed outcome but MUST NOT mutate raw artifacts.  
+- Journals/logs are append-only; never rewrite history.  
+  
+5) **Validation is read-only**  
+- `veriscope validate` MUST NOT “fix” artifacts (no rewrites, no normalization writes).  
+  
+---  
+  
+## 6) Canonical schema reference (schema_version = 1)  
+  
+### 6.1 Conventions  
+- Schemas below are **wire-accurate spines**: extra keys are allowed (forward-compat).  
+- Types are TypeScript-like for readability.  
+- JSON examples are plain JSON (no comments) to enable copy/paste.  
+  
+### 6.2 Shared enums  
+```ts  
+type Decision = "pass" | "warn" | "fail" | "skip";  
+type RunStatus = "success" | "user_code_failure" | "veriscope_failure";  
+```  
+  
+### 6.3 `window_signature.json` (comparability root)  
+This file defines the evidence space. **Any change to its contents changes the hash**, and therefore comparability.  
+  
+```ts  
+interface WindowSignatureV1 {  
+  schema_version: 1;  
+  
+  // Informational fields (recommended)  
+  created_ts_utc?: string;      // ISO8601 UTC Z  
+  description?: string;  
+  
+  // Identity-defining content (examples; repo may add more keys)  
+  transport?: {  
+    name: string;               // e.g. "nanogpt_metrics_v1"  
+    cadence?: string;           // e.g. "every_50_iters"  
+  };  
+  
+  evidence?: {  
+    metrics: string[];          // metric names expected/used  
+    window?: {                  // optional: windowing parameters  
+      kind: string;             // e.g. "rolling", "fixed"  
+      size?: number;  
+      stride?: number;  
+    };  
+  };  
+  
+  gates?: {  
+    preset: string;             // gate preset name, e.g. "tuned_v0"  
+    params?: Record<string, any>;  
+  };  
+  
+  // Anything else allowed; note it will affect hashing/comparability  
+  [k: string]: any;  
+}  
+```  
+  
+### 6.4 `window_signature_ref` (embedded)  
+```ts  
+interface WindowSignatureRefV1 {  
+  hash: string; // 64 lowercase hex (sha256)  
+  path: string; // typically "window_signature.json" (relative path)  
+}  
+```  
+  
+### 6.5 `results_summary.json` (authoritative for pipelines)  
+Consumers SHOULD rely on this file as the stable interface.  
+  
+```ts  
+interface CountsV1 {  
+  evaluated: number; // MUST == pass + warn + fail  
+  skip: number;  
+  pass: number;  
+  warn: number;  
+  fail: number;  
+}  
+  
+interface ResultsSummaryV1 {  
+  schema_version: 1;  
+  
+  run_id: string;  
+  window_signature_ref: WindowSignatureRefV1;  
+  
+  profile: {  
+    gate_preset: string;  
+    overrides?: Record<string, any>;  
+  };  
+  
+  run_status: RunStatus;  
+  runner_exit_code?: number | null;  
+  runner_signal?: string | null;  
+  
+  started_ts_utc: string; // ISO8601 UTC Z  
+  ended_ts_utc?: string | null;  
+  
+  counts: CountsV1;  
+  final_decision: Decision;  
+  
+  // optional  
+  partial?: boolean; // true if run did not complete (may omit results.json)  
+}  
+```  
+  
+**Final decision derivation (MUST match validator logic)**  
+- If `fail > 0` → `final_decision="fail"`  
+- Else if `warn > 0` → `final_decision="warn"`  
+- Else if `pass > 0` → `final_decision="pass"`  
+- Else (i.e. `evaluated == 0`) → `final_decision="skip"`  
+  
+### 6.6 `results.json` (detailed audit; one record per cadence)  
+```ts  
+interface AuditV1 {  
+  evaluated: boolean;  
+  
+  // When evaluated=true, these MUST be present (validator rule):  
+  reason?: string;  
+  policy?: string;  
+  evidence_total?: number;  
+  min_evidence?: number;  
+  
+  // Gate-specific numeric payloads (may be null when not applicable)  
+  worst_DW?: number | null;  
+  eps_eff?: number | null;  
+  
+  // Always present (may be empty)  
+  per_metric_tv: Record<string, number>;  
+}  
+  
+interface GateRecordV1 {  
+  iter: number;  
+  decision: Decision;  
+  audit: AuditV1;  
+  
+  // transitional / non-canonical:  
+  ok?: boolean | null;  
+  warn?: boolean | null;  
+}  
+  
+interface MetricRecordV1 {  
+  name: string;  
+  value: any; // JSON-compatible only  
+}  
+  
+interface ResultsV1 {  
+  schema_version: 1;  
+  
+  run_id: string;  
+  window_signature_ref: WindowSignatureRefV1;  
+  
+  profile: {  
+    gate_preset: string;  
+    overrides?: Record<string, any>;  
+  };  
+  
+  run_status: RunStatus;  
+  runner_exit_code?: number | null;  
+  runner_signal?: string | null;  
+  
+  started_ts_utc: string;  
+  ended_ts_utc?: string | null;  
+  
+  gates: GateRecordV1[];  
+  metrics: MetricRecordV1[];  
+}  
+```  
+  
+**Gate-record decision rules (MUST)**  
+- If `audit.evaluated == false` → `decision = "skip"`  
+- If `audit.evaluated == true` → `decision ∈ {"pass","warn","fail"}` and MUST be explicit  
+- If legacy booleans exist, they MUST be consistent with `decision` (but never treated as canonical)  
+  
+### 6.7 Manual overlay: `manual_judgement.json` (optional)  
+Overlay does not mutate raw records.  
+  
+```ts  
+type JudgementStatus = "pass" | "fail";  
+  
+interface ManualJudgementV1 {  
+  schema_version: 1;  
+  
+  run_id: string;  
+  status: JudgementStatus; // intentionally narrower than Decision  
+  reason: string;  
+  
+  reviewer?: string | null;  
+  ts_utc: string; // ISO8601 UTC Z  
+}  
+```  
+  
+### 6.8 Governance journal: `governance_log.jsonl` (optional, append-only)  
+Each line is a JSON object. Writers MUST include `entry_hash`; readers MAY warn on legacy lines missing it.  
+  
+```ts  
+type GovernanceEventType =  
+  | "manual_judgement_set"  
+  | "manual_judgement_cleared"  
+  | "artifact_note"  
+  | "recompute_summary";  
+  
+interface GovernanceEntryV1 {  
+  schema_version: 1;  
+  
+  rev: number;        // MUST be strictly consecutive starting at 1  
+  ts_utc: string;     // informational ordering (not authoritative)  
+  actor?: string;  
+  
+  event_type: GovernanceEventType;  
+  payload: Record<string, any>;  
+  
+  prev_hash?: string | null;  
+  entry_hash: string; // sha256(canonical_json(entry_without_entry_hash))  
+}  
+```  
+  
+---  
+  
+## 7) Hashing and canonicalization rules (agent-ready)  
+  
+### 7.1 Canonical JSON serialization (MUST)  
+Python reference:  
+```py  
+json.dumps(  
+  obj,  
+  sort_keys=True,  
+  separators=(",", ":"),  
+  ensure_ascii=False,  
+  allow_nan=False,  
 )  
 ```  
-
-### 2. GateEngine  
-Performs the core stability check:  
-- **Gain check**: prequential gain ≥ threshold (learning is progressing)  
-- **Stability check**: D_W(past, recent) ≤ ε - ε_stat (distribution stable)  
-- **Sensitivity check**: κ_sens ≤ ε_sens (not overly sensitive to perturbations)  
-
-### 3. RegimeAnchoredGateEngine  
-Extended gate with reference-based drift detection:  
-- **Change detection**: D_W(past, recent) — detects transitions  
-- **Regime detection**: D_W(ref, recent) — detects sustained deviation from healthy baseline  
-- Reference established only during a configurable "build phase" when model is healthy  
-
-### 4. Metrics Tracked  
-| Metric | Description | Schedule |  
-|--------|-------------|----------|  
-| `var_out_k` | Variance outside top-k eigenspace | Every epoch |  
-| `eff_dim` | Effective dimension (participation ratio) | Every epoch |  
-| `cos_disp` | Cosine similarity dispersion | Every epoch |  
-| `ftle` | Finite-time Lyapunov exponent proxy | Every epoch |  
-| `sw2` | Sliced Wasserstein-2 distance | Heavy (cadenced) |  
-| `pers_H0` | H0 persistence (ripser) | Heavy (cadenced) |  
-| `mon_entropy` | Monitor set entropy | Cadenced |  
-
-### 5. Ground Truth (GT) Detection  
-Unified GT labels collapse events:  
-- **Hard collapse**: NaN/Inf in loss/gradients, gradient explosion  
-- **Soft collapse**: Sustained low effective dimension (rank collapse)  
-
----
-
-## Important Files & Entry Points
-
-### Main Entry Points  
-1. **`veriscope/runners/legacy_cli_refactor.py::main()`** — CIFAR sweep CLI  
-2. **`veriscope/runners/gpt/train_nanogpt.py`** — GPT training with gating  
-3. **`veriscope/pipeline.py`** — Programmatic API (`run_one`, `run_sweep`, `evaluate`)  
-
-### Configuration  
-- **`veriscope/config.py`** — Defaults and env loading (`CFG` dict)  
-- **`veriscope/runners/legacy/runtime.py`** — Runtime state (`install_runtime()`)  
-- Environment variables: `SCAR_SMOKE`, `SCAR_FR`, `SCAR_GATE_*`, `SCAR_OUTDIR`, etc.  
-
-### Core FR Framework  
-- **`veriscope/core/window.py`** — `WindowDecl`, `FRWindow`, `window_decl_identity_hash`  
-- **`veriscope/core/gate.py`** — `GateEngine`, `GateResult`  
-- **`veriscope/core/regime.py`** — `RegimeAnchoredGateEngine`, `RegimeConfig`  
-- **`veriscope/core/transport.py`** — `DeclTransport`, `assert_naturality`  
-- **`veriscope/core/ipm.py`** — `tv_hist_fixed`, `d_Pi`, `dPi_product_tv`, `D_W`  
-- **`veriscope/core/calibration.py`** — `epsilon_statistic_bhc`, `aggregate_epsilon_stat`  
-
----
-
-## Common Tasks
-
-### Adding a New Metric  
-1. Compute the metric in the training loop (e.g., `legacy_cli_refactor.py::run_one`)  
-2. Add to `WindowDecl.metrics` and `WindowDecl.weights`  
-3. Calibrate `cal_ranges` from control runs (factor='none')  
-4. Update `det_features` in detector training if used for learned detection  
-
-### Tuning Gate Parameters  
-```python  
-CFG["gate_window"] = 16        # Epochs per half-window  
-CFG["gate_epsilon"] = 0.12     # Base tolerance  
-CFG["gate_gain_thresh"] = 0.05 # bits/sample learning threshold  
-CFG["gate_min_evidence"] = 16  # Min samples before evaluating  
-CFG["warn_consec"] = 3         # Consecutive failures to trigger  
-```  
-
-### Running Smoke Tests  
+  
+### 7.2 Hash primitive (MUST)  
+- `sha256(utf8_bytes(canonical_json_string)) -> lowercase hex digest`  
+  
+### 7.3 Window signature hash (comparability key)  
+- `window_signature_ref.hash == sha256(canonical_json(window_signature.json))`  
+  
+**Important: avoid self-reference traps**  
+- Treat the file hash as authoritative.  
+- If `window_signature.json` contains an internal `hash` field, do not trust it; recompute the canonical hash of the file object for verification/comparison.  
+  
+### 7.4 Governance chaining  
+To compute `entry_hash`, serialize the entry with the `entry_hash` key removed entirely (not present and not set to `null`).  
+- `entry_hash = sha256(canonical_json(entry_without_entry_hash))`  
+- `prev_hash = previous entry_hash` (or `null` for the first entry)  
+  
+---  
+  
+## 8) Comparability predicate (Comparable(A,B))  
+  
+Two runs A and B are comparable iff:  
+- both have `schema_version == 1`  
+- `A.window_signature_ref.hash == B.window_signature_ref.hash`  
+- `A.profile.gate_preset == B.profile.gate_preset`  
+- unless an explicit CLI override is used (e.g. `--allow-gate-preset-mismatch`)  
+  
+If not comparable:  
+- `veriscope diff` MUST return non-zero and explain why (hash mismatch, preset mismatch, invalid capsule, etc.)  
+  
+---  
+  
+## 9) Outcome resolution (raw vs displayed)  
+  
+- **Raw outcome**: `results_summary.final_decision` derived from emitted gate results  
+- **Displayed outcome** (reporting/UI): raw outcome + overlays (e.g. `manual_judgement.json`)    
+  Overlays MUST NOT change raw artifacts.  
+  
+Agents changing report/diff behavior MUST state clearly whether they operate on raw or displayed outcomes, and MUST NOT silently substitute one for the other.  
+  
+---  
+  
+## 10) CLI surface (copy/paste)  
+  
+### 10.1 Validate a capsule  
 ```bash  
-SCAR_SMOKE=1 python -m veriscope.runners.legacy_cli_refactor  
+veriscope validate OUTDIR  
 ```  
-Smoke mode reduces epochs, seeds, and relaxes thresholds for quick E2E validation.  
-
-### Enabling FR Gating  
+  
+### 10.2 Generate a report  
 ```bash  
-SCAR_FR=1 python -m veriscope.runners.legacy_cli_refactor  
+veriscope report OUTDIR > report.md  
+veriscope report OUTDIR --format text  
 ```  
-
----
-
-## Code Patterns
-
-### Environment-Driven Configuration  
-```python  
-if env_truthy("SCAR_SMOKE"):  
-    cfg["epochs"] = 24  
-    cfg["gate_window"] = 3  
-
-# Env overrides have highest precedence  
-v = os.environ.get("SCAR_GATE_EPSILON")  
-if v is not None:  
-    CFG["gate_epsilon"] = float(v)  
+  
+### 10.3 Compare two runs  
+```bash  
+veriscope diff OUTDIR_A OUTDIR_B  
 ```  
-
-### Robust Numeric Handling  
-```python  
-from veriscope.runners.legacy.utils import as_int, as_float, to_numeric_series  
-
-x = as_int(cfg.get("epochs"), default=72)  
-y = as_float(audit.get("worst_DW", np.nan), default=float("nan"))  
+  
+### 10.4 Override displayed outcome (overlay, not mutation)  
+```bash  
+veriscope override OUTDIR --status pass --reason "Known infrastructure noise" --reviewer "Windowwright"  
 ```  
-
-### Gate Check Pattern  
-```python  
-result = gate_engine.check(  
-    past=past_dict,           # {metric: np.ndarray}  
-    recent=recent_dict,       # {metric: np.ndarray}  
-    counts_by_metric=counts,  # {metric: int}  
-    gain_bits=gain,           # float  
-    kappa_sens=kappa,         # float  
-    eps_stat_value=eps_stat,  # float  
-)  
-if not result.ok:  
-    # Gate failed — potential instability  
-    print(f"Gate FAIL: {result.audit}")  
+  
+### 10.5 Run GPT (arguments after `--` are forwarded to runner)  
+```bash  
+veriscope run gpt --outdir OUTDIR -- \  
+  --dataset shakespeare_char \  
+  --nanogpt_dir ./nanoGPT \  
+  --device cuda \  
+  --max_iters 200 \  
+  --no_regime  
 ```  
-
-### WindowDecl Cloning  
-```python  
-# Preferred: use copy_with() or dataclasses.replace()  
-regime_decl = base_decl.copy_with(epsilon=0.18)  
+  
+### 10.6 Run CIFAR legacy smoke  
+```bash  
+veriscope run cifar --smoke --outdir OUTDIR  
 ```  
-
----
-
-## Testing & Validation
-
-### Key Invariants  
-1. **ε_stat ∈ [0, ε * max_frac]** — Statistical uncertainty is bounded  
-2. **gate_warn=1 means PASS, gate_warn=0 means FAIL** — Important for metrics  
-3. **Non-evaluated epochs are neutral (PASS)** — Insufficient history doesn't fail  
-4. **Reference only established during build phase** — Prevents "bad but stationary" bug  
-
-### Common Failure Modes  
-- **Gate never evaluates**: Check `gate_min_evidence`, `gate_window`, and warmup  
-- **False alarms in smoke**: Increase `gate_eps_inflation_max` or `gate_epsilon`  
-- **Missing metrics**: Verify `cal_ranges` exists for all tracked metrics  
-
----
-
-## Dependencies
-
-### Required  
-- Python ≥3.9  
-- PyTorch, torchvision  
-- NumPy, pandas, matplotlib  
-
-### Optional  
-- `ripser` — For H0 persistence (topology)  
-- `filelock` — For dataset download coordination  
-- `nanoGPT` — For GPT experiments (external checkout)  
-
----
-
-## Important Warnings
-
-1. **DO NOT import from `legacy_cli_refactor.py` in core modules** — Phase-1 boundary  
-2. **CFG is a live mutable dict** — Always mutate in place, never rebind  
-3. **Determinism requires `CUBLAS_WORKSPACE_CONFIG=:4096:8`** — Set early  
-4. **Heavy metrics have budgets** — SW2 and ripser calls are rate-limited  
-5. **Smoke mode changes many defaults** — Check `CFG_SMOKE` and `SMOKE_CRITICAL_KEYS`  
-
----
-
-## Glossary
-
-| Term | Definition |  
-|------|------------|  
-| **FR** | Finite Realism — the mathematical framework |  
-| **D_W** | Operational distinguishability on Φ_W |  
-| **ε** | Epsilon — divergence tolerance |  
-| **ε_stat** | Statistical uncertainty from finite samples |  
-| **TV** | Total Variation distance |  
-| **SW2** | Sliced Wasserstein-2 distance |  
-| **PH** | Persistent Homology / Page-Hinkley test |  
-| **GT** | Ground Truth (collapse labels) |  
-| **warm_idx** | warmup + ph_burn epochs |  
-| **κ_sens** | Sensitivity budget (response to perturbations) |  
-
----
-
-## Scope Note on GPT Experiments
-Transformer experiments (nanoGPT) are treated as *validation domains* to test transfer of FR gating logic beyond vision models. Success or failure here informs metric choice and window design; it does not redefine core FR semantics.
-
----
-
-## Contact & Contributing
-
-This is a research codebase. Key design decisions are documented in docstrings and the `regime.py` module header contains detailed rationale for reference-anchored detection.
+  
+### 10.7 Exit code contract (MUST be stable for CI)  
+These are the **intended** semantics. If implementation differs, align implementation + tests + this doc.  
+  
+- `veriscope validate OUTDIR`  
+  - `0`: valid  
+  - `2`: invalid capsule (schema/cross-artifact errors)  
+  
+- `veriscope diff A B`  
+  - `0`: comparable and diff completed successfully (no structural errors)  
+  - `2`: not comparable / invalid input capsules  
+  - (If you want “differences found” to be non-zero, document that explicitly and keep it stable.)  
+  
+- `veriscope run ...`  
+  - `0`: run completed and artifacts emitted (even if decision is warn/fail; those are in artifacts)  
+  - non-zero: runner execution failure or veriscope internal failure (`run_status != success`)  
+  
+---  
+  
+## 11) Common anti-patterns (and consequences)  
+  
+1) Reading `ok` / `warn` booleans as the contract  
+Consequence: you miss `skip` states and treat “not evaluated” as “pass”.  
+  
+2) Treating `skip` as “pass”  
+Consequence: FAR and evaluation metrics become meaningless; broken emitters look healthy.  
+  
+3) Comparing runs without a window signature match  
+Consequence: you mix incomparable evidence spaces (different metrics/bins/transport/gate controls).  
+  
+4) Letting CLI import runners or ML deps at top-level  
+Consequence: `veriscope --help` becomes slow/fragile; breaks thin-CLI invariant.  
+  
+5) “Fixing” artifacts during validate/report  
+Consequence: audits become non-reproducible; governance loses meaning; append-only tests become invalid.  
+  
+---  
+  
+## 12) Change-impact matrix (when you change X, update Y)  
+  
+- If you change any artifact schema:  
+  - update Pydantic models (core)  
+  - update validators + cross-artifact checks  
+  - update smoke scripts/expected outputs (if any)  
+  - update `docs/contract_v1.md` (if it mirrors this)  
+  
+- If you change hashing/canonicalization:  
+  - update `veriscope/core/jsonutil.py`  
+  - update validators and any comparisons/diffs  
+  - update this document (§7) and any migration docs  
+  
+- If you add/modify a runner:  
+  - keep it in `veriscope/runners/*`  
+  - ensure CLI imports it lazily (function scope) or via subprocess  
+  - update smoke scripts if it’s part of the golden path  
+  
+- If you change decision semantics:  
+  - update derivation rules in one place (core)  
+  - update report rendering and diff logic  
+  - ensure `skip` semantics remain neutral and explicit  
+  
+---  
+  
+## 13) Implementation cues (where to look)  
+  
+- Schemas and decision derivation:  
+  - `veriscope/core/artifacts.py` (Pydantic models + `derive_final_decision`)  
+- Canonical JSON + SHA256:  
+  - `veriscope/core/jsonutil.py`  
+- CLI entrypoint and command routing:  
+  - `veriscope/cli/main.py`  
+- GPT artifact emission:  
+  - `veriscope/runners/gpt/emit_artifacts.py`  
+- Frozen contract text (if applicable):  
+  - `docs/contract_v1.md`  
+- Migration invariants:  
+  - `docs/migration_invariants.md`
