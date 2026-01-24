@@ -393,10 +393,10 @@ def emit_gpt_artifacts_v1(
     results_summary_path = outdir / "results_summary.json"
 
     logger.debug("Writing %s", results_path)
-    atomic_write_pydantic_json(results_path, results, by_alias=True, exclude_none=True)
+    atomic_write_pydantic_json(results_path, results, by_alias=True, exclude_none=True, fsync=True)
 
     logger.debug("Writing %s", results_summary_path)
-    atomic_write_pydantic_json(results_summary_path, summary, by_alias=True, exclude_none=True)
+    atomic_write_pydantic_json(results_summary_path, summary, by_alias=True, exclude_none=True, fsync=True)
 
     logger.info("Artifacts generated successfully (final_decision=%s)", final_decision)
 

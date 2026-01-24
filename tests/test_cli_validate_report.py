@@ -229,6 +229,17 @@ def test_validate_detects_run_id_mismatch_minimal(minimal_artifact_dir: Path) ->
     assert re.search(r"mismatch", v.message, flags=re.IGNORECASE)
 
 
+def test_validate_identity_mismatch_fails_default(minimal_artifact_dir: Path) -> None:
+    p = minimal_artifact_dir / "results_summary.json"
+    obj = _read_json_dict(p)
+    obj["profile"]["gate_preset"] = "different"
+    _write_json(p, obj)
+
+    v = validate_outdir(minimal_artifact_dir)
+    assert not v.ok
+    assert "ARTIFACT_IDENTITY_MISMATCH" in v.message
+
+
 def test_report_smoke_and_integrity_minimal(minimal_artifact_dir: Path) -> None:
     """
     Truth is asserted via Pydantic; report checks are presentation-layer smoke checks.

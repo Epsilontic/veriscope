@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
+import argparse
 from pathlib import Path
 from typing import Any
 
@@ -77,18 +78,14 @@ def test_inspect_strict_governance_requires_log(tmp_path: Path, capsys: pytest.C
     outdir = tmp_path / "run_a"
     _make_minimal_artifacts(outdir, run_id="run_a")
 
-    args = type(
-        "Args",
-        (),
-        {
-            "outdir": str(outdir),
-            "format": "text",
-            "no_report": True,
-            "strict_governance": True,
-            "allow_legacy_governance": False,
-            "require_governance": True,
-        },
-    )()
+    args = argparse.Namespace(
+        outdir=str(outdir),
+        format="text",
+        no_report=True,
+        strict_governance=True,
+        allow_legacy_governance=False,
+        require_governance=True,
+    )
     exit_code = _cmd_inspect(args)
     captured = capsys.readouterr()
 
@@ -100,20 +97,65 @@ def test_inspect_strict_governance_warns_when_optional(tmp_path: Path, capsys: p
     outdir = tmp_path / "run_b"
     _make_minimal_artifacts(outdir, run_id="run_b")
 
-    args = type(
-        "Args",
-        (),
-        {
-            "outdir": str(outdir),
-            "format": "text",
-            "no_report": True,
-            "strict_governance": True,
-            "allow_legacy_governance": False,
-            "require_governance": False,
-        },
-    )()
+    args = argparse.Namespace(
+        outdir=str(outdir),
+        format="text",
+        no_report=True,
+        strict_governance=True,
+        allow_legacy_governance=False,
+        require_governance=False,
+    )
     exit_code = _cmd_inspect(args)
     captured = capsys.readouterr()
 
     assert exit_code == 0
     assert "WARNING:GOVERNANCE_LOG_MISSING" in captured.err
+
+
+def _mutate_summary_run_id(outdir: Path, *, run_id: str) -> None:
+    path = outdir / "results_summary.json"
+    obj = _read_json_dict(path)
+    obj["run_id"] = run_id
+    _write_json(path, obj)
+
+
+def test_inspect_allow_partial_warns_on_identity_mismatch(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    outdir = tmp_path / "run_identity_warn"
+    _make_minimal_artifacts(outdir, run_id="run_identity_warn")
+    _mutate_summary_run_id(outdir, run_id="mismatched_run")
+
+    args = argparse.Namespace(
+        outdir=str(outdir),
+        format="text",
+        no_report=True,
+        strict_governance=False,
+        allow_legacy_governance=False,
+        require_governance=False,
+        strict_identity=False,
+    )
+    exit_code = _cmd_inspect(args)
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert "WARNING:ARTIFACT_IDENTITY_MISMATCH" in captured.err
+
+
+def test_inspect_strict_identity_fails(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    outdir = tmp_path / "run_identity_strict"
+    _make_minimal_artifacts(outdir, run_id="run_identity_strict")
+    _mutate_summary_run_id(outdir, run_id="mismatched_run")
+
+    args = argparse.Namespace(
+        outdir=str(outdir),
+        format="text",
+        no_report=True,
+        strict_governance=False,
+        allow_legacy_governance=False,
+        require_governance=False,
+        strict_identity=True,
+    )
+    exit_code = _cmd_inspect(args)
+    captured = capsys.readouterr()
+
+    assert exit_code == 2
+    assert "ERROR:ARTIFACT_IDENTITY_MISMATCH" in captured.err

@@ -170,7 +170,7 @@ def _write_partial_summary(
     payload["partial"] = True
     payload["note"] = note
     payload["wrapper_emitted"] = wrapper_emitted
-    atomic_write_json(outdir / "results_summary.json", payload)
+    atomic_write_json(outdir / "results_summary.json", payload, fsync=True)
 
 
 VERISCOPE_FAILURE: RunStatus = "veriscope_failure"
@@ -184,6 +184,7 @@ def _summary_wrapper_exit_code(outdir: Path) -> Optional[int]:
         summary = ResultsSummaryV1.model_validate_json(summary_path.read_text("utf-8"))
     except Exception:
         return None
+    # Exit code is derived from run_status (operational), not final_decision (epistemic).
     if summary.run_status == "success":
         return 0
     if summary.run_status == "user_code_failure":
@@ -528,9 +529,38 @@ def _cmd_run_gpt(args: argparse.Namespace) -> int:
     try:
         proc: Optional[subprocess.Popen] = None
         threads: List[threading.Thread] = []
-        prev_int = None
-        prev_term = None
         runner_launch_error: Optional[Exception] = None
+
+        forwarder: Optional[_SignalForwarder] = None
+        pending_signals: List[int] = []
+
+        def _handle_wrapper_signal(signum: int, frame: Optional[Any]) -> None:
+            # Prevent default SIGINT behavior (KeyboardInterrupt) from killing the wrapper process.
+            # If we already have a forwarder (child started), delegate to it.
+            nonlocal forwarder, proc
+            if forwarder is not None:
+                try:
+                    forwarder.handle(signum, frame)
+                except Exception:
+                    pass
+                return
+
+            # Child not started yet (or still launching): record the interrupt and forward best-effort.
+            try:
+                lifecycle.mark_interrupted(signum)
+            except Exception:
+                pass
+            pending_signals.append(signum)
+            if proc is not None:
+                try:
+                    _signal_child(proc, signum)
+                except Exception:
+                    pass
+
+        # Install handlers immediately to close the race where SIGINT/SIGTERM kills the wrapper.
+        prev_int = signal.signal(signal.SIGINT, _handle_wrapper_signal)
+        prev_term = signal.signal(signal.SIGTERM, _handle_wrapper_signal)
+
         try:
             lifecycle.mark_running()
             _write_run_config_merge(outdir, {"lifecycle_state": lifecycle.state})
@@ -553,21 +583,24 @@ def _cmd_run_gpt(args: argparse.Namespace) -> int:
                 threads = _start_stream_threads(proc)
                 forwarder = _SignalForwarder(proc, lifecycle)
 
-                prev_int = signal.signal(signal.SIGINT, forwarder.handle)
-                prev_term = signal.signal(signal.SIGTERM, forwarder.handle)
-                try:
-                    while proc.poll() is None:
-                        if forwarder.interrupted:
-                            forwarder.maybe_escalate()
-                            time.sleep(0.1)
-                        else:
-                            try:
-                                proc.wait(timeout=0.5)
-                            except subprocess.TimeoutExpired:
-                                pass
-                finally:
-                    signal.signal(signal.SIGINT, prev_int)
-                    signal.signal(signal.SIGTERM, prev_term)
+                # Replay any signals that arrived before the child/forwarder existed.
+                if pending_signals:
+                    for s in list(pending_signals):
+                        try:
+                            forwarder.handle(s, None)
+                        except Exception:
+                            pass
+                    pending_signals.clear()
+
+                while proc.poll() is None:
+                    if forwarder.interrupted:
+                        forwarder.maybe_escalate()
+                        time.sleep(0.1)
+                    else:
+                        try:
+                            proc.wait(timeout=0.5)
+                        except subprocess.TimeoutExpired:
+                            pass
 
                 lifecycle.mark_runner_exit(proc.returncode)
 
@@ -597,6 +630,12 @@ def _cmd_run_gpt(args: argparse.Namespace) -> int:
                 internal_error=True,
             )
         finally:
+            # Always restore wrapper signal handlers at the very end (avoid leaving a custom handler installed).
+            try:
+                signal.signal(signal.SIGINT, prev_int)
+                signal.signal(signal.SIGTERM, prev_term)
+            except Exception:
+                pass
             for thread in threads:
                 thread.join(timeout=1.0)
 
@@ -659,10 +698,16 @@ def _cmd_validate(args: argparse.Namespace) -> int:
     from veriscope.cli.governance import validate_governance_log
     from veriscope.cli.validate import validate_outdir
 
-    v = validate_outdir(outdir)
+    strict_identity = bool(getattr(args, "strict_identity", False))
+    v = validate_outdir(outdir, strict_identity=strict_identity)
     if not v.ok:
         _eprint(f"INVALID: {v.message}")
+        for err in v.errors:
+            if err != v.message:
+                _eprint(err)
         return 2
+    for warning in v.warnings:
+        _eprint(warning)
 
     strict_governance = bool(getattr(args, "strict_governance", False))
     allow_legacy = bool(getattr(args, "allow_legacy_governance", False))
@@ -770,9 +815,13 @@ def _cmd_inspect(args: argparse.Namespace) -> int:
     from veriscope.cli.governance import validate_governance_log
     from veriscope.cli.validate import validate_outdir
 
-    v = validate_outdir(outdir, allow_partial=True)
+    strict_identity = bool(getattr(args, "strict_identity", False))
+    v = validate_outdir(outdir, allow_partial=True, strict_identity=strict_identity)
     if not v.ok:
         _eprint(f"INVALID: {v.message}")
+        for err in v.errors:
+            if err != v.message:
+                _eprint(err)
         _eprint("")
         _eprint("Expected canonical artifacts under OUTDIR:")
         _eprint("  - window_signature.json")
@@ -784,6 +833,8 @@ def _cmd_inspect(args: argparse.Namespace) -> int:
         _eprint("  - manual_judgement.jsonl")
         _eprint("  - governance_log.jsonl")
         return 2
+    for warning in v.warnings:
+        _eprint(warning)
 
     strict_governance = bool(getattr(args, "strict_governance", False))
     allow_legacy = bool(getattr(args, "allow_legacy_governance", False))
@@ -886,6 +937,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="Fail validation if governance_log.jsonl is invalid",
     )
     p_validate.add_argument(
+        "--strict-identity",
+        action="store_true",
+        help="Fail validation on identity mismatches even in partial/inspect mode",
+    )
+    p_validate.add_argument(
         "--allow-legacy-governance",
         action="store_true",
         help="Allow governance_log.jsonl entries missing entry_hash (warn only)",
@@ -935,6 +991,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         "--strict-governance",
         action="store_true",
         help="Fail validation if governance_log.jsonl is invalid",
+    )
+    p_inspect.add_argument(
+        "--strict-identity",
+        action="store_true",
+        help="Fail validation on identity mismatches even in partial/inspect mode",
     )
     p_inspect.add_argument(
         "--allow-legacy-governance",
