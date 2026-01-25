@@ -174,15 +174,16 @@ veriscope
 
 ---
 
-## Pilot / Design Partner Use
+## Pilot kit overview
 
-If you want to pilot Veriscope on a training run, start with the GPT runner and a known preset:
-
-```bash
-veriscope run gpt --outdir OUTDIR --gate_preset tuned -- <your training args>
-```
+If you are piloting Veriscope with a design partner, the pilot kit provides:
+- A control + injected-pathology workflow with a shareable report and calibration summary.
+- Success criteria grounded in the v0 contract.
+- A stable artifact bundle to share with Veriscope.
 
 For operational semantics (exit codes, schemas, artifact contracts, and validation), see `docs/productization.md`.
+For narrative guidance, success criteria, and sharing guidance, see `docs/pilot/README.md`.
+For script usage, outputs, and troubleshooting, see `scripts/pilot/README.md`.
 
 ---
 
@@ -349,4 +350,3 @@ Use the repository’s `CITATION.cff` (GitHub: “Cite this repository”) and i
 **Maintainer:** Craig Holmander  
 📧 craig.holm@protonmail.com  
 🌐 ORCID: https://orcid.org/0009-0002-3145-8498
-

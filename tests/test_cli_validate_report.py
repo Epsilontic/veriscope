@@ -103,6 +103,17 @@ def _make_minimal_artifacts(outdir: Path, *, run_id: str = "test_run_min") -> No
     ResultsSummaryV1.model_validate_json((outdir / "results_summary.json").read_text(encoding="utf-8"))
 
 
+def _rewrite_run_status(outdir: Path, run_status: str) -> None:
+    res_path = outdir / "results.json"
+    summ_path = outdir / "results_summary.json"
+    res_obj = _read_json_dict(res_path)
+    summ_obj = _read_json_dict(summ_path)
+    res_obj["run_status"] = run_status
+    summ_obj["run_status"] = run_status
+    _write_json(res_path, res_obj)
+    _write_json(summ_path, summ_obj)
+
+
 def _write_manual_judgement(outdir: Path, *, status: str = "fail") -> None:
     run_id = ResultsV1.model_validate_json((outdir / "results.json").read_text(encoding="utf-8")).run_id
     judgement = ManualJudgementV1(
@@ -191,6 +202,14 @@ def test_validate_happy_path_minimal(minimal_artifact_dir: Path) -> None:
     v = validate_outdir(minimal_artifact_dir)
     assert v.ok, v.message
     assert v.window_signature_hash is not None
+
+
+def test_validate_allows_user_code_failure_status(minimal_artifact_dir: Path) -> None:
+    _rewrite_run_status(minimal_artifact_dir, "user_code_failure")
+    ResultsV1.model_validate_json((minimal_artifact_dir / "results.json").read_text(encoding="utf-8"))
+    ResultsSummaryV1.model_validate_json((minimal_artifact_dir / "results_summary.json").read_text(encoding="utf-8"))
+    v = validate_outdir(minimal_artifact_dir)
+    assert v.ok, v.message
 
 
 def test_counts_v1_canonical_json_key_is_pass() -> None:
