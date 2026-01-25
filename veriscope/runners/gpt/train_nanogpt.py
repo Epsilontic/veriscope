@@ -54,7 +54,7 @@ from __future__ import annotations
 
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 import time
 import math
@@ -74,6 +74,14 @@ def _ensure_nanogpt_on_path(nanogpt_dir: str) -> None:
     p = str(Path(nanogpt_dir).resolve())
     if p not in sys.path:
         sys.path.insert(0, p)
+
+
+def _iso_utc(dt: datetime) -> str:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    return dt.replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def compute_window_spans(
@@ -118,6 +126,7 @@ from veriscope.runners.gpt.adapter import (
 from veriscope.core.calibration import aggregate_epsilon_stat
 from veriscope.runners.gpt.emit_artifacts import emit_gpt_artifacts_v1
 from veriscope.core.jsonutil import atomic_write_json, canonical_json_sha256
+from veriscope.core.redaction_policy import POLICY_REV, prepare_env_capture, redact_argv
 
 # Regime-anchored detection imports
 from veriscope.core.regime import (
@@ -1680,7 +1689,7 @@ if __name__ == "__main__":
     # Canonical artifacts directory: colocate with legacy out_json
     artifacts_outdir = out_path.parent
 
-    started_ts_utc = datetime.utcnow()
+    started_ts_utc_dt = datetime.utcnow()
     run_status = "success"
     _train_exc: BaseException | None = None
 
@@ -1811,7 +1820,7 @@ if __name__ == "__main__":
         trainer = VeriscopeGatedTrainer(config)
         metrics, gates = trainer.train(get_batch)
     except BaseException as e:
-        run_status = "error"
+        run_status = "user_code_failure"
         _train_exc = e
         # Preserve whatever we have so far, if any
         try:
@@ -1821,7 +1830,7 @@ if __name__ == "__main__":
         except Exception:
             pass
     finally:
-        ended_ts_utc = datetime.utcnow()
+        ended_ts_utc_dt = datetime.utcnow()
 
         # Build a resolved gate config dict for the artifact signature.
         resolved_gate_cfg: Dict[str, Any] = {
@@ -1851,8 +1860,8 @@ if __name__ == "__main__":
         emitted = emit_gpt_artifacts_v1(
             outdir=artifacts_outdir,
             run_id=out_path.stem,
-            started_ts_utc=started_ts_utc,
-            ended_ts_utc=ended_ts_utc,
+            started_ts_utc=started_ts_utc_dt,
+            ended_ts_utc=ended_ts_utc_dt,
             gate_preset=str(args.gate_preset),
             overrides=None,
             resolved_gate_cfg=resolved_gate_cfg,
@@ -1863,15 +1872,18 @@ if __name__ == "__main__":
         )
 
         # --- Resolved run config artifact (canonical, stable) ---
+        env_safe, env_capture = prepare_env_capture(os.environ.copy())
+        safe_argv, _argv_redacted = redact_argv(list(sys.argv))
+
         run_cfg_obj: Dict[str, Any] = {
             "schema_version": 1,
             "run_id": str(out_path.stem),
             "run_status": str(run_status),
-            "started_ts_utc": started_ts_utc,
-            "ended_ts_utc": ended_ts_utc,
+            "started_ts_utc": _iso_utc(started_ts_utc_dt),
+            "ended_ts_utc": _iso_utc(ended_ts_utc_dt),
             "out_json": str(out_path),
             "artifacts_outdir": str(artifacts_outdir),
-            "argv": list(sys.argv),
+            "argv": safe_argv,
             "gate_preset": str(args.gate_preset),
             "resolved_gate_cfg": dict(resolved_gate_cfg),
             "metric_pipeline": {"transport": "nanoGPT"},
@@ -1879,6 +1891,9 @@ if __name__ == "__main__":
                 "hash": emitted.window_signature_hash,
                 "path": "window_signature.json",
             },
+            "env": env_safe,
+            "env_capture": env_capture,
+            "provenance": {"policy_rev": POLICY_REV},
         }
 
         if _train_exc is not None:

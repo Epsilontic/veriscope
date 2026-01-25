@@ -19,10 +19,11 @@ from typing import Any, Dict, List, Optional
 from veriscope.core.artifacts import CountsV1, ProfileV1, ResultsSummaryV1, RunStatus, WindowSignatureRefV1
 from veriscope.core.jsonutil import atomic_write_json, canonical_json_sha256
 from veriscope.core.lifecycle import RunLifecycle, map_status_and_exit
+from veriscope.core.redaction_policy import POLICY_REV, default_env_capture, prepare_env_capture, redact_argv
 
 
 def _now_utc_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def _pkg_version() -> str:
@@ -51,16 +52,6 @@ def _git_sha(cwd: Optional[Path] = None) -> Optional[str]:
         return None
 
 
-def _relevant_env(env: Dict[str, str]) -> Dict[str, str]:
-    keep_prefixes = ("SCAR_", "VERISCOPE_", "NANOGPT_", "CUDA_", "CUBLAS_")
-    keep_exact = {"CUDA_VISIBLE_DEVICES", "PYTHONHASHSEED"}
-    out: Dict[str, str] = {}
-    for k, v in env.items():
-        if k in keep_exact or k.startswith(keep_prefixes):
-            out[k] = v
-    return dict(sorted(out.items()))
-
-
 def _default_outdir(kind: str) -> Path:
     base = Path(os.environ.get("VERISCOPE_OUT_BASE", "./out")).expanduser()
     ts = time.strftime("%Y%m%d_%H%M%S")
@@ -73,10 +64,50 @@ def _legacy_default_cifar_outdir() -> Path:
     return Path("./scar_bundle_phase4")
 
 
+def _sanitize_run_config_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    sanitized = dict(payload)
+    # NOTE: env_capture is recomputed on every write to avoid stale provenance.
+    env = sanitized.get("env")
+    env_capture = default_env_capture()
+    env_present = False
+    if isinstance(env, dict):
+        env_safe, env_capture = prepare_env_capture({str(k): str(v) for k, v in env.items()})
+        sanitized["env"] = env_safe
+        env_present = True
+
+    argv = sanitized.get("argv")
+    argv_redacted = False
+    if isinstance(argv, list) and all(isinstance(item, str) for item in argv):
+        safe_list, argv_redacted = redact_argv(argv)
+        sanitized["argv"] = safe_list
+    elif isinstance(argv, dict):
+        argv_safe: Dict[str, Any] = {}
+        for key, value in argv.items():
+            if isinstance(value, list) and all(isinstance(item, str) for item in value):
+                safe_list, redacted = redact_argv(value)
+                argv_safe[key] = safe_list
+                argv_redacted = argv_redacted or redacted
+            else:
+                argv_safe[key] = value
+        sanitized["argv"] = argv_safe
+    env_capture["env_present"] = env_present
+    env_capture["redactions_applied"] = bool(env_capture.get("redactions_applied")) or argv_redacted
+    sanitized["env_capture"] = env_capture
+
+    provenance = sanitized.get("provenance")
+    if isinstance(provenance, dict):
+        provenance_safe = dict(provenance)
+    else:
+        provenance_safe = {}
+    provenance_safe["policy_rev"] = POLICY_REV
+    sanitized["provenance"] = provenance_safe
+    return sanitized
+
+
 def _write_resolved_config(outdir: Path, payload: Dict[str, Any]) -> None:
     outdir.mkdir(parents=True, exist_ok=True)
     p = outdir / "run_config_resolved.json"
-    atomic_write_json(p, payload)
+    atomic_write_json(p, _sanitize_run_config_payload(payload))
 
 
 def _read_json_obj(path: Path) -> Dict[str, Any]:
@@ -376,7 +407,7 @@ def _cmd_run_cifar(args: argparse.Namespace) -> int:
             "legacy_argv": legacy_args,
             "legacy_entrypoint": "veriscope-legacy (console script)",
         },
-        "env": _relevant_env(env),
+        "env": env,
         "wrapper_exit_code": None,
         "runner_exit_code": None,
         "runner_signal": None,
@@ -510,7 +541,7 @@ def _cmd_run_gpt(args: argparse.Namespace) -> int:
             + (args.gpt_args or []),
             "runner_cmd": cmd,
         },
-        "env": _relevant_env(env),
+        "env": env,
         "wrapper_exit_code": None,
         "runner_exit_code": None,
         "runner_signal": None,
