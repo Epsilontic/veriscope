@@ -12,7 +12,7 @@
 
 *Detect representation collapse before it's too late.*
 
-[Quick Start](#quick-start) • [Pilot / Design Partner Use](#pilot--design-partner-use) • [Gate Semantics](#gate-semantics) • [Core API](#core-api) • [Output Artifacts](#output-artifacts) • [Contributing](#contributing) • [Citation](#citation)
+[Quick Start](#quick-start) • [Pilot kit overview](#pilot-kit-overview) • [Gate Semantics](#gate-semantics) • [Core API](#core-api) • [Output Artifacts](#output-artifacts) • [Contributing](#contributing) • [Citation](#citation)
 
 </div>
 
@@ -80,7 +80,7 @@ At a high level, Veriscope turns training-time monitoring into a reproducible de
 
 - Multi-metric consensus (`min_metrics_exceeding`): can suppress stability exceedance even when `worst_DW > eps_eff` if too few per-metric TVs exceed `eps_eff`.
 
-For exact decision logic, rely on `GateEngine.check(...).audit` and/or the calibration CSV fields emitted during runs.
+For exact decision logic, rely on `GateEngine.check(...).audit`, the calibration CSV fields, and the CLI validators (`veriscope validate`, `veriscope diff`) described in `docs/productization.md`.
 
 ---
 
@@ -133,40 +133,25 @@ Note: dependencies are declared in `pyproject.toml`, so you normally do not need
 
 ## Quick Start
 
-After installation, run Veriscope via the CLI entrypoint (recommended):
+After installation, run Veriscope via explicit subcommands (recommended).
+Use `veriscope --help` to see the available subcommands.
 
-- Using the installed command:
-
-  ```bash
-  veriscope [OPTIONS]
-  ```
-
-- If the console script is not available in your environment:
-
-  ```bash
-  python -m veriscope [OPTIONS]
-  ```
-
-### Smoke run (fast end-to-end)
+### CIFAR smoke run (fast end-to-end)
 
 ```bash
-export SCAR_SMOKE=1
-export SCAR_OUTDIR=./out_scar_smoke
 export SCAR_DATA=./data
-veriscope
+veriscope run cifar --smoke --outdir ./out/cifar_smoke_$(date +%Y%m%d_%H%M%S)
 # If the console script is not available:
-# python -m veriscope
+# python -m veriscope run cifar --smoke --outdir ./out/cifar_smoke_$(date +%Y%m%d_%H%M%S)
 ```
 
-Runs a small sweep (few seeds, short epochs), writing artifacts to `SCAR_OUTDIR`.
+Runs a small CIFAR sweep (few seeds, short epochs) into the specified outdir.
 
-### Full sweep (more seeds/epochs)
+### Full CIFAR sweep (more seeds/epochs)
 
 ```bash
-unset SCAR_SMOKE
-export SCAR_OUTDIR=./out_scar_full
 export SCAR_DATA=./data
-veriscope
+veriscope run cifar --outdir ./out/cifar_full_$(date +%Y%m%d_%H%M%S)
 ```
 
 
@@ -185,11 +170,34 @@ For operational semantics (exit codes, schemas, artifact contracts, and validati
 For narrative guidance, success criteria, and sharing guidance, see `docs/pilot/README.md`.
 For script usage, outputs, and troubleshooting, see `scripts/pilot/README.md`.
 
+Pilot harness commands (copy/paste):
+
+```bash
+# Prereq: clone and prepare nanoGPT data (see GPT runner section below).
+# Control run (baseline)
+bash scripts/pilot/run.sh ./out/pilot_control -- --dataset shakespeare_char --nanogpt_dir ./nanoGPT
+
+# Injected run (pathology via data corruption flags)
+bash scripts/pilot/run.sh ./out/pilot_injected -- --dataset shakespeare_char --nanogpt_dir ./nanoGPT \
+  --data_corrupt_at 2500 --data_corrupt_len 400 --data_corrupt_frac 0.15 --data_corrupt_mode permute
+# (See `python -m veriscope.runners.gpt.train_nanogpt --help` for corruption flag details.)
+
+# Score calibration
+python scripts/pilot/score.py \
+  --control-dir ./out/pilot_control \
+  --injected-dir ./out/pilot_injected \
+  --out calibration.json \
+  --out-md calibration.md
+
+# Negative controls on a completed capsule
+bash scripts/pilot/negative_controls.sh ./out/pilot_control
+```
+
 ---
 
 ## GPT runner (nanoGPT)
 
-The GPT runner wraps nanoGPT training with FR gating and emits a single JSON results file (plus optional calibration CSV).
+The GPT runner wraps nanoGPT training with FR gating and emits a capsule directory (results summary + provenance + optional calibration CSV). For the authoritative contract, defer to `docs/productization.md`.
 
 ```bash
 # Clone nanoGPT alongside veriscope
@@ -200,12 +208,20 @@ cd nanoGPT
 python data/shakespeare_char/prepare.py
 cd ..
 
+veriscope run gpt --outdir ./out/gpt_run --force -- \
+  --dataset shakespeare_char \
+  --nanogpt_dir ./nanoGPT \
+  --gate_preset tuned_v0
+```
+
+Advanced: run the module directly (bypasses the CLI wrapper):
+
+```bash
 python -m veriscope.runners.gpt.train_nanogpt \
   --dataset shakespeare_char \
   --nanogpt_dir ./nanoGPT \
-  --gate_preset tuned
+  --gate_preset tuned_v0
 ```
-
 ---
 
 ## Core API
@@ -264,7 +280,7 @@ print("eps_eff:", result.audit.get("eps_eff"))
 
 ## Output artifacts
 
-Written under `SCAR_OUTDIR`:
+### CIFAR sweep artifacts (run outdir)
 
 - **Run logs**
   - `bundle_runs_{tag}.parquet` (CSV fallback if parquet unavailable)
@@ -291,7 +307,24 @@ Written under `SCAR_OUTDIR`:
 - **Figures**
   - `figs/*.png`
 
-Writes are atomic where possible; parquet falls back to CSV automatically.
+Writes are atomic where possible; parquet falls back to CSV automatically. Legacy tooling may also respect `SCAR_OUTDIR` if set.
+
+### Pilot capsule outputs (`OUTDIR`)
+
+- **Required capsule files**
+  - `results_summary.json`
+  - `window_signature.json`
+  - `run_config_resolved.json`
+- **CLI outputs captured by the pilot harness**
+  - `validate.txt`
+  - `inspect.txt`
+  - `report.md`
+  - `report_stderr.txt`
+  - `git_sha.txt`
+  - `version.txt`
+- **Calibration outputs (from score.py)**
+  - `calibration.json`
+  - `calibration.md`
 
 ---
 
