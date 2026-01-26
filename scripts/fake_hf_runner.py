@@ -7,7 +7,7 @@ from pathlib import Path
 
 import veriscope
 from veriscope.core.artifacts import CountsV1, ProfileV1, ResultsSummaryV1, ResultsV1, WindowSignatureRefV1
-from veriscope.core.jsonutil import atomic_write_json, canonical_json_sha256
+from veriscope.core.jsonutil import atomic_write_json, atomic_write_pydantic_json, canonical_json_sha256, read_json_obj
 
 
 def _iso_utc_now() -> str:
@@ -26,10 +26,10 @@ def _emit_minimal_artifacts(outdir: Path, run_id: str, gate_preset: str) -> None
         "gate_controls": {"gate_window": 16, "min_evidence": 16},
         "metric_interval": 16,
     }
-    ws_hash = canonical_json_sha256(window_signature)
+    window_signature_path = outdir / "window_signature.json"
+    atomic_write_json(window_signature_path, window_signature)
+    ws_hash = canonical_json_sha256(read_json_obj(window_signature_path))
     ws_ref = WindowSignatureRefV1(hash=ws_hash, path="window_signature.json")
-
-    atomic_write_json(outdir / "window_signature.json", window_signature)
 
     profile = ProfileV1(gate_preset=gate_preset, overrides={})
     counts = CountsV1(evaluated=0, skip=0, pass_=0, warn=0, fail=0)
@@ -45,7 +45,7 @@ def _emit_minimal_artifacts(outdir: Path, run_id: str, gate_preset: str) -> None
         counts=counts,
         final_decision="skip",
     )
-    atomic_write_json(outdir / "results_summary.json", summary.model_dump(mode="json", by_alias=True))
+    atomic_write_pydantic_json(outdir / "results_summary.json", summary, by_alias=True, exclude_none=True, fsync=True)
 
     results = ResultsV1(
         run_id=run_id,
@@ -59,7 +59,7 @@ def _emit_minimal_artifacts(outdir: Path, run_id: str, gate_preset: str) -> None
         gates=[],
         metrics=[],
     )
-    atomic_write_json(outdir / "results.json", results.model_dump(mode="json", by_alias=True))
+    atomic_write_pydantic_json(outdir / "results.json", results, by_alias=True, exclude_none=True, fsync=True)
 
 
 def main() -> int:
