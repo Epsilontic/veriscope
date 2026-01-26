@@ -1,10 +1,11 @@
 cff-version: 1.2.0
+title: "Veriscope"
 message: "If you use this software, please cite it as below."
 authors:
   - family-names: Holmander
     given-names: Craig
-title: "Veriscope: Finite-Window Model Drift Predictor"
-version: "0.1.0"
-date-released: "2025-09-29"
-url: "https://github.com/[your-username]/[project-repo]"
-license: "AGPL-3.0-only OR LicenseRef-Holmander-Commercial"
+repository-code: https://github.com/Epsilontic/veriscope
+url: https://github.com/Epsilontic/veriscope
+version: 0.1.0
+date-released: 2026-01-26
+license: AGPL-3.0-only
