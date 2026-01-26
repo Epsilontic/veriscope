@@ -19,7 +19,7 @@ Veriscope is a CLI-first training reliability gate that flags representation dri
 ML platform / research engineering teams running expensive fine-tuning or long training jobs (labs, startups, enterprise AI) where wasted GPU time and postmortems are costly, and where a CLI gate + reproducible artifacts can be adopted quickly.
 
 ### What the design-partner pilot will look like (v0)
-Partner runs Veriscope on 1–2 internal fine-tunes:
+Partner runs Veriscope on 1–2 internal fine-tunes (run gpt shown; run hf uses the same wrapper semantics with HF-specific runner args):
 
 ```bash
 veriscope run gpt --gate-preset tuned_v0 --outdir OUTDIR -- <their training args>
@@ -53,9 +53,11 @@ Operator FAQ (read this first)
 Entry points
 	•	CLI: veriscope/cli/main.py
 	•	veriscope run gpt ... delegates to veriscope/runners/gpt/train_nanogpt.py
+	•	veriscope run hf ... delegates to veriscope/runners/hf/train_hf.py
 	•	veriscope run cifar ... delegates to legacy subprocess (out-of-scope v0)
 	•	Smoke scripts:
 	•	scripts/run_gpt_smoke.sh
+	•	scripts/run_hf_smoke.sh
 	•	scripts/run_cifar_smoke.sh (legacy; out-of-scope v0)
 
 What the GPT runner emits today
@@ -101,20 +103,36 @@ Process safety requirements (v0 must-have)
 	•	Start a new process group/session for the runner and forward signals to the process group:
 	•	On POSIX: spawn runner in a new session and forward SIGINT/SIGTERM to the group.
 	•	Best-effort finalization on SIGINT/SIGTERM: wrapper attempts best-effort finalization (write/update summary/status); no guarantee on SIGKILL.
-	•	Exit code propagation: see Exit Codes (§2.5). veriscope run must return non-zero on runner crash or gate FAIL.
+	•	Exit code propagation: see Exit Codes (§2.6). veriscope run must return non-zero on runner crash or veriscope internal failure.
 
 Exit code decision rule (authoritative)
-veriscope run determines its own exit code only from results_summary.json when available.
+veriscope run determines its own exit code from run_status in results_summary.json when available.
 
 Fallback (consistent, non-brittle):
 If results_summary.json is missing/unreadable:
 	1.	If the runner exited non-zero → exit code 2 (user_code_failure)
-	2.	Else if results.json exists and validates → compute an in-memory temporary summary using the same final_decision policy as §4D and decide exit code from that
-	3.	Else → exit code 3 (veriscope_failure)
+	2.	Else → exit code 3 (veriscope_failure)
 
 ⸻
 
-2.2 veriscope validate OUTDIR (new)
+2.2 veriscope run hf (hardened wrapper)
+
+veriscope run hf \
+  --gate-preset tuned_v0 \
+  --outdir OUTDIR \
+  [--force] \
+  -- <training args>
+
+Notes (HF runner)
+	•	Wrapper inserts --outdir and --run_id if missing.
+	•	HF dependency preflight runs before launch and fails fast if datasets/transformers are missing.
+	•	Override runner command via VERISCOPE_HF_RUNNER_CMD for CI-safe integration testing.
+	•	HF runner inherits the same wrapper process-safety invariants as run gpt (streaming logs, process group, signal forwarding, best-effort finalization).
+	•	--force has the same meaning as run gpt (bypass GPU lock).
+
+⸻
+
+2.3 veriscope validate OUTDIR (new)
 
 veriscope validate OUTDIR [--strict-version]
 
@@ -135,7 +153,7 @@ Schema compatibility rule:
 
 ⸻
 
-2.3 veriscope report OUTDIR (new; Markdown-first)
+2.4 veriscope report OUTDIR (new; Markdown-first)
 
 veriscope report OUTDIR \
   [--control] \
@@ -166,7 +184,7 @@ Appendix A provides a golden reference.
 
 ⸻
 
-2.4 veriscope override OUTDIR (optional v0+, recommended)
+2.5 veriscope override OUTDIR (optional v0+, recommended)
 
 veriscope override OUTDIR --status pass|fail --reason "..." [--reviewer "Name"] [--ts-utc "..."]
 
@@ -176,17 +194,17 @@ Clarification: manual judgement does not change raw gate records; it is an opera
 
 ⸻
 
-2.5 Exit codes (CI-friendly and unambiguous)
+2.6 Exit codes (CI-friendly and unambiguous)
 
 veriscope run
 
 Code	Meaning
-0	runner exited 0; final_decision != "fail"
-1	runner exited 0; final_decision == "fail"
+0	runner exited 0; run_status="success"
 2	runner crash (run_status="user_code_failure")
 3	veriscope internal error (run_status="veriscope_failure")
 
 Note: WARN does not produce non-zero exit.
+Decision outcomes (pass/warn/fail/skip) are recorded in artifacts rather than as exit codes.
 
 veriscope validate
 

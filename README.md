@@ -154,8 +154,22 @@ export SCAR_DATA=./data
 veriscope run cifar --outdir ./out/cifar_full_$(date +%Y%m%d_%H%M%S)
 ```
 
-
 > Note: a full sweep can take hours depending on hardware.
+
+### HF quick start (transformers runner)
+
+```bash
+# Requires transformers + datasets
+veriscope run hf --gate-preset tuned_v0 --outdir ./out/hf_smoke_$(date +%Y%m%d_%H%M%S) -- \
+  --model gpt2 \
+  --dataset wikitext:wikitext-2-raw-v1 \
+  --dataset_split train \
+  --max_steps 50 \
+  --device cpu
+```
+
+Runs a short HF training loop and writes a capsule in the specified outdir.
+For a scripted version, see `scripts/run_hf_smoke.sh`.
 
 ---
 

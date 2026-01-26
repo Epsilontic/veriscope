@@ -221,9 +221,9 @@ def _ensure_window_signature(outdir: Path, *, reason: str, run_kind: str) -> Win
 
 def _extract_gate_preset(args: List[str]) -> str:
     for idx, arg in enumerate(args):
-        if arg.startswith("--gate_preset="):
+        if arg.startswith("--gate_preset=") or arg.startswith("--gate-preset="):
             return arg.split("=", 1)[1] or "unknown"
-        if arg == "--gate_preset" and idx + 1 < len(args):
+        if arg in ("--gate_preset", "--gate-preset") and idx + 1 < len(args):
             return args[idx + 1]
     return "unknown"
 
@@ -819,6 +819,12 @@ def _cmd_run_hf(args: argparse.Namespace) -> int:
     has_run_id = ("--run_id" in hf_args) or any(a.startswith("--run_id=") for a in hf_args)
     if not has_run_id:
         hf_args = ["--run_id", run_id] + hf_args
+    if args.gate_preset:
+        has_gate_preset = ("--gate_preset" in hf_args) or ("--gate-preset" in hf_args) or any(
+            a.startswith("--gate_preset=") or a.startswith("--gate-preset=") for a in hf_args
+        )
+        if not has_gate_preset:
+            hf_args = ["--gate_preset", args.gate_preset] + hf_args
 
     override_cmd = (os.environ.get("VERISCOPE_HF_RUNNER_CMD") or "").strip()
     if override_cmd:
@@ -826,8 +832,10 @@ def _cmd_run_hf(args: argparse.Namespace) -> int:
     else:
         cmd = [sys.executable, "-m", "veriscope.runners.hf.train_hf"] + hf_args
 
-    gate_preset = _extract_gate_preset(hf_args)
+    gate_preset = args.gate_preset or _extract_gate_preset(hf_args)
     veriscope_argv = ["veriscope", "run", "hf"]
+    if args.gate_preset:
+        veriscope_argv += ["--gate-preset", args.gate_preset]
     if outdir_str:
         veriscope_argv += ["--outdir", str(outdir)]
     veriscope_argv += list(args.hf_args or [])
@@ -1135,6 +1143,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     p_hf = run_sub.add_parser("hf", help="Run the Hugging Face transformer runner")
     p_hf.add_argument("--outdir", type=str, default="", help="Output directory (default: ./out/...)")
+    p_hf.add_argument("--gate-preset", type=str, default="tuned_v0", help="Gate preset name")
     p_hf.add_argument("--force", action="store_true", help="Bypass GPU lock")
     p_hf.add_argument("hf_args", nargs=argparse.REMAINDER, help="Args forwarded to train_hf.py")
     p_hf.set_defaults(_handler=_cmd_run_hf)
