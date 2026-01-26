@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -16,7 +15,7 @@ from veriscope.core.artifacts import (
     WindowSignatureRefV1,
     derive_final_decision,
 )
-from veriscope.core.jsonutil import atomic_write_json, atomic_write_pydantic_json, canonical_json_sha256
+from veriscope.core.jsonutil import atomic_write_json, atomic_write_pydantic_json, canonical_json_sha256, read_json_obj
 
 logger = logging.getLogger(__name__)
 
@@ -54,14 +53,6 @@ def _counts_from_gates(gates: Iterable[GateRecordV1]) -> CountsV1:
     return CountsV1(evaluated=evaluated, skip=skip, pass_=pass_n, warn=warn, fail=fail)
 
 
-def _read_json_obj(path: Path) -> Dict[str, Any]:
-    txt = path.read_text(encoding="utf-8")
-    obj = json.loads(txt)
-    if not isinstance(obj, dict):
-        raise TypeError(f"{path.name} must be a JSON object")
-    return obj
-
-
 def emit_hf_artifacts_v1(
     *,
     outdir: Path,
@@ -81,7 +72,7 @@ def emit_hf_artifacts_v1(
     window_signature_path = outdir / "window_signature.json"
     atomic_write_json(window_signature_path, window_signature)
 
-    ws_on_disk = _read_json_obj(window_signature_path)
+    ws_on_disk = read_json_obj(window_signature_path)
     ws_hash = canonical_json_sha256(ws_on_disk)
     ws_ref = WindowSignatureRefV1(hash=ws_hash, path="window_signature.json")
 
@@ -89,6 +80,7 @@ def emit_hf_artifacts_v1(
     profile = ProfileV1(gate_preset=gate_preset, overrides={})
 
     results = ResultsV1(
+        schema_version=1,
         run_id=run_id,
         window_signature_ref=ws_ref,
         profile=profile,
@@ -97,15 +89,16 @@ def emit_hf_artifacts_v1(
         runner_signal=runner_signal,
         started_ts_utc=_iso_z(started_ts_utc),
         ended_ts_utc=_iso_z(ended_ts_utc) if ended_ts_utc else None,
-        gates=tuple(gate_records_list),
-        metrics=tuple(),
+        gates=gate_records_list,
+        metrics=[],
     )
 
     results_path = outdir / "results.json"
-    atomic_write_pydantic_json(results_path, results)
+    atomic_write_pydantic_json(results_path, results, by_alias=True, exclude_none=True, fsync=True)
 
     counts = _counts_from_gates(gate_records_list)
     summary = ResultsSummaryV1(
+        schema_version=1,
         run_id=run_id,
         window_signature_ref=ws_ref,
         profile=profile,
@@ -119,7 +112,7 @@ def emit_hf_artifacts_v1(
     )
 
     results_summary_path = outdir / "results_summary.json"
-    atomic_write_pydantic_json(results_summary_path, summary)
+    atomic_write_pydantic_json(results_summary_path, summary, by_alias=True, exclude_none=True, fsync=True)
 
     logger.info("Wrote HF artifacts to %s (run_id=%s)", outdir, run_id)
     return EmittedArtifactsV1(

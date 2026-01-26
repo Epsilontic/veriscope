@@ -163,6 +163,18 @@ def atomic_write_pydantic_json(
     atomic_write_json(path, payload, fsync=fsync)
 
 
+def read_json_obj(path: Path) -> dict[str, Any]:
+    """
+    Read a JSON file and require a top-level object.
+
+    Raises TypeError if the JSON is not an object.
+    """
+    obj = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(obj, dict):
+        raise TypeError(f"{Path(path).name} must be a JSON object")
+    return obj
+
+
 def cleanup_tmp_siblings(path: Path, *, include_legacy: bool = False) -> int:
     """
     Optional utility: remove stale sibling temp files created by this module.
