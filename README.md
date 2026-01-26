@@ -387,6 +387,9 @@ This project is dual-licensed:
 - **GNU Affero General Public License v3.0 (AGPL-3.0-only)**
 - **Commercial license** (for organizations preferring not to comply with AGPL terms)
 
+The dual-license model ensures Veriscope remains open and auditable for research and open-source use,
+while also enabling sustainable commercial support and long-term maintenance.
+
 Use AGPL-3.0-only for open-source compliance; obtain a commercial license if you prefer not to comply with AGPL obligations for proprietary or hosted deployments.
 
 See `LICENSE` and `COMMERCIAL_LICENSE.md` for details.
