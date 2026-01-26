@@ -1,0 +1,497 @@
+from __future__ import annotations
+
+import argparse
+import os
+import random
+import time
+import uuid
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional
+
+import numpy as np
+import torch
+from torch.utils.data import DataLoader
+
+import veriscope
+from veriscope.core.artifacts import AuditV1, GateRecordV1
+from veriscope.core.calibration import aggregate_epsilon_stat
+from veriscope.core.gate import GateEngine
+from veriscope.core.transport import DeclTransport
+from veriscope.core.window import FRWindow, WindowDecl
+from veriscope.core.jsonutil import atomic_write_json
+from veriscope.runners.hf.adapter import HFMetricComputer, HFMetricConfig
+from veriscope.runners.hf.emit_artifacts import emit_hf_artifacts_v1
+
+
+@dataclass(frozen=True)
+class HFRunConfig:
+    model: str
+    dataset_name: str
+    dataset_config: Optional[str]
+    dataset_split: str
+    dataset_text_column: str
+    outdir: Path
+    run_id: str
+    max_steps: int
+    batch_size: int
+    lr: float
+    seed: int
+    cadence: int
+    block_size: int
+    device: str
+    grad_clip: float
+    gate_preset: str
+    gate_window: int
+    gate_epsilon: float
+    gate_min_evidence: int
+    gate_gain_thresh: float
+    gate_policy: str
+    gate_persistence_k: int
+    rp_dim: int
+
+
+def _iso_utc(dt: datetime) -> str:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    return dt.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _default_outdir() -> Path:
+    base = Path(os.environ.get("VERISCOPE_OUT_BASE", "./out")).expanduser()
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    return base / f"veriscope_hf_{ts}_{os.getpid()}"
+
+
+def _set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def _build_window_decl(cfg: HFRunConfig) -> WindowDecl:
+    return WindowDecl(
+        epsilon=float(cfg.gate_epsilon),
+        metrics=["var_out_k", "eff_dim"],
+        weights={"var_out_k": 0.5, "eff_dim": 0.5},
+        bins=16,
+        interventions=(lambda x: x,),
+        cal_ranges={"var_out_k": (0.0, 1.0), "eff_dim": (0.0, float(cfg.rp_dim))},
+    )
+
+
+def _build_gate_engine(cfg: HFRunConfig, window_decl: WindowDecl) -> GateEngine:
+    transport = DeclTransport(window_decl)
+    window_decl.attach_transport(transport)
+    fr_win = FRWindow(decl=window_decl, transport=transport, tests=())
+    return GateEngine(
+        frwin=fr_win,
+        gain_thresh=float(cfg.gate_gain_thresh),
+        eps_stat_alpha=0.05,
+        eps_stat_max_frac=0.25,
+        eps_sens=0.04,
+        min_evidence=int(cfg.gate_min_evidence),
+        policy=str(cfg.gate_policy),
+        persistence_k=int(cfg.gate_persistence_k),
+        min_metrics_exceeding=1,
+    )
+
+
+def _build_window_signature(cfg: HFRunConfig) -> Dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "created_ts_utc": _iso_utc(datetime.now(timezone.utc)),
+        "description": "HF transformer runner (custom loop)",
+        "code_identity": {"package_version": veriscope.__version__},
+        "transport": {"name": "hf_hidden_state_v1", "cadence": f"every_{cfg.cadence}_steps"},
+        "evidence": {
+            "metrics": ["var_out_k", "eff_dim"],
+            "window": {"kind": "fixed", "size": cfg.gate_window, "stride": cfg.cadence},
+        },
+        "gates": {
+            "preset": cfg.gate_preset,
+            "params": {
+                "epsilon": cfg.gate_epsilon,
+                "min_evidence": cfg.gate_min_evidence,
+                "gain_thresh": cfg.gate_gain_thresh,
+                "policy": cfg.gate_policy,
+                "persistence_k": cfg.gate_persistence_k,
+            },
+        },
+        "model": {"name": cfg.model},
+        "dataset": {
+            "name": cfg.dataset_name,
+            "config": cfg.dataset_config,
+            "split": cfg.dataset_split,
+            "text_column": cfg.dataset_text_column,
+        },
+        "sketch": {"kind": "jl", "dim": cfg.rp_dim, "seed": cfg.seed},
+    }
+
+
+def _tokenize_dataset(
+    dataset_name: str,
+    dataset_config: Optional[str],
+    dataset_split: str,
+    dataset_text_column: str,
+    tokenizer: Any,
+    *,
+    block_size: int,
+    batch_size: int,
+    seed: int,
+) -> Iterable[Dict[str, torch.Tensor]]:
+    from datasets import load_dataset
+
+    if dataset_config:
+        dataset = load_dataset(dataset_name, dataset_config, split=dataset_split)
+    else:
+        dataset = load_dataset(dataset_name, split=dataset_split)
+
+    if dataset_text_column not in dataset.column_names:
+        raise ValueError(f"Dataset column '{dataset_text_column}' not found. Available columns: {dataset.column_names}")
+
+    def tokenize_fn(batch: Dict[str, List[str]]) -> Dict[str, List[int]]:
+        return tokenizer(batch[dataset_text_column], add_special_tokens=False)["input_ids"]
+
+    tokenized = dataset.map(tokenize_fn, batched=True, remove_columns=dataset.column_names)
+
+    def group_texts(batch: Dict[str, List[List[int]]]) -> Dict[str, List[List[int]]]:
+        concatenated: List[int] = []
+        for ids in batch["input_ids"]:
+            concatenated.extend(ids)
+        total_len = (len(concatenated) // block_size) * block_size
+        result = {"input_ids": [concatenated[i : i + block_size] for i in range(0, total_len, block_size)]}
+        return result
+
+    grouped = tokenized.map(group_texts, batched=True)
+
+    def collate(batch: List[Dict[str, List[int]]]) -> Dict[str, torch.Tensor]:
+        input_ids = torch.tensor([item["input_ids"] for item in batch], dtype=torch.long)
+        return {"input_ids": input_ids, "labels": input_ids}
+
+    generator = torch.Generator().manual_seed(int(seed))
+    return DataLoader(grouped, batch_size=batch_size, shuffle=True, collate_fn=collate, generator=generator)
+
+
+def _metric_snapshot(
+    metric_history: List[Dict[str, Any]], gate_window: int
+) -> tuple[list[Dict[str, Any]], list[Dict[str, Any]]]:
+    if gate_window <= 0:
+        return [], []
+    if len(metric_history) < gate_window:
+        return [], list(metric_history)
+    past = metric_history[-2 * gate_window : -gate_window]
+    recent = metric_history[-gate_window:]
+    return past, recent
+
+
+def _gate_from_history(
+    gate_engine: GateEngine,
+    window_decl: WindowDecl,
+    metric_history: List[Dict[str, Any]],
+    gate_window: int,
+    iter_num: int,
+    gate_policy: str,
+    gate_min_evidence: int,
+) -> GateRecordV1:
+    past_slice, recent_slice = _metric_snapshot(metric_history, gate_window)
+    if not past_slice or not recent_slice:
+        audit = AuditV1(
+            evaluated=False,
+            reason="not_evaluated_insufficient_evidence",
+            policy=gate_policy,
+            per_metric_tv={},
+            evidence_total=0,
+            min_evidence=gate_min_evidence,
+        )
+        return GateRecordV1(iter=iter_num, decision="skip", audit=audit, ok=True, warn=False)
+    metrics = list(window_decl.weights.keys())
+
+    def _extract(slice_data: List[Dict[str, Any]], key: str) -> np.ndarray:
+        vals = [float(d.get(key, np.nan)) for d in slice_data]
+        arr = np.array(vals, dtype=float)
+        return arr[np.isfinite(arr)]
+
+    past_dict = {m: _extract(past_slice, m) for m in metrics}
+    recent_dict = {m: _extract(recent_slice, m) for m in metrics}
+    counts = {m: min(len(past_dict[m]), len(recent_dict[m])) for m in metrics}
+
+    eps_stat_value = float("nan")
+    if sum(counts.values()) > 0:
+        eps_stat_value = aggregate_epsilon_stat(window_decl, counts, alpha=0.05)
+
+    result = gate_engine.check(
+        past=past_dict,
+        recent=recent_dict,
+        counts_by_metric=counts,
+        gain_bits=0.0,
+        kappa_sens=0.0,
+        eps_stat_value=eps_stat_value,
+        iter_num=iter_num,
+    )
+
+    audit_payload = dict(result.audit or {})
+    audit_payload.setdefault("per_metric_tv", {})
+    audit = AuditV1(**audit_payload)
+
+    if not audit.evaluated:
+        decision = "skip"
+    elif result.warn:
+        decision = "warn"
+    elif result.ok:
+        decision = "pass"
+    else:
+        decision = "fail"
+
+    return GateRecordV1(iter=iter_num, decision=decision, audit=audit, ok=result.ok, warn=result.warn)
+
+
+def _run(cfg: HFRunConfig) -> int:
+    cfg.outdir.mkdir(parents=True, exist_ok=True)
+    _set_seed(cfg.seed)
+
+    device = torch.device(cfg.device)
+
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(cfg.model)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    model = AutoModelForCausalLM.from_pretrained(cfg.model)
+    model.config.use_cache = False
+    model.to(device)
+    model.train()
+
+    data_loader = _tokenize_dataset(
+        cfg.dataset_name,
+        cfg.dataset_config,
+        cfg.dataset_split,
+        cfg.dataset_text_column,
+        tokenizer,
+        block_size=cfg.block_size,
+        batch_size=cfg.batch_size,
+        seed=cfg.seed,
+    )
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
+
+    metric_config = HFMetricConfig(
+        max_tokens_per_batch=cfg.batch_size * cfg.block_size,
+        rp_dim=cfg.rp_dim,
+    )
+    metric_computer = HFMetricComputer(config=metric_config, seed=cfg.seed)
+
+    window_decl = _build_window_decl(cfg)
+    gate_engine = _build_gate_engine(cfg, window_decl)
+
+    run_id = cfg.run_id
+    started_ts = datetime.now(timezone.utc)
+
+    metric_history: List[Dict[str, Any]] = []
+    gate_records: List[GateRecordV1] = []
+
+    step = 0
+    data_iter = iter(data_loader)
+    while step < cfg.max_steps:
+        try:
+            batch = next(data_iter)
+        except StopIteration:
+            data_iter = iter(data_loader)
+            batch = next(data_iter)
+
+        input_ids = batch["input_ids"].to(device)
+        labels = batch["labels"].to(device)
+
+        attention_mask = None
+        if tokenizer.pad_token_id is not None and tokenizer.pad_token_id != tokenizer.eos_token_id:
+            attention_mask = (input_ids != tokenizer.pad_token_id).long()
+        need_hidden = step % cfg.cadence == 0
+        outputs = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            output_hidden_states=need_hidden,
+            use_cache=False,
+        )
+        loss = outputs.loss
+        loss.backward()
+        if cfg.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+        optimizer.step()
+        optimizer.zero_grad()
+
+        if step % cfg.cadence == 0:
+            with torch.no_grad():
+                hidden_states = outputs.hidden_states[-1] if outputs.hidden_states else None
+                if hidden_states is None:
+                    metrics = {"var_out_k": float("nan"), "eff_dim": float("nan")}
+                else:
+                    metrics = metric_computer.compute_metrics(
+                        hidden_states=hidden_states.detach(),
+                        attention_mask=attention_mask,
+                        step=step,
+                    )
+            metric_history.append(
+                {
+                    "iter": step,
+                    "loss": float(loss.detach().cpu().item()),
+                    "var_out_k": float(metrics.get("var_out_k", float("nan"))),
+                    "eff_dim": float(metrics.get("eff_dim", float("nan"))),
+                }
+            )
+            gate_records.append(
+                _gate_from_history(
+                    gate_engine,
+                    window_decl,
+                    metric_history,
+                    cfg.gate_window,
+                    step,
+                    cfg.gate_policy,
+                    cfg.gate_min_evidence,
+                )
+            )
+
+        step += 1
+
+    ended_ts = datetime.now(timezone.utc)
+
+    window_signature = _build_window_signature(cfg)
+    emit_hf_artifacts_v1(
+        outdir=cfg.outdir,
+        run_id=run_id,
+        started_ts_utc=started_ts,
+        ended_ts_utc=ended_ts,
+        gate_preset=cfg.gate_preset,
+        window_signature=window_signature,
+        gate_records=gate_records,
+        run_status="success",
+        runner_exit_code=0,
+        runner_signal=None,
+    )
+    return 0
+
+
+def _parse_args() -> HFRunConfig:
+    parser = argparse.ArgumentParser(description="Veriscope HF transformer runner (custom loop).")
+    parser.add_argument("--model", type=str, default="gpt2", help="HF model name (default: gpt2)")
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="wikitext:wikitext-2-raw-v1",
+        help="HF dataset spec (name[:config]) (default: wikitext:wikitext-2-raw-v1)",
+    )
+    parser.add_argument("--dataset_name", type=str, default="", help="HF dataset name override")
+    parser.add_argument("--dataset_config", type=str, default="", help="HF dataset config override")
+    parser.add_argument("--dataset_split", type=str, default="train", help="HF dataset split")
+    parser.add_argument("--dataset_text_column", type=str, default="text", help="Text column name")
+    parser.add_argument("--outdir", type=str, default="", help="Output directory for artifacts")
+    parser.add_argument("--run_id", type=str, default="", help="Run identifier (wrapper overrides)")
+    parser.add_argument("--max_steps", type=int, default=200, help="Max training steps")
+    parser.add_argument("--batch_size", type=int, default=4, help="Batch size")
+    parser.add_argument("--lr", type=float, default=5e-4, help="Learning rate")
+    parser.add_argument("--seed", type=int, default=1337, help="Random seed")
+    parser.add_argument("--cadence", type=int, default=10, help="Instrumentation cadence (steps)")
+    parser.add_argument("--block_size", type=int, default=128, help="Sequence length for training")
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cuda" if torch.cuda.is_available() else "cpu",
+        help="Device (cuda or cpu)",
+    )
+    parser.add_argument("--grad_clip", type=float, default=1.0, help="Gradient clipping (0 to disable)")
+    parser.add_argument("--gate_preset", type=str, default="tuned_v0", help="Gate preset name")
+    parser.add_argument("--gate_window", type=int, default=20, help="Gate window (metric snapshots)")
+    parser.add_argument("--gate_epsilon", type=float, default=0.12, help="Gate epsilon")
+    parser.add_argument("--gate_min_evidence", type=int, default=8, help="Gate minimum evidence")
+    parser.add_argument("--gate_gain_thresh", type=float, default=0.0, help="Gate gain threshold")
+    parser.add_argument("--gate_policy", type=str, default="persistence", help="Gate policy")
+    parser.add_argument("--gate_persistence_k", type=int, default=2, help="Gate persistence K")
+    parser.add_argument("--rp_dim", type=int, default=64, help="JL projection dimension")
+
+    args = parser.parse_args()
+    outdir = Path(args.outdir).expanduser() if args.outdir else _default_outdir()
+    run_id = args.run_id.strip() or uuid.uuid4().hex[:12]
+    dataset_name = args.dataset_name.strip()
+    dataset_config = args.dataset_config.strip()
+    if not dataset_name:
+        dataset_spec = args.dataset.strip()
+        if ":" in dataset_spec:
+            dataset_name, dataset_config = dataset_spec.split(":", 1)
+        else:
+            dataset_name = dataset_spec
+    dataset_name = dataset_name or "wikitext"
+    dataset_config = dataset_config or None
+    return HFRunConfig(
+        model=args.model,
+        dataset_name=dataset_name,
+        dataset_config=dataset_config,
+        dataset_split=args.dataset_split,
+        dataset_text_column=args.dataset_text_column,
+        outdir=outdir,
+        run_id=run_id,
+        max_steps=int(args.max_steps),
+        batch_size=int(args.batch_size),
+        lr=float(args.lr),
+        seed=int(args.seed),
+        cadence=int(args.cadence),
+        block_size=int(args.block_size),
+        device=str(args.device),
+        grad_clip=float(args.grad_clip),
+        gate_preset=str(args.gate_preset),
+        gate_window=int(args.gate_window),
+        gate_epsilon=float(args.gate_epsilon),
+        gate_min_evidence=int(args.gate_min_evidence),
+        gate_gain_thresh=float(args.gate_gain_thresh),
+        gate_policy=str(args.gate_policy),
+        gate_persistence_k=int(args.gate_persistence_k),
+        rp_dim=int(args.rp_dim),
+    )
+
+
+def main() -> int:
+    cfg = _parse_args()
+    cfg.outdir.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(
+        cfg.outdir / "runner_config.json",
+        {
+            "schema_version": 1,
+            "ts_utc": _iso_utc(datetime.now(timezone.utc)),
+            "runner": "hf",
+            "config": {
+                "run_id": cfg.run_id,
+                "model": cfg.model,
+                "dataset_name": cfg.dataset_name,
+                "dataset_config": cfg.dataset_config,
+                "dataset_split": cfg.dataset_split,
+                "dataset_text_column": cfg.dataset_text_column,
+                "max_steps": cfg.max_steps,
+                "batch_size": cfg.batch_size,
+                "lr": cfg.lr,
+                "seed": cfg.seed,
+                "cadence": cfg.cadence,
+                "block_size": cfg.block_size,
+                "device": cfg.device,
+                "grad_clip": cfg.grad_clip,
+                "gate_preset": cfg.gate_preset,
+                "gate_window": cfg.gate_window,
+                "gate_epsilon": cfg.gate_epsilon,
+                "gate_min_evidence": cfg.gate_min_evidence,
+                "gate_gain_thresh": cfg.gate_gain_thresh,
+                "gate_policy": cfg.gate_policy,
+                "gate_persistence_k": cfg.gate_persistence_k,
+                "rp_dim": cfg.rp_dim,
+            },
+        },
+    )
+    return _run(cfg)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
