@@ -58,6 +58,66 @@ def _default_outdir(kind: str) -> Path:
     return base / f"veriscope_{kind}_{ts}_{os.getpid()}"
 
 
+def _filter_env_for_run(env: Dict[str, str]) -> Dict[str, str]:
+    allowlist = {
+        "CUDA_VISIBLE_DEVICES",
+        "HF_HOME",
+        "TRANSFORMERS_CACHE",
+        "HF_HUB_DISABLE_TELEMETRY",
+        "PYTHONHASHSEED",
+        "CUBLAS_WORKSPACE_CONFIG",
+        "CUDA_LAUNCH_BLOCKING",
+        "TORCH_DETERMINISTIC",
+        "CUDNN_DETERMINISTIC",
+        "OMP_NUM_THREADS",
+        "MKL_NUM_THREADS",
+    }
+    return {k: v for k, v in env.items() if k.startswith("VERISCOPE_") or k in allowlist}
+
+
+def _print_cmd(cmd: List[str]) -> None:
+    try:
+        rendered = shlex.join(cmd)
+    except AttributeError:
+        rendered = " ".join(shlex.quote(part) for part in cmd)
+    print(f"[veriscope] cmd={rendered}")
+
+
+def _build_resolved_payload(
+    *,
+    run_kind: str,
+    run_id: str,
+    outdir: Path,
+    lifecycle: RunLifecycle,
+    veriscope_argv: List[str],
+    raw_forwarded_args: List[str],
+    normalized_forwarded_args: List[str],
+    cmd: List[str],
+    env: Dict[str, str],
+) -> Dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "ts_utc": _now_utc_iso(),
+        "package": {"name": "veriscope", "version": _pkg_version()},
+        "git_sha": _git_sha(),
+        "run": {"kind": run_kind, "run_id": run_id, "outdir": str(outdir)},
+        "argv": {
+            "veriscope_argv": veriscope_argv,
+            "raw_forwarded_args": raw_forwarded_args,
+            "normalized_forwarded_args": normalized_forwarded_args,
+            "runner_cmd": cmd,
+        },
+        "env": _filter_env_for_run(env),
+        "wrapper_exit_code": None,
+        "runner_exit_code": None,
+        "runner_signal": None,
+        "run_status": "running",
+        "lifecycle_state": lifecycle.state,
+        "started_ts_utc": lifecycle.started_ts_utc.isoformat(),
+        "ended_ts_utc": None,
+    }
+
+
 def _legacy_default_cifar_outdir() -> Path:
     # IMPORTANT: matches legacy default in veriscope.runners.legacy_cli_refactor
     # OUTDIR = Path(os.environ.get("SCAR_OUTDIR", "./scar_bundle_phase4"))
@@ -363,6 +423,200 @@ def _run_legacy(argv_passthrough: List[str]) -> int:
     return _run_legacy_subprocess(list(argv_passthrough), env=os.environ.copy())
 
 
+def _run_subprocess_wrapper(
+    *,
+    run_kind: str,
+    outdir: Path,
+    run_id: str,
+    cmd: List[str],
+    gate_preset: str,
+    raw_forwarded_args: List[str],
+    normalized_forwarded_args: List[str],
+    veriscope_argv: List[str],
+    env: Dict[str, str],
+    force: bool,
+) -> int:
+    lifecycle = RunLifecycle(run_id=run_id, run_kind=run_kind)
+    resolved = _build_resolved_payload(
+        run_kind=run_kind,
+        run_id=run_id,
+        outdir=outdir,
+        lifecycle=lifecycle,
+        veriscope_argv=veriscope_argv,
+        raw_forwarded_args=raw_forwarded_args,
+        normalized_forwarded_args=normalized_forwarded_args,
+        cmd=cmd,
+        env=env,
+    )
+    _write_resolved_config(outdir, resolved)
+    print(f"[veriscope] outdir={outdir}")
+    _print_cmd(cmd)
+    print(f"[veriscope] wrote {outdir / 'run_config_resolved.json'}")
+
+    _ensure_window_signature(outdir, reason="wrapper_start", run_kind=run_kind)
+
+    lock = _acquire_gpu_lock(force=force)
+    try:
+        proc: Optional[subprocess.Popen] = None
+        threads: List[threading.Thread] = []
+        runner_launch_error: Optional[Exception] = None
+
+        forwarder: Optional[_SignalForwarder] = None
+        pending_signals: List[int] = []
+
+        def _handle_wrapper_signal(signum: int, frame: Optional[Any]) -> None:
+            nonlocal forwarder, proc
+            if forwarder is not None:
+                try:
+                    forwarder.handle(signum, frame)
+                except Exception:
+                    pass
+                return
+
+            try:
+                lifecycle.mark_interrupted(signum)
+            except Exception:
+                pass
+            pending_signals.append(signum)
+            if proc is not None:
+                try:
+                    _signal_child(proc, signum)
+                except Exception:
+                    pass
+
+        prev_int = signal.signal(signal.SIGINT, _handle_wrapper_signal)
+        prev_term = signal.signal(signal.SIGTERM, _handle_wrapper_signal)
+
+        try:
+            lifecycle.mark_running()
+            _write_run_config_merge(outdir, {"lifecycle_state": lifecycle.state})
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    env=env,
+                    start_new_session=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    bufsize=1,
+                )
+            except OSError as exc:
+                runner_launch_error = exc
+
+            if runner_launch_error is None and proc is not None:
+                threads = _start_stream_threads(proc)
+                forwarder = _SignalForwarder(proc, lifecycle)
+
+                if pending_signals:
+                    for s in list(pending_signals):
+                        try:
+                            forwarder.handle(s, None)
+                        except Exception:
+                            pass
+                    pending_signals.clear()
+
+                while proc.poll() is None:
+                    if forwarder.interrupted:
+                        forwarder.maybe_escalate()
+                        time.sleep(0.1)
+                    else:
+                        try:
+                            proc.wait(timeout=0.5)
+                        except subprocess.TimeoutExpired:
+                            pass
+
+                lifecycle.mark_runner_exit(proc.returncode)
+
+                summary_path = outdir / "results_summary.json"
+                summary_ok = summary_path.exists() and _summary_is_valid(summary_path)
+                run_status, wrapper_exit = map_status_and_exit(
+                    runner_exit_code=proc.returncode,
+                    runner_signal=lifecycle.runner_signal,
+                    internal_error=False,
+                )
+                if not summary_ok:
+                    run_status = VERISCOPE_FAILURE
+                    wrapper_exit = 2
+                else:
+                    summary_exit = _summary_wrapper_exit_code(outdir)
+                    if summary_exit is not None and run_status == "success":
+                        wrapper_exit = summary_exit
+            else:
+                lifecycle.mark_internal_failure(str(runner_launch_error))
+                run_status = VERISCOPE_FAILURE
+                wrapper_exit = 2
+        except Exception as exc:
+            lifecycle.mark_internal_failure(str(exc))
+            run_status, wrapper_exit = map_status_and_exit(
+                runner_exit_code=lifecycle.runner_exit_code,
+                runner_signal=lifecycle.runner_signal,
+                internal_error=True,
+            )
+        finally:
+            try:
+                signal.signal(signal.SIGINT, prev_int)
+                signal.signal(signal.SIGTERM, prev_term)
+            except Exception:
+                pass
+            for thread in threads:
+                thread.join(timeout=1.0)
+
+        lifecycle.finalize(run_status=run_status, wrapper_exit_code=wrapper_exit)
+        _write_run_config_merge(
+            outdir,
+            {
+                "wrapper_exit_code": lifecycle.wrapper_exit_code,
+                "runner_exit_code": lifecycle.runner_exit_code,
+                "runner_signal": lifecycle.runner_signal,
+                "run_status": lifecycle.run_status,
+                "lifecycle_state": lifecycle.state,
+                "ended_ts_utc": lifecycle.ended_ts_utc.isoformat() if lifecycle.ended_ts_utc else None,
+            },
+        )
+        summary_path = outdir / "results_summary.json"
+        if not (summary_path.exists() and _summary_is_valid(summary_path)):
+            try:
+                _write_partial_summary(
+                    outdir=outdir,
+                    run_id=run_id,
+                    ws_ref=_ensure_window_signature(
+                        outdir,
+                        reason="wrapper_emitted_partial_summary",
+                        run_kind=run_kind,
+                    ),
+                    gate_preset=gate_preset,
+                    started_ts_utc=lifecycle.started_ts_utc,
+                    ended_ts_utc=lifecycle.ended_ts_utc or datetime.now(timezone.utc),
+                    run_status=lifecycle.run_status,
+                    runner_exit_code=lifecycle.runner_exit_code,
+                    runner_signal=lifecycle.runner_signal,
+                    note="wrapper-emitted partial summary: results_summary.json missing",
+                )
+            except Exception:
+                lifecycle.wrapper_exit_code = 2
+                try:
+                    _write_run_config_merge(
+                        outdir,
+                        {
+                            "wrapper_exit_code": lifecycle.wrapper_exit_code,
+                            "run_status": lifecycle.run_status,
+                            "lifecycle_state": lifecycle.state,
+                            "ended_ts_utc": lifecycle.ended_ts_utc.isoformat() if lifecycle.ended_ts_utc else None,
+                        },
+                    )
+                except Exception:
+                    pass
+        return int(lifecycle.wrapper_exit_code or 0)
+    finally:
+        if lock is not None:
+            try:
+                lock.release()
+            except Exception:
+                pass
+
+
 def _select_cifar_outdir(args_outdir: str) -> Path:
     outdir_str = (args_outdir or "").strip()
     scar_outdir = (os.environ.get("SCAR_OUTDIR") or "").strip()
@@ -508,7 +762,6 @@ def _cmd_run_gpt(args: argparse.Namespace) -> int:
 
     env = os.environ.copy()
     run_id = uuid.uuid4().hex[:12]
-    lifecycle = RunLifecycle(run_id=run_id, run_kind="gpt")
 
     gpt_args = list(args.gpt_args or [])
     if gpt_args and gpt_args[0] == "--":
@@ -529,195 +782,127 @@ def _cmd_run_gpt(args: argparse.Namespace) -> int:
         cmd = [sys.executable, "-m", "veriscope.runners.gpt.train_nanogpt"] + gpt_args
 
     gate_preset = _extract_gate_preset(gpt_args)
-    resolved = {
-        "schema_version": 1,
-        "ts_utc": _now_utc_iso(),
-        "package": {"name": "veriscope", "version": _pkg_version()},
-        "git_sha": _git_sha(),
-        "run": {"kind": "gpt", "run_id": run_id, "outdir": str(outdir)},
-        "argv": {
-            "veriscope_argv": ["veriscope", "run", "gpt"]
-            + (["--outdir", str(outdir)] if outdir_str else [])
-            + (args.gpt_args or []),
-            "runner_cmd": cmd,
-        },
-        "env": env,
-        "wrapper_exit_code": None,
-        "runner_exit_code": None,
-        "runner_signal": None,
-        "run_status": "running",
-        "lifecycle_state": lifecycle.state,
-        "started_ts_utc": lifecycle.started_ts_utc.isoformat(),
-        "ended_ts_utc": None,
-    }
-    _write_resolved_config(outdir, resolved)
-    print(f"[veriscope] outdir={outdir}")
-    print(f"[veriscope] cmd={' '.join(cmd)}")
-    print(f"[veriscope] wrote {outdir / 'run_config_resolved.json'}")
+    veriscope_argv = ["veriscope", "run", "gpt"]
+    if outdir_str:
+        veriscope_argv += ["--outdir", str(outdir)]
+    veriscope_argv += list(args.gpt_args or [])
 
-    ws_ref = _ensure_window_signature(outdir, reason="wrapper_start", run_kind="gpt")
-    lock = _acquire_gpu_lock(force=bool(args.force))
+    return _run_subprocess_wrapper(
+        run_kind="gpt",
+        outdir=outdir,
+        run_id=run_id,
+        cmd=cmd,
+        gate_preset=gate_preset,
+        raw_forwarded_args=list(args.gpt_args or []),
+        normalized_forwarded_args=list(gpt_args),
+        veriscope_argv=veriscope_argv,
+        env=env,
+        force=bool(args.force),
+    )
+
+
+def _cmd_run_hf(args: argparse.Namespace) -> int:
+    outdir_str = (args.outdir or "").strip()
+    outdir = Path(outdir_str).expanduser() if outdir_str else _default_outdir("hf")
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    env = os.environ.copy()
+    run_id = uuid.uuid4().hex[:12]
+
+    hf_args = list(args.hf_args or [])
+    if hf_args and hf_args[0] == "--":
+        hf_args = hf_args[1:]
+
+    has_outdir = ("--outdir" in hf_args) or any(a.startswith("--outdir=") for a in hf_args)
+    if not has_outdir:
+        hf_args = ["--outdir", str(outdir)] + hf_args
+    has_run_id = ("--run_id" in hf_args) or any(a.startswith("--run_id=") for a in hf_args)
+    if not has_run_id:
+        hf_args = ["--run_id", run_id] + hf_args
+
+    override_cmd = (os.environ.get("VERISCOPE_HF_RUNNER_CMD") or "").strip()
+    if override_cmd:
+        cmd = shlex.split(override_cmd) + hf_args
+    else:
+        cmd = [sys.executable, "-m", "veriscope.runners.hf.train_hf"] + hf_args
+
+    gate_preset = _extract_gate_preset(hf_args)
+    veriscope_argv = ["veriscope", "run", "hf"]
+    if outdir_str:
+        veriscope_argv += ["--outdir", str(outdir)]
+    veriscope_argv += list(args.hf_args or [])
+
     try:
-        proc: Optional[subprocess.Popen] = None
-        threads: List[threading.Thread] = []
-        runner_launch_error: Optional[Exception] = None
+        preflight = subprocess.run(
+            [sys.executable, "-c", "import datasets, transformers"],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=env,
+        )
+    except Exception as exc:
+        preflight = None
+        _eprint(f"HF dependency preflight failed to execute: {exc}")
 
-        forwarder: Optional[_SignalForwarder] = None
-        pending_signals: List[int] = []
-
-        def _handle_wrapper_signal(signum: int, frame: Optional[Any]) -> None:
-            # Prevent default SIGINT behavior (KeyboardInterrupt) from killing the wrapper process.
-            # If we already have a forwarder (child started), delegate to it.
-            nonlocal forwarder, proc
-            if forwarder is not None:
-                try:
-                    forwarder.handle(signum, frame)
-                except Exception:
-                    pass
-                return
-
-            # Child not started yet (or still launching): record the interrupt and forward best-effort.
-            try:
-                lifecycle.mark_interrupted(signum)
-            except Exception:
-                pass
-            pending_signals.append(signum)
-            if proc is not None:
-                try:
-                    _signal_child(proc, signum)
-                except Exception:
-                    pass
-
-        # Install handlers immediately to close the race where SIGINT/SIGTERM kills the wrapper.
-        prev_int = signal.signal(signal.SIGINT, _handle_wrapper_signal)
-        prev_term = signal.signal(signal.SIGTERM, _handle_wrapper_signal)
-
-        try:
-            lifecycle.mark_running()
-            _write_run_config_merge(outdir, {"lifecycle_state": lifecycle.state})
-            try:
-                proc = subprocess.Popen(
-                    cmd,
-                    env=env,
-                    start_new_session=True,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    bufsize=1,
-                )
-            except OSError as exc:
-                runner_launch_error = exc
-
-            if runner_launch_error is None and proc is not None:
-                threads = _start_stream_threads(proc)
-                forwarder = _SignalForwarder(proc, lifecycle)
-
-                # Replay any signals that arrived before the child/forwarder existed.
-                if pending_signals:
-                    for s in list(pending_signals):
-                        try:
-                            forwarder.handle(s, None)
-                        except Exception:
-                            pass
-                    pending_signals.clear()
-
-                while proc.poll() is None:
-                    if forwarder.interrupted:
-                        forwarder.maybe_escalate()
-                        time.sleep(0.1)
-                    else:
-                        try:
-                            proc.wait(timeout=0.5)
-                        except subprocess.TimeoutExpired:
-                            pass
-
-                lifecycle.mark_runner_exit(proc.returncode)
-
-                summary_path = outdir / "results_summary.json"
-                summary_ok = summary_path.exists() and _summary_is_valid(summary_path)
-                run_status, wrapper_exit = map_status_and_exit(
-                    runner_exit_code=proc.returncode,
-                    runner_signal=lifecycle.runner_signal,
-                    internal_error=False,
-                )
-                if not summary_ok:
-                    run_status = VERISCOPE_FAILURE
-                    wrapper_exit = 2
-                else:
-                    summary_exit = _summary_wrapper_exit_code(outdir)
-                    if summary_exit is not None and run_status == "success":
-                        wrapper_exit = summary_exit
-            else:
-                lifecycle.mark_internal_failure(str(runner_launch_error))
-                run_status = VERISCOPE_FAILURE
-                wrapper_exit = 2
-        except Exception as exc:
-            lifecycle.mark_internal_failure(str(exc))
-            run_status, wrapper_exit = map_status_and_exit(
-                runner_exit_code=lifecycle.runner_exit_code,
-                runner_signal=lifecycle.runner_signal,
-                internal_error=True,
-            )
-        finally:
-            # Always restore wrapper signal handlers at the very end (avoid leaving a custom handler installed).
-            try:
-                signal.signal(signal.SIGINT, prev_int)
-                signal.signal(signal.SIGTERM, prev_term)
-            except Exception:
-                pass
-            for thread in threads:
-                thread.join(timeout=1.0)
-
-        lifecycle.finalize(run_status=run_status, wrapper_exit_code=wrapper_exit)
+    if preflight is not None and preflight.returncode != 0:
+        msg = (preflight.stderr or preflight.stdout or "").strip()
+        if not msg:
+            msg = "HF dependency preflight failed (datasets/transformers not importable)"
+        _eprint(msg)
+        lifecycle = RunLifecycle(run_id=run_id, run_kind="hf")
+        resolved = _build_resolved_payload(
+            run_kind="hf",
+            run_id=run_id,
+            outdir=outdir,
+            lifecycle=lifecycle,
+            veriscope_argv=veriscope_argv,
+            raw_forwarded_args=list(args.hf_args or []),
+            normalized_forwarded_args=list(hf_args),
+            cmd=cmd,
+            env=env,
+        )
+        _write_resolved_config(outdir, resolved)
+        ws_ref = _ensure_window_signature(outdir, reason="wrapper_preflight_failed", run_kind="hf")
+        run_status = "user_code_failure"
+        wrapper_exit_code = 2
+        _write_partial_summary(
+            outdir=outdir,
+            run_id=run_id,
+            ws_ref=ws_ref,
+            gate_preset=gate_preset,
+            started_ts_utc=lifecycle.started_ts_utc,
+            ended_ts_utc=datetime.now(timezone.utc),
+            run_status=run_status,
+            runner_exit_code=preflight.returncode,
+            runner_signal=None,
+            note="wrapper preflight failed: datasets/transformers not importable",
+        )
+        lifecycle.finalize(run_status=run_status, wrapper_exit_code=wrapper_exit_code)
         _write_run_config_merge(
             outdir,
             {
                 "wrapper_exit_code": lifecycle.wrapper_exit_code,
-                "runner_exit_code": lifecycle.runner_exit_code,
+                "runner_exit_code": preflight.returncode,
                 "runner_signal": lifecycle.runner_signal,
                 "run_status": lifecycle.run_status,
                 "lifecycle_state": lifecycle.state,
                 "ended_ts_utc": lifecycle.ended_ts_utc.isoformat() if lifecycle.ended_ts_utc else None,
             },
         )
-        summary_path = outdir / "results_summary.json"
-        if not (summary_path.exists() and _summary_is_valid(summary_path)):
-            try:
-                _write_partial_summary(
-                    outdir=outdir,
-                    run_id=run_id,
-                    ws_ref=ws_ref,
-                    gate_preset=gate_preset,
-                    started_ts_utc=lifecycle.started_ts_utc,
-                    ended_ts_utc=lifecycle.ended_ts_utc or datetime.now(timezone.utc),
-                    run_status=lifecycle.run_status,
-                    runner_exit_code=lifecycle.runner_exit_code,
-                    runner_signal=lifecycle.runner_signal,
-                    note="wrapper-emitted partial summary: results_summary.json missing",
-                )
-            except Exception:
-                lifecycle.wrapper_exit_code = 2
-                try:
-                    _write_run_config_merge(
-                        outdir,
-                        {
-                            "wrapper_exit_code": lifecycle.wrapper_exit_code,
-                            "run_status": lifecycle.run_status,
-                            "lifecycle_state": lifecycle.state,
-                            "ended_ts_utc": lifecycle.ended_ts_utc.isoformat() if lifecycle.ended_ts_utc else None,
-                        },
-                    )
-                except Exception:
-                    pass
-        return int(lifecycle.wrapper_exit_code or 0)
-    finally:
-        if lock is not None:
-            try:
-                lock.release()
-            except Exception:
-                pass
+        return 2
+
+    return _run_subprocess_wrapper(
+        run_kind="hf",
+        outdir=outdir,
+        run_id=run_id,
+        cmd=cmd,
+        gate_preset=gate_preset,
+        raw_forwarded_args=list(args.hf_args or []),
+        normalized_forwarded_args=list(hf_args),
+        veriscope_argv=veriscope_argv,
+        env=env,
+        force=bool(args.force),
+    )
 
 
 def _eprint(msg: str) -> None:
@@ -947,6 +1132,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_gpt.add_argument("--force", action="store_true", help="Bypass GPU lock")
     p_gpt.add_argument("gpt_args", nargs=argparse.REMAINDER, help="Args forwarded to train_nanogpt.py")
     p_gpt.set_defaults(_handler=_cmd_run_gpt)
+
+    p_hf = run_sub.add_parser("hf", help="Run the Hugging Face transformer runner")
+    p_hf.add_argument("--outdir", type=str, default="", help="Output directory (default: ./out/...)")
+    p_hf.add_argument("--force", action="store_true", help="Bypass GPU lock")
+    p_hf.add_argument("hf_args", nargs=argparse.REMAINDER, help="Args forwarded to train_hf.py")
+    p_hf.set_defaults(_handler=_cmd_run_hf)
 
     p_cifar = run_sub.add_parser("cifar", help="Run the legacy CIFAR runner (unchanged semantics)")
     p_cifar.add_argument(
