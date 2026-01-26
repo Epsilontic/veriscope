@@ -820,8 +820,10 @@ def _cmd_run_hf(args: argparse.Namespace) -> int:
     if not has_run_id:
         hf_args = ["--run_id", run_id] + hf_args
     if args.gate_preset:
-        has_gate_preset = ("--gate_preset" in hf_args) or ("--gate-preset" in hf_args) or any(
-            a.startswith("--gate_preset=") or a.startswith("--gate-preset=") for a in hf_args
+        has_gate_preset = (
+            ("--gate_preset" in hf_args)
+            or ("--gate-preset" in hf_args)
+            or any(a.startswith("--gate_preset=") or a.startswith("--gate-preset=") for a in hf_args)
         )
         if not has_gate_preset:
             hf_args = ["--gate_preset", args.gate_preset] + hf_args

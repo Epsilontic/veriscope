@@ -12,7 +12,7 @@
 
 *Detect representation collapse before it's too late.*
 
-[Quick Start](#quick-start) • [Pilot kit overview](#pilot-kit-overview) • [Gate Semantics](#gate-semantics) • [Core API](#core-api) • [Output Artifacts](#output-artifacts) • [Contributing](#contributing) • [Citation](#citation)
+[Quick Start](#quick-start) • [Pilot kit overview](#pilot-kit-overview) • [Gate Semantics](#gate-semantics) • [Core API](#core-api) • [Output Artifacts](#output-artifacts) • [Contributing](#contributing) • [Governance](#governance--community) • [Citation](#citation)
 
 </div>
 
@@ -366,6 +366,17 @@ Writes are atomic where possible; parquet falls back to CSV automatically. Legac
 Contributions are welcome. For non-trivial changes, please open an issue first to discuss scope and design.
 
 **CLA required:** All contributions require signing the Contributor License Agreement. See `INDIVIDUAL_CLA.md`.
+
+---
+
+## Governance & Community
+
+Veriscope’s governance and community expectations are documented here:
+
+- [Governance](./GOVERNANCE.md)
+- [Code of Conduct](./CODE_OF_CONDUCT.md)
+- [Security Policy](./SECURITY.md)
+- [Release Process](./RELEASE_PROCESS.md)
 
 ---
 
