@@ -31,26 +31,19 @@ jobs:
           python -m pip install ruff pytest
 
       - name: Check pilot script modes
+        shell: bash
         run: |
-          python - <<'PY'
-import os
-from pathlib import Path
-
-paths = [
-    Path("scripts/pilot/run.sh"),
-    Path("scripts/pilot/negative_controls.sh"),
-]
-missing = [str(p) for p in paths if not p.exists()]
-if missing:
-    raise SystemExit(f"MISSING_PILOT_SCRIPTS: {', '.join(missing)}")
-non_exec = [str(p) for p in paths if not os.access(p, os.X_OK)]
-if non_exec:
-    raise SystemExit(
-        f"NON_EXECUTABLE_PILOT_SCRIPTS: {', '.join(non_exec)}. "
-        "Run chmod +x scripts/pilot/run.sh scripts/pilot/negative_controls.sh "
-        "and git update-index --chmod=+x scripts/pilot/run.sh scripts/pilot/negative_controls.sh, then recommit."
-    )
-PY
+          set -euo pipefail
+          for p in scripts/pilot/run.sh scripts/pilot/negative_controls.sh; do
+            if [[ ! -f "$p" ]]; then
+              echo "MISSING_PILOT_SCRIPTS: $p" >&2
+              exit 1
+            fi
+            if [[ ! -x "$p" ]]; then
+              echo "NON_EXECUTABLE_PILOT_SCRIPTS: $p. Run chmod +x scripts/pilot/run.sh scripts/pilot/negative_controls.sh and git update-index --chmod=+x scripts/pilot/run.sh scripts/pilot/negative_controls.sh, then recommit." >&2
+              exit 1
+            fi
+          done
 
       - name: Ruff
         run: ruff check . --output-format=github
