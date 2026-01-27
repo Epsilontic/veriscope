@@ -828,6 +828,15 @@ def _cmd_run_hf(args: argparse.Namespace) -> int:
         if not has_gate_preset:
             hf_args = ["--gate_preset", args.gate_preset] + hf_args
 
+    # Forward wrapper-level --force into the HF runner so artifact emission can overwrite
+    # wrapper-created placeholders (e.g., window_signature.json) inside an existing capsule.
+    if bool(args.force):
+        has_force = ("--force" in hf_args) or any(a.startswith("--force=") for a in hf_args)
+        if not has_force:
+            hf_args = ["--force"] + hf_args
+        # Also expose as env for runners/wrappers that honor VERISCOPE_FORCE.
+        env["VERISCOPE_FORCE"] = "1"
+
     override_cmd = (os.environ.get("VERISCOPE_HF_RUNNER_CMD") or "").strip()
     if override_cmd:
         cmd = shlex.split(override_cmd) + hf_args
@@ -1271,3 +1280,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         return _run_legacy(argv)
 
     return int(ns._handler(ns))  # type: ignore[misc]
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

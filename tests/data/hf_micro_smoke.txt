@@ -1,0 +1,20 @@
+Sunrise over the harbor.
+Tiny models love small datasets.
+Veriscope checks windows and gates.
+Short lines keep the tokenizer busy.
+A quick brown fox naps.
+Metrics drift, but gates decide.
+Local data avoids flaky hubs.
+Another line for the micro smoke.
+The model reads a simple sentence.
+Training steps tick quietly.
+Loss curves begin to settle.
+A single batch can still teach.
+Small text, big confidence.
+The capsule keeps its artifacts.
+Gate records should be present.
+Deterministic seeds help tests.
+Local files are fast to load.
+Unit smoke, integration calm.
+One more line for luck.
+All done, carry on.

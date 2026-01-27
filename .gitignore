@@ -62,6 +62,8 @@ cache/
 *.pth
 *.pkl
 *.npz
+!tests/data/
+!tests/data/**
 
 # build locks / temp
 *.lock
