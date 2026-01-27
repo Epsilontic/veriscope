@@ -2,6 +2,7 @@
 
 set -euo pipefail
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(cd "${script_dir}/.." && pwd)"
 
 ts="$(date +%Y%m%d_%H%M%S)"
 outdir="${1:-./out/hf_micro_smoke_${ts}}"
@@ -14,34 +15,32 @@ export VERISCOPE_OUT_BASE="${VERISCOPE_OUT_BASE:-${outdir}}"
 # Smoke policy: force single-process semantics so artifact emission cannot be suppressed by any ambient launcher vars.
 export VERISCOPE_FORCE_SINGLE_PROCESS="${VERISCOPE_FORCE_SINGLE_PROCESS:-1}"
 
-force_flag_str=""
-if [ -n "${VERISCOPE_FORCE:-}" ]; then
-  force_flag_str="--force"
-fi
+# Smoke policy: always overwrite any pre-existing markers inside the temp outdir.
+force_flag_str="--force"
+
+# Ensure the HF runner (emit_artifacts) sees force as well.
+export VERISCOPE_FORCE="${VERISCOPE_FORCE:-1}"
 
 timeout_secs="${VERISCOPE_HF_MICRO_SMOKE_TIMEOUT_SECS:-180}"
 python_bin="${VERISCOPE_PYTHON_BIN:-python}"
 
 echo "[micro-smoke] outdir=${outdir}"
 echo "[micro-smoke] timeout=${timeout_secs}s"
-echo "[micro-smoke] cmd: ${python_bin} -m veriscope.cli.main run hf --gate-preset tuned_v0 --outdir ${outdir} ${force_flag_str} -- --outdir ${outdir} --run_id hf-micro-smoke --model sshleifer/tiny-gpt2 --dataset wikitext:wikitext-2-raw-v1 --dataset_split train --max_steps 16 --batch_size 1 --block_size 32 --cadence 1 --gate_window 2 --gate_min_evidence 2 --rp_dim 8 --seed 1337 --device cpu"
+echo "[micro-smoke] cmd: ${python_bin} -m veriscope.cli.main run hf --gate-preset tuned_v0 --outdir ${outdir} ${force_flag_str} -- --outdir ${outdir} --run_id hf-micro-smoke --model sshleifer/tiny-gpt2 --dataset file:${repo_root}/tests/data/hf_micro_smoke.txt --dataset_split train --max_steps 16 --batch_size 1 --block_size 32 --cadence 1 --gate_window 2 --gate_min_evidence 2 --rp_dim 8 --seed 1337 --device cpu"
 
 cmd=(
   "${python_bin}" -m veriscope.cli.main run hf
   --gate-preset tuned_v0
   --outdir "${outdir}"
+  --force
 )
-
-if [ -n "${VERISCOPE_FORCE:-}" ]; then
-  cmd+=(--force)
-fi
 
 cmd+=(
   --
   --outdir "${outdir}"
   --run_id "hf-micro-smoke"
   --model sshleifer/tiny-gpt2
-  --dataset wikitext:wikitext-2-raw-v1
+  --dataset "file:${repo_root}/tests/data/hf_micro_smoke.txt"
   --dataset_split train
   --max_steps 16
   --batch_size 1
@@ -73,6 +72,44 @@ if [[ $rc -ne 0 ]]; then
   exit $rc
 fi
 
+
+# --- DIAGNOSTICS (CI hardening) ---
+echo "[micro-smoke] python_bin=${python_bin}" >&2
+{
+  echo "[micro-smoke] python_bin=${python_bin}"
+  echo "[micro-smoke] sys.executable + veriscope import provenance:"
+  "${python_bin}" - <<'PY'
+import sys
+import veriscope
+print("python:", sys.executable)
+print("sys.path[0:8]:", sys.path[:8])
+print("veriscope.__file__:", veriscope.__file__)
+PY
+
+  echo "[micro-smoke] veriscope cli hf help (may fail if hf not registered):"
+  "${python_bin}" -m veriscope.cli.main run hf --help
+
+  echo "[micro-smoke] post-run outdir listing:"
+  ls -la "${outdir}" || true
+
+  echo "[micro-smoke] post-run find(outdir, maxdepth=4):"
+  find "${outdir}" -maxdepth 4 -print || true
+} >>"${log}" 2>&1
+
+# If the runner returned 0 but produced no artifacts, treat as failure and show the log.
+ws_hits="$(find "${outdir}" -type f -name window_signature.json 2>/dev/null | wc -l | tr -d ' ')"
+res_hits="$(find "${outdir}" -type f -name results.json 2>/dev/null | wc -l | tr -d ' ')"
+sum_hits="$(find "${outdir}" -type f -name results_summary.json 2>/dev/null | wc -l | tr -d ' ')"
+
+if [[ "${ws_hits}" -eq 0 && "${res_hits}" -eq 0 && "${sum_hits}" -eq 0 ]]; then
+  echo "[micro-smoke] ERROR: HF run returned rc=0 but emitted no artifacts under outdir." >&2
+  echo "[micro-smoke] wc -c ${log}:" >&2
+  wc -c "${log}" >&2 || true
+  echo "[micro-smoke] tail ${log} (last 200 lines):" >&2
+  tail -n 200 "${log}" >&2 || true
+  exit 2
+fi
+# --- END DIAGNOSTICS ---
 
 # Postcondition enforced by tests: exactly one window_signature.json must exist under ${outdir}.
 # Some runners may validate successfully while emitting newer marker files instead.
@@ -113,7 +150,6 @@ if [[ -z "${capdir}" && -d "${VERISCOPE_OUT_BASE}" ]]; then
   capdir="$(_find_marker_dir "${VERISCOPE_OUT_BASE}" || true)"
 fi
 if [[ -z "${capdir}" ]]; then
-  repo_root="$(cd "${script_dir}/.." && pwd)"
   if [[ -d "${repo_root}/out" ]]; then
     capdir="$(_find_marker_dir "${repo_root}/out" || true)"
   fi
@@ -121,7 +157,6 @@ fi
 
 # Broader bounded search if nothing found (runner may ignore outdir/base).
 if [[ -z "${capdir}" ]]; then
-  repo_root="$(cd "${script_dir}/.." && pwd)"
   # 1) Search in repo root with pruning, bounded depth.
   if [[ -d "${repo_root}" ]]; then
     capdir="$(_find_marker_dir "${repo_root}" || true)"
@@ -154,7 +189,6 @@ if [[ -z "${capdir}" ]]; then
   echo "[micro-smoke] VERISCOPE_OUT_BASE=${VERISCOPE_OUT_BASE}" >&2
   echo "[micro-smoke] listing outdir (maxdepth 3):" >&2
   find "${outdir}" -maxdepth 3 -print >&2 || true
-  repo_root="$(cd "${script_dir}/.." && pwd)"
   if [[ -d "${repo_root}/out" ]]; then
     echo "[micro-smoke] listing repo_root/out (maxdepth 3):" >&2
     find "${repo_root}/out" -maxdepth 3 -print >&2 || true
@@ -212,7 +246,7 @@ if [[ ! -f "${capdir}/run_manifest.json" ]]; then
   "capdir": "${capdir}",
   "python_bin": "${python_bin}",
   "timeout_secs": ${timeout_secs},
-  "cmd_str": "${python_bin} -m veriscope.cli.main run hf --gate-preset tuned_v0 --outdir ${outdir} ${force_flag_str} -- --outdir ${outdir} --run_id hf-micro-smoke --model sshleifer/tiny-gpt2 --dataset wikitext:wikitext-2-raw-v1 --dataset_split train --max_steps 16 --batch_size 1 --block_size 32 --cadence 1 --gate_window 2 --gate_min_evidence 2 --rp_dim 8 --seed 1337 --device cpu",
+  "cmd_str": "${python_bin} -m veriscope.cli.main run hf --gate-preset tuned_v0 --outdir ${outdir} ${force_flag_str} -- --outdir ${outdir} --run_id hf-micro-smoke --model sshleifer/tiny-gpt2 --dataset file:${repo_root}/tests/data/hf_micro_smoke.txt --dataset_split train --max_steps 16 --batch_size 1 --block_size 32 --cadence 1 --gate_window 2 --gate_min_evidence 2 --rp_dim 8 --seed 1337 --device cpu",
   "artifacts": {
     "window_signature": "window_signature.json",
     "results": "results.json",
@@ -221,7 +255,7 @@ if [[ ! -f "${capdir}/run_manifest.json" ]]; then
   },
   "params": {
     "model": "sshleifer/tiny-gpt2",
-    "dataset": "wikitext:wikitext-2-raw-v1",
+    "dataset": "file:${repo_root}/tests/data/hf_micro_smoke.txt",
     "dataset_split": "train",
     "max_steps": 16,
     "batch_size": 1,

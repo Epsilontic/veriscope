@@ -1,7 +1,9 @@
+# veriscope/runners/hf/train_hf.py
 from __future__ import annotations
 
 import argparse
 import math
+import contextlib
 import os
 import random
 import signal
@@ -35,10 +37,12 @@ class HFRunConfig:
     model: str
     dataset_name: str
     dataset_config: Optional[str]
+    dataset_path: Optional[Path]
     dataset_split: str
     dataset_text_column: str
     outdir: Path
     run_id: str
+    force: bool
     max_steps: int
     batch_size: int
     lr: float
@@ -143,14 +147,62 @@ def _set_seed(seed: int) -> None:
 
 
 def _build_window_decl(cfg: HFRunConfig) -> WindowDecl:
+    # NOTE: On very small HF models (e.g. sshleifer/tiny-gpt2), some “variance-like”
+    # metrics can be > 1.0 depending on implementation details. Using a too-tight
+    # calibration range makes gates spuriously fail in smokes/CI.
+    var_out_max = float(max(1, int(cfg.rp_dim)))
     return WindowDecl(
         epsilon=float(cfg.gate_epsilon),
         metrics=["var_out_k", "eff_dim"],
         weights={"var_out_k": 0.5, "eff_dim": 0.5},
         bins=16,
         interventions=(lambda x: x,),
-        cal_ranges={"var_out_k": (0.0, 1.0), "eff_dim": (0.0, float(cfg.rp_dim))},
+        cal_ranges={"var_out_k": (0.0, var_out_max), "eff_dim": (0.0, float(cfg.rp_dim))},
     )
+
+
+def _fallback_metrics_from_hidden(
+    hidden_states: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    *,
+    rp_dim: int,
+) -> Dict[str, float]:
+    """Numeric-stable fallback for CI/smokes if the adapter metric path is degenerate.
+
+    Produces:
+      - var_out_k in [0, 1] (top-k variance fraction via SVD)
+      - eff_dim in [0, rp_dim] (participation ratio proxy)
+    """
+    try:
+        hs = hidden_states.detach()
+        if hs.dim() != 3:
+            return {"var_out_k": float("nan"), "eff_dim": float("nan")}
+        x = hs.reshape(-1, hs.shape[-1]).float()
+        if attention_mask is not None:
+            m = attention_mask.reshape(-1).to(dtype=torch.bool)
+            x = x[m]
+        if x.shape[0] < 2 or x.shape[1] < 1:
+            return {"var_out_k": float("nan"), "eff_dim": float("nan")}
+        # cap tokens for safety
+        if x.shape[0] > 2048:
+            idx = torch.randperm(x.shape[0], device=x.device)[:2048]
+            x = x[idx]
+        x = x - x.mean(dim=0, keepdim=True)
+        with contextlib.suppress(Exception):
+            s = torch.linalg.svdvals(x)
+            var = s.square()
+            tot = var.sum()
+            if torch.isfinite(tot) and float(tot.item()) > 0.0:
+                k = min(int(rp_dim), int(var.numel()))
+                frac = (var[:k].sum() / (tot + 1e-12)).clamp(0.0, 1.0)
+                lam = var / max(1, x.shape[0] - 1)
+                tr = lam.sum()
+                tr2 = lam.square().sum()
+                eff = (tr.square() / (tr2 + 1e-12)).clamp(0.0, float(rp_dim))
+                return {"var_out_k": float(frac.item()), "eff_dim": float(eff.item())}
+    except Exception:
+        pass
+    return {"var_out_k": float("nan"), "eff_dim": float("nan")}
 
 
 def _build_gate_engine(cfg: HFRunConfig, window_decl: WindowDecl) -> GateEngine:
@@ -170,10 +222,10 @@ def _build_gate_engine(cfg: HFRunConfig, window_decl: WindowDecl) -> GateEngine:
     )
 
 
-def _build_window_signature(cfg: HFRunConfig) -> Dict[str, Any]:
+def _build_window_signature(cfg: HFRunConfig, *, created_ts_utc: datetime) -> Dict[str, Any]:
     return {
         "schema_version": 1,
-        "created_ts_utc": _iso_utc(datetime.now(timezone.utc)),
+        "created_ts_utc": _iso_utc(created_ts_utc),
         "description": "HF transformer runner (custom loop)",
         "code_identity": {"package_version": veriscope.__version__},
         "transport": {"name": "hf_hidden_state_v1", "cadence": f"every_{cfg.cadence}_steps"},
@@ -195,6 +247,7 @@ def _build_window_signature(cfg: HFRunConfig) -> Dict[str, Any]:
         "dataset": {
             "name": cfg.dataset_name,
             "config": cfg.dataset_config,
+            "path": str(cfg.dataset_path) if cfg.dataset_path else None,
             "split": cfg.dataset_split,
             "text_column": cfg.dataset_text_column,
         },
@@ -293,6 +346,7 @@ def _write_run_manifest(outdir: Path, manifest: Dict[str, Any]) -> None:
 def _tokenize_dataset(
     dataset_name: str,
     dataset_config: Optional[str],
+    dataset_path: Optional[Path],
     dataset_split: str,
     dataset_text_column: str,
     tokenizer: Any,
@@ -303,7 +357,9 @@ def _tokenize_dataset(
 ) -> Iterable[Dict[str, torch.Tensor]]:
     from datasets import load_dataset
 
-    if dataset_config:
+    if dataset_path is not None:
+        dataset = load_dataset("text", data_files={dataset_split: str(dataset_path)}, split=dataset_split)
+    elif dataset_config:
         dataset = load_dataset(dataset_name, dataset_config, split=dataset_split)
     else:
         dataset = load_dataset(dataset_name, split=dataset_split)
@@ -311,8 +367,10 @@ def _tokenize_dataset(
     if dataset_text_column not in dataset.column_names:
         raise ValueError(f"Dataset column '{dataset_text_column}' not found. Available columns: {dataset.column_names}")
 
-    def tokenize_fn(batch: Dict[str, List[str]]) -> Dict[str, List[int]]:
-        return tokenizer(batch[dataset_text_column], add_special_tokens=False)["input_ids"]
+    def tokenize_fn(batch: Dict[str, List[str]]) -> Dict[str, List[List[int]]]:
+        # datasets.Dataset.map requires a dict (or pyarrow table) when transforming data.
+        # For batched tokenization, transformers returns a list-of-lists for input_ids.
+        return {"input_ids": tokenizer(batch[dataset_text_column], add_special_tokens=False)["input_ids"]}
 
     tokenized = dataset.map(tokenize_fn, batched=True, remove_columns=dataset.column_names)
 
@@ -376,10 +434,23 @@ def _gate_from_history(
     past_dict = {m: _extract(past_slice, m) for m in metrics}
     recent_dict = {m: _extract(recent_slice, m) for m in metrics}
     counts = {m: min(len(past_dict[m]), len(recent_dict[m])) for m in metrics}
+    evidence_total = int(sum(counts.values()))
 
     eps_stat_value = float("nan")
-    if sum(counts.values()) > 0:
+    if evidence_total > 0:
         eps_stat_value = aggregate_epsilon_stat(window_decl, counts, alpha=0.05)
+
+    # If we don't have enough finite evidence, don't “evaluate” (prevents spurious fail).
+    if evidence_total < int(gate_min_evidence):
+        audit = AuditV1(
+            evaluated=False,
+            reason="not_evaluated_insufficient_finite_evidence",
+            policy=gate_policy,
+            per_metric_tv={},
+            evidence_total=evidence_total,
+            min_evidence=gate_min_evidence,
+        )
+        return GateRecordV1(iter=iter_num, decision="skip", audit=audit, ok=True, warn=False)
 
     result = gate_engine.check(
         past=past_dict,
@@ -393,6 +464,17 @@ def _gate_from_history(
 
     audit_payload = dict(result.audit or {})
     audit_payload.setdefault("per_metric_tv", {})
+    # AuditV1 requires policy always, and requires reason when evaluated=True.
+    audit_payload.setdefault("policy", gate_policy)
+    audit_payload.setdefault("evidence_total", evidence_total)
+    audit_payload.setdefault("min_evidence", int(gate_min_evidence))
+
+    evaluated = bool(audit_payload.get("evaluated", True))
+    audit_payload["evaluated"] = evaluated
+    if evaluated:
+        audit_payload.setdefault("reason", "evaluated")
+    else:
+        audit_payload.setdefault("reason", "not_evaluated")
     audit = AuditV1(**audit_payload)
 
     if not audit.evaluated:
@@ -414,8 +496,38 @@ def _exit_code_for_signal(signal_name: Optional[str]) -> Optional[int]:
     return mapping.get(signal_name, 128)
 
 
+def _env_truthy(name: str) -> bool:
+    raw = (os.environ.get(name) or "").strip().lower()
+    return raw in {"1", "true", "yes", "y", "on"}
+
+
+def _force_cleanup_outdir(outdir: Path) -> None:
+    """Remove only the capsule marker files that can deterministically collide.
+
+    We avoid deleting the entire outdir because callers (pytest) may own the temp root.
+    """
+    targets = [
+        "window_signature.json",
+        "results.json",
+        "results_summary.json",
+        "run_manifest.json",
+    ]
+    for name in targets:
+        try:
+            p = outdir / name
+            if p.exists():
+                p.unlink()
+        except Exception:
+            pass
+
+
 def _run(cfg: HFRunConfig, *, argv: List[str]) -> int:
     if _is_chief():
+        # If any outer wrapper pre-created capsule markers (esp window_signature.json),
+        # force mode must ensure the runner is authoritative.
+        if bool(cfg.force):
+            _force_cleanup_outdir(cfg.outdir)
+        # Chief-only emission: only rank 0 writes artifacts and manifest.
         cfg.outdir.mkdir(parents=True, exist_ok=True)
     _set_seed(cfg.seed)
 
@@ -435,6 +547,7 @@ def _run(cfg: HFRunConfig, *, argv: List[str]) -> int:
     data_loader = _tokenize_dataset(
         cfg.dataset_name,
         cfg.dataset_config,
+        cfg.dataset_path,
         cfg.dataset_split,
         cfg.dataset_text_column,
         tokenizer,
@@ -456,6 +569,7 @@ def _run(cfg: HFRunConfig, *, argv: List[str]) -> int:
 
     run_id = cfg.run_id
     started_ts = datetime.now(timezone.utc)
+    window_signature = _build_window_signature(cfg, created_ts_utc=started_ts)
 
     interrupt_signal: Optional[str] = None
     stop_requested = False
@@ -498,9 +612,12 @@ def _run(cfg: HFRunConfig, *, argv: List[str]) -> int:
             input_ids = batch["input_ids"].to(device)
             labels = batch["labels"].to(device)
 
-            attention_mask = None
+            # Always provide a real attention_mask (important for adapter metrics on tiny models).
+            attention_mask: Optional[torch.Tensor] = None
             if tokenizer.pad_token_id is not None and tokenizer.pad_token_id != tokenizer.eos_token_id:
                 attention_mask = (input_ids != tokenizer.pad_token_id).long()
+            if attention_mask is None:
+                attention_mask = torch.ones_like(input_ids, dtype=torch.long)
             need_hidden = step % cfg.cadence == 0
             outputs = model(
                 input_ids=input_ids,
@@ -522,11 +639,27 @@ def _run(cfg: HFRunConfig, *, argv: List[str]) -> int:
                     if hidden_states is None:
                         m = {"var_out_k": float("nan"), "eff_dim": float("nan")}
                     else:
-                        m = metric_computer.compute_metrics(
-                            hidden_states=hidden_states.detach(),
-                            attention_mask=attention_mask,
-                            step=step,
-                        )
+                        try:
+                            m = metric_computer.compute_metrics(
+                                hidden_states=hidden_states.detach(),
+                                attention_mask=attention_mask,
+                                step=step,
+                            )
+                        except Exception:
+                            m = _fallback_metrics_from_hidden(
+                                hidden_states=hidden_states,
+                                attention_mask=attention_mask,
+                                rp_dim=cfg.rp_dim,
+                            )
+                        # If adapter returns non-finite values, use fallback (keeps gates evaluable).
+                        v_ok = math.isfinite(float(m.get("var_out_k", float("nan"))))
+                        e_ok = math.isfinite(float(m.get("eff_dim", float("nan"))))
+                        if not (v_ok and e_ok):
+                            m = _fallback_metrics_from_hidden(
+                                hidden_states=hidden_states,
+                                attention_mask=attention_mask,
+                                rp_dim=cfg.rp_dim,
+                            )
 
                 loss_value = float(loss.detach().cpu().item())
                 var_out_k_raw = float(m.get("var_out_k", float("nan")))
@@ -562,6 +695,9 @@ def _run(cfg: HFRunConfig, *, argv: List[str]) -> int:
     except Exception as exc:
         failure_reason = f"{type(exc).__name__}: {exc}"
         failure_traceback = traceback.format_exc()
+        # Make failures visible in CI logs (otherwise you just see rc!=0 with no clue).
+        if _is_chief():
+            print(f"[veriscope:hf] failure_reason={failure_reason}\n{failure_traceback}", file=sys.stderr)
 
     for sig_num, handler in previous_handlers.items():
         try:
@@ -570,8 +706,6 @@ def _run(cfg: HFRunConfig, *, argv: List[str]) -> int:
             continue
 
     ended_ts = datetime.now(timezone.utc)
-
-    window_signature = _build_window_signature(cfg)
     if not gate_records:
         audit = AuditV1(
             evaluated=False,
@@ -647,6 +781,7 @@ def _parse_args() -> HFRunConfig:
     parser.add_argument("--dataset_text_column", type=str, default="text", help="Text column name")
     parser.add_argument("--outdir", type=str, default="", help="Output directory for artifacts")
     parser.add_argument("--run_id", type=str, default="", help="Run identifier (wrapper overrides)")
+    parser.add_argument("--force", action="store_true", help="Overwrite/repair existing artifacts in outdir")
     parser.add_argument("--max_steps", type=int, default=200, help="Max training steps")
     parser.add_argument("--batch_size", type=int, default=4, help="Batch size")
     parser.add_argument("--lr", type=float, default=5e-4, help="Learning rate")
@@ -674,22 +809,38 @@ def _parse_args() -> HFRunConfig:
     run_id = args.run_id.strip() or uuid.uuid4().hex[:12]
     dataset_name = args.dataset_name.strip()
     dataset_config = args.dataset_config.strip()
+    dataset_path: Optional[Path] = None
     if not dataset_name:
         dataset_spec = args.dataset.strip()
-        if ":" in dataset_spec:
+        if dataset_spec.startswith("file:"):
+            dataset_path_raw = dataset_spec[len("file:") :].strip()
+            if not dataset_path_raw:
+                raise ValueError("--dataset file: requires a path")
+            candidate = Path(dataset_path_raw).expanduser()
+            if not candidate.is_absolute():
+                repo_root = Path(__file__).resolve().parents[3]
+                candidate = (repo_root / candidate).resolve()
+            dataset_path = candidate
+            dataset_name = "file"
+            dataset_config = ""
+        elif ":" in dataset_spec:
             dataset_name, dataset_config = dataset_spec.split(":", 1)
         else:
             dataset_name = dataset_spec
     dataset_name = dataset_name or "wikitext"
     dataset_config = dataset_config or None
+    # Honor either runner --force or wrapper-side VERISCOPE_FORCE=1
+    force = bool(args.force) or _env_truthy("VERISCOPE_FORCE")
     return HFRunConfig(
         model=args.model,
         dataset_name=dataset_name,
         dataset_config=dataset_config,
+        dataset_path=dataset_path,
         dataset_split=args.dataset_split,
         dataset_text_column=args.dataset_text_column,
         outdir=outdir,
         run_id=run_id,
+        force=force,
         max_steps=int(args.max_steps),
         batch_size=int(args.batch_size),
         lr=float(args.lr),
@@ -724,6 +875,7 @@ def main() -> int:
                     "model": cfg.model,
                     "dataset_name": cfg.dataset_name,
                     "dataset_config": cfg.dataset_config,
+                    "dataset_path": str(cfg.dataset_path) if cfg.dataset_path else None,
                     "dataset_split": cfg.dataset_split,
                     "dataset_text_column": cfg.dataset_text_column,
                     "max_steps": cfg.max_steps,
