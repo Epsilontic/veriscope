@@ -78,7 +78,12 @@ fi
 # Some runners may validate successfully while emitting newer marker files instead.
 capdir=""
 markers=(
+  # Primary artifacts (what the integration test asserts on)
+  results.json
+  results_summary.json
   window_signature.json
+
+  # Optional/legacy markers (may or may not be present depending on runner)
   run_manifest.json
   capsule_manifest.json
   provenance.json
