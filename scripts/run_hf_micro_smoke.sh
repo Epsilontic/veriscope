@@ -54,21 +54,23 @@ cmd+=(
   --device cpu
 )
 
-log_file="${outdir}/hf_micro_smoke.log"
-run_rc=0
+log="${outdir}/hf_micro_smoke.log"
+
 set +e
 if command -v timeout >/dev/null 2>&1; then
-  timeout "${timeout_secs}s" "${cmd[@]}" 2>&1 | tee "${log_file}"
-  run_rc=${PIPESTATUS[0]}
+  timeout "${timeout_secs}" "${cmd[@]}" >"${log}" 2>&1
+  rc=$?
 else
-  "${cmd[@]}" 2>&1 | tee "${log_file}"
-  run_rc=${PIPESTATUS[0]}
+  "${cmd[@]}" >"${log}" 2>&1
+  rc=$?
 fi
 set -e
 
-if [[ "${run_rc}" -ne 0 ]]; then
-  echo "[micro-smoke] ERROR: HF run failed (exit=${run_rc}). See ${log_file}." >&2
-  exit "${run_rc}"
+if [[ $rc -ne 0 ]]; then
+  echo "[micro-smoke] HF run failed rc=${rc}" >&2
+  echo "[micro-smoke] tail ${log} (last 200 lines):" >&2
+  tail -n 200 "${log}" >&2 || true
+  exit $rc
 fi
 
 
@@ -152,9 +154,9 @@ if [[ -z "${capdir}" ]]; then
     echo "[micro-smoke] listing repo_root/out (maxdepth 3):" >&2
     find "${repo_root}/out" -maxdepth 3 -print >&2 || true
   fi
-  if [[ -f "${log_file}" ]]; then
-    echo "[micro-smoke] tail ${log_file} (last 200 lines):" >&2
-    tail -n 200 "${log_file}" >&2 || true
+  if [[ -f "${log}" ]]; then
+    echo "[micro-smoke] tail ${log} (last 200 lines):" >&2
+    tail -n 200 "${log}" >&2 || true
   fi
   exit 2
 fi
