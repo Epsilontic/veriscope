@@ -56,8 +56,8 @@ def sha256_hex(data: bytes) -> str:
 
 
 def canonical_json_sha256(obj: Any) -> str:
-    """SHA256 hex digest of canonical JSON bytes."""
-    return sha256_hex(canonical_bytes(obj))
+    """SHA256 hex digest of canonical JSON bytes (canonical_dumps -> utf-8 -> sha256)."""
+    return sha256_hex(canonical_dumps(obj).encode("utf-8"))
 
 
 def _unique_tmp_path_for(path: Path) -> Path:

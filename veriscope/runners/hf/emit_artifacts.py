@@ -9,13 +9,20 @@ from typing import Any, Dict, Iterable, Optional
 from veriscope.core.artifacts import (
     CountsV1,
     GateRecordV1,
+    MetricRecordV1,
     ProfileV1,
     ResultsSummaryV1,
     ResultsV1,
     WindowSignatureRefV1,
     derive_final_decision,
 )
-from veriscope.core.jsonutil import atomic_write_json, atomic_write_pydantic_json, canonical_json_sha256, read_json_obj
+from veriscope.core.jsonutil import (
+    atomic_write_json,
+    atomic_write_pydantic_json,
+    canonical_dumps,
+    canonical_json_sha256,
+    read_json_obj,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +69,7 @@ def emit_hf_artifacts_v1(
     gate_preset: str,
     window_signature: Dict[str, Any],
     gate_records: Iterable[GateRecordV1],
+    metrics: Optional[Iterable[MetricRecordV1]] = None,
     run_status: str = "success",
     runner_exit_code: Optional[int] = None,
     runner_signal: Optional[str] = None,
@@ -70,13 +78,26 @@ def emit_hf_artifacts_v1(
     outdir.mkdir(parents=True, exist_ok=True)
 
     window_signature_path = outdir / "window_signature.json"
-    atomic_write_json(window_signature_path, window_signature)
-
-    ws_on_disk = read_json_obj(window_signature_path)
-    ws_hash = canonical_json_sha256(ws_on_disk)
+    if window_signature_path.exists():
+        ws_on_disk = read_json_obj(window_signature_path)
+        ws_hash = canonical_json_sha256(ws_on_disk)
+        ws_on_disk_canonical = canonical_dumps(ws_on_disk)
+        ws_in_memory_canonical = canonical_dumps(window_signature)
+        if ws_on_disk_canonical != ws_in_memory_canonical:
+            ws_in_memory_hash = canonical_json_sha256(window_signature)
+            raise ValueError(
+                "window_signature.json already exists and differs from the provided window_signature; "
+                f"on-disk hash={ws_hash} in-memory hash={ws_in_memory_hash}. "
+                "Use a new outdir, remove the existing capsule, or rerun with --force if the wrapper handles cleanup."
+            )
+    else:
+        atomic_write_json(window_signature_path, window_signature)
+        ws_on_disk = read_json_obj(window_signature_path)
+        ws_hash = canonical_json_sha256(ws_on_disk)
     ws_ref = WindowSignatureRefV1(hash=ws_hash, path="window_signature.json")
 
     gate_records_list = list(gate_records)
+    metrics_list = list(metrics or [])
     profile = ProfileV1(gate_preset=gate_preset, overrides={})
 
     results = ResultsV1(
@@ -90,7 +111,7 @@ def emit_hf_artifacts_v1(
         started_ts_utc=_iso_z(started_ts_utc),
         ended_ts_utc=_iso_z(ended_ts_utc) if ended_ts_utc else None,
         gates=gate_records_list,
-        metrics=[],
+        metrics=metrics_list,
     )
 
     results_path = outdir / "results.json"
