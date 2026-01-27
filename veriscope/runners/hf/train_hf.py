@@ -12,6 +12,7 @@ import sys
 import traceback
 import time
 import uuid
+import zlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -59,6 +60,16 @@ class HFRunConfig:
     gate_policy: str
     gate_persistence_k: int
     rp_dim: int
+    lr_spike_at: int
+    lr_spike_len: int
+    lr_spike_mult: float
+    lr_spike_verify: bool
+    data_corrupt_at: int
+    data_corrupt_len: int
+    data_corrupt_frac: float
+    data_corrupt_mode: str
+    data_corrupt_target: str
+    data_corrupt_mask_id: Optional[int]
 
 
 def _jsonable_float(x: float) -> Optional[float]:
@@ -205,6 +216,110 @@ def _fallback_metrics_from_hidden(
     return {"var_out_k": float("nan"), "eff_dim": float("nan")}
 
 
+def _lr_spike_active(cfg: HFRunConfig, step: int) -> bool:
+    if cfg.lr_spike_at < 0 or cfg.lr_spike_len <= 0:
+        return False
+    return int(cfg.lr_spike_at) <= int(step) < (int(cfg.lr_spike_at) + int(cfg.lr_spike_len))
+
+
+def _effective_lr(cfg: HFRunConfig, step: int) -> float:
+    lr = float(cfg.lr)
+    if _lr_spike_active(cfg, step):
+        lr = lr * float(cfg.lr_spike_mult)
+    return lr
+
+
+def _data_corrupt_active(cfg: HFRunConfig, step: int) -> bool:
+    if cfg.data_corrupt_at < 0 or cfg.data_corrupt_len <= 0 or cfg.data_corrupt_frac <= 0.0:
+        return False
+    end = int(cfg.data_corrupt_at) + int(cfg.data_corrupt_len)
+    return int(cfg.data_corrupt_at) <= int(step) < end
+
+
+def _corrupt_seed(cfg: HFRunConfig, step: int, rank: int, batch_idx: int) -> int:
+    base = int(cfg.seed) & 0xFFFFFFFF
+    rid = zlib.crc32(cfg.run_id.encode("utf-8")) & 0xFFFFFFFF
+    return (
+        base ^ (rid << 1) ^ (int(step) * 0x9E3779B1) ^ (int(rank) * 0x85EBCA77) ^ (int(batch_idx) * 0xC2B2AE3D)
+    ) & 0xFFFFFFFF
+
+
+def _maybe_corrupt_batch(
+    input_ids: torch.Tensor,
+    labels: torch.Tensor,
+    *,
+    cfg: HFRunConfig,
+    step: int,
+    vocab_size: int,
+    mask_token_id: int,
+    attention_mask: Optional[torch.Tensor],
+    rank: int,
+    batch_idx: int,
+) -> tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
+    """Apply token corruption for pathology injection (HF runner).
+
+    Modes:
+      - permute: permute a fraction of positions within each sequence
+      - random: replace a fraction of positions with random token IDs
+      - mask: replace a fraction of positions with mask_token_id
+    """
+    if not _data_corrupt_active(cfg, step):
+        return input_ids, labels, {"corrupt_frac_effective": 0.0}
+    if input_ids.ndim != 2:
+        return input_ids, labels, {"corrupt_frac_effective": 0.0}
+
+    bsz, seq_len = int(input_ids.shape[0]), int(input_ids.shape[1])
+    n_corrupt = int(round(float(seq_len) * float(cfg.data_corrupt_frac)))
+    n_corrupt = max(0, min(seq_len, n_corrupt))
+    if n_corrupt == 0:
+        return input_ids, labels, {"corrupt_frac_effective": 0.0}
+
+    x_corrupt = input_ids.clone()
+    gen = torch.Generator(device=input_ids.device)
+    gen.manual_seed(_corrupt_seed(cfg, step, rank, batch_idx))
+
+    mode = str(cfg.data_corrupt_mode).lower().strip()
+    if mode not in ("permute", "random", "mask"):
+        raise ValueError(f"Unknown data_corrupt_mode={cfg.data_corrupt_mode!r}")
+
+    vocab_size = max(1, int(vocab_size))
+    if attention_mask is None:
+        attention_mask = torch.ones_like(input_ids, dtype=torch.long)
+    active_mask = attention_mask.to(dtype=torch.bool)
+    active_mask = active_mask & (labels != -100)
+
+    total_picked = 0
+    total_active = 0
+    for b in range(bsz):
+        valid_pos = torch.nonzero(active_mask[b], as_tuple=False).flatten()
+        if valid_pos.numel() == 0:
+            continue
+        total_active += int(valid_pos.numel())
+        n_pick = min(int(n_corrupt), int(valid_pos.numel()))
+        if n_pick <= 0:
+            continue
+        total_picked += int(n_pick)
+        pos = valid_pos[torch.randperm(valid_pos.numel(), generator=gen, device=input_ids.device)[:n_pick]]
+        if mode == "permute":
+            shuf = torch.randperm(n_pick, generator=gen, device=input_ids.device)
+            x_corrupt[b, pos] = input_ids[b, pos[shuf]]
+        elif mode == "random":
+            rnd = torch.randint(0, vocab_size, (n_pick,), generator=gen, device=input_ids.device)
+            x_corrupt[b, pos] = rnd
+        else:
+            x_corrupt[b, pos] = int(mask_token_id)
+
+    target_mode = str(cfg.data_corrupt_target).lower().strip()
+    if target_mode == "same":
+        new_labels = labels.clone()
+        keep = labels != -100
+        new_labels[keep] = x_corrupt[keep]
+        frac_effective = float(total_picked) / float(total_active) if total_active > 0 else 0.0
+        return x_corrupt, new_labels.detach(), {"corrupt_frac_effective": frac_effective}
+    frac_effective = float(total_picked) / float(total_active) if total_active > 0 else 0.0
+    return x_corrupt, labels, {"corrupt_frac_effective": frac_effective}
+
+
 def _build_gate_engine(cfg: HFRunConfig, window_decl: WindowDecl) -> GateEngine:
     transport = DeclTransport(window_decl)
     window_decl.attach_transport(transport)
@@ -292,8 +407,64 @@ def _build_run_manifest(
     runner_signal: Optional[str],
     failure_reason: Optional[str],
     failure_traceback: Optional[str],
+    rank_used_for_corrupt_seed: Optional[int],
+    world_size_used_for_corrupt_seed: Optional[int],
 ) -> Dict[str, Any]:
     env = os.environ
+
+    def _env_int(name: str) -> Optional[int]:
+        raw = env.get(name)
+        if raw is None or raw == "":
+            return None
+        try:
+            return int(raw)
+        except Exception:
+            return None
+
+    if rank_used_for_corrupt_seed is None:
+        rank_used_for_corrupt_seed = _env_int("RANK")
+    if world_size_used_for_corrupt_seed is None:
+        world_size_used_for_corrupt_seed = _env_int("WORLD_SIZE")
+
+    pathology_payload = {
+        "lr_spike_at": cfg.lr_spike_at,
+        "lr_spike_len": cfg.lr_spike_len,
+        "lr_spike_mult": cfg.lr_spike_mult,
+        "lr_spike_verify": cfg.lr_spike_verify,
+        "data_corrupt_at": cfg.data_corrupt_at,
+        "data_corrupt_len": cfg.data_corrupt_len,
+        "data_corrupt_frac": cfg.data_corrupt_frac,
+        "data_corrupt_mode": cfg.data_corrupt_mode,
+        "data_corrupt_target": cfg.data_corrupt_target,
+        "data_corrupt_mask_id": cfg.data_corrupt_mask_id,
+        "corrupt_seed_scheme": "seed^runid^step^rank^batch_idx",
+        "rank_used_for_corrupt_seed": rank_used_for_corrupt_seed,
+        "world_size_observed_for_corrupt_seed": world_size_used_for_corrupt_seed,
+        "corrupt_seed_note": "seed uses rank; world_size recorded for provenance",
+    }
+    if cfg.data_corrupt_at >= 0 and cfg.data_corrupt_len > 0 and cfg.data_corrupt_frac > 0.0:
+        s0 = int(cfg.data_corrupt_at)
+        seed_rank = int(rank_used_for_corrupt_seed or 0)
+        pathology_payload[f"corrupt_seed_at_start_rank{seed_rank}_batch0"] = _corrupt_seed(cfg, s0, seed_rank, 0)
+        required_snaps = max(
+            int(cfg.gate_window) + max(0, int(cfg.gate_persistence_k) - 1),
+            int(cfg.gate_min_evidence),
+        )
+        required_len_steps_min = (required_snaps - 1) * int(cfg.cadence) + 1 if required_snaps > 0 else 0
+        injected_snaps_est = (int(cfg.data_corrupt_len) + int(cfg.cadence) - 1) // int(cfg.cadence)
+        pathology_payload["data_corrupt_required_snaps"] = required_snaps
+        pathology_payload["data_corrupt_required_len_steps_min"] = required_len_steps_min
+        pathology_payload["data_corrupt_injected_snaps_est"] = injected_snaps_est
+    if cfg.lr_spike_at >= 0 and cfg.lr_spike_len > 0:
+        required_snaps = max(
+            int(cfg.gate_window) + max(0, int(cfg.gate_persistence_k) - 1),
+            int(cfg.gate_min_evidence),
+        )
+        required_len_steps_min = (required_snaps - 1) * int(cfg.cadence) + 1 if required_snaps > 0 else 0
+        injected_snaps_est = (int(cfg.lr_spike_len) + int(cfg.cadence) - 1) // int(cfg.cadence)
+        pathology_payload["lr_spike_required_snaps"] = required_snaps
+        pathology_payload["lr_spike_required_len_steps_min"] = required_len_steps_min
+        pathology_payload["lr_spike_injected_snaps_est"] = injected_snaps_est
     return {
         "schema_version": 1,
         "argv": list(argv),
@@ -321,6 +492,7 @@ def _build_run_manifest(
                 getattr(torch, "are_deterministic_algorithms_enabled", lambda: False)()
             ),
         },
+        "pathology": pathology_payload,
         "timestamps": {
             "started_ts_utc": _iso_utc(started_ts_utc),
             "ended_ts_utc": _iso_utc(ended_ts_utc) if ended_ts_utc else None,
@@ -543,6 +715,17 @@ def _run(cfg: HFRunConfig, *, argv: List[str]) -> int:
     model.config.use_cache = False
     model.to(device)
     model.train()
+    vocab_size = int(
+        getattr(model.config, "vocab_size", None) or getattr(tokenizer, "vocab_size", None) or len(tokenizer)
+    )
+    mask_token_id = cfg.data_corrupt_mask_id
+    if mask_token_id is None:
+        mask_token_id = getattr(tokenizer, "mask_token_id", None)
+    if mask_token_id is None:
+        if str(cfg.data_corrupt_mode).lower().strip() == "mask":
+            raise ValueError("--data_corrupt_mask_id required when tokenizer has no mask_token_id")
+        mask_token_id = tokenizer.eos_token_id
+    mask_token_id = int(mask_token_id or 0)
 
     data_loader = _tokenize_dataset(
         cfg.dataset_name,
@@ -557,6 +740,7 @@ def _run(cfg: HFRunConfig, *, argv: List[str]) -> int:
     )
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
+    current_lr = float(cfg.lr)
 
     metric_config = HFMetricConfig(
         max_tokens_per_batch=cfg.batch_size * cfg.block_size,
@@ -570,6 +754,52 @@ def _run(cfg: HFRunConfig, *, argv: List[str]) -> int:
     run_id = cfg.run_id
     started_ts = datetime.now(timezone.utc)
     window_signature = _build_window_signature(cfg, created_ts_utc=started_ts)
+
+    if _is_chief():
+        if cfg.data_corrupt_len > 0 and cfg.data_corrupt_frac > 0.0:
+            if int(cfg.data_corrupt_at) < 0:
+                print("[veriscope:hf] WARNING: data_corrupt_len set but data_corrupt_at < 0; corruption is disabled.")
+        if cfg.cadence > 0 and cfg.data_corrupt_len > 0 and cfg.data_corrupt_frac > 0.0 and cfg.data_corrupt_at >= 0:
+            injected_snaps = (int(cfg.data_corrupt_len) + int(cfg.cadence) - 1) // int(cfg.cadence)
+            required_snaps = max(
+                int(cfg.gate_window) + max(0, int(cfg.gate_persistence_k) - 1),
+                int(cfg.gate_min_evidence),
+            )
+            required_len_steps_min = (required_snaps - 1) * int(cfg.cadence) + 1 if required_snaps > 0 else 0
+            if injected_snaps < required_snaps:
+                print(
+                    "[veriscope:hf] WARNING: data corruption provides only "
+                    f"{injected_snaps} cadenced samples (< required={required_snaps}); "
+                    f"min required steps ~{required_len_steps_min}; "
+                    "gate trip may be delayed or never occur."
+                )
+            if int(cfg.data_corrupt_at) >= 0 and int(cfg.data_corrupt_at) % int(cfg.cadence) != 0:
+                print(
+                    "[veriscope:hf] WARNING: data_corrupt_at is not aligned to cadence; "
+                    "first injected snapshot may be delayed."
+                )
+        if cfg.lr_spike_len > 0:
+            if int(cfg.lr_spike_at) < 0:
+                print("[veriscope:hf] WARNING: lr_spike_len set but lr_spike_at < 0; lr spike is disabled.")
+        if cfg.cadence > 0 and cfg.lr_spike_len > 0 and cfg.lr_spike_at >= 0:
+            injected_snaps = (int(cfg.lr_spike_len) + int(cfg.cadence) - 1) // int(cfg.cadence)
+            required_snaps = max(
+                int(cfg.gate_window) + max(0, int(cfg.gate_persistence_k) - 1),
+                int(cfg.gate_min_evidence),
+            )
+            required_len_steps_min = (required_snaps - 1) * int(cfg.cadence) + 1 if required_snaps > 0 else 0
+            if injected_snaps < required_snaps:
+                print(
+                    "[veriscope:hf] WARNING: lr spike provides only "
+                    f"{injected_snaps} cadenced samples (< required={required_snaps}); "
+                    f"min required steps ~{required_len_steps_min}; "
+                    "gate trip may be delayed or never occur."
+                )
+            if int(cfg.lr_spike_at) >= 0 and int(cfg.lr_spike_at) % int(cfg.cadence) != 0:
+                print(
+                    "[veriscope:hf] WARNING: lr_spike_at is not aligned to cadence; "
+                    "first injected snapshot may be delayed."
+                )
 
     interrupt_signal: Optional[str] = None
     stop_requested = False
@@ -598,6 +828,8 @@ def _run(cfg: HFRunConfig, *, argv: List[str]) -> int:
     metric_records: List[MetricRecordV1] = []
 
     step = 0
+    batch_idx = 0
+    rank, world_size = _get_rank_and_world()
     data_iter = iter(data_loader)
     try:
         while step < cfg.max_steps:
@@ -618,6 +850,27 @@ def _run(cfg: HFRunConfig, *, argv: List[str]) -> int:
                 attention_mask = (input_ids != tokenizer.pad_token_id).long()
             if attention_mask is None:
                 attention_mask = torch.ones_like(input_ids, dtype=torch.long)
+
+            input_ids, labels, corrupt_stats = _maybe_corrupt_batch(
+                input_ids,
+                labels,
+                cfg=cfg,
+                step=step,
+                vocab_size=vocab_size,
+                mask_token_id=mask_token_id,
+                attention_mask=attention_mask,
+                rank=rank,
+                batch_idx=batch_idx,
+            )
+
+            effective_lr = _effective_lr(cfg, step)
+            if effective_lr != current_lr:
+                for group in optimizer.param_groups:
+                    group["lr"] = effective_lr
+                current_lr = effective_lr
+            if cfg.lr_spike_verify and _lr_spike_active(cfg, step) and step == cfg.lr_spike_at and _is_chief():
+                ratio = effective_lr / float(cfg.lr) if float(cfg.lr) != 0.0 else float("inf")
+                print(f"[veriscope:hf] lr_spike_verify ratio={ratio:.4f} step={step}")
             need_hidden = step % cfg.cadence == 0
             outputs = model(
                 input_ids=input_ids,
@@ -671,6 +924,10 @@ def _run(cfg: HFRunConfig, *, argv: List[str]) -> int:
                         "loss": loss_value,
                         "var_out_k": var_out_k_raw,
                         "eff_dim": eff_dim_raw,
+                        "lr": effective_lr,
+                        "data_corrupt_active": int(_data_corrupt_active(cfg, step)),
+                        "lr_spike_active": int(_lr_spike_active(cfg, step)),
+                        "data_corrupt_frac_effective": float(corrupt_stats.get("corrupt_frac_effective", 0.0)),
                     }
                 )
 
@@ -678,6 +935,28 @@ def _run(cfg: HFRunConfig, *, argv: List[str]) -> int:
                 metric_records.append(MetricRecordV1(name="loss", iter=step, value=_jsonable_float(loss_value)))
                 metric_records.append(MetricRecordV1(name="var_out_k", iter=step, value=_jsonable_float(var_out_k_raw)))
                 metric_records.append(MetricRecordV1(name="eff_dim", iter=step, value=_jsonable_float(eff_dim_raw)))
+                metric_records.append(MetricRecordV1(name="lr", iter=step, value=_jsonable_float(effective_lr)))
+                metric_records.append(
+                    MetricRecordV1(
+                        name="data_corrupt_frac_effective",
+                        iter=step,
+                        value=_jsonable_float(float(corrupt_stats.get("corrupt_frac_effective", 0.0))),
+                    )
+                )
+                metric_records.append(
+                    MetricRecordV1(
+                        name="data_corrupt_active",
+                        iter=step,
+                        value=_jsonable_float(float(_data_corrupt_active(cfg, step))),
+                    )
+                )
+                metric_records.append(
+                    MetricRecordV1(
+                        name="lr_spike_active",
+                        iter=step,
+                        value=_jsonable_float(float(_lr_spike_active(cfg, step))),
+                    )
+                )
 
                 gate_records.append(
                     _gate_from_history(
@@ -692,6 +971,7 @@ def _run(cfg: HFRunConfig, *, argv: List[str]) -> int:
                 )
 
             step += 1
+            batch_idx += 1
     except Exception as exc:
         failure_reason = f"{type(exc).__name__}: {exc}"
         failure_traceback = traceback.format_exc()
@@ -761,6 +1041,8 @@ def _run(cfg: HFRunConfig, *, argv: List[str]) -> int:
             runner_signal=runner_signal,
             failure_reason=failure_reason,
             failure_traceback=failure_traceback,
+            rank_used_for_corrupt_seed=rank,
+            world_size_used_for_corrupt_seed=world_size,
         )
         _write_run_manifest(cfg.outdir, manifest)
     return int(runner_exit_code if runner_exit_code is not None else 1)
@@ -785,6 +1067,14 @@ def _parse_args() -> HFRunConfig:
     parser.add_argument("--max_steps", type=int, default=200, help="Max training steps")
     parser.add_argument("--batch_size", type=int, default=4, help="Batch size")
     parser.add_argument("--lr", type=float, default=5e-4, help="Learning rate")
+    parser.add_argument("--lr_spike_at", type=int, default=-1, help="Step to start LR spike (<0 disables)")
+    parser.add_argument("--lr_spike_len", type=int, default=0, help="Number of steps to spike LR")
+    parser.add_argument("--lr_spike_mult", type=float, default=1.0, help="LR multiplier during spike")
+    parser.add_argument(
+        "--lr_spike_verify",
+        action="store_true",
+        help="Log LR spike verification ratio when spike begins",
+    )
     parser.add_argument("--seed", type=int, default=1337, help="Random seed")
     parser.add_argument("--cadence", type=int, default=10, help="Instrumentation cadence (steps)")
     parser.add_argument("--block_size", type=int, default=128, help="Sequence length for training")
@@ -803,8 +1093,36 @@ def _parse_args() -> HFRunConfig:
     parser.add_argument("--gate_policy", type=str, default="persistence", help="Gate policy")
     parser.add_argument("--gate_persistence_k", type=int, default=2, help="Gate persistence K")
     parser.add_argument("--rp_dim", type=int, default=64, help="JL projection dimension")
+    parser.add_argument("--data_corrupt_at", type=int, default=-1, help="Step to start data corruption (<0 disables)")
+    parser.add_argument("--data_corrupt_len", type=int, default=0, help="Number of steps to corrupt data")
+    parser.add_argument(
+        "--data_corrupt_frac",
+        type=float,
+        default=0.0,
+        help="Fraction of tokens to corrupt per sequence",
+    )
+    parser.add_argument(
+        "--data_corrupt_mode",
+        type=str,
+        default="permute",
+        help="Token corruption mode: permute, random, or mask",
+    )
+    parser.add_argument(
+        "--data_corrupt_target",
+        type=str,
+        default="clean",
+        help="Corruption target: clean (default) or same",
+    )
+    parser.add_argument(
+        "--data_corrupt_mask_id",
+        type=int,
+        default=None,
+        help="Override mask token id for data corruption (used when mode=mask)",
+    )
 
     args = parser.parse_args()
+    if int(args.cadence) <= 0:
+        raise ValueError("--cadence must be >= 1")
     outdir = Path(args.outdir).expanduser() if args.outdir else _default_outdir()
     run_id = args.run_id.strip() or uuid.uuid4().hex[:12]
     dataset_name = args.dataset_name.strip()
@@ -829,6 +1147,34 @@ def _parse_args() -> HFRunConfig:
             dataset_name = dataset_spec
     dataset_name = dataset_name or "wikitext"
     dataset_config = dataset_config or None
+    if not math.isfinite(float(args.lr)):
+        raise ValueError("--lr must be finite")
+    if float(args.lr) <= 0.0:
+        raise ValueError("--lr must be > 0")
+    if not math.isfinite(float(args.lr_spike_mult)):
+        raise ValueError("--lr_spike_mult must be finite")
+    if not math.isfinite(float(args.data_corrupt_frac)):
+        raise ValueError("--data_corrupt_frac must be finite")
+    if float(args.data_corrupt_frac) < 0.0 or float(args.data_corrupt_frac) > 1.0:
+        raise ValueError("--data_corrupt_frac must be within [0, 1]")
+    if int(args.data_corrupt_len) < 0:
+        raise ValueError("--data_corrupt_len must be >= 0")
+    if int(args.data_corrupt_at) < -1:
+        raise ValueError("--data_corrupt_at must be >= -1")
+    if float(args.lr_spike_mult) <= 0.0:
+        raise ValueError("--lr_spike_mult must be > 0")
+    if int(args.lr_spike_len) < 0:
+        raise ValueError("--lr_spike_len must be >= 0")
+    if int(args.lr_spike_at) < -1:
+        raise ValueError("--lr_spike_at must be >= -1")
+    if args.data_corrupt_mask_id is not None and int(args.data_corrupt_mask_id) < 0:
+        raise ValueError("--data_corrupt_mask_id must be >= 0")
+    mode = str(args.data_corrupt_mode).lower().strip()
+    if mode not in {"permute", "random", "mask"}:
+        raise ValueError("--data_corrupt_mode must be one of: permute, random, mask")
+    target_mode = str(args.data_corrupt_target).lower().strip()
+    if target_mode not in {"clean", "same"}:
+        raise ValueError("--data_corrupt_target must be one of: clean, same")
     # Honor either runner --force or wrapper-side VERISCOPE_FORCE=1
     force = bool(args.force) or _env_truthy("VERISCOPE_FORCE")
     return HFRunConfig(
@@ -857,6 +1203,16 @@ def _parse_args() -> HFRunConfig:
         gate_policy=str(args.gate_policy),
         gate_persistence_k=int(args.gate_persistence_k),
         rp_dim=int(args.rp_dim),
+        lr_spike_at=int(args.lr_spike_at),
+        lr_spike_len=int(args.lr_spike_len),
+        lr_spike_mult=float(args.lr_spike_mult),
+        lr_spike_verify=bool(args.lr_spike_verify),
+        data_corrupt_at=int(args.data_corrupt_at),
+        data_corrupt_len=int(args.data_corrupt_len),
+        data_corrupt_frac=float(args.data_corrupt_frac),
+        data_corrupt_mode=mode,
+        data_corrupt_target=target_mode,
+        data_corrupt_mask_id=args.data_corrupt_mask_id,
     )
 
 
@@ -881,6 +1237,10 @@ def main() -> int:
                     "max_steps": cfg.max_steps,
                     "batch_size": cfg.batch_size,
                     "lr": cfg.lr,
+                    "lr_spike_at": cfg.lr_spike_at,
+                    "lr_spike_len": cfg.lr_spike_len,
+                    "lr_spike_mult": cfg.lr_spike_mult,
+                    "lr_spike_verify": cfg.lr_spike_verify,
                     "seed": cfg.seed,
                     "cadence": cfg.cadence,
                     "block_size": cfg.block_size,
@@ -894,6 +1254,12 @@ def main() -> int:
                     "gate_policy": cfg.gate_policy,
                     "gate_persistence_k": cfg.gate_persistence_k,
                     "rp_dim": cfg.rp_dim,
+                    "data_corrupt_at": cfg.data_corrupt_at,
+                    "data_corrupt_len": cfg.data_corrupt_len,
+                    "data_corrupt_frac": cfg.data_corrupt_frac,
+                    "data_corrupt_mode": cfg.data_corrupt_mode,
+                    "data_corrupt_target": cfg.data_corrupt_target,
+                    "data_corrupt_mask_id": cfg.data_corrupt_mask_id,
                 },
             },
         )
