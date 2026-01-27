@@ -33,7 +33,7 @@ Trademark = "https://github.com/Epsilontic/veriscope/blob/main/TRADEMARK.md"
 
 [project.optional-dependencies]
 torch = ["torch>=2.1", "torchvision>=0.16"]
-hf = ["torch>=2.1", "torchvision>=0.16", "transformers", "datasets"]
+hf = ["torch>=2.1", "torchvision>=0.16", "transformers", "datasets", "accelerate"]
 topo = ["ripser>=0.6.4"]
 
 [project.scripts]  
