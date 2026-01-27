@@ -17,8 +17,6 @@ dependencies = [
   "filelock>=3.7",
   "pyarrow>=14.0",
   "pydantic>=2.0,<3",
-  "torch>=2.1",
-  "torchvision>=0.16",
   "typing_extensions>=4.0",
 ]
 classifiers = [
@@ -34,6 +32,8 @@ Notice = "https://github.com/Epsilontic/veriscope/blob/main/NOTICE"
 Trademark = "https://github.com/Epsilontic/veriscope/blob/main/TRADEMARK.md"
 
 [project.optional-dependencies]
+torch = ["torch>=2.1", "torchvision>=0.16"]
+hf = ["torch>=2.1", "torchvision>=0.16", "transformers", "datasets"]
 topo = ["ripser>=0.6.4"]
 
 [project.scripts]  
