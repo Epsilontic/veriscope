@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import random
+import signal
+import subprocess
+import sys
+import traceback
 import time
 import uuid
 from dataclasses import dataclass
@@ -15,7 +20,7 @@ import torch
 from torch.utils.data import DataLoader
 
 import veriscope
-from veriscope.core.artifacts import AuditV1, GateRecordV1
+from veriscope.core.artifacts import AuditV1, GateRecordV1, MetricRecordV1
 from veriscope.core.calibration import aggregate_epsilon_stat
 from veriscope.core.gate import GateEngine
 from veriscope.core.transport import DeclTransport
@@ -52,6 +57,15 @@ class HFRunConfig:
     rp_dim: int
 
 
+def _jsonable_float(x: float) -> Optional[float]:
+    """Convert float to JSON-safe value: finite -> float, non-finite -> None."""
+    try:
+        v = float(x)
+    except Exception:
+        return None
+    return v if math.isfinite(v) else None
+
+
 def _iso_utc(dt: datetime) -> str:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
@@ -64,6 +78,59 @@ def _default_outdir() -> Path:
     base = Path(os.environ.get("VERISCOPE_OUT_BASE", "./out")).expanduser()
     ts = time.strftime("%Y%m%d_%H%M%S")
     return base / f"veriscope_hf_{ts}_{os.getpid()}"
+
+
+def _get_rank_and_world() -> tuple[int, int]:
+    """Determine (rank, world_size) without being confused by unrelated env vars.
+
+    Policy:
+      1) If a torch.distributed process group is initialized, trust it.
+      2) Else, only trust env vars if we appear to be under torchrun/elastic
+         (LOCAL_RANK or TORCHELASTIC_RUN_ID present).
+      3) Otherwise treat as single-process (0, 1).
+    """
+    # For smokes/CI, allow an explicit override to force single-process emission.
+    force = (os.environ.get("VERISCOPE_FORCE_SINGLE_PROCESS") or "").strip().lower()
+    if force in {"1", "true", "yes", "y", "on"}:
+        return 0, 1
+    # 1) Trust an initialized process group (most reliable).
+    try:
+        import torch.distributed as dist  # local import
+
+        if dist.is_available() and dist.is_initialized():
+            return int(dist.get_rank()), int(dist.get_world_size())
+    except Exception:
+        pass
+
+    # 2) Only trust env rank/world when torchrun/elastic hints are present.
+    if os.environ.get("LOCAL_RANK") is None and os.environ.get("TORCHELASTIC_RUN_ID") is None:
+        return 0, 1
+
+    def _as_int(name: str, default: int) -> int:
+        raw = os.environ.get(name)
+        if raw is None or raw == "":
+            return default
+        try:
+            return int(raw)
+        except ValueError:
+            return default
+
+    rank = _as_int("RANK", 0)
+    world_size = _as_int("WORLD_SIZE", 1)
+    if world_size < 1:
+        world_size = 1
+    if rank < 0:
+        rank = 0
+    if rank >= world_size:
+        # Clamp rather than silently acting non-chief and emitting nothing.
+        rank = 0
+        world_size = 1
+    return rank, world_size
+
+
+def _is_chief() -> bool:
+    rank, _ = _get_rank_and_world()
+    return rank == 0
 
 
 def _set_seed(seed: int) -> None:
@@ -133,6 +200,94 @@ def _build_window_signature(cfg: HFRunConfig) -> Dict[str, Any]:
         },
         "sketch": {"kind": "jl", "dim": cfg.rp_dim, "seed": cfg.seed},
     }
+
+
+def _best_effort_git_sha() -> Optional[str]:
+    try:
+        repo_root = Path(__file__).resolve().parents[3]
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            return None
+        return (result.stdout or "").strip() or None
+    except Exception:
+        return None
+
+
+def _best_effort_transformers_version() -> Optional[str]:
+    try:
+        import transformers  # local import to avoid module-level dependency
+
+        return getattr(transformers, "__version__", None)
+    except Exception:
+        return None
+
+
+def _build_run_manifest(
+    cfg: HFRunConfig,
+    *,
+    argv: List[str],
+    started_ts_utc: datetime,
+    ended_ts_utc: Optional[datetime],
+    run_status: str,
+    runner_exit_code: Optional[int],
+    runner_signal: Optional[str],
+    failure_reason: Optional[str],
+    failure_traceback: Optional[str],
+) -> Dict[str, Any]:
+    env = os.environ
+    return {
+        "schema_version": 1,
+        "argv": list(argv),
+        "env": {
+            "CUDA_VISIBLE_DEVICES": env.get("CUDA_VISIBLE_DEVICES"),
+            "WORLD_SIZE": env.get("WORLD_SIZE"),
+            "RANK": env.get("RANK"),
+            "MASTER_ADDR": env.get("MASTER_ADDR"),
+            "MASTER_PORT": env.get("MASTER_PORT"),
+            "HF_HOME": env.get("HF_HOME"),
+            "TRANSFORMERS_CACHE": env.get("TRANSFORMERS_CACHE"),
+            "PYTHONPATH": env.get("PYTHONPATH"),
+            "OMP_NUM_THREADS": env.get("OMP_NUM_THREADS"),
+        },
+        "seeds": {
+            "seed": cfg.seed,
+            "torch_manual_seed": cfg.seed,
+            "numpy_seed": cfg.seed,
+            "python_random_seed": cfg.seed,
+        },
+        "determinism": {
+            "cudnn_deterministic": bool(torch.backends.cudnn.deterministic),
+            "cudnn_benchmark": bool(torch.backends.cudnn.benchmark),
+            "torch_deterministic_algorithms": bool(
+                getattr(torch, "are_deterministic_algorithms_enabled", lambda: False)()
+            ),
+        },
+        "timestamps": {
+            "started_ts_utc": _iso_utc(started_ts_utc),
+            "ended_ts_utc": _iso_utc(ended_ts_utc) if ended_ts_utc else None,
+        },
+        "run_status": run_status,
+        "runner_exit_code": runner_exit_code,
+        "runner_signal": runner_signal,
+        "failure_reason": failure_reason,
+        "failure_traceback": failure_traceback,
+        "git": {"commit_sha": _best_effort_git_sha()},
+        "versions": {
+            "veriscope": veriscope.__version__,
+            "torch": getattr(torch, "__version__", None),
+            "transformers": _best_effort_transformers_version(),
+        },
+    }
+
+
+def _write_run_manifest(outdir: Path, manifest: Dict[str, Any]) -> None:
+    atomic_write_json(outdir / "run_manifest.json", manifest, fsync=True)
 
 
 def _tokenize_dataset(
@@ -252,8 +407,16 @@ def _gate_from_history(
     return GateRecordV1(iter=iter_num, decision=decision, audit=audit, ok=result.ok, warn=result.warn)
 
 
-def _run(cfg: HFRunConfig) -> int:
-    cfg.outdir.mkdir(parents=True, exist_ok=True)
+def _exit_code_for_signal(signal_name: Optional[str]) -> Optional[int]:
+    if not signal_name:
+        return None
+    mapping = {"SIGINT": 130, "SIGTERM": 143}
+    return mapping.get(signal_name, 128)
+
+
+def _run(cfg: HFRunConfig, *, argv: List[str]) -> int:
+    if _is_chief():
+        cfg.outdir.mkdir(parents=True, exist_ok=True)
     _set_seed(cfg.seed)
 
     device = torch.device(cfg.device)
@@ -294,88 +457,179 @@ def _run(cfg: HFRunConfig) -> int:
     run_id = cfg.run_id
     started_ts = datetime.now(timezone.utc)
 
+    interrupt_signal: Optional[str] = None
+    stop_requested = False
+    previous_handlers: Dict[int, Any] = {}
+    failure_reason: Optional[str] = None
+    failure_traceback: Optional[str] = None
+
+    def _signal_handler(signum: int, _frame: Any) -> None:
+        nonlocal interrupt_signal, stop_requested
+        stop_requested = True
+        try:
+            interrupt_signal = signal.Signals(signum).name
+        except Exception:
+            interrupt_signal = f"SIG{signum}"
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            sig_num = sig.value if hasattr(sig, "value") else int(sig)
+            previous_handlers[sig_num] = signal.getsignal(sig_num)
+            signal.signal(sig_num, _signal_handler)
+        except Exception:
+            continue
+
     metric_history: List[Dict[str, Any]] = []
     gate_records: List[GateRecordV1] = []
+    metric_records: List[MetricRecordV1] = []
 
     step = 0
     data_iter = iter(data_loader)
-    while step < cfg.max_steps:
-        try:
-            batch = next(data_iter)
-        except StopIteration:
-            data_iter = iter(data_loader)
-            batch = next(data_iter)
+    try:
+        while step < cfg.max_steps:
+            if stop_requested:
+                break
+            try:
+                batch = next(data_iter)
+            except StopIteration:
+                data_iter = iter(data_loader)
+                batch = next(data_iter)
 
-        input_ids = batch["input_ids"].to(device)
-        labels = batch["labels"].to(device)
+            input_ids = batch["input_ids"].to(device)
+            labels = batch["labels"].to(device)
 
-        attention_mask = None
-        if tokenizer.pad_token_id is not None and tokenizer.pad_token_id != tokenizer.eos_token_id:
-            attention_mask = (input_ids != tokenizer.pad_token_id).long()
-        need_hidden = step % cfg.cadence == 0
-        outputs = model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            labels=labels,
-            output_hidden_states=need_hidden,
-            use_cache=False,
-        )
-        loss = outputs.loss
-        loss.backward()
-        if cfg.grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
-        optimizer.step()
-        optimizer.zero_grad()
-
-        if step % cfg.cadence == 0:
-            with torch.no_grad():
-                hidden_states = outputs.hidden_states[-1] if outputs.hidden_states else None
-                if hidden_states is None:
-                    metrics = {"var_out_k": float("nan"), "eff_dim": float("nan")}
-                else:
-                    metrics = metric_computer.compute_metrics(
-                        hidden_states=hidden_states.detach(),
-                        attention_mask=attention_mask,
-                        step=step,
-                    )
-            metric_history.append(
-                {
-                    "iter": step,
-                    "loss": float(loss.detach().cpu().item()),
-                    "var_out_k": float(metrics.get("var_out_k", float("nan"))),
-                    "eff_dim": float(metrics.get("eff_dim", float("nan"))),
-                }
+            attention_mask = None
+            if tokenizer.pad_token_id is not None and tokenizer.pad_token_id != tokenizer.eos_token_id:
+                attention_mask = (input_ids != tokenizer.pad_token_id).long()
+            need_hidden = step % cfg.cadence == 0
+            outputs = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+                output_hidden_states=need_hidden,
+                use_cache=False,
             )
-            gate_records.append(
-                _gate_from_history(
-                    gate_engine,
-                    window_decl,
-                    metric_history,
-                    cfg.gate_window,
-                    step,
-                    cfg.gate_policy,
-                    cfg.gate_min_evidence,
+            loss = outputs.loss
+            loss.backward()
+            if cfg.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+            optimizer.step()
+            optimizer.zero_grad()
+
+            if step % cfg.cadence == 0:
+                with torch.no_grad():
+                    hidden_states = outputs.hidden_states[-1] if outputs.hidden_states else None
+                    if hidden_states is None:
+                        m = {"var_out_k": float("nan"), "eff_dim": float("nan")}
+                    else:
+                        m = metric_computer.compute_metrics(
+                            hidden_states=hidden_states.detach(),
+                            attention_mask=attention_mask,
+                            step=step,
+                        )
+
+                loss_value = float(loss.detach().cpu().item())
+                var_out_k_raw = float(m.get("var_out_k", float("nan")))
+                eff_dim_raw = float(m.get("eff_dim", float("nan")))
+
+                metric_history.append(
+                    {
+                        "iter": step,
+                        "loss": loss_value,
+                        "var_out_k": var_out_k_raw,
+                        "eff_dim": eff_dim_raw,
+                    }
                 )
-            )
 
-        step += 1
+                # Emit JSON-safe MetricRecordV1 for declared evidence metrics (and loss).
+                metric_records.append(MetricRecordV1(name="loss", iter=step, value=_jsonable_float(loss_value)))
+                metric_records.append(MetricRecordV1(name="var_out_k", iter=step, value=_jsonable_float(var_out_k_raw)))
+                metric_records.append(MetricRecordV1(name="eff_dim", iter=step, value=_jsonable_float(eff_dim_raw)))
+
+                gate_records.append(
+                    _gate_from_history(
+                        gate_engine,
+                        window_decl,
+                        metric_history,
+                        cfg.gate_window,
+                        step,
+                        cfg.gate_policy,
+                        cfg.gate_min_evidence,
+                    )
+                )
+
+            step += 1
+    except Exception as exc:
+        failure_reason = f"{type(exc).__name__}: {exc}"
+        failure_traceback = traceback.format_exc()
+
+    for sig_num, handler in previous_handlers.items():
+        try:
+            signal.signal(sig_num, handler)
+        except Exception:
+            continue
 
     ended_ts = datetime.now(timezone.utc)
 
     window_signature = _build_window_signature(cfg)
-    emit_hf_artifacts_v1(
-        outdir=cfg.outdir,
-        run_id=run_id,
-        started_ts_utc=started_ts,
-        ended_ts_utc=ended_ts,
-        gate_preset=cfg.gate_preset,
-        window_signature=window_signature,
-        gate_records=gate_records,
-        run_status="success",
-        runner_exit_code=0,
-        runner_signal=None,
-    )
-    return 0
+    if not gate_records:
+        audit = AuditV1(
+            evaluated=False,
+            reason="not_evaluated_no_steps",
+            policy=cfg.gate_policy,
+            per_metric_tv={},
+            evidence_total=0,
+            min_evidence=cfg.gate_min_evidence,
+        )
+        gate_records.append(GateRecordV1(iter=0, decision="skip", audit=audit, ok=True, warn=False))
+
+    metrics = list(metric_records)
+    if not metrics:
+        # Ensure non-degenerate emission even when no steps completed.
+        metrics = [
+            MetricRecordV1(name="loss", iter=0, value=None),
+            MetricRecordV1(name="var_out_k", iter=0, value=None),
+            MetricRecordV1(name="eff_dim", iter=0, value=None),
+        ]
+
+    run_status = "success"
+    runner_signal = interrupt_signal
+    runner_exit_code = 0
+    if failure_reason:
+        run_status = "user_code_failure"
+        runner_exit_code = 1
+    elif stop_requested:
+        run_status = "user_code_failure"
+        runner_exit_code = _exit_code_for_signal(interrupt_signal) or 1
+
+    if _is_chief():
+        # Chief-only emission: only rank 0 writes artifacts and manifest.
+        emit_hf_artifacts_v1(
+            outdir=cfg.outdir,
+            run_id=run_id,
+            started_ts_utc=started_ts,
+            ended_ts_utc=ended_ts,
+            gate_preset=cfg.gate_preset,
+            window_signature=window_signature,
+            gate_records=gate_records,
+            metrics=metrics,
+            run_status=run_status,
+            runner_exit_code=runner_exit_code,
+            runner_signal=runner_signal,
+        )
+        manifest = _build_run_manifest(
+            cfg,
+            argv=argv,
+            started_ts_utc=started_ts,
+            ended_ts_utc=ended_ts,
+            run_status=run_status,
+            runner_exit_code=runner_exit_code,
+            runner_signal=runner_signal,
+            failure_reason=failure_reason,
+            failure_traceback=failure_traceback,
+        )
+        _write_run_manifest(cfg.outdir, manifest)
+    return int(runner_exit_code if runner_exit_code is not None else 1)
 
 
 def _parse_args() -> HFRunConfig:
@@ -457,40 +711,41 @@ def _parse_args() -> HFRunConfig:
 
 def main() -> int:
     cfg = _parse_args()
-    cfg.outdir.mkdir(parents=True, exist_ok=True)
-    atomic_write_json(
-        cfg.outdir / "runner_config.json",
-        {
-            "schema_version": 1,
-            "ts_utc": _iso_utc(datetime.now(timezone.utc)),
-            "runner": "hf",
-            "config": {
-                "run_id": cfg.run_id,
-                "model": cfg.model,
-                "dataset_name": cfg.dataset_name,
-                "dataset_config": cfg.dataset_config,
-                "dataset_split": cfg.dataset_split,
-                "dataset_text_column": cfg.dataset_text_column,
-                "max_steps": cfg.max_steps,
-                "batch_size": cfg.batch_size,
-                "lr": cfg.lr,
-                "seed": cfg.seed,
-                "cadence": cfg.cadence,
-                "block_size": cfg.block_size,
-                "device": cfg.device,
-                "grad_clip": cfg.grad_clip,
-                "gate_preset": cfg.gate_preset,
-                "gate_window": cfg.gate_window,
-                "gate_epsilon": cfg.gate_epsilon,
-                "gate_min_evidence": cfg.gate_min_evidence,
-                "gate_gain_thresh": cfg.gate_gain_thresh,
-                "gate_policy": cfg.gate_policy,
-                "gate_persistence_k": cfg.gate_persistence_k,
-                "rp_dim": cfg.rp_dim,
+    if _is_chief():
+        cfg.outdir.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(
+            cfg.outdir / "runner_config.json",
+            {
+                "schema_version": 1,
+                "ts_utc": _iso_utc(datetime.now(timezone.utc)),
+                "runner": "hf",
+                "config": {
+                    "run_id": cfg.run_id,
+                    "model": cfg.model,
+                    "dataset_name": cfg.dataset_name,
+                    "dataset_config": cfg.dataset_config,
+                    "dataset_split": cfg.dataset_split,
+                    "dataset_text_column": cfg.dataset_text_column,
+                    "max_steps": cfg.max_steps,
+                    "batch_size": cfg.batch_size,
+                    "lr": cfg.lr,
+                    "seed": cfg.seed,
+                    "cadence": cfg.cadence,
+                    "block_size": cfg.block_size,
+                    "device": cfg.device,
+                    "grad_clip": cfg.grad_clip,
+                    "gate_preset": cfg.gate_preset,
+                    "gate_window": cfg.gate_window,
+                    "gate_epsilon": cfg.gate_epsilon,
+                    "gate_min_evidence": cfg.gate_min_evidence,
+                    "gate_gain_thresh": cfg.gate_gain_thresh,
+                    "gate_policy": cfg.gate_policy,
+                    "gate_persistence_k": cfg.gate_persistence_k,
+                    "rp_dim": cfg.rp_dim,
+                },
             },
-        },
-    )
-    return _run(cfg)
+        )
+    return _run(cfg, argv=sys.argv)
 
 
 if __name__ == "__main__":

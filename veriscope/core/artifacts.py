@@ -1,5 +1,5 @@
-# veriscope/core/artifacts.py
 from __future__ import annotations
+import math
 
 from datetime import datetime, timezone
 from types import MappingProxyType
@@ -223,7 +223,16 @@ class MetricRecordV1(VSModel):
     """
 
     name: str = Field(min_length=1)
+    iter: Optional[NonNegInt] = None
     value: JsonValue = None
+
+    @field_validator("value")
+    @classmethod
+    def _no_nan_inf(cls, v: JsonValue) -> JsonValue:
+        # Robustness: forbid non-JSON floats at the contract boundary.
+        if isinstance(v, float) and not math.isfinite(v):
+            return None
+        return v
 
 
 class _ResultsHeaderV1(VSModel):
