@@ -8,7 +8,10 @@ from pathlib import Path
 
 import pytest
 
+torch = pytest.importorskip("torch")
+
 from veriscope.core.jsonutil import canonical_json_sha256, read_json_obj
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
