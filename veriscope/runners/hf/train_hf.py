@@ -171,97 +171,149 @@ def _set_seed(seed: int) -> None:
 
 
 def _maybe_init_ddp() -> bool:
+    """
+    Returns True iff we initialized the process group in this function.
+    In torchrun/elastic multi-rank context, failures are fatal (raise) to avoid rank skew.
+    """
+
+    def _in_strict_torchrun_context() -> bool:
+        # "strict context" = real multi-rank launcher, not polluted env vars
+        try:
+            ws = int(os.environ.get("WORLD_SIZE", "1") or "1")
+        except Exception:
+            ws = 1
+        return (ws > 1) and (
+            os.environ.get("LOCAL_RANK") is not None or os.environ.get("TORCHELASTIC_RUN_ID") is not None
+        )
+
+    strict = _in_strict_torchrun_context()
+
     if not ddp_is_active():
+        # If we're in strict torchrun context but ddp_is_active() says no, that's an invariant violation.
+        if strict:
+            raise RuntimeError(
+                "Strict torchrun DDP context detected (WORLD_SIZE>1) but ddp_is_active() is false. "
+                "Refusing to continue to avoid rank skew."
+            )
         logger.debug("Skipping DDP init: ddp_is_active() is false.")
         return False
+
     try:
         import torch.distributed as dist  # local import
-    except Exception:
-        logger.warning("DDP env active but torch.distributed import failed; skipping init.")
+    except Exception as exc:
+        msg = f"DDP env active but torch.distributed import failed: {exc}"
+        if strict:
+            raise RuntimeError(msg) from exc
+        logger.warning("%s; skipping init.", msg)
         return False
+
     if not getattr(dist, "is_available", lambda: False)():
-        logger.warning("DDP env active but torch.distributed unavailable; skipping init.")
+        msg = "DDP env active but torch.distributed unavailable."
+        if strict:
+            raise RuntimeError(msg)
+        logger.warning("%s; skipping init.", msg)
         return False
+
     try:
         if dist.is_initialized():
             logger.debug("Skipping DDP init: process group already initialized.")
             return False
-    except Exception:
-        logger.warning("DDP env active but could not check init status; skipping init.")
+    except Exception as exc:
+        msg = f"DDP env active but could not check init status: {exc}"
+        if strict:
+            raise RuntimeError(msg) from exc
+        logger.warning("%s; skipping init.", msg)
         return False
+
+    # Required env for env://
     master_addr = os.environ.get("MASTER_ADDR")
     master_port = os.environ.get("MASTER_PORT")
     rank_raw = os.environ.get("RANK")
     world_size_raw = os.environ.get("WORLD_SIZE")
+
     if not master_addr or not master_port or not rank_raw or not world_size_raw:
-        logger.debug("Skipping DDP init: required env vars missing.")
+        msg = (
+            "Skipping DDP init: required env vars missing "
+            f"(MASTER_ADDR={master_addr!r}, MASTER_PORT={master_port!r}, "
+            f"RANK={rank_raw!r}, WORLD_SIZE={world_size_raw!r})."
+        )
+        if strict:
+            raise RuntimeError(msg)
+        logger.debug(msg)
         return False
+
     try:
         rank = int(rank_raw)
         world_size = int(world_size_raw)
         _ = int(master_port)
-    except (TypeError, ValueError):
-        logger.debug("Skipping DDP init: required env vars not parseable.")
+    except (TypeError, ValueError) as exc:
+        msg = (
+            "Skipping DDP init: required env vars not parseable "
+            f"(RANK={rank_raw!r}, WORLD_SIZE={world_size_raw!r}, MASTER_PORT={master_port!r})."
+        )
+        if strict:
+            raise RuntimeError(msg) from exc
+        logger.debug(msg)
         return False
+
     if world_size <= 1 or rank < 0:
-        logger.debug("Skipping DDP init: WORLD_SIZE <= 1 or rank invalid.")
+        msg = f"Skipping DDP init: WORLD_SIZE={world_size} <= 1 or rank invalid (rank={rank})."
+        if strict:
+            raise RuntimeError(msg)
+        logger.debug(msg)
         return False
+
     available_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
     local_rank = None
     local_rank_raw = os.environ.get("LOCAL_RANK")
-    local_rank_missing = local_rank_raw in (None, "")
-    if not local_rank_missing:
+    if local_rank_raw not in (None, ""):
         try:
             local_rank = int(local_rank_raw)
         except (TypeError, ValueError):
             local_rank = None
-    if torch.cuda.is_available():
-        if local_rank_missing:
-            logger.debug("LOCAL_RANK missing; using gloo backend.")
-        elif local_rank is None:
-            logger.debug("LOCAL_RANK unparseable; using gloo backend.")
+
     use_nccl = local_rank is not None and 0 <= local_rank < available_gpus
-    if use_nccl and env_truthy("VERISCOPE_DDP_REQUIRE_GPU_PER_LOCAL_RANKS"):
-        try:
-            local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", "0") or "0")
-        except (TypeError, ValueError):
-            local_world_size = 0
-        if local_world_size > 0 and available_gpus < local_world_size:
-            use_nccl = False
-            if _is_chief():
-                logger.warning(
-                    "DDP env detected but LOCAL_WORLD_SIZE=%s exceeds %s CUDA device(s); using gloo backend.",
-                    local_world_size,
-                    available_gpus,
-                )
     backend = "nccl" if use_nccl else "gloo"
-    if backend == "gloo" and _is_chief() and torch.cuda.is_available():
-        logger.warning(
-            "DDP env detected but only %s CUDA device(s) for local ranks; using gloo backend.",
-            available_gpus,
-        )
+
     if backend == "nccl":
         try:
             torch.cuda.set_device(local_rank)
-        except Exception:
-            logger.warning("DDP init failed to set CUDA device for LOCAL_RANK=%s.", local_rank)
+        except Exception as exc:
+            # In strict context, don't silently flip backend; fail loudly.
+            msg = f"DDP init failed to set CUDA device for LOCAL_RANK={local_rank_raw!r}: {exc}"
+            if strict:
+                raise RuntimeError(msg) from exc
+            logger.warning("%s; falling back to gloo.", msg)
             backend = "gloo"
+
     try:
         dist.init_process_group(backend=backend, init_method="env://", timeout=timedelta(seconds=30))
-    except TypeError:
+    except TypeError as exc:
+        # Older torch may not accept timeout=
         if not env_truthy("VERISCOPE_DDP_ALLOW_NO_TIMEOUT_INIT"):
-            logger.warning("DDP init_process_group timeout unsupported; skipping init.")
+            msg = "DDP init_process_group timeout unsupported."
+            if strict:
+                raise RuntimeError(msg) from exc
+            logger.warning("%s; skipping init.", msg)
             return False
+
         logger.debug("DDP init_process_group timeout unsupported; retrying without timeout.")
         try:
             dist.init_process_group(backend=backend, init_method="env://")
             logger.debug("DDP init_process_group succeeded without timeout.")
-        except Exception as exc:
-            logger.warning("DDP env active but init_process_group failed; continuing without DDP: %s", exc)
+        except Exception as exc2:
+            msg = f"DDP env active but init_process_group failed (no-timeout retry): {exc2}"
+            if strict:
+                raise RuntimeError(msg) from exc2
+            logger.warning("%s; continuing without DDP.", msg)
             return False
     except Exception as exc:
-        logger.warning("DDP env active but init_process_group failed; continuing without DDP: %s", exc)
+        msg = f"DDP env active but init_process_group failed: {exc}"
+        if strict:
+            raise RuntimeError(msg) from exc
+        logger.warning("%s; continuing without DDP.", msg)
         return False
+
     return True
 
 
