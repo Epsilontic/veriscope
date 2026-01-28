@@ -280,15 +280,48 @@ def _maybe_init_ddp() -> bool:
         return False
 
     available_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+
     local_rank = None
     local_rank_raw = os.environ.get("LOCAL_RANK")
-    if local_rank_raw not in (None, ""):
+    local_rank_missing = local_rank_raw in (None, "")
+    if not local_rank_missing:
         try:
             local_rank = int(local_rank_raw)
         except (TypeError, ValueError):
             local_rank = None
 
-    use_nccl = local_rank is not None and 0 <= local_rank < available_gpus
+    # Torchrun sets LOCAL_WORLD_SIZE; fall back to WORLD_SIZE if missing.
+    try:
+        local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", "") or "0")
+    except (TypeError, ValueError):
+        local_world_size = 0
+    if local_world_size <= 0:
+        local_world_size = world_size
+
+    if torch.cuda.is_available():
+        if local_rank_missing:
+            logger.debug("LOCAL_RANK missing; using gloo backend.")
+        elif local_rank is None:
+            logger.debug("LOCAL_RANK unparseable; using gloo backend.")
+
+        # IMPORTANT: backend choice must be consistent across ranks.
+        # Only use NCCL if *every* local rank can map to a CUDA device.
+        if available_gpus > 0 and available_gpus < local_world_size:
+            if _is_chief():
+                logger.warning(
+                    "DDP requested with LOCAL_WORLD_SIZE=%s but only %s CUDA device(s) available; "
+                    "forcing gloo backend for all ranks.",
+                    local_world_size,
+                    available_gpus,
+                )
+
+    use_nccl = (
+        torch.cuda.is_available()
+        and (local_rank is not None)
+        and (0 <= local_rank < available_gpus)
+        and (available_gpus >= local_world_size)
+    )
+
     backend = "nccl" if use_nccl else "gloo"
 
     if backend == "nccl":
