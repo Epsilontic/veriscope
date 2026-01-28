@@ -171,30 +171,45 @@ def _set_seed(seed: int) -> None:
 
 
 def _maybe_init_ddp() -> bool:
-    """
+    """Initialize torch.distributed process group when appropriate.
+
     Returns True iff we initialized the process group in this function.
-    In torchrun/elastic multi-rank context, failures are fatal (raise) to avoid rank skew.
+
+    Policy:
+      - Treat rank/world env vars as *inert* unless we are actually under torchrun/elastic
+        (LOCAL_RANK or TORCHELASTIC_RUN_ID present) OR an explicit escape hatch is enabled.
+      - In strict torchrun/elastic multi-rank context, failures are fatal (raise) to avoid rank skew.
     """
 
-    def _in_strict_torchrun_context() -> bool:
-        # "strict context" = real multi-rank launcher, not polluted env vars
+    # ---- NEW: treat rank/world env as inert unless we're really under torchrun/elastic ----
+    def _as_int(name: str, default: int) -> int:
+        raw = os.environ.get(name)
+        if raw is None or raw == "":
+            return default
         try:
-            ws = int(os.environ.get("WORLD_SIZE", "1") or "1")
+            return int(raw)
         except Exception:
-            ws = 1
-        return (ws > 1) and (
-            os.environ.get("LOCAL_RANK") is not None or os.environ.get("TORCHELASTIC_RUN_ID") is not None
-        )
+            return default
 
-    strict = _in_strict_torchrun_context()
+    world_size_env = _as_int("WORLD_SIZE", 1)
+    strict = (world_size_env > 1) and (
+        os.environ.get("LOCAL_RANK") is not None or os.environ.get("TORCHELASTIC_RUN_ID") is not None
+    )
+
+    # Optional escape hatch for advanced/manual rendezvous setups (default off).
+    allow_env_rendezvous = env_truthy("VERISCOPE_DDP_ALLOW_ENV_RANKWORLD")
+
+    if not strict and not allow_env_rendezvous:
+        # If env is polluted (WORLD_SIZE>1 etc) but not torchrun, do NOT attempt PG init.
+        if world_size_env > 1:
+            logger.debug(
+                "DDP env vars present but not in torchrun/elastic context; treating as inert. "
+                "Set VERISCOPE_DDP_ALLOW_ENV_RANKWORLD=1 to force env:// init."
+            )
+        return False
+    # ---- end NEW gate ----
 
     if not ddp_is_active():
-        # If we're in strict torchrun context but ddp_is_active() says no, that's an invariant violation.
-        if strict:
-            raise RuntimeError(
-                "Strict torchrun DDP context detected (WORLD_SIZE>1) but ddp_is_active() is false. "
-                "Refusing to continue to avoid rank skew."
-            )
         logger.debug("Skipping DDP init: ddp_is_active() is false.")
         return False
 
