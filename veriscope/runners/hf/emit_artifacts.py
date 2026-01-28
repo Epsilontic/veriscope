@@ -17,6 +17,7 @@ from veriscope.core.artifacts import (
     WindowSignatureRefV1,
     derive_final_decision,
 )
+from veriscope.core.ddp import ddp_is_chief
 from veriscope.core.jsonutil import (
     atomic_write_json,
     atomic_write_pydantic_json,
@@ -34,6 +35,7 @@ class EmittedArtifactsV1:
     results_path: Path
     results_summary_path: Path
     window_signature_hash: str
+    emitted: bool = True
 
 
 def _iso_z(dt: datetime) -> str:
@@ -76,6 +78,15 @@ def emit_hf_artifacts_v1(
     runner_signal: Optional[str] = None,
 ) -> EmittedArtifactsV1:
     outdir = Path(outdir)
+    if not ddp_is_chief():
+        logger.info("Skipping HF artifact emission on non-chief rank for %s", outdir)
+        return EmittedArtifactsV1(
+            window_signature_path=outdir / "window_signature.json",
+            results_path=outdir / "results.json",
+            results_summary_path=outdir / "results_summary.json",
+            window_signature_hash=canonical_json_sha256(window_signature),
+            emitted=False,
+        )
     outdir.mkdir(parents=True, exist_ok=True)
 
     window_signature_path = outdir / "window_signature.json"
