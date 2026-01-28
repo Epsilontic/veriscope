@@ -15,7 +15,7 @@ import time
 import uuid
 import zlib
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -168,6 +168,105 @@ def _set_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+
+
+def _maybe_init_ddp() -> bool:
+    if not ddp_is_active():
+        logger.debug("Skipping DDP init: ddp_is_active() is false.")
+        return False
+    try:
+        import torch.distributed as dist  # local import
+    except Exception:
+        logger.warning("DDP env active but torch.distributed import failed; skipping init.")
+        return False
+    if not getattr(dist, "is_available", lambda: False)():
+        logger.warning("DDP env active but torch.distributed unavailable; skipping init.")
+        return False
+    try:
+        if dist.is_initialized():
+            logger.debug("Skipping DDP init: process group already initialized.")
+            return False
+    except Exception:
+        logger.warning("DDP env active but could not check init status; skipping init.")
+        return False
+    master_addr = os.environ.get("MASTER_ADDR")
+    master_port = os.environ.get("MASTER_PORT")
+    rank_raw = os.environ.get("RANK")
+    world_size_raw = os.environ.get("WORLD_SIZE")
+    if not master_addr or not master_port or not rank_raw or not world_size_raw:
+        logger.debug("Skipping DDP init: required env vars missing.")
+        return False
+    try:
+        rank = int(rank_raw)
+        world_size = int(world_size_raw)
+        _ = int(master_port)
+    except (TypeError, ValueError):
+        logger.debug("Skipping DDP init: required env vars not parseable.")
+        return False
+    if world_size <= 1 or rank < 0:
+        logger.debug("Skipping DDP init: WORLD_SIZE <= 1 or rank invalid.")
+        return False
+    available_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    local_rank = None
+    local_rank_raw = os.environ.get("LOCAL_RANK")
+    local_rank_missing = local_rank_raw in (None, "")
+    if not local_rank_missing:
+        try:
+            local_rank = int(local_rank_raw)
+        except (TypeError, ValueError):
+            local_rank = None
+    if torch.cuda.is_available():
+        if local_rank_missing:
+            logger.debug("LOCAL_RANK missing; using gloo backend.")
+        elif local_rank is None:
+            logger.debug("LOCAL_RANK unparseable; using gloo backend.")
+    use_nccl = local_rank is not None and 0 <= local_rank < available_gpus
+    if use_nccl and env_truthy("VERISCOPE_DDP_REQUIRE_GPU_PER_LOCAL_RANKS"):
+        try:
+            local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", "0") or "0")
+        except (TypeError, ValueError):
+            local_world_size = 0
+        if local_world_size > 0 and available_gpus < local_world_size:
+            use_nccl = False
+            if _is_chief():
+                logger.warning(
+                    "DDP env detected but LOCAL_WORLD_SIZE=%s exceeds %s CUDA device(s); using gloo backend.",
+                    local_world_size,
+                    available_gpus,
+                )
+    backend = "nccl" if use_nccl else "gloo"
+    if backend == "gloo" and _is_chief() and torch.cuda.is_available():
+        logger.warning(
+            "DDP env detected but only %s CUDA device(s) for local ranks; using gloo backend.",
+            available_gpus,
+        )
+    if backend == "nccl":
+        try:
+            torch.cuda.set_device(local_rank)
+        except Exception:
+            logger.warning("DDP init failed to set CUDA device for LOCAL_RANK=%s.", local_rank)
+            backend = "gloo"
+    try:
+        dist.init_process_group(backend=backend, init_method="env://", timeout=timedelta(seconds=30))
+    except TypeError:
+        if not env_truthy("VERISCOPE_DDP_ALLOW_NO_TIMEOUT_INIT"):
+            logger.warning("DDP init_process_group timeout unsupported; skipping init.")
+            return False
+        logger.debug("DDP init_process_group timeout unsupported; retrying without timeout.")
+        try:
+            dist.init_process_group(backend=backend, init_method="env://")
+            logger.debug("DDP init_process_group succeeded without timeout.")
+        except Exception as exc:
+            logger.warning("DDP env active but init_process_group failed; continuing without DDP: %s", exc)
+            return False
+    except Exception as exc:
+        logger.warning("DDP env active but init_process_group failed; continuing without DDP: %s", exc)
+        return False
+    return True
+
+
+def _should_cleanup_ddp(initialized_here: bool) -> bool:
+    return bool(initialized_here) or env_truthy("VERISCOPE_DDP_CLEANUP")
 
 
 def _build_window_decl(cfg: HFRunConfig) -> WindowDecl:
@@ -653,7 +752,40 @@ def _gate_from_history(
     ddp_agg_used = False
     ddp_barrier_status: Optional[str] = None
     agg_metrics: Dict[str, Optional[str]] = {m: DDP_AGG_METRICS.get(m) for m in metrics}
-    if ddp_is_active():
+    ddp_env = ddp_is_active()
+    ddp_live = ddp_can_communicate()
+    if ddp_env and not ddp_live:
+        logger.debug(
+            "DDP env detected (WORLD_SIZE=%s RANK=%s MASTER_ADDR=%s MASTER_PORT=%s) but process group inactive; "
+            "skipping gates: ddp_unsupported.",
+            os.environ.get("WORLD_SIZE"),
+            os.environ.get("RANK"),
+            os.environ.get("MASTER_ADDR"),
+            os.environ.get("MASTER_PORT"),
+        )
+        recent_slice = list(metric_history[-gate_window:])
+        if len(recent_slice) < gate_window:
+            recent_slice = [{}] * (gate_window - len(recent_slice)) + recent_slice
+        past_end = max(0, len(metric_history) - gate_window)
+        past_start = max(0, past_end - gate_window)
+        past_slice = list(metric_history[past_start:past_end])
+        if len(past_slice) < gate_window:
+            past_slice = [{}] * (gate_window - len(past_slice)) + past_slice
+        evidence_total = 0
+        if past_slice and recent_slice:
+            counts = {m: min(_count_finite(past_slice, m), _count_finite(recent_slice, m)) for m in metrics}
+            evidence_total = int(sum(counts.values()))
+        audit = AuditV1(
+            evaluated=False,
+            reason="ddp_unsupported",
+            policy=gate_policy,
+            per_metric_tv={},
+            evidence_total=evidence_total,
+            min_evidence=gate_min_evidence,
+            ddp_barrier_status="skipped_inactive",
+        )
+        return GateRecordV1(iter=iter_num, decision="skip", audit=audit, ok=True, warn=False)
+    if ddp_env and ddp_live:
         aggregated_past = None
         aggregated_recent = None
         strict_sync = env_truthy("VERISCOPE_DDP_STRICT_GATE_SYNC")
@@ -804,7 +936,7 @@ def _force_cleanup_outdir(outdir: Path) -> None:
             pass
 
 
-def _run(cfg: HFRunConfig, *, argv: List[str]) -> int:
+def _run_body(cfg: HFRunConfig, *, argv: List[str]) -> int:
     if _is_chief():
         # If any outer wrapper pre-created capsule markers (esp window_signature.json),
         # force mode must ensure the runner is authoritative.
@@ -812,7 +944,6 @@ def _run(cfg: HFRunConfig, *, argv: List[str]) -> int:
             _force_cleanup_outdir(cfg.outdir)
         # Chief-only emission: only rank 0 writes artifacts and manifest.
         cfg.outdir.mkdir(parents=True, exist_ok=True)
-    _set_seed(cfg.seed)
 
     device = torch.device(cfg.device)
 
@@ -1128,7 +1259,10 @@ def _run(cfg: HFRunConfig, *, argv: List[str]) -> int:
         runner_exit_code = _exit_code_for_signal(interrupt_signal) or 1
 
     # DDP barrier default skips if backend lacks timeout support (avoid hangs).
-    barrier_status = ddp_barrier()
+    if ddp_can_communicate():
+        barrier_status = ddp_barrier()
+    else:
+        barrier_status = "skipped_inactive"
     try:
         if barrier_status == "skipped_no_timeout":
             global _DDP_BARRIER_WARNED
@@ -1170,10 +1304,19 @@ def _run(cfg: HFRunConfig, *, argv: List[str]) -> int:
             _write_run_manifest(cfg.outdir, manifest)
     finally:
         # Best-effort teardown sync (same non-hanging policy as pre-finalize barrier).
-        ddp_barrier()
-        if env_truthy("VERISCOPE_DDP_CLEANUP"):
-            ddp_destroy_process_group()
+        if ddp_can_communicate():
+            ddp_barrier()
     return int(runner_exit_code if runner_exit_code is not None else 1)
+
+
+def _run(cfg: HFRunConfig, *, argv: List[str]) -> int:
+    initialized_here = _maybe_init_ddp()
+    _set_seed(cfg.seed)
+    try:
+        return _run_body(cfg, argv=argv)
+    finally:
+        if _should_cleanup_ddp(initialized_here):
+            ddp_destroy_process_group()
 
 
 def _parse_args() -> HFRunConfig:
