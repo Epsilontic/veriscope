@@ -121,6 +121,60 @@ def _install_fake_torch(
     return calls
 
 
+def _install_fake_torch_ddp_init(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
+    torch_mod = types.ModuleType("torch")
+    utils_mod = types.ModuleType("torch.utils")
+    data_mod = types.ModuleType("torch.utils.data")
+    cuda_mod = types.SimpleNamespace()
+    torch_mod.__path__ = []
+    utils_mod.__path__ = []
+    data_mod.__path__ = []
+
+    def _noop(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    class _DummyCudnn:  # pragma: no cover - only for import safety
+        deterministic = False
+        benchmark = False
+
+    class _DummyBackends:  # pragma: no cover - only for import safety
+        cudnn = _DummyCudnn()
+
+    class _DummyDataLoader:  # pragma: no cover - only for import safety
+        pass
+
+    data_mod.DataLoader = _DummyDataLoader
+    utils_mod.data = data_mod
+    torch_mod.utils = utils_mod
+    cuda_mod.manual_seed_all = _noop
+    cuda_mod.is_available = lambda: False
+    cuda_mod.device_count = lambda: 0
+    cuda_mod.set_device = _noop
+    torch_mod.cuda = cuda_mod
+    torch_mod.backends = _DummyBackends()
+    torch_mod.manual_seed = _noop
+    torch_mod.device = lambda *_args, **_kwargs: "cpu"
+
+    dist_mod = types.ModuleType("torch.distributed")
+    calls: dict[str, object] = {"init": 0, "kwargs": None}
+
+    def _init_process_group(*_args: object, **kwargs: object) -> None:
+        calls["init"] = int(calls["init"]) + 1
+        calls["kwargs"] = dict(kwargs)
+
+    dist_mod.is_available = lambda: True
+    dist_mod.is_initialized = lambda: False
+    dist_mod.init_process_group = _init_process_group
+
+    torch_mod.distributed = dist_mod
+
+    monkeypatch.setitem(sys.modules, "torch", torch_mod)
+    monkeypatch.setitem(sys.modules, "torch.utils", utils_mod)
+    monkeypatch.setitem(sys.modules, "torch.utils.data", data_mod)
+    monkeypatch.setitem(sys.modules, "torch.distributed", dist_mod)
+    return calls
+
+
 def test_ddp_non_chief_skips_artifact_emission(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     import veriscope.core.ddp as ddp
 
@@ -217,9 +271,122 @@ def test_ddp_gate_returns_skip_with_audit(monkeypatch: pytest.MonkeyPatch) -> No
     assert record.audit.per_metric_tv == {}
 
 
+def test_ddp_gate_skips_when_env_active_but_no_comms(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_fake_torch_ddp_init(monkeypatch)
+    sys.modules.pop("veriscope.runners.hf.train_hf", None)
+    train_hf = importlib.import_module("veriscope.runners.hf.train_hf")
+    monkeypatch.setattr(train_hf, "ddp_is_active", lambda: True)
+    monkeypatch.setattr(train_hf, "ddp_can_communicate", lambda: False)
+    _gate_from_history = train_hf._gate_from_history
+
+    window_decl = WindowDecl(
+        epsilon=0.12,
+        metrics=["var_out_k", "eff_dim"],
+        weights={"var_out_k": 0.5, "eff_dim": 0.5},
+        bins=16,
+    )
+    transport = DeclTransport(window_decl)
+    window_decl.attach_transport(transport)
+    fr_win = FRWindow(decl=window_decl, transport=transport, tests=())
+    gate_engine = GateEngine(
+        frwin=fr_win,
+        gain_thresh=0.0,
+        eps_stat_alpha=0.05,
+        eps_stat_max_frac=0.25,
+        eps_sens=0.04,
+        min_evidence=1,
+        policy="persistence",
+        persistence_k=2,
+        min_metrics_exceeding=1,
+    )
+
+    metric_history = [
+        {"iter": 0, "var_out_k": 0.1, "eff_dim": 0.2},
+        {"iter": 1, "var_out_k": 0.12, "eff_dim": 0.22},
+        {"iter": 2, "var_out_k": 0.11, "eff_dim": 0.21},
+        {"iter": 3, "var_out_k": 0.13, "eff_dim": 0.23},
+    ]
+
+    record = _gate_from_history(
+        gate_engine,
+        window_decl,
+        metric_history,
+        gate_window=2,
+        iter_num=3,
+        gate_policy="persistence",
+        gate_min_evidence=1,
+    )
+
+    assert record.decision == "skip"
+    assert record.audit.evaluated is False
+    assert record.audit.reason == "ddp_unsupported"
+    assert record.audit.ddp_barrier_status == "skipped_inactive"
+    assert record.audit.per_metric_tv == {}
+
+
+def test_hf_ddp_init_shim_calls_process_group(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = _install_fake_torch_ddp_init(monkeypatch)
+    initialized = {"value": False}
+    dist_mod = sys.modules["torch.distributed"]
+
+    def _is_initialized() -> bool:
+        return bool(initialized["value"])
+
+    def _init_process_group(*_args: object, **kwargs: object) -> None:
+        calls["init"] = int(calls["init"]) + 1
+        calls["kwargs"] = dict(kwargs)
+        initialized["value"] = True
+
+    dist_mod.is_initialized = _is_initialized
+    dist_mod.init_process_group = _init_process_group
+    for key in ("WORLD_SIZE", "RANK", "MASTER_ADDR", "MASTER_PORT", "LOCAL_RANK"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setenv("RANK", "0")
+    monkeypatch.setenv("MASTER_ADDR", "127.0.0.1")
+    monkeypatch.setenv("MASTER_PORT", "29500")
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", "2")
+
+    sys.modules.pop("veriscope.runners.hf.train_hf", None)
+    train_hf = importlib.import_module("veriscope.runners.hf.train_hf")
+    initialized_here = train_hf._maybe_init_ddp()
+
+    assert initialized_here is True
+    assert calls["init"] == 1
+    assert calls["kwargs"]["backend"] == "gloo"
+    assert calls["kwargs"]["init_method"] == "env://"
+    assert "timeout" in calls["kwargs"]
+
+
+def test_hf_ddp_init_shim_skips_when_already_initialized(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = _install_fake_torch_ddp_init(monkeypatch)
+    dist_mod = sys.modules["torch.distributed"]
+    dist_mod.is_initialized = lambda: True
+    dist_mod.init_process_group = lambda *_args, **_kwargs: calls.update({"init": 999})
+    for key in ("WORLD_SIZE", "RANK", "MASTER_ADDR", "MASTER_PORT", "LOCAL_RANK"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setenv("RANK", "0")
+    monkeypatch.setenv("MASTER_ADDR", "127.0.0.1")
+    monkeypatch.setenv("MASTER_PORT", "29500")
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    sys.modules.pop("veriscope.runners.hf.train_hf", None)
+    train_hf = importlib.import_module("veriscope.runners.hf.train_hf")
+
+    initialized_here = train_hf._maybe_init_ddp()
+
+    assert initialized_here is False
+    assert calls["init"] == 0
+    monkeypatch.delenv("VERISCOPE_DDP_CLEANUP", raising=False)
+    assert train_hf._should_cleanup_ddp(initialized_here) is False
+    assert train_hf._should_cleanup_ddp(True) is True
+
+
 def test_ddp_gate_aggregates_when_dist_initialized(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("VERISCOPE_DDP_STRICT_GATE_SYNC", raising=False)
     calls = _install_fake_torch(monkeypatch, with_dist=True, other_rank_value=0.5)
+    assert "torch" in sys.modules
     sys.modules.pop("veriscope.runners.hf.train_hf", None)
     train_hf = importlib.import_module("veriscope.runners.hf.train_hf")
     _gate_from_history = train_hf._gate_from_history
