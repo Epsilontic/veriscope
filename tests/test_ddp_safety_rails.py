@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import importlib
+import math
 from pathlib import Path
 import sys
 import types
@@ -14,9 +16,9 @@ from veriscope.core.window import FRWindow, WindowDecl
 from veriscope.runners.hf.emit_artifacts import emit_hf_artifacts_v1
 
 
-def _install_fake_torch(monkeypatch: pytest.MonkeyPatch) -> None:
-    if "torch" in sys.modules:
-        return
+def _install_fake_torch(
+    monkeypatch: pytest.MonkeyPatch, *, with_dist: bool = False, other_rank_value: float = 0.0
+) -> dict[str, int]:
     torch_mod = types.ModuleType("torch")
     utils_mod = types.ModuleType("torch.utils")
     data_mod = types.ModuleType("torch.utils.data")
@@ -42,6 +44,8 @@ def _install_fake_torch(monkeypatch: pytest.MonkeyPatch) -> None:
     utils_mod.data = data_mod
     torch_mod.utils = utils_mod
     cuda_mod.manual_seed_all = _noop
+    cuda_mod.is_available = lambda: False
+    cuda_mod.device_count = lambda: 0
     torch_mod.cuda = cuda_mod
     torch_mod.backends = _DummyBackends()
     torch_mod.manual_seed = _noop
@@ -49,6 +53,72 @@ def _install_fake_torch(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setitem(sys.modules, "torch", torch_mod)
     monkeypatch.setitem(sys.modules, "torch.utils", utils_mod)
     monkeypatch.setitem(sys.modules, "torch.utils.data", data_mod)
+    if not with_dist:
+        return {}
+
+    dist_mod = types.ModuleType("torch.distributed")
+
+    class _FakeScalar:
+        def __init__(self, value: float) -> None:
+            self._value = float(value)
+
+        def item(self) -> float:
+            return float(self._value)
+
+    class _FakeTensor:
+        def __init__(self, value: float | list[float]) -> None:
+            if isinstance(value, list):
+                self._data = [float(v) for v in value]
+            else:
+                self._data = float(value)
+
+        def item(self) -> float:
+            if isinstance(self._data, list):
+                raise TypeError("Use indexing for list tensors")
+            return float(self._data)
+
+        def __getitem__(self, index: int) -> _FakeScalar:
+            if not isinstance(self._data, list):
+                raise TypeError("Indexing only supported for list tensors")
+            return _FakeScalar(self._data[index])
+
+    class _ReduceOp:
+        SUM = "sum"
+
+    def _tensor(value: float | list[float], *_args: object, **_kwargs: object) -> _FakeTensor:
+        return _FakeTensor(value)
+
+    calls = {"barrier": 0}
+
+    def _all_reduce(tensor: _FakeTensor, *_args: object, **_kwargs: object) -> None:
+        if isinstance(tensor._data, list):
+            for i in range(0, len(tensor._data), 2):
+                tensor._data[i] = float(tensor._data[i]) + float(other_rank_value)
+                if i + 1 < len(tensor._data):
+                    tensor._data[i + 1] = float(tensor._data[i + 1]) + 1.0
+            return
+        tensor._data = float(tensor._data) * 2.0
+
+    def _barrier(*_args: object, **_kwargs: object) -> None:
+        calls["barrier"] += 1
+
+    dist_mod.is_available = lambda: True
+    dist_mod.is_initialized = lambda: True
+    dist_mod.get_rank = lambda: 0
+    dist_mod.get_world_size = lambda: 2
+    dist_mod.all_reduce = _all_reduce
+    dist_mod.barrier = _barrier
+    dist_mod.get_backend = lambda: "gloo"
+    dist_mod.ReduceOp = _ReduceOp
+    torch_mod.distributed = dist_mod
+    torch_mod.tensor = _tensor
+    torch_mod.float32 = object()
+    torch_mod.int64 = object()
+    torch_mod.device = lambda *_args, **_kwargs: "cpu"
+    torch_mod.cuda.is_available = lambda: False
+
+    monkeypatch.setitem(sys.modules, "torch.distributed", dist_mod)
+    return calls
 
 
 def test_ddp_non_chief_skips_artifact_emission(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -89,7 +159,9 @@ def test_ddp_gate_returns_skip_with_audit(monkeypatch: pytest.MonkeyPatch) -> No
 
     monkeypatch.setattr(ddp, "_dist_module", lambda: None)
     _install_fake_torch(monkeypatch)
-    from veriscope.runners.hf.train_hf import _gate_from_history
+    sys.modules.pop("veriscope.runners.hf.train_hf", None)
+    train_hf = importlib.import_module("veriscope.runners.hf.train_hf")
+    _gate_from_history = train_hf._gate_from_history
 
     for key in ("WORLD_SIZE", "RANK", "MASTER_ADDR", "MASTER_PORT", "LOCAL_RANK"):
         monkeypatch.delenv(key, raising=False)
@@ -143,6 +215,124 @@ def test_ddp_gate_returns_skip_with_audit(monkeypatch: pytest.MonkeyPatch) -> No
     assert record.audit.evidence_total == 4
     assert record.audit.min_evidence == 1
     assert record.audit.per_metric_tv == {}
+
+
+def test_ddp_gate_aggregates_when_dist_initialized(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("VERISCOPE_DDP_STRICT_GATE_SYNC", raising=False)
+    calls = _install_fake_torch(monkeypatch, with_dist=True, other_rank_value=0.5)
+    sys.modules.pop("veriscope.runners.hf.train_hf", None)
+    train_hf = importlib.import_module("veriscope.runners.hf.train_hf")
+    _gate_from_history = train_hf._gate_from_history
+    _ddp_aggregate_slice = train_hf._ddp_aggregate_slice
+
+    window_decl = WindowDecl(
+        epsilon=0.12,
+        metrics=["var_out_k", "eff_dim"],
+        weights={"var_out_k": 0.5, "eff_dim": 0.5},
+        bins=16,
+    )
+    transport = DeclTransport(window_decl)
+    window_decl.attach_transport(transport)
+    fr_win = FRWindow(decl=window_decl, transport=transport, tests=())
+    gate_engine = GateEngine(
+        frwin=fr_win,
+        gain_thresh=0.0,
+        eps_stat_alpha=0.05,
+        eps_stat_max_frac=0.25,
+        eps_sens=0.04,
+        min_evidence=1,
+        policy="persistence",
+        persistence_k=2,
+        min_metrics_exceeding=1,
+    )
+
+    metric_history = [
+        {"iter": 0, "var_out_k": 0.1, "eff_dim": 0.2},
+        {"iter": 1, "var_out_k": 0.12, "eff_dim": 0.22},
+        {"iter": 2, "var_out_k": 0.11, "eff_dim": 0.21},
+        {"iter": 3, "var_out_k": 0.13, "eff_dim": 0.23},
+    ]
+
+    record = _gate_from_history(
+        gate_engine,
+        window_decl,
+        metric_history,
+        gate_window=2,
+        iter_num=3,
+        gate_policy="persistence",
+        gate_min_evidence=1,
+    )
+
+    past_slice = metric_history[:2]
+    agg_metrics = {"var_out_k": "mean", "eff_dim": "mean"}
+    aggregated_past = _ddp_aggregate_slice(past_slice, agg_metrics, ["var_out_k", "eff_dim"])
+    assert aggregated_past is not None
+    assert aggregated_past[0]["var_out_k"] != metric_history[0]["var_out_k"]
+    assert record.audit.reason != "ddp_unsupported"
+    assert record.audit.ddp_agg == "mean"
+    assert record.audit.ddp_barrier_status == "not_requested"
+    assert calls["barrier"] == 0
+
+
+def test_ddp_gate_strict_sync_uses_barrier(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VERISCOPE_DDP_STRICT_GATE_SYNC", "1")
+    monkeypatch.delenv("VERISCOPE_DDP_STRICT_BARRIER", raising=False)
+    calls = _install_fake_torch(monkeypatch, with_dist=True, other_rank_value=0.5)
+    sys.modules.pop("veriscope.runners.hf.train_hf", None)
+    train_hf = importlib.import_module("veriscope.runners.hf.train_hf")
+    _gate_from_history = train_hf._gate_from_history
+
+    window_decl = WindowDecl(
+        epsilon=0.12,
+        metrics=["var_out_k", "eff_dim"],
+        weights={"var_out_k": 0.5, "eff_dim": 0.5},
+        bins=16,
+    )
+    transport = DeclTransport(window_decl)
+    window_decl.attach_transport(transport)
+    fr_win = FRWindow(decl=window_decl, transport=transport, tests=())
+    gate_engine = GateEngine(
+        frwin=fr_win,
+        gain_thresh=0.0,
+        eps_stat_alpha=0.05,
+        eps_stat_max_frac=0.25,
+        eps_sens=0.04,
+        min_evidence=1,
+        policy="persistence",
+        persistence_k=2,
+        min_metrics_exceeding=1,
+    )
+
+    metric_history = [
+        {"iter": 0, "var_out_k": 0.1, "eff_dim": 0.2},
+        {"iter": 1, "var_out_k": 0.12, "eff_dim": 0.22},
+        {"iter": 2, "var_out_k": 0.11, "eff_dim": 0.21},
+        {"iter": 3, "var_out_k": 0.13, "eff_dim": 0.23},
+    ]
+
+    record = _gate_from_history(
+        gate_engine,
+        window_decl,
+        metric_history,
+        gate_window=2,
+        iter_num=3,
+        gate_policy="persistence",
+        gate_min_evidence=1,
+    )
+
+    assert record.audit.reason != "ddp_unsupported"
+    assert record.audit.ddp_barrier_status == "performed"
+    assert calls["barrier"] >= 1
+
+
+def test_ddp_masked_mean_ignores_nan(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_fake_torch(monkeypatch, with_dist=True, other_rank_value=0.5)
+    from veriscope.core.ddp import ddp_reduce_mean_scalars_masked
+
+    result = ddp_reduce_mean_scalars_masked([float("nan")])
+    assert result is not None
+    assert math.isfinite(result[0])
+    assert result[0] == pytest.approx(0.5)
 
 
 def test_ddp_rank_uses_initialized_dist(monkeypatch: pytest.MonkeyPatch) -> None:

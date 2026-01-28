@@ -26,7 +26,15 @@ from torch.utils.data import DataLoader
 import veriscope
 from veriscope.core.artifacts import AuditV1, GateRecordV1, MetricRecordV1
 from veriscope.core.calibration import aggregate_epsilon_stat
-from veriscope.core.ddp import ddp_barrier, ddp_destroy_process_group, ddp_is_active, ddp_is_chief, env_truthy
+from veriscope.core.ddp import (
+    ddp_barrier,
+    ddp_can_communicate,
+    ddp_destroy_process_group,
+    ddp_is_active,
+    ddp_is_chief,
+    ddp_reduce_mean_scalars_masked,
+    env_truthy,
+)
 from veriscope.core.gate import GateEngine
 from veriscope.core.transport import DeclTransport
 from veriscope.core.window import FRWindow, WindowDecl
@@ -36,6 +44,7 @@ from veriscope.runners.hf.emit_artifacts import emit_hf_artifacts_v1
 
 logger = logging.getLogger(__name__)
 _DDP_BARRIER_WARNED = False
+DDP_AGG_METRICS = {"var_out_k": "mean", "eff_dim": "mean"}
 
 
 @dataclass(frozen=True)
@@ -580,6 +589,35 @@ def _metric_snapshot(
     return past, recent
 
 
+def _ddp_aggregate_slice(
+    slice_data: List[Dict[str, Any]], agg_metrics: Dict[str, Optional[str]], metrics: List[str]
+) -> Optional[List[Dict[str, Any]]]:
+    if not ddp_can_communicate():
+        return None
+    aggregated: List[Dict[str, Any]] = []
+    for step in slice_data:
+        step_out = dict(step)
+        values: List[float] = []
+        for metric in metrics:
+            agg = agg_metrics.get(metric)
+            if agg != "mean":
+                logger.debug("DDP aggregation unsupported for metric=%s agg=%s", metric, agg)
+                return None
+            raw = step.get(metric, float("nan"))
+            try:
+                val = float(raw)
+            except Exception:
+                val = float("nan")
+            values.append(val)
+        reduced = ddp_reduce_mean_scalars_masked(values)
+        if reduced is None:
+            return None
+        for metric, value in zip(metrics, reduced):
+            step_out[metric] = float(value)
+        aggregated.append(step_out)
+    return aggregated
+
+
 def _gate_from_history(
     gate_engine: GateEngine,
     window_decl: WindowDecl,
@@ -589,7 +627,17 @@ def _gate_from_history(
     gate_policy: str,
     gate_min_evidence: int,
 ) -> GateRecordV1:
-    past_slice, recent_slice = _metric_snapshot(metric_history, gate_window)
+    if gate_window <= 0:
+        audit = AuditV1(
+            evaluated=False,
+            reason="not_evaluated_insufficient_evidence",
+            policy=gate_policy,
+            per_metric_tv={},
+            evidence_total=0,
+            min_evidence=gate_min_evidence,
+        )
+        return GateRecordV1(iter=iter_num, decision="skip", audit=audit, ok=True, warn=False)
+
     metrics = list(window_decl.weights.keys())
 
     def _count_finite(slice_data: List[Dict[str, Any]], key: str) -> int:
@@ -602,28 +650,60 @@ def _gate_from_history(
         arr = np.array(vals, dtype=float)
         return arr[np.isfinite(arr)]
 
+    ddp_agg_used = False
+    ddp_barrier_status: Optional[str] = None
+    agg_metrics: Dict[str, Optional[str]] = {m: DDP_AGG_METRICS.get(m) for m in metrics}
     if ddp_is_active():
-        logger.info(
-            "DDP env detected (WORLD_SIZE=%s RANK=%s MASTER_ADDR=%s MASTER_PORT=%s). "
-            "Skipping gates: ddp_unsupported (no aggregation).",
-            os.environ.get("WORLD_SIZE"),
-            os.environ.get("RANK"),
-            os.environ.get("MASTER_ADDR"),
-            os.environ.get("MASTER_PORT"),
-        )
-        evidence_total = 0
-        if past_slice and recent_slice:
-            counts = {m: min(_count_finite(past_slice, m), _count_finite(recent_slice, m)) for m in metrics}
-            evidence_total = int(sum(counts.values()))
-        audit = AuditV1(
-            evaluated=False,
-            reason="ddp_unsupported",
-            policy=gate_policy,
-            per_metric_tv={},
-            evidence_total=evidence_total,
-            min_evidence=gate_min_evidence,
-        )
-        return GateRecordV1(iter=iter_num, decision="skip", audit=audit, ok=True, warn=False)
+        aggregated_past = None
+        aggregated_recent = None
+        strict_sync = env_truthy("VERISCOPE_DDP_STRICT_GATE_SYNC")
+        # Permissive mode assumes all ranks call aggregation collectives in lockstep; strict sync
+        # runs a best-effort timed barrier first to reduce deadlock risk.
+        if strict_sync:
+            ddp_barrier_status = ddp_barrier(timeout_s=10.0)
+        else:
+            ddp_barrier_status = "not_requested"
+
+        recent_slice = list(metric_history[-gate_window:])
+        if len(recent_slice) < gate_window:
+            recent_slice = [{}] * (gate_window - len(recent_slice)) + recent_slice
+        past_end = max(0, len(metric_history) - gate_window)
+        past_start = max(0, past_end - gate_window)
+        past_slice = list(metric_history[past_start:past_end])
+        if len(past_slice) < gate_window:
+            past_slice = [{}] * (gate_window - len(past_slice)) + past_slice
+
+        if (not strict_sync or ddp_barrier_status == "performed") and not any(agg_metrics[m] is None for m in metrics):
+            aggregated_past = _ddp_aggregate_slice(past_slice, agg_metrics, metrics)
+            aggregated_recent = _ddp_aggregate_slice(recent_slice, agg_metrics, metrics)
+        if aggregated_past is None or aggregated_recent is None:
+            logger.info(
+                "DDP env detected (WORLD_SIZE=%s RANK=%s MASTER_ADDR=%s MASTER_PORT=%s). "
+                "Skipping gates: ddp_unsupported (no aggregation).",
+                os.environ.get("WORLD_SIZE"),
+                os.environ.get("RANK"),
+                os.environ.get("MASTER_ADDR"),
+                os.environ.get("MASTER_PORT"),
+            )
+            evidence_total = 0
+            if past_slice and recent_slice:
+                counts = {m: min(_count_finite(past_slice, m), _count_finite(recent_slice, m)) for m in metrics}
+                evidence_total = int(sum(counts.values()))
+            audit = AuditV1(
+                evaluated=False,
+                reason="ddp_unsupported",
+                policy=gate_policy,
+                per_metric_tv={},
+                evidence_total=evidence_total,
+                min_evidence=gate_min_evidence,
+                ddp_barrier_status=ddp_barrier_status,
+            )
+            return GateRecordV1(iter=iter_num, decision="skip", audit=audit, ok=True, warn=False)
+        ddp_agg_used = True
+        past_slice = aggregated_past
+        recent_slice = aggregated_recent
+    else:
+        past_slice, recent_slice = _metric_snapshot(metric_history, gate_window)
     if not past_slice or not recent_slice:
         audit = AuditV1(
             evaluated=False,
@@ -672,6 +752,10 @@ def _gate_from_history(
     audit_payload.setdefault("policy", gate_policy)
     audit_payload.setdefault("evidence_total", evidence_total)
     audit_payload.setdefault("min_evidence", int(gate_min_evidence))
+    if ddp_agg_used:
+        audit_payload.setdefault("ddp_agg", "mean")
+    if ddp_barrier_status is not None:
+        audit_payload.setdefault("ddp_barrier_status", ddp_barrier_status)
 
     evaluated = bool(audit_payload.get("evaluated", True))
     audit_payload["evaluated"] = evaluated
