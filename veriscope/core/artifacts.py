@@ -168,6 +168,9 @@ class AuditV1(VSModel):
         description="Per-metric TV / D_W distances (subset of metrics may be present).",
     )
 
+    ddp_agg: Optional[str] = None
+    ddp_barrier_status: Optional[str] = None
+
     evidence_total: Optional[NonNegInt] = None
     min_evidence: Optional[NonNegInt] = None
 

@@ -2,9 +2,13 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 from datetime import timedelta
-from typing import Any, Optional
+from typing import Any, Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:  # pragma: no cover
+    import torch
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +57,17 @@ def ddp_is_active() -> bool:
     return _env_ddp_signature()
 
 
+def ddp_can_communicate() -> bool:
+    """True when torch.distributed is initialized with world_size > 1."""
+    dist = _dist_module()
+    if dist is None:
+        return False
+    rw = _dist_rank_and_world(dist)
+    if not rw:
+        return False
+    return rw[1] > 1
+
+
 def ddp_rank() -> int:
     dist = _dist_module()
     if dist is not None:
@@ -63,7 +78,10 @@ def ddp_rank() -> int:
 
 
 def ddp_local_rank() -> int:
-    return _env_int("LOCAL_RANK", 0)
+    env = os.environ.get("LOCAL_RANK")
+    if env is not None and env != "":
+        return _env_int("LOCAL_RANK", 0)
+    return 0
 
 
 def ddp_world_size() -> int:
@@ -120,6 +138,124 @@ def ddp_barrier(timeout_s: float = 30.0) -> str:
     except Exception:
         logger.debug("DDP barrier failed; skipping barrier.", exc_info=True)
         return "skipped_error"
+
+
+def _ddp_reduce_device() -> Optional["torch.device"]:
+    try:
+        import torch  # local import
+        import torch.distributed as dist  # local import
+
+        backend = None
+        try:
+            backend = dist.get_backend()
+        except Exception:
+            backend = None
+        if backend == "nccl":
+            if not torch.cuda.is_available():
+                logger.debug("DDP backend nccl but CUDA unavailable; skipping reduction.")
+                return None
+            if os.environ.get("LOCAL_RANK") in (None, ""):
+                logger.debug("DDP backend nccl but LOCAL_RANK unset; skipping reduction.")
+                return None
+            return torch.device("cuda", ddp_local_rank())
+        return torch.device("cpu")
+    except Exception:
+        return None
+
+
+def ddp_reduce_mean_scalar(x: float) -> Optional[float]:
+    try:
+        if not ddp_can_communicate():
+            return None
+        import torch  # local import
+        import torch.distributed as dist  # local import
+
+        device = _ddp_reduce_device()
+        if device is None:
+            return None
+        tensor = torch.tensor(float(x), dtype=torch.float32, device=device)
+        op = getattr(dist, "ReduceOp", None)
+        op_sum = op.SUM if op is not None else None
+        if op_sum is not None:
+            dist.all_reduce(tensor, op=op_sum)
+        else:
+            dist.all_reduce(tensor)
+        world_size = int(dist.get_world_size())
+        if world_size <= 0:
+            return None
+        return float(tensor.item()) / float(world_size)
+    except Exception:
+        logger.debug("DDP mean reduction failed.", exc_info=True)
+        return None
+
+
+def ddp_reduce_mean_scalar_masked(x: float) -> Optional[float]:
+    try:
+        if not ddp_can_communicate():
+            return None
+        import torch  # local import
+        import torch.distributed as dist  # local import
+
+        device = _ddp_reduce_device()
+        if device is None:
+            return None
+        val = float(x)
+        is_finite = math.isfinite(val)
+        sum_val = val if is_finite else 0.0
+        count_val = 1.0 if is_finite else 0.0
+        tensor = torch.tensor([sum_val, count_val], dtype=torch.float32, device=device)
+        op = getattr(dist, "ReduceOp", None)
+        op_sum = op.SUM if op is not None else None
+        if op_sum is not None:
+            dist.all_reduce(tensor, op=op_sum)
+        else:
+            dist.all_reduce(tensor)
+        total_sum = float(tensor[0].item())
+        total_count = float(tensor[1].item())
+        if total_count <= 0.0:
+            return float("nan")
+        return total_sum / total_count
+    except Exception:
+        logger.debug("DDP masked mean reduction failed.", exc_info=True)
+        return None
+
+
+def ddp_reduce_mean_scalars_masked(values: list[float]) -> Optional[list[float]]:
+    try:
+        if not ddp_can_communicate():
+            return None
+        if not values:
+            return []
+        import torch  # local import
+        import torch.distributed as dist  # local import
+
+        device = _ddp_reduce_device()
+        if device is None:
+            return None
+        packed: list[float] = []
+        for val in values:
+            is_finite = math.isfinite(float(val))
+            packed.append(float(val) if is_finite else 0.0)
+            packed.append(1.0 if is_finite else 0.0)
+        tensor = torch.tensor(packed, dtype=torch.float32, device=device)
+        op = getattr(dist, "ReduceOp", None)
+        op_sum = op.SUM if op is not None else None
+        if op_sum is not None:
+            dist.all_reduce(tensor, op=op_sum)
+        else:
+            dist.all_reduce(tensor)
+        results: list[float] = []
+        for i in range(len(values)):
+            total_sum = float(tensor[2 * i].item())
+            total_count = float(tensor[2 * i + 1].item())
+            if total_count <= 0.0:
+                results.append(float("nan"))
+            else:
+                results.append(total_sum / total_count)
+        return results
+    except Exception:
+        logger.debug("DDP masked mean reduction failed.", exc_info=True)
+        return None
 
 
 def ddp_destroy_process_group() -> None:
