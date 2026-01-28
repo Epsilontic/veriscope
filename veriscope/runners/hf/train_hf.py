@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import math
 import contextlib
+import logging
 import os
 import random
 import signal
@@ -25,12 +26,16 @@ from torch.utils.data import DataLoader
 import veriscope
 from veriscope.core.artifacts import AuditV1, GateRecordV1, MetricRecordV1
 from veriscope.core.calibration import aggregate_epsilon_stat
+from veriscope.core.ddp import ddp_barrier, ddp_destroy_process_group, ddp_is_active, ddp_is_chief, env_truthy
 from veriscope.core.gate import GateEngine
 from veriscope.core.transport import DeclTransport
 from veriscope.core.window import FRWindow, WindowDecl
 from veriscope.core.jsonutil import atomic_write_json
 from veriscope.runners.hf.adapter import HFMetricComputer, HFMetricConfig
 from veriscope.runners.hf.emit_artifacts import emit_hf_artifacts_v1
+
+logger = logging.getLogger(__name__)
+_DDP_BARRIER_WARNED = False
 
 
 @dataclass(frozen=True)
@@ -144,8 +149,7 @@ def _get_rank_and_world() -> tuple[int, int]:
 
 
 def _is_chief() -> bool:
-    rank, _ = _get_rank_and_world()
-    return rank == 0
+    return ddp_is_chief()
 
 
 def _set_seed(seed: int) -> None:
@@ -586,6 +590,40 @@ def _gate_from_history(
     gate_min_evidence: int,
 ) -> GateRecordV1:
     past_slice, recent_slice = _metric_snapshot(metric_history, gate_window)
+    metrics = list(window_decl.weights.keys())
+
+    def _count_finite(slice_data: List[Dict[str, Any]], key: str) -> int:
+        vals = [float(d.get(key, np.nan)) for d in slice_data]
+        arr = np.array(vals, dtype=float)
+        return int(np.isfinite(arr).sum())
+
+    def _extract(slice_data: List[Dict[str, Any]], key: str) -> np.ndarray:
+        vals = [float(d.get(key, np.nan)) for d in slice_data]
+        arr = np.array(vals, dtype=float)
+        return arr[np.isfinite(arr)]
+
+    if ddp_is_active():
+        logger.info(
+            "DDP env detected (WORLD_SIZE=%s RANK=%s MASTER_ADDR=%s MASTER_PORT=%s). "
+            "Skipping gates: ddp_unsupported (no aggregation).",
+            os.environ.get("WORLD_SIZE"),
+            os.environ.get("RANK"),
+            os.environ.get("MASTER_ADDR"),
+            os.environ.get("MASTER_PORT"),
+        )
+        evidence_total = 0
+        if past_slice and recent_slice:
+            counts = {m: min(_count_finite(past_slice, m), _count_finite(recent_slice, m)) for m in metrics}
+            evidence_total = int(sum(counts.values()))
+        audit = AuditV1(
+            evaluated=False,
+            reason="ddp_unsupported",
+            policy=gate_policy,
+            per_metric_tv={},
+            evidence_total=evidence_total,
+            min_evidence=gate_min_evidence,
+        )
+        return GateRecordV1(iter=iter_num, decision="skip", audit=audit, ok=True, warn=False)
     if not past_slice or not recent_slice:
         audit = AuditV1(
             evaluated=False,
@@ -596,12 +634,6 @@ def _gate_from_history(
             min_evidence=gate_min_evidence,
         )
         return GateRecordV1(iter=iter_num, decision="skip", audit=audit, ok=True, warn=False)
-    metrics = list(window_decl.weights.keys())
-
-    def _extract(slice_data: List[Dict[str, Any]], key: str) -> np.ndarray:
-        vals = [float(d.get(key, np.nan)) for d in slice_data]
-        arr = np.array(vals, dtype=float)
-        return arr[np.isfinite(arr)]
 
     past_dict = {m: _extract(past_slice, m) for m in metrics}
     recent_dict = {m: _extract(recent_slice, m) for m in metrics}
@@ -666,11 +698,6 @@ def _exit_code_for_signal(signal_name: Optional[str]) -> Optional[int]:
         return None
     mapping = {"SIGINT": 130, "SIGTERM": 143}
     return mapping.get(signal_name, 128)
-
-
-def _env_truthy(name: str) -> bool:
-    raw = (os.environ.get(name) or "").strip().lower()
-    return raw in {"1", "true", "yes", "y", "on"}
 
 
 def _force_cleanup_outdir(outdir: Path) -> None:
@@ -1016,35 +1043,52 @@ def _run(cfg: HFRunConfig, *, argv: List[str]) -> int:
         run_status = "user_code_failure"
         runner_exit_code = _exit_code_for_signal(interrupt_signal) or 1
 
-    if _is_chief():
-        # Chief-only emission: only rank 0 writes artifacts and manifest.
-        emit_hf_artifacts_v1(
-            outdir=cfg.outdir,
-            run_id=run_id,
-            started_ts_utc=started_ts,
-            ended_ts_utc=ended_ts,
-            gate_preset=cfg.gate_preset,
-            window_signature=window_signature,
-            gate_records=gate_records,
-            metrics=metrics,
-            run_status=run_status,
-            runner_exit_code=runner_exit_code,
-            runner_signal=runner_signal,
-        )
-        manifest = _build_run_manifest(
-            cfg,
-            argv=argv,
-            started_ts_utc=started_ts,
-            ended_ts_utc=ended_ts,
-            run_status=run_status,
-            runner_exit_code=runner_exit_code,
-            runner_signal=runner_signal,
-            failure_reason=failure_reason,
-            failure_traceback=failure_traceback,
-            rank_used_for_corrupt_seed=rank,
-            world_size_used_for_corrupt_seed=world_size,
-        )
-        _write_run_manifest(cfg.outdir, manifest)
+    # DDP barrier default skips if backend lacks timeout support (avoid hangs).
+    barrier_status = ddp_barrier()
+    try:
+        if barrier_status == "skipped_no_timeout":
+            global _DDP_BARRIER_WARNED
+            if not _DDP_BARRIER_WARNED:
+                logger.warning(
+                    "DDP barrier timeout unsupported; barrier skipped (default non-hanging policy). "
+                    "Partial capsule possible under rank skew. Set VERISCOPE_DDP_STRICT_BARRIER=1 "
+                    "to force unbounded barrier (may hang)."
+                )
+                _DDP_BARRIER_WARNED = True
+        if _is_chief():
+            # Chief-only emission: only rank 0 writes artifacts and manifest.
+            emit_hf_artifacts_v1(
+                outdir=cfg.outdir,
+                run_id=run_id,
+                started_ts_utc=started_ts,
+                ended_ts_utc=ended_ts,
+                gate_preset=cfg.gate_preset,
+                window_signature=window_signature,
+                gate_records=gate_records,
+                metrics=metrics,
+                run_status=run_status,
+                runner_exit_code=runner_exit_code,
+                runner_signal=runner_signal,
+            )
+            manifest = _build_run_manifest(
+                cfg,
+                argv=argv,
+                started_ts_utc=started_ts,
+                ended_ts_utc=ended_ts,
+                run_status=run_status,
+                runner_exit_code=runner_exit_code,
+                runner_signal=runner_signal,
+                failure_reason=failure_reason,
+                failure_traceback=failure_traceback,
+                rank_used_for_corrupt_seed=rank,
+                world_size_used_for_corrupt_seed=world_size,
+            )
+            _write_run_manifest(cfg.outdir, manifest)
+    finally:
+        # Best-effort teardown sync (same non-hanging policy as pre-finalize barrier).
+        ddp_barrier()
+        if env_truthy("VERISCOPE_DDP_CLEANUP"):
+            ddp_destroy_process_group()
     return int(runner_exit_code if runner_exit_code is not None else 1)
 
 
@@ -1176,7 +1220,7 @@ def _parse_args() -> HFRunConfig:
     if target_mode not in {"clean", "same"}:
         raise ValueError("--data_corrupt_target must be one of: clean, same")
     # Honor either runner --force or wrapper-side VERISCOPE_FORCE=1
-    force = bool(args.force) or _env_truthy("VERISCOPE_FORCE")
+    force = bool(args.force) or env_truthy("VERISCOPE_FORCE")
     return HFRunConfig(
         model=args.model,
         dataset_name=dataset_name,
