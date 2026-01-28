@@ -256,6 +256,22 @@ def _maybe_init_ddp() -> bool:
         logger.debug(msg)
         return False
 
+    # ---- FAIL FAST GUARDS (must run before init_process_group) ----
+    if world_size < 1:
+        msg = f"Invalid WORLD_SIZE={world_size} (must be >= 1)."
+        if strict:
+            raise RuntimeError(msg)
+        logger.warning("%s Skipping DDP init.", msg)
+        return False
+
+    if not (0 <= rank < world_size):
+        msg = f"Invalid rank/world size: RANK={rank} must be in [0, {world_size - 1}] for WORLD_SIZE={world_size}."
+        if strict:
+            raise RuntimeError(msg)
+        logger.warning("%s Skipping DDP init.", msg)
+        return False
+    # ---- end fail fast guards ----
+
     if world_size <= 1 or rank < 0:
         msg = f"Skipping DDP init: WORLD_SIZE={world_size} <= 1 or rank invalid (rank={rank})."
         if strict:
