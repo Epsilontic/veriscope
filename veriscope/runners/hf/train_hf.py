@@ -1288,17 +1288,18 @@ def _run_body(cfg: HFRunConfig, *, argv: List[str]) -> int:
                 loss_delta = float("nan")
                 loss_delta_z = float("nan")
                 # Evidence: compute from aggregated (cross-rank mean) loss stream ONLY.
-                # Past-only, full-window reference: require exactly gate_window finite past values.
-                if len(metric_history) >= int(cfg.gate_window):
-                    hist_losses_mean = [
-                        float(d.get("loss_mean", float("nan"))) for d in metric_history[-int(cfg.gate_window) :]
-                    ]
-                    hist_arr = np.array(hist_losses_mean, dtype=float)
-                    if int(np.isfinite(hist_arr).sum()) == int(cfg.gate_window):
-                        mean_loss = float(hist_arr.mean())
-                        std_loss = float(hist_arr.std(ddof=1)) if hist_arr.size > 1 else 0.0
-                        loss_delta = loss_mean - mean_loss
-                        loss_delta_z = loss_delta / max(std_loss, 1e-4)
+                # Past-only, variable-length (<=gate_window) reference; require >=2 finite.
+                gw = int(cfg.gate_window)
+                if gw > 0 and metric_history:
+                    ref_window = metric_history[-min(len(metric_history), gw) :]
+                    ref_losses = [float(d.get("loss_mean", d.get("loss", float("nan")))) for d in ref_window]
+                    ref_arr = np.array([v for v in ref_losses if math.isfinite(v)], dtype=float)
+                    if ref_arr.size >= 2:
+                        ref_mean = float(ref_arr.mean())
+                        ref_std = float(ref_arr.std(ddof=1))
+                        loss_delta = loss_mean - ref_mean
+                        loss_delta_z = loss_delta / max(ref_std, 1e-4)
+                        loss_delta_z = float(np.clip(loss_delta_z, -6.0, 6.0))
 
                 var_out_k_raw = float(m.get("var_out_k", float("nan")))
                 eff_dim_raw = float(m.get("eff_dim", float("nan")))
