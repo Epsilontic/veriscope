@@ -44,7 +44,11 @@ from veriscope.runners.hf.emit_artifacts import emit_hf_artifacts_v1
 
 logger = logging.getLogger(__name__)
 _DDP_BARRIER_WARNED = False
-DDP_AGG_METRICS = {"var_out_k": "mean", "eff_dim": "mean"}
+DDP_AGG_METRICS = {
+    "var_out_k": "mean",
+    "eff_dim": "mean",
+    "loss_delta_z": "mean",
+}
 
 
 @dataclass(frozen=True)
@@ -386,17 +390,16 @@ def _should_cleanup_ddp(initialized_here: bool) -> bool:
 
 
 def _build_window_decl(cfg: HFRunConfig) -> WindowDecl:
-    # NOTE: On very small HF models (e.g. sshleifer/tiny-gpt2), some “variance-like”
-    # metrics can be > 1.0 depending on implementation details. Using a too-tight
-    # calibration range makes gates spuriously fail in smokes/CI.
-    var_out_max = float(max(1, int(cfg.rp_dim)))
+    # NOTE: Use a broad loss z-score calibration range to avoid spurious gate trips
+    # on tiny HF models and short runs.
     return WindowDecl(
         epsilon=float(cfg.gate_epsilon),
-        metrics=["var_out_k", "eff_dim"],
-        weights={"var_out_k": 0.5, "eff_dim": 0.5},
+        # Evidence: DDP-correct loss z-score computed from cross-rank mean loss history.
+        metrics=["loss_delta_z"],
+        weights={"loss_delta_z": 1.0},
         bins=16,
         interventions=(lambda x: x,),
-        cal_ranges={"var_out_k": (0.0, var_out_max), "eff_dim": (0.0, float(cfg.rp_dim))},
+        cal_ranges={"loss_delta_z": (-6.0, 6.0)},
     )
 
 
@@ -573,7 +576,7 @@ def _build_window_signature(cfg: HFRunConfig, *, created_ts_utc: datetime) -> Di
         "code_identity": {"package_version": veriscope.__version__},
         "transport": {"name": "hf_hidden_state_v1", "cadence": f"every_{cfg.cadence}_steps"},
         "evidence": {
-            "metrics": ["var_out_k", "eff_dim"],
+            "metrics": ["loss_delta_z"],
             "window": {"kind": "fixed", "size": cfg.gate_window, "stride": cfg.cadence},
         },
         "gates": {
@@ -1272,14 +1275,41 @@ def _run_body(cfg: HFRunConfig, *, argv: List[str]) -> int:
                                 rp_dim=cfg.rp_dim,
                             )
 
-                loss_value = float(loss.detach().cpu().item())
+                # Telemetry: local loss and cross-rank mean loss (for DDP-correct evidence computation).
+                loss_local = float(loss.detach().cpu().item())
+                loss_mean = loss_local
+                if ddp_can_communicate():
+                    reduced = ddp_reduce_mean_scalars_masked([loss_local])
+                    if reduced is not None and len(reduced) == 1:
+                        reduced_value = float(reduced[0])
+                        if math.isfinite(reduced_value):
+                            loss_mean = reduced_value
+
+                loss_delta = float("nan")
+                loss_delta_z = float("nan")
+                # Evidence: compute from aggregated (cross-rank mean) loss stream ONLY.
+                # Past-only, full-window reference: require exactly gate_window finite past values.
+                if len(metric_history) >= int(cfg.gate_window):
+                    hist_losses_mean = [
+                        float(d.get("loss_mean", float("nan"))) for d in metric_history[-int(cfg.gate_window) :]
+                    ]
+                    hist_arr = np.array(hist_losses_mean, dtype=float)
+                    if int(np.isfinite(hist_arr).sum()) == int(cfg.gate_window):
+                        mean_loss = float(hist_arr.mean())
+                        std_loss = float(hist_arr.std(ddof=1)) if hist_arr.size > 1 else 0.0
+                        loss_delta = loss_mean - mean_loss
+                        loss_delta_z = loss_delta / max(std_loss, 1e-4)
+
                 var_out_k_raw = float(m.get("var_out_k", float("nan")))
                 eff_dim_raw = float(m.get("eff_dim", float("nan")))
 
                 metric_history.append(
                     {
                         "iter": step,
-                        "loss": loss_value,
+                        "loss": loss_local,
+                        "loss_mean": loss_mean,
+                        "loss_delta": loss_delta,
+                        "loss_delta_z": loss_delta_z,
                         "var_out_k": var_out_k_raw,
                         "eff_dim": eff_dim_raw,
                         "lr": effective_lr,
@@ -1290,7 +1320,12 @@ def _run_body(cfg: HFRunConfig, *, argv: List[str]) -> int:
                 )
 
                 # Emit JSON-safe MetricRecordV1 for declared evidence metrics (and loss).
-                metric_records.append(MetricRecordV1(name="loss", iter=step, value=_jsonable_float(loss_value)))
+                metric_records.append(MetricRecordV1(name="loss", iter=step, value=_jsonable_float(loss_local)))
+                metric_records.append(MetricRecordV1(name="loss_mean", iter=step, value=_jsonable_float(loss_mean)))
+                metric_records.append(MetricRecordV1(name="loss_delta", iter=step, value=_jsonable_float(loss_delta)))
+                metric_records.append(
+                    MetricRecordV1(name="loss_delta_z", iter=step, value=_jsonable_float(loss_delta_z))
+                )
                 metric_records.append(MetricRecordV1(name="var_out_k", iter=step, value=_jsonable_float(var_out_k_raw)))
                 metric_records.append(MetricRecordV1(name="eff_dim", iter=step, value=_jsonable_float(eff_dim_raw)))
                 metric_records.append(MetricRecordV1(name="lr", iter=step, value=_jsonable_float(effective_lr)))
@@ -1360,6 +1395,9 @@ def _run_body(cfg: HFRunConfig, *, argv: List[str]) -> int:
         # Ensure non-degenerate emission even when no steps completed.
         metrics = [
             MetricRecordV1(name="loss", iter=0, value=None),
+            MetricRecordV1(name="loss_mean", iter=0, value=None),
+            MetricRecordV1(name="loss_delta", iter=0, value=None),
+            MetricRecordV1(name="loss_delta_z", iter=0, value=None),
             MetricRecordV1(name="var_out_k", iter=0, value=None),
             MetricRecordV1(name="eff_dim", iter=0, value=None),
         ]
