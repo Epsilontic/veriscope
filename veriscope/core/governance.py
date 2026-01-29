@@ -10,6 +10,7 @@ from typing import Any, Iterable, List, Optional
 
 from veriscope.core.jsonutil import atomic_append_jsonl, canonical_json_sha256, sanitize_json_value
 
+
 GOVERNANCE_LOG_SCHEMA_VERSION = 1
 MANUAL_GOVERNANCE_EVENT_TYPES = (
     "manual_judgement_set",

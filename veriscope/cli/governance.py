@@ -5,16 +5,17 @@ import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import List, Optional
 
 from pydantic import ValidationError as PydanticValidationError
 from pydantic_core import ValidationError as PydanticCoreValidationError
 
 from veriscope.core.artifacts import ManualJudgementV1
-from veriscope.core.governance import (
+from veriscope.core.governance import (  # noqa: F401
     GOVERNANCE_EVENT_TYPES,
     GOVERNANCE_LOG_SCHEMA_VERSION,
     MANUAL_GOVERNANCE_EVENT_TYPES,
+    RUN_GOVERNANCE_EVENT_TYPES,
     GovernanceStatus,
     append_governance_log,
     append_gate_decision,
@@ -25,7 +26,26 @@ from veriscope.core.governance import (
     read_governance_log,
     validate_governance_log,
 )
+
 from veriscope.core.jsonutil import canonical_dumps
+
+# Public re-exports: this module is part of the CLI surface, and tests/CLI code
+# import these names from veriscope.cli.governance. Keep them stable.
+__all__ = [
+    "GOVERNANCE_EVENT_TYPES",
+    "GOVERNANCE_LOG_SCHEMA_VERSION",
+    "MANUAL_GOVERNANCE_EVENT_TYPES",
+    "RUN_GOVERNANCE_EVENT_TYPES",
+    "GovernanceStatus",
+    "append_governance_log",
+    "append_gate_decision",
+    "append_overrides",
+    "append_run_started",
+    "build_code_identity",
+    "get_governance_status",
+    "read_governance_log",
+    "validate_governance_log",
+]
 
 
 @dataclass(frozen=True)

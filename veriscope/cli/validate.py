@@ -329,7 +329,12 @@ def validate_outdir(
 
             run_governance_present = any(
                 gov_result.event_counts.get(event_name, 0) > 0
-                for event_name in ("run_started_v1", "capsule_opened_v1", "run_overrides_applied_v1", "gate_decision_v1")
+                for event_name in (
+                    "run_started_v1",
+                    "capsule_opened_v1",
+                    "run_overrides_applied_v1",
+                    "gate_decision_v1",
+                )
             )
 
             if run_governance_present and overrides_required:
