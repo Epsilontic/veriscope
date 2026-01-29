@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import uuid
 from pathlib import Path
@@ -58,6 +59,19 @@ def sha256_hex(data: bytes) -> str:
 def canonical_json_sha256(obj: Any) -> str:
     """SHA256 hex digest of canonical JSON bytes (canonical_dumps -> utf-8 -> sha256)."""
     return sha256_hex(canonical_dumps(obj).encode("utf-8"))
+
+
+def sanitize_json_value(obj: Any) -> Any:
+    """Convert non-finite floats to None and recursively sanitize JSON containers."""
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: sanitize_json_value(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [sanitize_json_value(v) for v in obj]
+    if isinstance(obj, Path):
+        return str(obj)
+    return obj
 
 
 def _unique_tmp_path_for(path: Path) -> Path:
@@ -136,6 +150,33 @@ def atomic_write_json(path: Path, obj: Any, *, fsync: bool = False) -> None:
     Appends a trailing newline for POSIX-friendly text conventions.
     """
     atomic_write_text(path, canonical_dumps(obj) + "\n", fsync=fsync)
+
+
+def atomic_append_jsonl(path: Path, obj: Any, *, fsync: bool = True) -> None:
+    """
+    Append a JSON object as a single JSONL line.
+
+    Writes use O_APPEND and loop until all bytes are written to reduce partial-line interleaves on POSIX.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = sanitize_json_value(obj)
+    line = canonical_dumps(payload) + "\n"
+    data = line.encode("utf-8")
+    fd = os.open(str(path), os.O_APPEND | os.O_CREAT | os.O_WRONLY)
+    try:
+        offset = 0
+        data_len = len(data)
+        while offset < data_len:
+            written = os.write(fd, data[offset:])
+            if written == 0:
+                raise OSError("atomic_append_jsonl() short write (0 bytes)")
+            offset += written
+        if fsync:
+            os.fsync(fd)
+            _fsync_dir_best_effort(path.parent)
+    finally:
+        os.close(fd)
 
 
 def atomic_write_pydantic_json(

@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 import veriscope
+from veriscope.core.governance import append_gate_decision, append_overrides, append_run_started
 from veriscope.core.artifacts import (
     AuditV1,
     CountsV1,
@@ -274,6 +276,7 @@ def emit_gpt_artifacts_v1(
     run_status: str = "success",
     runner_exit_code: Optional[int] = None,
     runner_signal: Optional[str] = None,
+    argv: Optional[Iterable[str]] = None,
 ) -> EmittedArtifactsV1:
     """
     Emit standardized Veriscope artifacts (V1):
@@ -312,6 +315,31 @@ def emit_gpt_artifacts_v1(
     window_sig_on_disk = _read_json_obj(window_signature_path)
     ws_hash = canonical_json_sha256(window_sig_on_disk)
     ws_ref = WindowSignatureRefV1(hash=ws_hash, path="window_signature.json")
+    argv_list = list(argv) if argv is not None else list(sys.argv)
+    try:
+        append_run_started(
+            outdir,
+            run_id=run_id,
+            outdir_path=outdir,
+            argv=argv_list,
+            code_identity=dict(code_identity),
+            window_signature_ref={"hash": ws_hash, "path": "window_signature.json"},
+            entrypoint={"kind": "runner", "name": "veriscope.runners.gpt.train_nanogpt"},
+        )
+    except Exception as exc:
+        logger.warning("Failed to append governance run_started entry: %s", exc)
+    if overrides:
+        try:
+            append_overrides(
+                outdir,
+                run_id=run_id,
+                overrides=dict(overrides),
+                profile={"gate_preset": gate_preset, "overrides": dict(overrides)},
+                entrypoint={"kind": "runner", "name": "veriscope.runners.gpt.emit_artifacts"},
+                argv=argv_list,
+            )
+        except Exception as exc:
+            logger.warning("Failed to append governance overrides entry: %s", exc)
 
     # --- 2) gate_history -> GateRecordV1 ---
     n_events = len(gate_history)
@@ -333,7 +361,21 @@ def emit_gpt_artifacts_v1(
             if "warn" in ev:
                 rec_kwargs["warn"] = bool(ev.get("warn"))
 
-            gate_records.append(GateRecordV1(**rec_kwargs))
+            record = GateRecordV1(**rec_kwargs)
+            gate_records.append(record)
+            try:
+                audit_payload = record.audit.model_dump(mode="json", by_alias=True, exclude_none=True)
+                append_gate_decision(
+                    outdir,
+                    run_id=run_id,
+                    iter_num=int(record.iter),
+                    decision=str(record.decision),
+                    ok=record.ok,
+                    warn=record.warn,
+                    audit=audit_payload,
+                )
+            except Exception as exc:
+                logger.warning("Failed to append governance gate decision: %s", exc)
 
         except Exception as e:
             iter_hint = ev.get("iter", ev.get("iter_num", "MISSING"))

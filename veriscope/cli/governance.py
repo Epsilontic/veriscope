@@ -11,7 +11,21 @@ from pydantic import ValidationError as PydanticValidationError
 from pydantic_core import ValidationError as PydanticCoreValidationError
 
 from veriscope.core.artifacts import ManualJudgementV1
-from veriscope.core.jsonutil import canonical_dumps, canonical_json_sha256
+from veriscope.core.governance import (
+    GOVERNANCE_EVENT_TYPES,
+    GOVERNANCE_LOG_SCHEMA_VERSION,
+    MANUAL_GOVERNANCE_EVENT_TYPES,
+    GovernanceStatus,
+    append_governance_log,
+    append_gate_decision,
+    append_overrides,
+    append_run_started,
+    build_code_identity,
+    get_governance_status,
+    read_governance_log,
+    validate_governance_log,
+)
+from veriscope.core.jsonutil import canonical_dumps
 
 
 @dataclass(frozen=True)
@@ -36,59 +50,11 @@ class ManualJudgementEffective:
 
 
 @dataclass(frozen=True)
-class GovernanceLogEntry:
-    schema_version: int
-    rev: int
-    ts_utc: str
-    actor: Optional[str]
-    event_type: str
-    payload: dict[str, Any]
-    prev_hash: Optional[str]
-    entry_hash: Optional[str]
-    line_no: int
-
-
-@dataclass(frozen=True)
-class GovernanceLogResult:
-    entry: Optional[GovernanceLogEntry]
-    rev: Optional[int]
-    entry_hash: Optional[str]
-    warnings: tuple[str, ...]
-
-
-@dataclass(frozen=True)
-class GovernanceLogValidation:
-    ok: bool
-    warnings: tuple[str, ...]
-    errors: tuple[str, ...]
-
-
-@dataclass(frozen=True)
-class GovernanceStatus:
-    present: bool
-    ok: bool
-    rev: Optional[int]
-    entry_hash: Optional[str]
-    errors: tuple[str, ...]
-    warnings: tuple[str, ...]
-    legacy_missing_entry_hash: bool
-
-
-@dataclass(frozen=True)
 class DisplayStatus:
     status: str
     source: str
     manual: Optional[ManualJudgementV1]
     warnings: tuple[str, ...]
-
-
-GOVERNANCE_LOG_SCHEMA_VERSION = 1
-GOVERNANCE_EVENT_TYPES = (
-    "manual_judgement_set",
-    "manual_judgement_cleared",
-    "artifact_note",
-    "recompute_summary",
-)
 
 
 def _warn_invalid_log_line(line_no: int, message: str) -> str:
@@ -101,30 +67,6 @@ def _warn_ts_decrease(line_no: int) -> str:
 
 def _warn_manual_run_id_mismatch(line_no: int, *, expected: str, got: str) -> str:
     return f"WARNING:MANUAL_JUDGEMENT_RUN_ID_MISMATCH line={line_no} expected={expected} got={got}"
-
-
-def _warn_governance_invalid(line_no: int, message: str) -> str:
-    return f"WARNING:GOVERNANCE_LOG_INVALID line={line_no} {message}"
-
-
-def _warn_governance_ts_decrease(line_no: int) -> str:
-    return f"WARNING:GOVERNANCE_LOG_TS_DECREASE line={line_no}"
-
-
-def _warn_governance_rev_nonmonotone(line_no: int, rev: int, prev_rev: int) -> str:
-    return f"WARNING:GOVERNANCE_LOG_REV_NONMONOTONE line={line_no} rev={rev} prev_rev={prev_rev}"
-
-
-def _warn_governance_hash_mismatch(line_no: int) -> str:
-    return f"WARNING:GOVERNANCE_LOG_HASH_MISMATCH line={line_no}"
-
-
-def _warn_governance_prev_hash_mismatch(line_no: int) -> str:
-    return f"WARNING:GOVERNANCE_LOG_PREV_HASH_MISMATCH line={line_no}"
-
-
-def _warn_governance_entry_hash_missing(line_no: int) -> str:
-    return f"WARNING:GOVERNANCE_LOG_ENTRY_HASH_MISSING line={line_no}"
 
 
 def _parse_log_line(line: str, *, line_no: int) -> tuple[Optional[ManualJudgementLogEntry], Optional[str]]:
@@ -292,259 +234,6 @@ def append_manual_judgement_log(outdir: Path, judgement: ManualJudgementV1) -> t
 
     entry = judgement.model_dump(mode="json", by_alias=True)
     entry["rev"] = last_rev + 1
-    line = canonical_dumps(entry)
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    with log_path.open("a", encoding="utf-8", newline="\n") as f:
-        f.write(line + "\n")
-
-    return log_path, tuple(warnings)
-
-
-def _parse_ts_utc_z(ts_utc: str) -> datetime:
-    raw = ts_utc.strip()
-    if not raw:
-        raise ValueError("ts_utc cannot be empty")
-    if raw.endswith("Z"):
-        raw = raw[:-1] + "+00:00"
-    dt = datetime.fromisoformat(raw)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
-
-
-def _hash_governance_entry(entry: dict[str, Any]) -> str:
-    payload = {k: v for k, v in entry.items() if k not in {"entry_hash", "line_no"}}
-    return canonical_json_sha256(payload)
-
-
-def _parse_governance_log_line(line: str, *, line_no: int) -> tuple[Optional[GovernanceLogEntry], Optional[str]]:
-    raw = line.strip()
-    if not raw:
-        return None, None
-    try:
-        obj = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        return None, _warn_governance_invalid(line_no, f"json_error={exc.msg}")
-    if not isinstance(obj, dict):
-        return None, _warn_governance_invalid(line_no, "not_object")
-
-    try:
-        schema_version = int(obj.get("schema_version"))
-    except Exception:
-        return None, _warn_governance_invalid(line_no, "schema_version_missing_or_invalid")
-    if schema_version != GOVERNANCE_LOG_SCHEMA_VERSION:
-        return None, _warn_governance_invalid(line_no, f"schema_version={schema_version}")
-
-    try:
-        rev_int = int(obj.get("rev"))
-    except Exception:
-        return None, _warn_governance_invalid(line_no, "rev_missing_or_invalid")
-
-    event_type = obj.get("event_type")
-    if event_type not in GOVERNANCE_EVENT_TYPES:
-        return None, _warn_governance_invalid(line_no, f"event_type_invalid={event_type}")
-
-    payload = obj.get("payload")
-    if not isinstance(payload, dict):
-        return None, _warn_governance_invalid(line_no, "payload_missing_or_invalid")
-
-    ts_utc = obj.get("ts_utc")
-    if not isinstance(ts_utc, str):
-        return None, _warn_governance_invalid(line_no, "ts_utc_missing_or_invalid")
-    try:
-        _ = _parse_ts_utc_z(ts_utc)
-    except Exception as exc:
-        return None, _warn_governance_invalid(line_no, f"ts_utc_invalid={exc}")
-
-    actor = obj.get("actor")
-    if actor is not None and not isinstance(actor, str):
-        return None, _warn_governance_invalid(line_no, "actor_invalid")
-
-    prev_hash = obj.get("prev_hash")
-    if prev_hash is not None and not isinstance(prev_hash, str):
-        return None, _warn_governance_invalid(line_no, "prev_hash_invalid")
-
-    entry_hash = obj.get("entry_hash")
-    if entry_hash is not None and not isinstance(entry_hash, str):
-        return None, _warn_governance_invalid(line_no, "entry_hash_invalid")
-
-    return (
-        GovernanceLogEntry(
-            schema_version=schema_version,
-            rev=rev_int,
-            ts_utc=ts_utc,
-            actor=actor,
-            event_type=event_type,
-            payload=payload,
-            prev_hash=prev_hash,
-            entry_hash=entry_hash,
-            line_no=line_no,
-        ),
-        None,
-    )
-
-
-def read_governance_log(path: Path) -> GovernanceLogResult:
-    warnings: List[str] = []
-    last_entry: Optional[GovernanceLogEntry] = None
-    last_ts: Optional[datetime] = None
-    last_rev: Optional[int] = None
-    last_hash: Optional[str] = None
-
-    if not path.exists():
-        return GovernanceLogResult(entry=None, rev=None, entry_hash=None, warnings=tuple(warnings))
-
-    for idx, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
-        entry, warning = _parse_governance_log_line(line, line_no=idx)
-        if warning:
-            warnings.append(warning)
-            continue
-        if entry is None:
-            continue
-
-        if last_rev is None:
-            if entry.rev != 1:
-                warnings.append(_warn_governance_rev_nonmonotone(entry.line_no, entry.rev, 0))
-        elif entry.rev != last_rev + 1:
-            warnings.append(_warn_governance_rev_nonmonotone(entry.line_no, entry.rev, last_rev))
-
-        try:
-            ts = _parse_ts_utc_z(entry.ts_utc)
-            if last_ts is not None and ts < last_ts:
-                warnings.append(_warn_governance_ts_decrease(entry.line_no))
-            last_ts = ts
-        except Exception:
-            pass
-
-        expected_hash = _hash_governance_entry(
-            {
-                "schema_version": entry.schema_version,
-                "rev": entry.rev,
-                "ts_utc": entry.ts_utc,
-                "actor": entry.actor,
-                "event_type": entry.event_type,
-                "payload": entry.payload,
-                "prev_hash": entry.prev_hash,
-            }
-        )
-
-        if entry.entry_hash is None:
-            warnings.append(_warn_governance_entry_hash_missing(entry.line_no))
-            effective_hash = expected_hash
-        else:
-            if entry.entry_hash != expected_hash:
-                warnings.append(_warn_governance_hash_mismatch(entry.line_no))
-            effective_hash = entry.entry_hash
-
-        if last_hash is None:
-            if entry.prev_hash is not None:
-                warnings.append(_warn_governance_prev_hash_mismatch(entry.line_no))
-        elif entry.prev_hash != last_hash:
-            warnings.append(_warn_governance_prev_hash_mismatch(entry.line_no))
-
-        last_entry = entry
-        last_rev = entry.rev
-        last_hash = effective_hash
-
-    if last_entry is None:
-        return GovernanceLogResult(entry=None, rev=None, entry_hash=None, warnings=tuple(warnings))
-    return GovernanceLogResult(entry=last_entry, rev=last_entry.rev, entry_hash=last_hash, warnings=tuple(warnings))
-
-
-def validate_governance_log(path: Path, *, allow_legacy_governance: bool = False) -> GovernanceLogValidation:
-    result = read_governance_log(path)
-    errors: List[str] = []
-    for warning in result.warnings:
-        if "GOVERNANCE_LOG_HASH_MISMATCH" in warning or "GOVERNANCE_LOG_PREV_HASH_MISMATCH" in warning:
-            errors.append(warning)
-        if "GOVERNANCE_LOG_INVALID" in warning:
-            errors.append(warning)
-        if "GOVERNANCE_LOG_ENTRY_HASH_MISSING" in warning and not allow_legacy_governance:
-            errors.append(warning)
-        if "GOVERNANCE_LOG_REV_NONMONOTONE" in warning:
-            errors.append(warning)
-    ok = not errors
-    return GovernanceLogValidation(ok=ok, warnings=result.warnings, errors=tuple(errors))
-
-
-def get_governance_status(outdir: Path, *, allow_legacy_governance: bool) -> GovernanceStatus:
-    outdir = Path(outdir)
-    gov_path = outdir / "governance_log.jsonl"
-    if not gov_path.exists():
-        return GovernanceStatus(
-            present=False,
-            ok=True,
-            rev=None,
-            entry_hash=None,
-            errors=tuple(),
-            warnings=tuple(),
-            legacy_missing_entry_hash=False,
-        )
-
-    result = read_governance_log(gov_path)
-    validation = validate_governance_log(gov_path, allow_legacy_governance=allow_legacy_governance)
-    legacy_missing_entry_hash = any("GOVERNANCE_LOG_ENTRY_HASH_MISSING" in w for w in result.warnings)
-    return GovernanceStatus(
-        present=True,
-        ok=validation.ok,
-        rev=result.rev,
-        entry_hash=result.entry_hash,
-        errors=validation.errors,
-        warnings=result.warnings,
-        legacy_missing_entry_hash=legacy_missing_entry_hash,
-    )
-
-
-def append_governance_log(
-    outdir: Path,
-    *,
-    event_type: str,
-    payload: dict[str, Any],
-    ts_utc: str,
-    actor: Optional[str] = None,
-) -> tuple[Path, tuple[str, ...]]:
-    if event_type not in GOVERNANCE_EVENT_TYPES:
-        raise ValueError(f"Unsupported governance event_type={event_type!r}")
-
-    outdir = Path(outdir)
-    log_path = outdir / "governance_log.jsonl"
-
-    last_rev = 0
-    last_ts = None
-    last_hash = None
-    warnings: List[str] = []
-    if log_path.exists():
-        # Legacy governance logs (missing entry_hash) are invalid for appends.
-        validation = validate_governance_log(log_path)
-        if not validation.ok:
-            raise RuntimeError(f"Cannot append to invalid governance_log.jsonl: {validation.errors}")
-        result = read_governance_log(log_path)
-        if result.rev is not None:
-            last_rev = result.rev
-        if result.entry is not None:
-            try:
-                last_ts = _parse_ts_utc_z(result.entry.ts_utc)
-            except Exception:
-                last_ts = None
-        last_hash = result.entry_hash
-        warnings.extend(result.warnings)
-
-    ts_dt = _parse_ts_utc_z(ts_utc)
-    if last_ts is not None and ts_dt < last_ts:
-        warnings.append(_warn_governance_ts_decrease(0))
-
-    entry: dict[str, Any] = {
-        "schema_version": GOVERNANCE_LOG_SCHEMA_VERSION,
-        "rev": last_rev + 1,
-        "ts_utc": ts_utc,
-        "actor": actor,
-        "event_type": event_type,
-        "payload": payload,
-        "prev_hash": last_hash,
-    }
-    entry_hash = _hash_governance_entry(entry)
-    entry["entry_hash"] = entry_hash
-
     line = canonical_dumps(entry)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("a", encoding="utf-8", newline="\n") as f:

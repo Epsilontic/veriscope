@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from veriscope.core.jsonutil import atomic_write_json, atomic_write_text
+from veriscope.core.jsonutil import atomic_append_jsonl, atomic_write_json, atomic_write_text
 
 pytestmark = pytest.mark.unit
 
@@ -66,3 +66,15 @@ def test_atomic_write_text_fsync_path_smoke(tmp_path: Path) -> None:
 
     assert target.exists()
     assert _read_text(target) == "x\n"
+
+
+def test_atomic_append_jsonl_appends_entries(tmp_path: Path) -> None:
+    target = tmp_path / "governance_log.jsonl"
+
+    atomic_append_jsonl(target, {"b": 2, "a": 1})
+    atomic_append_jsonl(target, {"value": float("nan")})
+
+    lines = _read_text(target).splitlines()
+    assert len(lines) == 2
+    assert json.loads(lines[0]) == {"a": 1, "b": 2}
+    assert json.loads(lines[1]) == {"value": None}

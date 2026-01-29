@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 
+from veriscope.cli.governance import append_run_started
 from veriscope.cli.main import _cmd_inspect
 from veriscope.core.artifacts import ResultsSummaryV1, ResultsV1
 from veriscope.core.jsonutil import canonical_json_sha256
@@ -90,7 +91,7 @@ def test_inspect_strict_governance_requires_log(tmp_path: Path, capsys: pytest.C
     captured = capsys.readouterr()
 
     assert exit_code == 2
-    assert "governance_log.jsonl is required but missing" in captured.err
+    assert "Missing governance_log.jsonl for results.json" in captured.err
 
 
 def test_inspect_strict_governance_warns_when_optional(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -122,6 +123,19 @@ def _mutate_summary_run_id(outdir: Path, *, run_id: str) -> None:
 def test_inspect_allow_partial_warns_on_identity_mismatch(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     outdir = tmp_path / "run_identity_warn"
     _make_minimal_artifacts(outdir, run_id="run_identity_warn")
+    append_run_started(
+        outdir,
+        run_id="run_identity_warn",
+        outdir_path=outdir,
+        argv=["pytest", "inspect_fixture"],
+        code_identity={"package_version": "test"},
+        window_signature_ref={
+            "hash": canonical_json_sha256(_read_json_dict(outdir / "window_signature.json")),
+            "path": "window_signature.json",
+        },
+        entrypoint={"kind": "runner", "name": "tests.inspect_fixture"},
+        ts_utc=_iso_z(T0),
+    )
     _mutate_summary_run_id(outdir, run_id="mismatched_run")
 
     args = argparse.Namespace(

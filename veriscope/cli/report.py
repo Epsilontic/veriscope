@@ -7,7 +7,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from veriscope.cli.comparability import ComparableResult, comparable_explain, load_run_metadata
-from veriscope.cli.governance import get_governance_status, resolve_effective_status
+from veriscope.cli.governance import resolve_effective_status
+from veriscope.core.governance import get_governance_status
 from veriscope.cli.validate import validate_outdir
 from veriscope.core.artifacts import ResultsSummaryV1, ResultsV1
 
@@ -83,7 +84,12 @@ def render_report_md(outdir: Path, *, fmt: str = "md") -> str:
     outdir = Path(outdir)
 
     # Report is best-effort; allow partial artifact capsules by default.
-    v = validate_outdir(outdir, allow_partial=True)
+    v = validate_outdir(
+        outdir,
+        allow_partial=True,
+        allow_missing_governance=True,
+        allow_invalid_governance=True,
+    )
     if not v.ok:
         raise ValueError(f"Cannot report: {v.message}")
 
@@ -161,6 +167,9 @@ def render_report_md(outdir: Path, *, fmt: str = "md") -> str:
             lines.append(f"  Last Rev: {gov_status.rev if gov_status.rev is not None else '-'}")
             lines.append(f"  Last Hash: {_short_hash(gov_status.entry_hash or '')}")
             lines.append(f"  Legacy (missing entry_hash): {'YES' if gov_status.legacy_missing_entry_hash else 'NO'}")
+            if gov_status.event_counts:
+                counts = ", ".join(f"{k}={v}" for k, v in sorted(gov_status.event_counts.items()))
+                lines.append(f"  Events: {counts}")
             if not gov_status.ok and gov_status.errors:
                 lines.append("  ⚠ Governance log invalid:")
                 for err in gov_status.errors:
@@ -233,6 +242,9 @@ def render_report_md(outdir: Path, *, fmt: str = "md") -> str:
         lines.append(f"| Last Rev | {gov_status.rev if gov_status.rev is not None else '-'} |")
         lines.append(f"| Last Hash | `{_short_hash(gov_status.entry_hash or '')}` |")
         lines.append(f"| Legacy (missing entry_hash) | {'YES' if gov_status.legacy_missing_entry_hash else 'NO'} |")
+        if gov_status.event_counts:
+            counts = ", ".join(f"{k}={v}" for k, v in sorted(gov_status.event_counts.items()))
+            lines.append(f"| Event Counts | {counts} |")
         if gov_status.warnings:
             lines.append(f"| Warnings | {len(gov_status.warnings)} |")
     lines.append("")
@@ -318,7 +330,12 @@ def render_report_compare(
 
     validations = []
     for outdir in outdirs:
-        v = validate_outdir(Path(outdir), allow_partial=True)
+        v = validate_outdir(
+            Path(outdir),
+            allow_partial=True,
+            allow_missing_governance=True,
+            allow_invalid_governance=True,
+        )
         if not v.ok:
             return ReportCompareOutput(exit_code=2, stdout="", stderr=f"INVALID: {v.message}")
         validations.append(v)

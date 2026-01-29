@@ -18,6 +18,7 @@ try:
 except Exception:  # pragma: no cover
     PydanticCoreValidationError = PydanticValidationError  # type: ignore
 
+from veriscope.core.governance import read_governance_log, validate_governance_log
 from veriscope.core.artifacts import ManualJudgementV1, ResultsSummaryV1, ResultsV1
 from veriscope.core.jsonutil import canonical_json_sha256
 
@@ -58,6 +59,17 @@ def _read_json_dict(path: Path) -> Dict[str, Any]:
         raise TypeError(f"{path.name} must be a JSON object (dict), got {type(obj).__name__}")
 
     return obj
+
+
+def _extract_profile_overrides(results: Optional[ResultsV1], summary: ResultsSummaryV1) -> Dict[str, Any]:
+    if results is not None:
+        return dict(results.profile.overrides or {})
+    return dict(summary.profile.overrides or {})
+
+
+def _run_config_overrides_present(run_cfg: Dict[str, Any]) -> bool:
+    overrides = run_cfg.get("overrides")
+    return isinstance(overrides, dict) and bool(overrides)
 
 
 def _format_pydantic_error(e: Exception) -> str:
@@ -124,6 +136,9 @@ def validate_outdir(
     strict_version: bool = False,
     allow_partial: bool = False,
     strict_identity: bool = False,
+    allow_missing_governance: bool = True,
+    allow_invalid_governance: bool = False,
+    allow_legacy_governance: bool = False,
 ) -> ValidationResult:
     """
     Validate the canonical artifact set in OUTDIR.
@@ -134,7 +149,7 @@ def validate_outdir(
       - Pydantic schema validation succeeds for results (if present) + summary
       - manual_judgement.json is optional but must validate if present
       - manual_judgement.jsonl is ignored by validation (governance log)
-      - governance_log.jsonl is ignored by validation (append-only operator log)
+      - governance_log.jsonl must exist and be parseable when results.json exists (unless allow_missing_governance=True)
       - window_signature_ref.hash matches hash(window_signature.json) in results (if present) + summary
       - window_signature_ref.path equals "window_signature.json" in results (if present) + summary
       - when results.json exists, identity fields match results_summary.json (run_id, schema_version,
@@ -264,6 +279,98 @@ def validate_outdir(
             errors=identity_errors,
         )
 
+    warnings = list(identity_warnings)
+    errors = list(identity_errors)
+    if res is not None:
+        gov_path = outdir / "governance_log.jsonl"
+        if not gov_path.exists():
+            if allow_missing_governance:
+                warnings.append("WARNING:GOVERNANCE_LOG_MISSING governance_log.jsonl not present")
+            else:
+                return ValidationResult(
+                    False,
+                    "Missing governance_log.jsonl for results.json",
+                    window_signature_hash=ws_hash,
+                    partial=False,
+                    warnings=tuple(warnings),
+                    errors=tuple(errors),
+                )
+        if not gov_path.exists():
+            # Skip further governance checks if missing and allowed.
+            gov_result = None
+        else:
+            gov_validation = validate_governance_log(gov_path, allow_legacy_governance=allow_legacy_governance)
+            warnings.extend(gov_validation.warnings)
+            if not gov_validation.ok:
+                if allow_invalid_governance:
+                    warnings.append("WARNING:GOVERNANCE_LOG_INVALID governance_log.jsonl invalid")
+                    gov_result = None
+                else:
+                    errors.extend(gov_validation.errors)
+                    return ValidationResult(
+                        False,
+                        "governance_log.jsonl invalid",
+                        window_signature_hash=ws_hash,
+                        partial=False,
+                        warnings=tuple(warnings),
+                        errors=tuple(errors),
+                    )
+            else:
+                gov_result = read_governance_log(gov_path)
+        if gov_result is not None:
+            overrides_required = bool(_extract_profile_overrides(res, summ))
+            run_cfg_path = outdir / "run_config_resolved.json"
+            if run_cfg_path.exists():
+                try:
+                    run_cfg = _read_json_dict(run_cfg_path)
+                except Exception:
+                    run_cfg = {}
+                overrides_required = overrides_required or _run_config_overrides_present(run_cfg)
+
+            run_governance_present = any(
+                gov_result.event_counts.get(event_name, 0) > 0
+                for event_name in ("run_started_v1", "capsule_opened_v1", "run_overrides_applied_v1", "gate_decision_v1")
+            )
+
+            if run_governance_present and overrides_required:
+                if gov_result.event_counts.get("run_overrides_applied_v1", 0) < 1:
+                    msg = "Missing governance overrides entry for applied overrides"
+                    token = "ERROR:GOVERNANCE_OVERRIDES_MISSING run_overrides_applied_v1 entry required"
+                    if allow_invalid_governance:
+                        warnings.append(token.replace("ERROR", "WARNING"))
+                    else:
+                        errors.append(token)
+                        return ValidationResult(
+                            False,
+                            msg,
+                            window_signature_hash=ws_hash,
+                            partial=False,
+                            warnings=tuple(warnings),
+                            errors=tuple(errors),
+                        )
+
+            if run_governance_present and res.gates:
+                required_gate_events = len(res.gates)
+                gate_events = gov_result.event_counts.get("gate_decision_v1", 0)
+                if gate_events < required_gate_events:
+                    msg = "Missing governance gate decision entries for results"
+                    token = (
+                        "ERROR:GOVERNANCE_GATE_DECISIONS_MISSING "
+                        f"gate_decision_v1 entries={gate_events} expected={required_gate_events}"
+                    )
+                    if allow_invalid_governance:
+                        warnings.append(token.replace("ERROR", "WARNING"))
+                    else:
+                        errors.append(token)
+                        return ValidationResult(
+                            False,
+                            msg,
+                            window_signature_hash=ws_hash,
+                            partial=False,
+                            warnings=tuple(warnings),
+                            errors=tuple(errors),
+                        )
+
     # Return the derived truth (the computed hash), not just the referenced one.
     summary_partial = bool(getattr(summ, "partial", False))
     return ValidationResult(
@@ -271,6 +378,6 @@ def validate_outdir(
         "OK",
         window_signature_hash=ws_hash,
         partial=(res is None or summary_partial or identity_partial),
-        warnings=identity_warnings,
-        errors=identity_errors,
+        warnings=tuple(warnings),
+        errors=tuple(errors),
     )

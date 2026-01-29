@@ -9,7 +9,7 @@ from typing import Any, Callable
 
 import pytest
 
-from veriscope.cli.governance import GOVERNANCE_LOG_SCHEMA_VERSION, append_governance_log
+from veriscope.cli.governance import GOVERNANCE_LOG_SCHEMA_VERSION, append_governance_log, append_run_started
 from veriscope.cli.report import render_report_md
 from veriscope.core.jsonutil import canonical_dumps
 from veriscope.cli.validate import validate_outdir
@@ -98,6 +98,17 @@ def _make_minimal_artifacts(outdir: Path, *, run_id: str = "test_run_min") -> No
     _write_json(outdir / "results.json", res_obj)
     _write_json(outdir / "results_summary.json", summ_obj)
 
+    append_run_started(
+        outdir,
+        run_id=run_id,
+        outdir_path=outdir,
+        argv=["pytest", "fixture"],
+        code_identity={"package_version": "test"},
+        window_signature_ref={"hash": ws_hash, "path": "window_signature.json"},
+        entrypoint={"kind": "runner", "name": "tests.fixture"},
+        ts_utc=_iso_z(T0),
+    )
+
     # Sanity: fixtures must conform to schemas
     ResultsV1.model_validate_json((outdir / "results.json").read_text(encoding="utf-8"))
     ResultsSummaryV1.model_validate_json((outdir / "results_summary.json").read_text(encoding="utf-8"))
@@ -155,7 +166,13 @@ def _tamper_governance_log(outdir: Path) -> None:
     if not lines:
         return
     obj = json.loads(lines[0])
-    obj["payload"]["note"] = "tampered"
+    payload = obj.get("payload")
+    if isinstance(payload, dict):
+        payload["note"] = "tampered"
+    elif "run_id" in obj:
+        obj["run_id"] = f"{obj['run_id']}-tampered"
+    else:
+        obj["event"] = "tampered"
     lines[0] = json.dumps(obj, sort_keys=True)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -287,6 +304,7 @@ def test_report_smoke_and_integrity_minimal(minimal_artifact_dir: Path) -> None:
 
 
 def test_report_governance_absent(minimal_artifact_dir: Path) -> None:
+    (minimal_artifact_dir / "governance_log.jsonl").unlink()
     txt = render_report_md(minimal_artifact_dir, fmt="text")
     assert "GOVERNANCE:" in txt
     assert "Log: NO" in txt
@@ -297,14 +315,15 @@ def test_report_governance_valid(minimal_artifact_dir: Path) -> None:
     txt = render_report_md(minimal_artifact_dir, fmt="text")
     assert "Log: YES" in txt
     assert "Valid: YES" in txt
-    assert "Last Rev: 1" in txt
+    assert "Last Rev: 2" in txt
 
 
 def test_report_governance_invalid_tampered(minimal_artifact_dir: Path) -> None:
     _write_valid_governance_log(minimal_artifact_dir)
     _tamper_governance_log(minimal_artifact_dir)
     txt = render_report_md(minimal_artifact_dir, fmt="text")
-    assert "⚠ Governance log invalid" in txt
+    assert "Log: YES" in txt
+    assert "Valid: NO" in txt
     assert "GOVERNANCE_LOG_HASH_MISMATCH" in txt
 
 
@@ -332,6 +351,13 @@ def test_report_manual_judgement_overlay(minimal_artifact_dir: Path) -> None:
     txt = render_report_md(minimal_artifact_dir, fmt="text")
     assert "MANUAL JUDGEMENT:" in txt
     assert "Final Status: MANUAL FAIL" in txt
+
+
+def test_validate_fails_on_malformed_governance_log(minimal_artifact_dir: Path) -> None:
+    (minimal_artifact_dir / "governance_log.jsonl").write_text("{bad json\n", encoding="utf-8")
+    v = validate_outdir(minimal_artifact_dir)
+    assert not v.ok
+    assert "governance_log.jsonl invalid" in v.message
 
 
 def test_validate_rejects_invalid_manual_judgement(minimal_artifact_dir: Path) -> None:

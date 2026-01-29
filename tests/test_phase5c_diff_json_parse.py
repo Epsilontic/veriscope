@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 
 from veriscope.cli.diff import diff_outdirs
+from veriscope.cli.governance import append_run_started
 from veriscope.core.artifacts import ResultsSummaryV1, ResultsV1
 from veriscope.core.jsonutil import canonical_json_sha256
 
@@ -72,6 +73,17 @@ def _make_minimal_artifacts(outdir: Path, *, run_id: str, extra: str | None = No
 
     _write_json(outdir / "results.json", res_obj)
     _write_json(outdir / "results_summary.json", summ_obj)
+
+    append_run_started(
+        outdir,
+        run_id=run_id,
+        outdir_path=outdir,
+        argv=["pytest", "diff_json_fixture"],
+        code_identity={"package_version": "test"},
+        window_signature_ref={"hash": ws_hash, "path": "window_signature.json"},
+        entrypoint={"kind": "runner", "name": "tests.diff_json_fixture"},
+        ts_utc=_iso_z(T0),
+    )
 
     ResultsV1.model_validate_json((outdir / "results.json").read_text(encoding="utf-8"))
     ResultsSummaryV1.model_validate_json((outdir / "results_summary.json").read_text(encoding="utf-8"))

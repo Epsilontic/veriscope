@@ -38,7 +38,8 @@ from veriscope.core.ddp import (
 from veriscope.core.gate import GateEngine
 from veriscope.core.transport import DeclTransport
 from veriscope.core.window import FRWindow, WindowDecl
-from veriscope.core.jsonutil import atomic_write_json
+from veriscope.core.governance import append_gate_decision, append_run_started, build_code_identity
+from veriscope.core.jsonutil import atomic_write_json, canonical_json_sha256, read_json_obj
 from veriscope.runners.hf.adapter import HFMetricComputer, HFMetricConfig
 from veriscope.runners.hf.emit_artifacts import emit_hf_artifacts_v1
 
@@ -1115,6 +1116,28 @@ def _run_body(cfg: HFRunConfig, *, argv: List[str]) -> int:
     run_id = cfg.run_id
     started_ts = datetime.now(timezone.utc)
     window_signature = _build_window_signature(cfg, created_ts_utc=started_ts)
+    window_signature_ref: Dict[str, Any] = {"path": "window_signature.json"}
+    if _is_chief():
+        try:
+            window_signature_path = cfg.outdir / "window_signature.json"
+            atomic_write_json(window_signature_path, window_signature)
+            window_signature_ref["hash"] = canonical_json_sha256(read_json_obj(window_signature_path))
+        except Exception as exc:
+            logger.warning("Failed to write window_signature.json before governance: %s", exc)
+
+        try:
+            code_identity = build_code_identity(git_sha=_best_effort_git_sha())
+            append_run_started(
+                cfg.outdir,
+                run_id=run_id,
+                outdir_path=cfg.outdir,
+                argv=argv,
+                code_identity=code_identity,
+                window_signature_ref=window_signature_ref,
+                entrypoint={"kind": "runner", "name": "veriscope.runners.hf.train_hf"},
+            )
+        except Exception as exc:
+            logger.warning("Failed to append governance run_started entry: %s", exc)
 
     if _is_chief():
         if cfg.data_corrupt_len > 0 and cfg.data_corrupt_frac > 0.0:
@@ -1352,17 +1375,30 @@ def _run_body(cfg: HFRunConfig, *, argv: List[str]) -> int:
                     )
                 )
 
-                gate_records.append(
-                    _gate_from_history(
-                        gate_engine,
-                        window_decl,
-                        metric_history,
-                        cfg.gate_window,
-                        step,
-                        cfg.gate_policy,
-                        cfg.gate_min_evidence,
-                    )
+                gate_record = _gate_from_history(
+                    gate_engine,
+                    window_decl,
+                    metric_history,
+                    cfg.gate_window,
+                    step,
+                    cfg.gate_policy,
+                    cfg.gate_min_evidence,
                 )
+                gate_records.append(gate_record)
+                if _is_chief():
+                    try:
+                        audit_payload = gate_record.audit.model_dump(mode="json", by_alias=True, exclude_none=True)
+                        append_gate_decision(
+                            cfg.outdir,
+                            run_id=run_id,
+                            iter_num=int(gate_record.iter),
+                            decision=str(gate_record.decision),
+                            ok=gate_record.ok,
+                            warn=gate_record.warn,
+                            audit=audit_payload,
+                        )
+                    except Exception as exc:
+                        logger.warning("Failed to append governance gate decision: %s", exc)
 
             step += 1
             batch_idx += 1

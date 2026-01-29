@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 
 from veriscope.cli.comparability import comparable, comparable_explain, load_run_metadata
+from veriscope.cli.governance import append_run_started
 from veriscope.cli.diff import diff_outdirs
 from veriscope.cli.validate import validate_outdir
 from veriscope.core.artifacts import ManualJudgementV1, ResultsSummaryV1, ResultsV1
@@ -72,6 +73,17 @@ def _make_minimal_artifacts(outdir: Path, *, run_id: str, gate_preset: str = "te
 
     _write_json(outdir / "results.json", res_obj)
     _write_json(outdir / "results_summary.json", summ_obj)
+
+    append_run_started(
+        outdir,
+        run_id=run_id,
+        outdir_path=outdir,
+        argv=["pytest", "diff_fixture"],
+        code_identity={"package_version": "test"},
+        window_signature_ref={"hash": ws_hash, "path": "window_signature.json"},
+        entrypoint={"kind": "runner", "name": "tests.diff_fixture"},
+        ts_utc=_iso_z(T0),
+    )
 
     ResultsV1.model_validate_json((outdir / "results.json").read_text(encoding="utf-8"))
     ResultsSummaryV1.model_validate_json((outdir / "results_summary.json").read_text(encoding="utf-8"))

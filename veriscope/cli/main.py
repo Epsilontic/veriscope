@@ -94,8 +94,9 @@ def _build_resolved_payload(
     normalized_forwarded_args: List[str],
     cmd: List[str],
     env: Dict[str, str],
+    overrides: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    return {
+    payload: Dict[str, Any] = {
         "schema_version": 1,
         "ts_utc": _now_utc_iso(),
         "package": {"name": "veriscope", "version": _pkg_version()},
@@ -116,6 +117,9 @@ def _build_resolved_payload(
         "started_ts_utc": lifecycle.started_ts_utc.isoformat(),
         "ended_ts_utc": None,
     }
+    if overrides:
+        payload["overrides"] = overrides
+    return payload
 
 
 def _legacy_default_cifar_outdir() -> Path:
@@ -435,6 +439,7 @@ def _run_subprocess_wrapper(
     veriscope_argv: List[str],
     env: Dict[str, str],
     force: bool,
+    overrides: Optional[Dict[str, Any]] = None,
 ) -> int:
     lifecycle = RunLifecycle(run_id=run_id, run_kind=run_kind)
     resolved = _build_resolved_payload(
@@ -447,6 +452,7 @@ def _run_subprocess_wrapper(
         normalized_forwarded_args=normalized_forwarded_args,
         cmd=cmd,
         env=env,
+        overrides=overrides,
     )
     _write_resolved_config(outdir, resolved)
     print(f"[veriscope] outdir={outdir}")
@@ -489,6 +495,20 @@ def _run_subprocess_wrapper(
 
         try:
             lifecycle.mark_running()
+            if overrides:
+                try:
+                    from veriscope.core.governance import append_overrides
+
+                    append_overrides(
+                        outdir,
+                        run_id=run_id,
+                        overrides=overrides,
+                        profile={"gate_preset": gate_preset, "overrides": overrides},
+                        entrypoint={"kind": "cli", "name": f"veriscope.cli.main:run_{run_kind}"},
+                        argv=veriscope_argv,
+                    )
+                except Exception as exc:
+                    _eprint(f"[veriscope] WARNING: failed to append overrides governance entry: {exc}")
             _write_run_config_merge(outdir, {"lifecycle_state": lifecycle.state})
             try:
                 proc = subprocess.Popen(
@@ -782,6 +802,7 @@ def _cmd_run_gpt(args: argparse.Namespace) -> int:
         cmd = [sys.executable, "-m", "veriscope.runners.gpt.train_nanogpt"] + gpt_args
 
     gate_preset = _extract_gate_preset(gpt_args)
+    overrides_payload = None
     veriscope_argv = ["veriscope", "run", "gpt"]
     if outdir_str:
         veriscope_argv += ["--outdir", str(outdir)]
@@ -798,6 +819,7 @@ def _cmd_run_gpt(args: argparse.Namespace) -> int:
         veriscope_argv=veriscope_argv,
         env=env,
         force=bool(args.force),
+        overrides=overrides_payload,
     )
 
 
@@ -844,6 +866,9 @@ def _cmd_run_hf(args: argparse.Namespace) -> int:
         cmd = [sys.executable, "-m", "veriscope.runners.hf.train_hf"] + hf_args
 
     gate_preset = args.gate_preset or _extract_gate_preset(hf_args)
+    overrides_payload = None
+    if args.gate_preset and args.gate_preset != "tuned_v0":
+        overrides_payload = {"gate_preset": args.gate_preset}
     veriscope_argv = ["veriscope", "run", "hf"]
     if args.gate_preset:
         veriscope_argv += ["--gate-preset", args.gate_preset]
@@ -879,6 +904,7 @@ def _cmd_run_hf(args: argparse.Namespace) -> int:
             normalized_forwarded_args=list(hf_args),
             cmd=cmd,
             env=env,
+            overrides=overrides_payload,
         )
         _write_resolved_config(outdir, resolved)
         ws_ref = _ensure_window_signature(outdir, reason="wrapper_preflight_failed", run_kind="hf")
@@ -921,6 +947,7 @@ def _cmd_run_hf(args: argparse.Namespace) -> int:
         veriscope_argv=veriscope_argv,
         env=env,
         force=bool(args.force),
+        overrides=overrides_payload,
     )
 
 
@@ -930,11 +957,20 @@ def _eprint(msg: str) -> None:
 
 def _cmd_validate(args: argparse.Namespace) -> int:
     outdir = Path(str(args.outdir)).expanduser()
-    from veriscope.cli.governance import validate_governance_log
     from veriscope.cli.validate import validate_outdir
 
     strict_identity = bool(getattr(args, "strict_identity", False))
-    v = validate_outdir(outdir, strict_identity=strict_identity)
+    strict_governance = bool(getattr(args, "strict_governance", False))
+    allow_legacy = bool(getattr(args, "allow_legacy_governance", False))
+    require_governance = bool(getattr(args, "require_governance", False))
+
+    v = validate_outdir(
+        outdir,
+        strict_identity=strict_identity,
+        allow_missing_governance=not require_governance,
+        allow_invalid_governance=not strict_governance,
+        allow_legacy_governance=allow_legacy,
+    )
     if not v.ok:
         _eprint(f"INVALID: {v.message}")
         for err in v.errors:
@@ -943,29 +979,6 @@ def _cmd_validate(args: argparse.Namespace) -> int:
         return 2
     for warning in v.warnings:
         _eprint(warning)
-
-    strict_governance = bool(getattr(args, "strict_governance", False))
-    allow_legacy = bool(getattr(args, "allow_legacy_governance", False))
-    require_governance = bool(getattr(args, "require_governance", False))
-
-    gov_path = outdir / "governance_log.jsonl"
-    if not gov_path.exists():
-        if require_governance:
-            _eprint("INVALID: governance_log.jsonl is required but missing")
-            return 2
-    else:
-        validation = validate_governance_log(gov_path, allow_legacy_governance=allow_legacy)
-        for warning in validation.warnings:
-            _eprint(warning)
-        if strict_governance and not validation.ok:
-            _eprint("INVALID: governance_log.jsonl failed validation:")
-            for err in validation.errors:
-                _eprint(f"  {err}")
-            return 2
-    if strict_governance and not gov_path.exists() and not require_governance:
-        _eprint(
-            "WARNING:GOVERNANCE_LOG_MISSING governance_log.jsonl not present (strict_governance set, but not required)"
-        )
 
     if v.window_signature_hash:
         print(f"OK window_signature_hash={v.window_signature_hash}")
@@ -1047,11 +1060,21 @@ def _cmd_inspect(args: argparse.Namespace) -> int:
     """
     outdir = Path(str(args.outdir)).expanduser()
     from veriscope.cli.report import render_report_md
-    from veriscope.cli.governance import validate_governance_log
     from veriscope.cli.validate import validate_outdir
 
     strict_identity = bool(getattr(args, "strict_identity", False))
-    v = validate_outdir(outdir, allow_partial=True, strict_identity=strict_identity)
+    strict_governance = bool(getattr(args, "strict_governance", False))
+    allow_legacy = bool(getattr(args, "allow_legacy_governance", False))
+    require_governance = bool(getattr(args, "require_governance", False))
+
+    v = validate_outdir(
+        outdir,
+        allow_partial=True,
+        strict_identity=strict_identity,
+        allow_missing_governance=not require_governance,
+        allow_invalid_governance=not strict_governance,
+        allow_legacy_governance=allow_legacy,
+    )
     if not v.ok:
         _eprint(f"INVALID: {v.message}")
         for err in v.errors:
@@ -1070,29 +1093,6 @@ def _cmd_inspect(args: argparse.Namespace) -> int:
         return 2
     for warning in v.warnings:
         _eprint(warning)
-
-    strict_governance = bool(getattr(args, "strict_governance", False))
-    allow_legacy = bool(getattr(args, "allow_legacy_governance", False))
-    require_governance = bool(getattr(args, "require_governance", False))
-
-    gov_path = outdir / "governance_log.jsonl"
-    if not gov_path.exists():
-        if require_governance:
-            _eprint("INVALID: governance_log.jsonl is required but missing")
-            return 2
-    else:
-        validation = validate_governance_log(gov_path, allow_legacy_governance=allow_legacy)
-        for warning in validation.warnings:
-            _eprint(warning)
-        if strict_governance and not validation.ok:
-            _eprint("INVALID: governance_log.jsonl failed validation:")
-            for err in validation.errors:
-                _eprint(f"  {err}")
-            return 2
-    if strict_governance and not gov_path.exists() and not require_governance:
-        _eprint(
-            "WARNING:GOVERNANCE_LOG_MISSING governance_log.jsonl not present (strict_governance set, but not required)"
-        )
 
     no_report = bool(getattr(args, "no_report", False))
     if no_report:

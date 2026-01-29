@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -50,17 +51,8 @@ def _must_exist(capdir: Path, name: str) -> Path:
     return matches[0]
 
 
-@pytest.mark.integration
-def test_hf_micro_smoke_integration(tmp_path: Path) -> None:
-    pytest.importorskip("torch")
-    pytest.importorskip("transformers")
-    pytest.importorskip("datasets")
-    if os.environ.get("HF_HUB_OFFLINE") == "1" or os.environ.get("TRANSFORMERS_OFFLINE") == "1":
-        pytest.skip("HF offline mode enabled; skipping HF micro smoke.")
-
-    outdir = tmp_path / "hf_micro_smoke"
+def _hf_smoke_env(tmp_path: Path) -> dict[str, str]:
     env = os.environ.copy()
-    # Ensure no ambient torchrun/elastic variables accidentally suppress chief emission.
     for k in (
         "RANK",
         "WORLD_SIZE",
@@ -72,21 +64,13 @@ def test_hf_micro_smoke_integration(tmp_path: Path) -> None:
         "TORCHELASTIC_RUN_ID",
     ):
         env.pop(k, None)
-
-    # Force any runner-side default outdir logic to stay inside this temp capsule root.
-    # train_hf._default_outdir() honors VERISCOPE_OUT_BASE.
-    env["VERISCOPE_OUT_BASE"] = str(outdir)
-
-    # Hard override: ensure HF runner always emits artifacts in this smoke.
     env["VERISCOPE_FORCE_SINGLE_PROCESS"] = "1"
-
     pythonpath = env.get("PYTHONPATH", "")
     extra_paths = [str(REPO_ROOT)]
     if pythonpath:
         extra_paths.append(pythonpath)
     env["PYTHONPATH"] = os.pathsep.join(extra_paths)
     env["VERISCOPE_PYTHON_BIN"] = sys.executable
-    env["VERISCOPE_HF_MICRO_SMOKE_TIMEOUT_SECS"] = "180"
     env["CUDA_VISIBLE_DEVICES"] = ""
     env["HF_HOME"] = str(tmp_path / "hf_home")
     env["TRANSFORMERS_CACHE"] = str(tmp_path / "hf_cache")
@@ -94,6 +78,21 @@ def test_hf_micro_smoke_integration(tmp_path: Path) -> None:
     env["HF_HUB_DISABLE_TELEMETRY"] = "1"
     env["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
     env["TOKENIZERS_PARALLELISM"] = "false"
+    return env
+
+
+@pytest.mark.integration
+def test_hf_micro_smoke_integration(tmp_path: Path) -> None:
+    pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+    pytest.importorskip("datasets")
+    if os.environ.get("HF_HUB_OFFLINE") == "1" or os.environ.get("TRANSFORMERS_OFFLINE") == "1":
+        pytest.skip("HF offline mode enabled; skipping HF micro smoke.")
+
+    outdir = tmp_path / "hf_micro_smoke"
+    env = _hf_smoke_env(tmp_path)
+    env["VERISCOPE_OUT_BASE"] = str(outdir)
+    env["VERISCOPE_HF_MICRO_SMOKE_TIMEOUT_SECS"] = "180"
 
     result = subprocess.run(
         ["bash", str(SCRIPT), str(outdir)],
@@ -144,3 +143,68 @@ def test_hf_micro_smoke_integration(tmp_path: Path) -> None:
 
     counts_model = CountsV1.model_validate(counts)
     assert summary["final_decision"] == derive_final_decision(counts_model)
+
+
+@pytest.mark.integration
+def test_hf_micro_smoke_direct_runner_governance(tmp_path: Path) -> None:
+    pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+    pytest.importorskip("datasets")
+    if os.environ.get("HF_HUB_OFFLINE") == "1" or os.environ.get("TRANSFORMERS_OFFLINE") == "1":
+        pytest.skip("HF offline mode enabled; skipping HF micro smoke.")
+
+    outdir = tmp_path / "hf_micro_direct"
+    env = _hf_smoke_env(tmp_path)
+    env["VERISCOPE_OUT_BASE"] = str(outdir)
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "veriscope.runners.hf.train_hf",
+        "--outdir",
+        str(outdir),
+        "--run_id",
+        "hf-micro-direct",
+        "--model",
+        "sshleifer/tiny-gpt2",
+        "--dataset",
+        f"file:{REPO_ROOT}/tests/data/hf_micro_smoke.txt",
+        "--dataset_split",
+        "train",
+        "--max_steps",
+        "8",
+        "--batch_size",
+        "1",
+        "--block_size",
+        "32",
+        "--cadence",
+        "1",
+        "--gate_window",
+        "2",
+        "--gate_min_evidence",
+        "2",
+        "--rp_dim",
+        "8",
+        "--seed",
+        "1337",
+        "--device",
+        "cpu",
+        "--force",
+    ]
+    result = subprocess.run(
+        cmd,
+        cwd=str(REPO_ROOT),
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=240,
+    )
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+
+    capdir = _resolve_capsule_dir(outdir)
+    gov_path = _must_exist(capdir, "governance_log.jsonl")
+    lines = gov_path.read_text(encoding="utf-8").splitlines()
+    events = [json.loads(line).get("event") or json.loads(line).get("event_type") for line in lines]
+    assert "run_started_v1" in events
+    assert "gate_decision_v1" in events

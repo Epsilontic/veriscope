@@ -22,7 +22,8 @@ without breaking this contract, but new semantics must be documented here first.
 **Governance artifacts (optional, append-only unless noted):**
 - `manual_judgement.json` (snapshot overlay)
 - `manual_judgement.jsonl` (append-only)
-- `governance_log.jsonl` (append-only, canonical governance journal)
+- `governance_log.jsonl` (append-only, canonical governance journal; strict validators may require this when `results.json` exists)
+  - For non-partial capsules, governance logs are recommended when `results.json` is present; partial capsules may omit them.
 
 ## Hashing Rules
 
@@ -37,6 +38,9 @@ Hashing requirements:
 - Governance log hash chaining uses:
   - `entry_hash = sha256(canonical_json(entry_without_entry_hash))`
   - `prev_hash = previous entry_hash` (or null if first entry).
+- The governance hash includes whichever of `event` or `event_type` is present (writers should prefer `event`).
+- For new entries, `event` and `event_type` are mutually exclusive.
+- Non-finite floats MUST NOT appear in governance logs; writers MAY sanitize them to `null` but SHOULD warn.
 
 ## Governance Journal: `governance_log.jsonl`
 
@@ -45,12 +49,19 @@ Each line is a JSON object with:
 - `rev`: integer (strictly consecutive in append order; `prev_rev + 1`)
 - `ts_utc`: ISO-8601 timestamp in UTC (`Z` preferred; `+00:00` accepted) (informational, not authoritative)
 - `actor`: optional string (reviewer/operator)
-- `event_type`: one of:
+- `event` (preferred) or `event_type` (legacy), mutually exclusive for new entries: one of:
   - `manual_judgement_set`
   - `manual_judgement_cleared`
   - `artifact_note`
   - `recompute_summary`
-- `payload`: event-specific object (for manual judgement: `status`, `reason`, `reviewer`, `run_id`, `source_path`)
+  - `run_started_v1`
+  - `capsule_opened_v1` (reserved; not currently emitted)
+  - `run_overrides_applied_v1`
+  - `gate_decision_v1`
+- `payload`: event-specific object (required for all events). For run governance:
+  - `run_started_v1`: `run_id`, `outdir`, `argv`, `code_identity`, `window_signature_ref`, `entrypoint`
+  - `run_overrides_applied_v1`: `run_id`, `outdir`, `overrides`, `profile`, `entrypoint`, optional `argv` (wrappers should record default-divergent `gate_preset` values here)
+  - `gate_decision_v1`: `run_id`, `outdir`, `iter`, `decision`, optional `ok`/`warn`, `audit`
 - `prev_hash`: optional hash of previous entry
 - `entry_hash`: optional hash of this entry (writers MUST include; readers MAY accept missing entry_hash for legacy journals and must warn)
 
@@ -89,4 +100,3 @@ Runs A and B are comparable iff:
 |  | `2` | Incomparable or invalid artifacts |
 | `veriscope report --compare` | `0` | Report rendered |
 |  | `2` | Incompatible group (unless `--allow-incompatible`) |
-
