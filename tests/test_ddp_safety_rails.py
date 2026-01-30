@@ -179,12 +179,23 @@ def test_ddp_non_chief_skips_artifact_emission(tmp_path: Path, monkeypatch: pyte
     import veriscope.core.ddp as ddp
 
     monkeypatch.setattr(ddp, "_dist_module", lambda: None)
-    for key in ("WORLD_SIZE", "RANK", "MASTER_ADDR", "MASTER_PORT", "LOCAL_RANK"):
+    for key in (
+        "WORLD_SIZE",
+        "RANK",
+        "MASTER_ADDR",
+        "MASTER_PORT",
+        "LOCAL_RANK",
+        "LOCAL_WORLD_SIZE",
+        "TORCHELASTIC_RUN_ID",
+    ):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("WORLD_SIZE", "2")
     monkeypatch.setenv("RANK", "1")
     monkeypatch.setenv("MASTER_ADDR", "127.0.0.1")
     monkeypatch.setenv("MASTER_PORT", "29500")
+    # New policy: env rank/world is only trusted under torchrun/elastic context.
+    monkeypatch.setenv("LOCAL_RANK", "1")
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", "2")
 
     outdir = tmp_path / "hf_emit_non_chief"
     window_signature = {"schema_version": 1, "transport": {"name": "hf_hidden_state_v1", "cadence": "every_1_steps"}}
@@ -217,12 +228,23 @@ def test_ddp_gate_returns_skip_with_audit(monkeypatch: pytest.MonkeyPatch) -> No
     train_hf = importlib.import_module("veriscope.runners.hf.train_hf")
     _gate_from_history = train_hf._gate_from_history
 
-    for key in ("WORLD_SIZE", "RANK", "MASTER_ADDR", "MASTER_PORT", "LOCAL_RANK"):
+    for key in (
+        "WORLD_SIZE",
+        "RANK",
+        "MASTER_ADDR",
+        "MASTER_PORT",
+        "LOCAL_RANK",
+        "LOCAL_WORLD_SIZE",
+        "TORCHELASTIC_RUN_ID",
+    ):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("WORLD_SIZE", "2")
     monkeypatch.setenv("RANK", "1")
     monkeypatch.setenv("MASTER_ADDR", "127.0.0.1")
     monkeypatch.setenv("MASTER_PORT", "29500")
+    # New policy: env rank/world is only trusted under torchrun/elastic context.
+    monkeypatch.setenv("LOCAL_RANK", "1")
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", "2")
 
     window_decl = WindowDecl(
         epsilon=0.12,

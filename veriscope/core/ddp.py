@@ -13,6 +13,11 @@ if TYPE_CHECKING:  # pragma: no cover
 logger = logging.getLogger(__name__)
 
 
+def env_truthy(name: str) -> bool:
+    raw = (os.environ.get(name) or "").strip().lower()
+    return raw in {"1", "true", "yes", "y", "on"}
+
+
 def _env_int(name: str, default: int) -> int:
     raw = os.environ.get(name)
     if raw is None or raw == "":
@@ -48,12 +53,24 @@ def _env_ddp_signature() -> bool:
     return _env_int("WORLD_SIZE", 1) > 1 and _has("RANK") and _has("MASTER_ADDR") and _has("MASTER_PORT")
 
 
+def _env_allows_ddp_rank_world() -> bool:
+    if env_truthy("VERISCOPE_FORCE_SINGLE_PROCESS"):
+        return False
+    if env_truthy("VERISCOPE_DDP_ALLOW_ENV_RANKWORLD"):
+        return True
+    return os.environ.get("LOCAL_RANK") not in (None, "") or os.environ.get("TORCHELASTIC_RUN_ID") not in (None, "")
+
+
 def ddp_is_active() -> bool:
+    if env_truthy("VERISCOPE_FORCE_SINGLE_PROCESS"):
+        return False
     dist = _dist_module()
     if dist is not None:
         rw = _dist_rank_and_world(dist)
         if rw:
             return rw[1] > 1
+    if not _env_allows_ddp_rank_world():
+        return False
     return _env_ddp_signature()
 
 
@@ -74,12 +91,14 @@ def ddp_rank() -> int:
         rw = _dist_rank_and_world(dist)
         if rw:
             return rw[0]
+    if not _env_allows_ddp_rank_world():
+        return 0
     return _env_int("RANK", 0)
 
 
 def ddp_local_rank() -> int:
     env = os.environ.get("LOCAL_RANK")
-    if env is not None and env != "":
+    if env is not None and env != "" and _env_allows_ddp_rank_world():
         return _env_int("LOCAL_RANK", 0)
     return 0
 
@@ -90,17 +109,14 @@ def ddp_world_size() -> int:
         rw = _dist_rank_and_world(dist)
         if rw:
             return max(1, rw[1])
+    if not _env_allows_ddp_rank_world():
+        return 1
     size = _env_int("WORLD_SIZE", 1)
     return size if size > 0 else 1
 
 
 def ddp_is_chief() -> bool:
     return ddp_rank() == 0
-
-
-def env_truthy(name: str) -> bool:
-    raw = (os.environ.get(name) or "").strip().lower()
-    return raw in {"1", "true", "yes", "y", "on"}
 
 
 def ddp_barrier(timeout_s: float = 30.0) -> str:
