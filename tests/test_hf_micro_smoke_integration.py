@@ -111,11 +111,13 @@ def test_hf_micro_smoke_integration(tmp_path: Path) -> None:
     results_path = _must_exist(capdir, "results.json")
     summary_path = _must_exist(capdir, "results_summary.json")
     manifest_path = _must_exist(capdir, "run_manifest.json")
+    resolved_path = _must_exist(capdir, "run_config_resolved.json")
 
     assert window_signature_path.exists()
     assert results_path.exists()
     assert summary_path.exists()
     assert manifest_path.exists()
+    assert resolved_path.exists()
 
     ws_hash = window_signature_sha256(read_json_obj(window_signature_path))
     results = read_json_obj(results_path)
