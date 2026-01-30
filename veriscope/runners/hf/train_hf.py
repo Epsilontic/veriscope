@@ -186,6 +186,18 @@ def _maybe_init_ddp() -> bool:
       - In strict torchrun/elastic multi-rank context, failures are fatal (raise) to avoid rank skew.
     """
 
+    # Force single-process semantics even if launcher env vars are present.
+    # This is the strongest override and must dominate all other DDP detection.
+    if env_truthy("VERISCOPE_FORCE_SINGLE_PROCESS"):
+        logger.debug(
+            "FORCE_SINGLE_PROCESS=1; skipping DDP init (WORLD_SIZE=%r RANK=%r LOCAL_RANK=%r TORCHELASTIC_RUN_ID=%r).",
+            os.environ.get("WORLD_SIZE"),
+            os.environ.get("RANK"),
+            os.environ.get("LOCAL_RANK"),
+            os.environ.get("TORCHELASTIC_RUN_ID"),
+        )
+        return False
+
     # ---- NEW: treat rank/world env as inert unless we're really under torchrun/elastic ----
     def _as_int(name: str, default: int) -> int:
         raw = os.environ.get(name)
