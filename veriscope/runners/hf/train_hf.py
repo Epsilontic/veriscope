@@ -1086,6 +1086,11 @@ def _run_body(cfg: HFRunConfig, *, argv: List[str]) -> int:
         tokenizer.pad_token = tokenizer.eos_token
 
     model = AutoModelForCausalLM.from_pretrained(cfg.model)
+    # Silence HF warning about embedding tying for models whose checkpoints include both tensors.
+    # This is cosmetic/log-hygiene; it does not change training semantics for our runner.
+    with contextlib.suppress(Exception):
+        if hasattr(model, "config") and hasattr(model.config, "tie_word_embeddings"):
+            model.config.tie_word_embeddings = False
     model.config.use_cache = False
     model.to(device)
     model.train()
