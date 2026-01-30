@@ -1122,7 +1122,7 @@ def _run_body(cfg: HFRunConfig, *, argv: List[str]) -> int:
             with contextlib.suppress(Exception):
                 cur_dev = int(torch.cuda.current_device())
 
-        logger.info(
+        logger.warning(
             "device.requested=%r device.resolved=%s torch.cuda.is_available=%s torch.cuda.device_count=%d "
             "torch.cuda.current_device=%r CUDA_VISIBLE_DEVICES=%r",
             raw_device,
@@ -1174,7 +1174,7 @@ def _run_body(cfg: HFRunConfig, *, argv: List[str]) -> int:
     else:
         # Preserve non-cuda strings (e.g., "cpu", "mps") as provided.
         device = torch.device(raw_device)
-        logger.info("device.requested=%r device.resolved=%s", raw_device, device)
+        logger.warning("device.requested=%r device.resolved=%s", raw_device, device)
     # --- END FAIL-LOUD DEVICE SELECTION ---
 
     from transformers import AutoModelForCausalLM, AutoTokenizer

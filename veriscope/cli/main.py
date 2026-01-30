@@ -442,6 +442,34 @@ def _run_subprocess_wrapper(
     overrides: Optional[Dict[str, Any]] = None,
 ) -> int:
     lifecycle = RunLifecycle(run_id=run_id, run_kind=run_kind)
+
+    proc: Optional[subprocess.Popen] = None
+    threads: List[threading.Thread] = []
+    runner_launch_error: Optional[Exception] = None
+    forwarder: Optional[_SignalForwarder] = None
+    pending_signals: List[int] = []
+
+    def _handle_wrapper_signal(signum: int, frame: Optional[Any]) -> None:
+        nonlocal forwarder, proc
+        if forwarder is not None:
+            try:
+                forwarder.handle(signum, frame)
+            except Exception:
+                pass
+            return
+        try:
+            lifecycle.mark_interrupted(signum)
+        except Exception:
+            pass
+        pending_signals.append(signum)
+        if proc is not None:
+            try:
+                _signal_child(proc, signum)
+            except Exception:
+                pass
+
+    prev_int = signal.signal(signal.SIGINT, _handle_wrapper_signal)
+    prev_term = signal.signal(signal.SIGTERM, _handle_wrapper_signal)
     resolved = _build_resolved_payload(
         run_kind=run_kind,
         run_id=run_id,
@@ -461,38 +489,8 @@ def _run_subprocess_wrapper(
 
     _ensure_window_signature(outdir, reason="wrapper_start", run_kind=run_kind)
 
-    lock = _acquire_gpu_lock(force=force)
     try:
-        proc: Optional[subprocess.Popen] = None
-        threads: List[threading.Thread] = []
-        runner_launch_error: Optional[Exception] = None
-
-        forwarder: Optional[_SignalForwarder] = None
-        pending_signals: List[int] = []
-
-        def _handle_wrapper_signal(signum: int, frame: Optional[Any]) -> None:
-            nonlocal forwarder, proc
-            if forwarder is not None:
-                try:
-                    forwarder.handle(signum, frame)
-                except Exception:
-                    pass
-                return
-
-            try:
-                lifecycle.mark_interrupted(signum)
-            except Exception:
-                pass
-            pending_signals.append(signum)
-            if proc is not None:
-                try:
-                    _signal_child(proc, signum)
-                except Exception:
-                    pass
-
-        prev_int = signal.signal(signal.SIGINT, _handle_wrapper_signal)
-        prev_term = signal.signal(signal.SIGTERM, _handle_wrapper_signal)
-
+        lock = _acquire_gpu_lock(force=force)
         try:
             lifecycle.mark_running()
             if overrides:
@@ -575,11 +573,6 @@ def _run_subprocess_wrapper(
                 internal_error=True,
             )
         finally:
-            try:
-                signal.signal(signal.SIGINT, prev_int)
-                signal.signal(signal.SIGTERM, prev_term)
-            except Exception:
-                pass
             for thread in threads:
                 thread.join(timeout=1.0)
 
@@ -630,11 +623,18 @@ def _run_subprocess_wrapper(
                     pass
         return int(lifecycle.wrapper_exit_code or 0)
     finally:
+        # Release lock first, then restore signal handlers last.
+        # (Avoid a window where SIGINT could terminate the wrapper during cleanup.)
         if lock is not None:
             try:
                 lock.release()
             except Exception:
                 pass
+        try:
+            signal.signal(signal.SIGINT, prev_int)
+            signal.signal(signal.SIGTERM, prev_term)
+        except Exception:
+            pass
 
 
 def _select_cifar_outdir(args_outdir: str) -> Path:
