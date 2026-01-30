@@ -122,6 +122,12 @@ def test_hf_micro_smoke_integration(tmp_path: Path) -> None:
     ws_hash = window_signature_sha256(read_json_obj(window_signature_path))
     results = read_json_obj(results_path)
     summary = read_json_obj(summary_path)
+    resolved = read_json_obj(resolved_path)
+
+    assert resolved["schema_version"] == 1
+    assert resolved["ts_utc"]
+    assert resolved["run"]["kind"] == "hf"
+    assert resolved["env_capture"]["redactions_applied"] in (True, False)
 
     assert results["window_signature_ref"]["hash"] == ws_hash
     assert summary["window_signature_ref"]["hash"] == ws_hash

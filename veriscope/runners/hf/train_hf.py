@@ -1017,7 +1017,24 @@ def _gate_from_history(
     audit_payload.setdefault("evidence_total", evidence_total)
     audit_payload.setdefault("min_evidence", int(gate_min_evidence))
     if ddp_agg_used:
+        world_size: Optional[int] = None
+        try:
+            import torch.distributed as dist  # local import
+
+            if dist.is_available() and dist.is_initialized():
+                world_size = int(dist.get_world_size())
+        except Exception:
+            world_size = None
+        if world_size is None:
+            raw_world_size = os.environ.get("WORLD_SIZE")
+            if raw_world_size:
+                try:
+                    world_size = int(raw_world_size)
+                except Exception:
+                    world_size = None
         audit_payload.setdefault("ddp_agg", "mean")
+        audit_payload.setdefault("aggregation_method", "mean_allreduce")
+        audit_payload.setdefault("world_size", world_size)
     if ddp_barrier_status is not None:
         audit_payload.setdefault("ddp_barrier_status", ddp_barrier_status)
 
@@ -1132,35 +1149,6 @@ def _run_body(cfg: HFRunConfig, *, argv: List[str]) -> int:
 
     run_id = cfg.run_id
     started_ts = datetime.now(timezone.utc)
-    if _is_chief():
-        try:
-            cfg.outdir.mkdir(parents=True, exist_ok=True)
-            run_config_resolved = {
-                "schema_version": 1,
-                "created_ts_utc": started_ts.replace(microsecond=0).isoformat().replace("+00:00", "Z"),
-                "run_id": str(run_id),
-                "runner": {"name": "veriscope.runners.hf.train_hf"},
-                "argv": list(argv),
-                "code_identity": build_code_identity(git_sha=_best_effort_git_sha()),
-                "resolved": {
-                    "model": cfg.model,
-                    "dataset_name": cfg.dataset_name,
-                    "dataset_config": cfg.dataset_config,
-                    "dataset_path": str(cfg.dataset_path) if cfg.dataset_path is not None else None,
-                    "dataset_split": cfg.dataset_split,
-                    "dataset_text_column": cfg.dataset_text_column,
-                    "outdir": str(cfg.outdir),
-                    "max_steps": cfg.max_steps,
-                    "cadence": cfg.cadence,
-                    "gate_window": cfg.gate_window,
-                    "gate_min_evidence": cfg.gate_min_evidence,
-                    "seed": cfg.seed,
-                    "device": cfg.device,
-                },
-            }
-            atomic_write_json(cfg.outdir / "run_config_resolved.json", run_config_resolved)
-        except Exception as exc:
-            logger.warning("Failed to write run_config_resolved.json: %s", exc)
     window_signature = _build_window_signature(cfg, created_ts_utc=started_ts)
     window_signature_ref: Dict[str, Any] = {"path": "window_signature.json"}
     if _is_chief():

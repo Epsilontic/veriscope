@@ -136,7 +136,7 @@ jobs:
           python -m pip install pytest
 
       - name: Pytest (hf micro smoke integration)
-        run: python -m pytest -m integration -k hf_micro_smoke_integration -s
+        run: python -m pytest -m integration -k "hf_micro_smoke_integration or hf_ddp_smoke_cpu" -s
 
   build:
     runs-on: ubuntu-latest
