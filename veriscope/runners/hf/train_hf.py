@@ -1094,7 +1094,88 @@ def _run_body(cfg: HFRunConfig, *, argv: List[str]) -> int:
         # Chief-only emission: only rank 0 writes artifacts and manifest.
         cfg.outdir.mkdir(parents=True, exist_ok=True)
 
-    device = torch.device(cfg.device)
+    # --- FAIL-LOUD DEVICE SELECTION (prove CUDA when requested) ---
+    # NOTE: _run() initializes DDP (if any) before calling _run_body(), so LOCAL_RANK
+    # pinning via torch.cuda.set_device(local_rank) should already be in effect here.
+    raw_device = str(cfg.device or "cpu")
+    requested = raw_device.lower().strip()
+    wants_cuda = requested in ("cuda", "gpu") or requested.startswith("cuda")
+
+    if wants_cuda:
+        if requested == "gpu":
+            requested = "cuda"
+
+        # Resolve device:
+        #   - "cuda" => follow current CUDA device (DDP-safe: uses whatever LOCAL_RANK pinned)
+        #   - "cuda:N" => honor explicit index (and verify it doesn't fight DDP pinning)
+        if requested.startswith("cuda:"):
+            device = torch.device(requested)
+        else:
+            device = torch.device("cuda")
+
+        cuda_avail = bool(torch.cuda.is_available())
+        cuda_count = int(torch.cuda.device_count()) if cuda_avail else 0
+        vis = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+
+        cur_dev: int | None = None
+        if cuda_avail and cuda_count > 0:
+            with contextlib.suppress(Exception):
+                cur_dev = int(torch.cuda.current_device())
+
+        logger.info(
+            "device.requested=%r device.resolved=%s torch.cuda.is_available=%s torch.cuda.device_count=%d "
+            "torch.cuda.current_device=%r CUDA_VISIBLE_DEVICES=%r",
+            raw_device,
+            device,
+            cuda_avail,
+            cuda_count,
+            cur_dev,
+            vis,
+        )
+
+        if (not cuda_avail) or cuda_count <= 0:
+            raise RuntimeError(
+                f"--device {raw_device!r} requested but torch reports no CUDA devices "
+                f"(is_available={cuda_avail}, device_count={cuda_count}, CUDA_VISIBLE_DEVICES={vis!r})"
+            )
+
+        # If an explicit CUDA index was requested, validate it against the *visible* device count.
+        # Note: indices are relative to CUDA_VISIBLE_DEVICES (torch already remaps accordingly).
+        if device.index is not None:
+            if device.index < 0 or device.index >= cuda_count:
+                raise RuntimeError(
+                    f"--device {raw_device!r} requested but device index is out of range for visible GPUs "
+                    f"(index={device.index}, visible_device_count={cuda_count}, CUDA_VISIBLE_DEVICES={vis!r})"
+                )
+
+            # Env-only "DDP-likely" detection (no dependency on distributed helpers here).
+            ws = os.environ.get("WORLD_SIZE")
+            ddp_likely = (ws not in (None, "", "1")) or (os.environ.get("LOCAL_RANK") not in (None, ""))
+
+            # Under DDP-like context, don't let an explicit cuda:N fight rank pinning.
+            if ddp_likely and cur_dev is not None and cur_dev != int(device.index):
+                raise RuntimeError(
+                    f"--device {raw_device!r} conflicts with current CUDA device under DDP-like context "
+                    f"(current_device={cur_dev}, requested_index={device.index}). "
+                    "Use --device cuda (follow LOCAL_RANK pinning) or ensure each rank requests its correct cuda:N."
+                )
+
+            # Outside DDP, best-effort pin to the requested index.
+            if not ddp_likely:
+                torch.cuda.set_device(int(device.index))
+
+        # Prove CUDA runtime is actually usable (catches driver/runtime issues beyond is_available()).
+        try:
+            torch.empty(1, device=device)
+        except Exception as e:
+            raise RuntimeError(
+                f"CUDA was requested but CUDA runtime failed on first use for device={device}: {e}"
+            ) from e
+    else:
+        # Preserve non-cuda strings (e.g., "cpu", "mps") as provided.
+        device = torch.device(raw_device)
+        logger.info("device.requested=%r device.resolved=%s", raw_device, device)
+    # --- END FAIL-LOUD DEVICE SELECTION ---
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -1109,7 +1190,20 @@ def _run_body(cfg: HFRunConfig, *, argv: List[str]) -> int:
         if hasattr(model, "config") and hasattr(model.config, "tie_word_embeddings"):
             model.config.tie_word_embeddings = False
     model.config.use_cache = False
-    model.to(device)
+    # Move to device and fail loudly if it doesn't stick.
+    try:
+        model.to(device)
+    except Exception as e:
+        raise RuntimeError(f"failed to move model to device={device}: {e}") from e
+
+    # Hard assertion: if CUDA resolved, verify parameters/buffers are actually CUDA.
+    if device.type == "cuda":
+        for p in model.parameters():
+            if p.device.type != "cuda":
+                raise RuntimeError(f"CUDA requested but found parameter on non-CUDA device: {p.device}")
+        for b in model.buffers():
+            if b.device.type != "cuda":
+                raise RuntimeError(f"CUDA requested but found buffer on non-CUDA device: {b.device}")
     model.train()
     vocab_size = int(
         getattr(model.config, "vocab_size", None) or getattr(tokenizer, "vocab_size", None) or len(tokenizer)

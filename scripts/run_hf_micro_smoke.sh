@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 
 set -euo pipefail
+
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/.." && pwd)"
 
@@ -20,21 +21,57 @@ if [[ "${1:-}" == "--" ]]; then
   extra_args=("$@")
 fi
 
-# Safe string form for logging under `set -u`.
-extra_args_str=""
-if [[ ${#extra_args[@]} -gt 0 ]]; then
-  extra_args_str="${extra_args[*]}"
-fi
-
-# If the caller overrides --device, reflect it in shims/logging.
+# If the caller overrides --device, reflect it in shims/logging AND avoid passing --device twice.
+# Supports both:
+#   --device cuda
+#   --device=cuda
 smoke_device="cpu"
+caller_provided_device=0
 for ((i=0; i<${#extra_args[@]}; i++)); do
-  if [[ "${extra_args[$i]}" == "--device" ]]; then
-    if (( i+1 < ${#extra_args[@]} )); then
-      smoke_device="${extra_args[$((i+1))]}"
+  tok="${extra_args[$i]}"
+  if [[ "${tok}" == "--device" ]]; then
+    caller_provided_device=1
+    if (( i+1 >= ${#extra_args[@]} )); then
+      echo "[micro-smoke] ERROR: --device provided without a value" >&2
+      exit 2
     fi
+    smoke_device="${extra_args[$((i+1))]}"   # last one wins
+    continue
+  fi
+  if [[ "${tok}" == --device=* ]]; then
+    caller_provided_device=1
+    smoke_device="${tok#--device=}"          # last one wins
+    continue
   fi
 done
+
+# Filter device overrides out of extra_args so we don't pass --device twice.
+# Removes:
+#   --device <val>
+#   --device=<val>
+extra_args_filtered=()
+skip_next=0
+for ((i=0; i<${#extra_args[@]}; i++)); do
+  tok="${extra_args[$i]}"
+  if (( skip_next )); then
+    skip_next=0
+    continue
+  fi
+  if [[ "${tok}" == "--device" ]]; then
+    skip_next=1
+    continue
+  fi
+  if [[ "${tok}" == --device=* ]]; then
+    continue
+  fi
+  extra_args_filtered+=("${tok}")
+done
+
+# Safe string form for logging under `set -u`.
+extra_args_str=""
+if [[ ${#extra_args_filtered[@]} -gt 0 ]]; then
+  extra_args_str="${extra_args_filtered[*]}"
+fi
 
 mkdir -p "${outdir}"
 
@@ -56,7 +93,7 @@ python_bin="${VERISCOPE_PYTHON_BIN:-python}"
 echo "[micro-smoke] outdir=${outdir}"
 echo "[micro-smoke] timeout=${timeout_secs}s"
 echo "[micro-smoke] extra_args=${extra_args_str}"
-echo "[micro-smoke] cmd: ${python_bin} -m veriscope.cli.main run hf --gate-preset tuned_v0 --outdir ${outdir} ${force_flag_str} -- --outdir ${outdir} --run_id hf-micro-smoke --model sshleifer/tiny-gpt2 --dataset file:${repo_root}/tests/data/hf_micro_smoke.txt --dataset_split train --max_steps 16 --batch_size 1 --block_size 32 --cadence 1 --gate_window 2 --gate_min_evidence 2 --rp_dim 8 --seed 1337 --device cpu ${extra_args_str}"
+echo "[micro-smoke] cmd: ${python_bin} -m veriscope.cli.main run hf --gate-preset tuned_v0 --outdir ${outdir} ${force_flag_str} -- --outdir ${outdir} --run_id hf-micro-smoke --model sshleifer/tiny-gpt2 --dataset file:${repo_root}/tests/data/hf_micro_smoke.txt --dataset_split train --max_steps 16 --batch_size 1 --block_size 32 --cadence 1 --gate_window 2 --gate_min_evidence 2 --rp_dim 8 --seed 1337 --device ${smoke_device} ${extra_args_str}"
 
 cmd=(
   "${python_bin}" -m veriscope.cli.main run hf
@@ -80,12 +117,12 @@ cmd+=(
   --gate_min_evidence 2
   --rp_dim 8
   --seed 1337
-  --device cpu
+  --device "${smoke_device}"
 )
 
 # Append any caller-provided overrides AFTER defaults so argparse takes the last occurrence.
-if [[ ${#extra_args[@]} -gt 0 ]]; then
-  cmd+=("${extra_args[@]}")
+if [[ ${#extra_args_filtered[@]} -gt 0 ]]; then
+  cmd+=("${extra_args_filtered[@]}")
 fi
 
 log="${outdir}/hf_micro_smoke.log"
