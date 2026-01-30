@@ -20,7 +20,11 @@ from veriscope.core.artifacts import (
     WindowSignatureRefV1,
     derive_final_decision,
 )
-from veriscope.core.jsonutil import atomic_write_json, atomic_write_pydantic_json, canonical_json_sha256
+from veriscope.core.jsonutil import (
+    atomic_write_json,
+    atomic_write_pydantic_json,
+    window_signature_sha256,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -313,7 +317,7 @@ def emit_gpt_artifacts_v1(
 
     # Hash consistency: hash what is actually on disk (parsed object), not the in-memory dict.
     window_sig_on_disk = _read_json_obj(window_signature_path)
-    ws_hash = canonical_json_sha256(window_sig_on_disk)
+    ws_hash = window_signature_sha256(window_sig_on_disk)
     ws_ref = WindowSignatureRefV1(hash=ws_hash, path="window_signature.json")
     argv_list = list(argv) if argv is not None else list(sys.argv)
     try:

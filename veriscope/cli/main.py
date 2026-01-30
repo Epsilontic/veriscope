@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from veriscope.core.artifacts import CountsV1, ProfileV1, ResultsSummaryV1, RunStatus, WindowSignatureRefV1
-from veriscope.core.jsonutil import atomic_write_json, canonical_json_sha256
+from veriscope.core.jsonutil import atomic_write_json, window_signature_sha256
 from veriscope.core.lifecycle import RunLifecycle, map_status_and_exit
 from veriscope.core.redaction_policy import POLICY_REV, default_env_capture, prepare_env_capture, redact_argv
 
@@ -219,7 +219,7 @@ def _ensure_window_signature(outdir: Path, *, reason: str, run_kind: str) -> Win
         placeholder_with_error["error"] = {"message": err}
         atomic_write_json(ws_path, placeholder_with_error)
         ws_obj = placeholder_with_error
-    ws_hash = canonical_json_sha256(ws_obj)
+    ws_hash = window_signature_sha256(ws_obj)
     return WindowSignatureRefV1(hash=ws_hash, path="window_signature.json")
 
 

@@ -21,9 +21,10 @@ from veriscope.core.ddp import ddp_is_chief
 from veriscope.core.jsonutil import (
     atomic_write_json,
     atomic_write_pydantic_json,
+    canonicalize_window_signature,
     canonical_dumps,
-    canonical_json_sha256,
     read_json_obj,
+    window_signature_sha256,
 )
 
 logger = logging.getLogger(__name__)
@@ -84,7 +85,7 @@ def emit_hf_artifacts_v1(
             window_signature_path=outdir / "window_signature.json",
             results_path=outdir / "results.json",
             results_summary_path=outdir / "results_summary.json",
-            window_signature_hash=canonical_json_sha256(window_signature),
+            window_signature_hash=window_signature_sha256(window_signature),
             emitted=False,
         )
     outdir.mkdir(parents=True, exist_ok=True)
@@ -92,11 +93,11 @@ def emit_hf_artifacts_v1(
     window_signature_path = outdir / "window_signature.json"
     if window_signature_path.exists():
         ws_on_disk = read_json_obj(window_signature_path)
-        ws_hash = canonical_json_sha256(ws_on_disk)
-        ws_on_disk_canonical = canonical_dumps(ws_on_disk)
-        ws_in_memory_canonical = canonical_dumps(window_signature)
+        ws_hash = window_signature_sha256(ws_on_disk)
+        ws_on_disk_canonical = canonical_dumps(canonicalize_window_signature(ws_on_disk))
+        ws_in_memory_canonical = canonical_dumps(canonicalize_window_signature(window_signature))
         if ws_on_disk_canonical != ws_in_memory_canonical:
-            ws_in_memory_hash = canonical_json_sha256(window_signature)
+            ws_in_memory_hash = window_signature_sha256(window_signature)
             raise ValueError(
                 "window_signature.json already exists and differs from the provided window_signature; "
                 f"on-disk hash={ws_hash} in-memory hash={ws_in_memory_hash}. "
@@ -105,7 +106,7 @@ def emit_hf_artifacts_v1(
     else:
         atomic_write_json(window_signature_path, window_signature)
         ws_on_disk = read_json_obj(window_signature_path)
-        ws_hash = canonical_json_sha256(ws_on_disk)
+        ws_hash = window_signature_sha256(ws_on_disk)
     ws_ref = WindowSignatureRefV1(hash=ws_hash, path="window_signature.json")
 
     gate_records_list = list(gate_records)

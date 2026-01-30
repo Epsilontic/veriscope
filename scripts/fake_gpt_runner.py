@@ -24,7 +24,7 @@ from veriscope.core.artifacts import (
     RunStatus,
     WindowSignatureRefV1,
 )
-from veriscope.core.jsonutil import atomic_write_json, canonical_json_sha256
+from veriscope.core.jsonutil import atomic_write_json, window_signature_sha256
 
 SUCCESS_STATUS: RunStatus = "success"
 USER_CODE_FAILURE: RunStatus = "user_code_failure"
@@ -42,7 +42,7 @@ def _read_json_obj(path: Path) -> dict[str, Any]:
 def _emit_minimal_artifacts(out_dir: Path, *, run_status: RunStatus, runner_exit_code: int) -> None:
     ws_path = out_dir / "window_signature.json"
     ws_obj = _read_json_obj(ws_path) if ws_path.exists() else {"schema_version": 1, "placeholder": True}
-    ws_hash = canonical_json_sha256(ws_obj)
+    ws_hash = window_signature_sha256(ws_obj)
     ws_ref = WindowSignatureRefV1(hash=ws_hash, path="window_signature.json")
 
     run_config_path = out_dir / "run_config_resolved.json"

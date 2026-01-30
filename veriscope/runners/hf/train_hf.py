@@ -39,7 +39,7 @@ from veriscope.core.gate import GateEngine
 from veriscope.core.transport import DeclTransport
 from veriscope.core.window import FRWindow, WindowDecl
 from veriscope.core.governance import append_gate_decision, append_run_started, build_code_identity
-from veriscope.core.jsonutil import atomic_write_json, canonical_json_sha256, read_json_obj
+from veriscope.core.jsonutil import atomic_write_json, read_json_obj, window_signature_sha256
 from veriscope.runners.hf.adapter import HFMetricComputer, HFMetricConfig
 from veriscope.runners.hf.emit_artifacts import emit_hf_artifacts_v1
 
@@ -1133,7 +1133,7 @@ def _run_body(cfg: HFRunConfig, *, argv: List[str]) -> int:
         try:
             window_signature_path = cfg.outdir / "window_signature.json"
             atomic_write_json(window_signature_path, window_signature)
-            window_signature_ref["hash"] = canonical_json_sha256(read_json_obj(window_signature_path))
+            window_signature_ref["hash"] = window_signature_sha256(read_json_obj(window_signature_path))
         except Exception as exc:
             logger.warning("Failed to write window_signature.json before governance: %s", exc)
 

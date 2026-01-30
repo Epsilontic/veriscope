@@ -7,7 +7,7 @@ import math
 import os
 import uuid
 from pathlib import Path
-from typing import Any, Union
+from typing import Any, Mapping, Union
 
 try:
     # Pydantic v2 (core dep in your repo now); kept optional to avoid hard import coupling.
@@ -59,6 +59,23 @@ def sha256_hex(data: bytes) -> str:
 def canonical_json_sha256(obj: Any) -> str:
     """SHA256 hex digest of canonical JSON bytes (canonical_dumps -> utf-8 -> sha256)."""
     return sha256_hex(canonical_dumps(obj).encode("utf-8"))
+
+
+WINDOW_SIGNATURE_VOLATILE_KEYS = frozenset({"created_ts_utc"})
+
+
+def canonicalize_window_signature(window_signature: Mapping[str, Any]) -> dict[str, Any]:
+    """
+    Return a canonicalized window signature for hashing/comparability.
+
+    Volatile metadata (e.g., created_ts_utc) is excluded so identical evidence spaces remain comparable.
+    """
+    return {key: value for key, value in window_signature.items() if key not in WINDOW_SIGNATURE_VOLATILE_KEYS}
+
+
+def window_signature_sha256(window_signature: Mapping[str, Any]) -> str:
+    """SHA256 hash of the canonicalized window signature."""
+    return canonical_json_sha256(canonicalize_window_signature(window_signature))
 
 
 def sanitize_json_value(obj: Any) -> Any:

@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from veriscope.core.artifacts import CountsV1, derive_final_decision
-from veriscope.core.jsonutil import canonical_json_sha256, read_json_obj
+from veriscope.core.jsonutil import read_json_obj, window_signature_sha256
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -117,7 +117,7 @@ def test_hf_micro_smoke_integration(tmp_path: Path) -> None:
     assert summary_path.exists()
     assert manifest_path.exists()
 
-    ws_hash = canonical_json_sha256(read_json_obj(window_signature_path))
+    ws_hash = window_signature_sha256(read_json_obj(window_signature_path))
     results = read_json_obj(results_path)
     summary = read_json_obj(summary_path)
 

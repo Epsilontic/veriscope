@@ -77,8 +77,8 @@ OUTDIR/
 If a referenced file exists, it MUST be consistent:  
   
 - `results_summary.run_id` MUST match `results.run_id` (if `results.json` exists)  
-- `results_summary.window_signature_ref.hash` MUST equal the recomputed hash of `window_signature.json` (i.e. `sha256(canonical_json(window_signature.json))` per §7)  
-- `results.window_signature_ref.hash` MUST equal the recomputed hash of `window_signature.json` (i.e. `sha256(canonical_json(window_signature.json))` per §7) (if `results.json` exists)  
+- `results_summary.window_signature_ref.hash` MUST equal the recomputed hash of `window_signature.json` (i.e. `sha256(canonical_json(window_signature.json))` after dropping volatile keys like `created_ts_utc`, per §7)  
+- `results.window_signature_ref.hash` MUST equal the recomputed hash of `window_signature.json` (i.e. `sha256(canonical_json(window_signature.json))` after dropping volatile keys like `created_ts_utc`, per §7) (if `results.json` exists)  
 - `counts.evaluated == counts.pass + counts.warn + counts.fail`  
 - Gate emitters MUST emit one `GateRecord` per cadence; non-evaluated cadences MUST be emitted with `decision="skip"` so summary counts match `len(results.gates)`.  
 - If `results.json` exists:    
@@ -184,7 +184,7 @@ type RunStatus = "success" | "user_code_failure" | "veriscope_failure";
 ```  
   
 ### 6.3 `window_signature.json` (comparability root)  
-This file defines the evidence space. **Any change to its contents changes the hash**, and therefore comparability.  
+This file defines the evidence space. **Any change to its identity-defining contents changes the hash** (excluding volatile metadata like `created_ts_utc`), and therefore comparability.  
   
 ```ts  
 interface WindowSignatureV1 {  
@@ -396,7 +396,7 @@ json.dumps(
 - `sha256(utf8_bytes(canonical_json_string)) -> lowercase hex digest`  
   
 ### 7.3 Window signature hash (comparability key)  
-- `window_signature_ref.hash == sha256(canonical_json(window_signature.json))`  
+- `window_signature_ref.hash == sha256(canonical_json(window_signature.json))` with volatile keys (e.g., `created_ts_utc`) removed first.  
   
 **Important: avoid self-reference traps**  
 - Treat the file hash as authoritative.  

@@ -9,7 +9,12 @@ from pathlib import Path
 import veriscope
 from veriscope.core.governance import append_run_started, build_code_identity
 from veriscope.core.artifacts import CountsV1, ProfileV1, ResultsSummaryV1, ResultsV1, WindowSignatureRefV1
-from veriscope.core.jsonutil import atomic_write_json, atomic_write_pydantic_json, canonical_json_sha256, read_json_obj
+from veriscope.core.jsonutil import (
+    atomic_write_json,
+    atomic_write_pydantic_json,
+    read_json_obj,
+    window_signature_sha256,
+)
 
 
 def _iso_utc_now() -> str:
@@ -30,7 +35,7 @@ def _emit_minimal_artifacts(outdir: Path, run_id: str, gate_preset: str) -> None
     }
     window_signature_path = outdir / "window_signature.json"
     atomic_write_json(window_signature_path, window_signature)
-    ws_hash = canonical_json_sha256(read_json_obj(window_signature_path))
+    ws_hash = window_signature_sha256(read_json_obj(window_signature_path))
     ws_ref = WindowSignatureRefV1(hash=ws_hash, path="window_signature.json")
     try:
         append_run_started(

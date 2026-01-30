@@ -33,7 +33,7 @@ json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 ```
 
 Hashing requirements:
-- `window_signature_ref.hash` equals `sha256(canonical_json(window_signature.json))`.
+- `window_signature_ref.hash` equals `sha256(canonical_json(window_signature.json))` with volatile keys (e.g., `created_ts_utc`) removed first.
 - `window_signature_ref.path` equals `"window_signature.json"`.
 - Governance log hash chaining uses:
   - `entry_hash = sha256(canonical_json(entry_without_entry_hash))`

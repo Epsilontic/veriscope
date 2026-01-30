@@ -20,7 +20,7 @@ except Exception:  # pragma: no cover
 
 from veriscope.core.governance import read_governance_log, validate_governance_log
 from veriscope.core.artifacts import ManualJudgementV1, ResultsSummaryV1, ResultsV1
-from veriscope.core.jsonutil import canonical_json_sha256
+from veriscope.core.jsonutil import window_signature_sha256
 
 
 @dataclass(frozen=True)
@@ -194,7 +194,7 @@ def validate_outdir(
 
     # 4) Hash verification (hash what's on disk)
     try:
-        ws_hash = canonical_json_sha256(ws_obj)
+        ws_hash = window_signature_sha256(ws_obj)
     except Exception as e:
         return ValidationResult(False, f"Failed to compute canonical hash: {e}")
 
