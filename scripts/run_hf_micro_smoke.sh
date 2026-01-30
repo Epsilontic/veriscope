@@ -7,6 +7,35 @@ repo_root="$(cd "${script_dir}/.." && pwd)"
 ts="$(date +%Y%m%d_%H%M%S)"
 outdir="${1:-./out/hf_micro_smoke_${ts}}"
 
+# Allow forwarding extra runner args after a `--` sentinel.
+# Usage: bash scripts/run_hf_micro_smoke.sh <outdir> -- --device cuda --max_steps 12 ...
+extra_args=()
+# Shift off the outdir argument if present.
+if [[ $# -gt 0 ]]; then
+  shift
+fi
+
+if [[ "${1:-}" == "--" ]]; then
+  shift
+  extra_args=("$@")
+fi
+
+# Safe string form for logging under `set -u`.
+extra_args_str=""
+if [[ ${#extra_args[@]} -gt 0 ]]; then
+  extra_args_str="${extra_args[*]}"
+fi
+
+# If the caller overrides --device, reflect it in shims/logging.
+smoke_device="cpu"
+for ((i=0; i<${#extra_args[@]}; i++)); do
+  if [[ "${extra_args[$i]}" == "--device" ]]; then
+    if (( i+1 < ${#extra_args[@]} )); then
+      smoke_device="${extra_args[$((i+1))]}"
+    fi
+  fi
+done
+
 mkdir -p "${outdir}"
 
 # Ensure runner-side defaults (if the wrapper does not pass --outdir through) remain inside this capsule root.
@@ -26,7 +55,8 @@ python_bin="${VERISCOPE_PYTHON_BIN:-python}"
 
 echo "[micro-smoke] outdir=${outdir}"
 echo "[micro-smoke] timeout=${timeout_secs}s"
-echo "[micro-smoke] cmd: ${python_bin} -m veriscope.cli.main run hf --gate-preset tuned_v0 --outdir ${outdir} ${force_flag_str} -- --outdir ${outdir} --run_id hf-micro-smoke --model sshleifer/tiny-gpt2 --dataset file:${repo_root}/tests/data/hf_micro_smoke.txt --dataset_split train --max_steps 16 --batch_size 1 --block_size 32 --cadence 1 --gate_window 2 --gate_min_evidence 2 --rp_dim 8 --seed 1337 --device cpu"
+echo "[micro-smoke] extra_args=${extra_args_str}"
+echo "[micro-smoke] cmd: ${python_bin} -m veriscope.cli.main run hf --gate-preset tuned_v0 --outdir ${outdir} ${force_flag_str} -- --outdir ${outdir} --run_id hf-micro-smoke --model sshleifer/tiny-gpt2 --dataset file:${repo_root}/tests/data/hf_micro_smoke.txt --dataset_split train --max_steps 16 --batch_size 1 --block_size 32 --cadence 1 --gate_window 2 --gate_min_evidence 2 --rp_dim 8 --seed 1337 --device cpu ${extra_args_str}"
 
 cmd=(
   "${python_bin}" -m veriscope.cli.main run hf
@@ -52,6 +82,11 @@ cmd+=(
   --seed 1337
   --device cpu
 )
+
+# Append any caller-provided overrides AFTER defaults so argparse takes the last occurrence.
+if [[ ${#extra_args[@]} -gt 0 ]]; then
+  cmd+=("${extra_args[@]}")
+fi
 
 log="${outdir}/hf_micro_smoke.log"
 
@@ -246,7 +281,7 @@ if [[ ! -f "${capdir}/run_manifest.json" ]]; then
   "capdir": "${capdir}",
   "python_bin": "${python_bin}",
   "timeout_secs": ${timeout_secs},
-  "cmd_str": "${python_bin} -m veriscope.cli.main run hf --gate-preset tuned_v0 --outdir ${outdir} ${force_flag_str} -- --outdir ${outdir} --run_id hf-micro-smoke --model sshleifer/tiny-gpt2 --dataset file:${repo_root}/tests/data/hf_micro_smoke.txt --dataset_split train --max_steps 16 --batch_size 1 --block_size 32 --cadence 1 --gate_window 2 --gate_min_evidence 2 --rp_dim 8 --seed 1337 --device cpu",
+  "cmd_str": "${python_bin} -m veriscope.cli.main run hf --gate-preset tuned_v0 --outdir ${outdir} ${force_flag_str} -- --outdir ${outdir} --run_id hf-micro-smoke --model sshleifer/tiny-gpt2 --dataset file:${repo_root}/tests/data/hf_micro_smoke.txt --dataset_split train --max_steps 16 --batch_size 1 --block_size 32 --cadence 1 --gate_window 2 --gate_min_evidence 2 --rp_dim 8 --seed 1337 --device ${smoke_device}",
   "artifacts": {
     "window_signature": "window_signature.json",
     "results": "results.json",
@@ -265,7 +300,7 @@ if [[ ! -f "${capdir}/run_manifest.json" ]]; then
     "gate_min_evidence": 2,
     "rp_dim": 8,
     "seed": 1337,
-    "device": "cpu"
+    "device": "${smoke_device}"
   }
 }
 JSON
