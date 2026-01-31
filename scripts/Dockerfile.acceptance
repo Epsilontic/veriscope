@@ -6,13 +6,15 @@ RUN apt-get update \
   && apt-get install -y --no-install-recommends bash git \
   && rm -rf /var/lib/apt/lists/*
 
+ARG NANOGPT_REPO=https://github.com/karpathy/nanoGPT.git
+ARG NANOGPT_REF=8a2ee24f9f0f0f5c73f2a72f19574ae89c0d0a0f
+
 # Keep the image small and deterministic: GH Actions runners don't have GPUs,
 # so we explicitly use CPU-only torch wheels (avoid pulling CUDA user-space deps).
 # Also: make Docker layer cache stick by installing heavy deps before copying the full repo.
 RUN python -m pip install --upgrade pip \
   && python -m pip install build \
-  && python -m pip install --index-url https://download.pytorch.org/whl/cpu torch \
-  && python -m pip install requests
+  && python -m pip install numpy requests
 
 # Copy only packaging metadata + the package sources needed to build a wheel.
 # This keeps the expensive dependency layers above cacheable across most code changes.
@@ -21,9 +23,19 @@ COPY README* /work/
 COPY veriscope /work/veriscope
 
 # Build + install a wheel (non-editable) so we don't need the full repo to install.
-# Tighten: ensure any torch resolution prefers CPU wheels.
+# IMPORTANT: install the wheel from the default index (PyPI) for deps;
+# we install torch separately from the CPU-only index below.
 RUN python -m build --wheel --outdir /tmp/dist \
-  && python -m pip install --extra-index-url https://download.pytorch.org/whl/cpu /tmp/dist/*.whl
+  && python -m pip install /tmp/dist/*.whl
+
+# Now install CPU-only torch explicitly (avoid pulling CUDA user-space deps).
+RUN python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
+
+# Bake in a pinned nanoGPT checkout + prepared shakespeare_char bins.
+RUN git clone --filter=blob:none "${NANOGPT_REPO}" /work/nanoGPT \
+  && cd /work/nanoGPT \
+  && git checkout "${NANOGPT_REF}" \
+  && python /work/nanoGPT/data/shakespeare_char/prepare.py
 
 # Finally copy the rest of the repo (tests/scripts/etc). Changes here won't invalidate the heavy pip layers.
 COPY . /work
