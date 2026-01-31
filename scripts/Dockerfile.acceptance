@@ -7,7 +7,9 @@ RUN apt-get update \
   && rm -rf /var/lib/apt/lists/*
 
 ARG NANOGPT_REPO=https://github.com/karpathy/nanoGPT.git
-ARG NANOGPT_REF=8a2ee24f9f0f0f5c73f2a72f19574ae89c0d0a0f
+# NOTE: This must be reachable from the remote's advertised refs.
+# If CI fails with "upload-pack: not our ref", refresh this pin.
+ARG NANOGPT_REF=3adf61e154c3fe3fca428ad6bc3818b27a3b8291
 
 # Keep the image small and deterministic: GH Actions runners don't have GPUs,
 # so we explicitly use CPU-only torch wheels (avoid pulling CUDA user-space deps).
@@ -32,9 +34,13 @@ RUN python -m build --wheel --outdir /tmp/dist \
 RUN python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
 
 # Bake in a pinned nanoGPT checkout + prepared shakespeare_char bins.
-RUN git clone --filter=blob:none "${NANOGPT_REPO}" /work/nanoGPT \
+# Use a deterministic, minimal fetch of the pinned commit so CI doesn't depend
+# on whatever refs the default clone happens to download.
+RUN git init /work/nanoGPT \
   && cd /work/nanoGPT \
-  && git checkout "${NANOGPT_REF}" \
+  && git remote add origin "${NANOGPT_REPO}" \
+  && git fetch --depth 1 origin "${NANOGPT_REF}" \
+  && git checkout --detach FETCH_HEAD \
   && python /work/nanoGPT/data/shakespeare_char/prepare.py
 
 # Finally copy the rest of the repo (tests/scripts/etc). Changes here won't invalidate the heavy pip layers.
