@@ -170,8 +170,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Build acceptance image
-        run: docker build -f scripts/Dockerfile.acceptance -t veriscope-acceptance:ci .
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build acceptance image (cached)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: scripts/Dockerfile.acceptance
+          tags: veriscope-acceptance:ci
+          load: true
+          cache-from: type=gha,scope=container-acceptance
+          cache-to: type=gha,scope=container-acceptance,mode=max
 
       - name: Run container acceptance
         run: |

@@ -4,6 +4,8 @@ import json
 import os
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 import pytest
@@ -81,6 +83,34 @@ def _hf_smoke_env(tmp_path: Path) -> dict[str, str]:
     return env
 
 
+def _skip_if_hf_unreachable() -> None:
+    try:
+        req = urllib.request.Request("https://huggingface.co", method="HEAD")
+        with urllib.request.urlopen(req, timeout=5):
+            return
+    except (urllib.error.URLError, TimeoutError):
+        pytest.skip("Hugging Face hub unreachable; skipping HF micro smoke.")
+
+
+def _maybe_skip_hf_download_failure(result: subprocess.CompletedProcess[str]) -> None:
+    if result.returncode == 0:
+        return
+    output = f"{result.stdout}\n{result.stderr}".lower()
+    patterns = (
+        "readtimeout",
+        "read timeout",
+        "connectionerror",
+        "connection error",
+        "hf_hub_download",
+        "can't load the model",
+        "sslerror",
+        "maxretryerror",
+        "temporary failure in name resolution",
+    )
+    if any(p in output for p in patterns):
+        pytest.skip("Hugging Face hub download failed; skipping HF micro smoke.")
+
+
 @pytest.mark.integration
 def test_hf_micro_smoke_integration(tmp_path: Path) -> None:
     pytest.importorskip("torch")
@@ -88,6 +118,7 @@ def test_hf_micro_smoke_integration(tmp_path: Path) -> None:
     pytest.importorskip("datasets")
     if os.environ.get("HF_HUB_OFFLINE") == "1" or os.environ.get("TRANSFORMERS_OFFLINE") == "1":
         pytest.skip("HF offline mode enabled; skipping HF micro smoke.")
+    _skip_if_hf_unreachable()
 
     outdir = tmp_path / "hf_micro_smoke"
     env = _hf_smoke_env(tmp_path)
@@ -103,6 +134,7 @@ def test_hf_micro_smoke_integration(tmp_path: Path) -> None:
         check=False,
         timeout=240,
     )
+    _maybe_skip_hf_download_failure(result)
     assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
 
     capdir = _resolve_capsule_dir(outdir)
@@ -160,6 +192,7 @@ def test_hf_micro_smoke_direct_runner_governance(tmp_path: Path) -> None:
     pytest.importorskip("datasets")
     if os.environ.get("HF_HUB_OFFLINE") == "1" or os.environ.get("TRANSFORMERS_OFFLINE") == "1":
         pytest.skip("HF offline mode enabled; skipping HF micro smoke.")
+    _skip_if_hf_unreachable()
 
     outdir = tmp_path / "hf_micro_direct"
     env = _hf_smoke_env(tmp_path)
@@ -208,6 +241,7 @@ def test_hf_micro_smoke_direct_runner_governance(tmp_path: Path) -> None:
         check=False,
         timeout=240,
     )
+    _maybe_skip_hf_download_failure(result)
     assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
 
     capdir = _resolve_capsule_dir(outdir)
