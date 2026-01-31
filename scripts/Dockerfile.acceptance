@@ -18,10 +18,14 @@ RUN python -m pip install --upgrade pip \
   && python -m pip install build \
   && python -m pip install numpy requests
 
+# Now install CPU-only torch explicitly (avoid pulling CUDA user-space deps).
+RUN python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
+
 # Copy only packaging metadata + the package sources needed to build a wheel.
 # This keeps the expensive dependency layers above cacheable across most code changes.
 COPY pyproject.toml /work/
 COPY README* /work/
+COPY LICENSE /work/
 COPY veriscope /work/veriscope
 
 # Build + install a wheel (non-editable) so we don't need the full repo to install.
@@ -30,8 +34,7 @@ COPY veriscope /work/veriscope
 RUN python -m build --wheel --outdir /tmp/dist \
   && python -m pip install /tmp/dist/*.whl
 
-# Now install CPU-only torch explicitly (avoid pulling CUDA user-space deps).
-RUN python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
+# Acceptance uses `veriscope report`, which requires report dependencies.
 
 # Bake in a pinned nanoGPT checkout + prepared shakespeare_char bins.
 # Use a deterministic, minimal fetch of the pinned commit so CI doesn't depend

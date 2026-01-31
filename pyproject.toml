@@ -8,16 +8,14 @@ version = "0.1.0"
 description = "Finite-window early warning and gating (refactor)"
 readme = "README.md"
 requires-python = ">=3.9"
-license = { file = "LICENSE" }
+license = "AGPL-3.0-only"
+license-files = ["LICENSE"]
 authors = [{name = "Craig Holmander"}]
 dependencies = [
   "numpy>=1.21",
-  "pandas>=1.3",
-  "matplotlib>=3.5",
-  "filelock>=3.7",
-  "pyarrow>=14.0",
   "pydantic>=2.0,<3",
   "typing_extensions>=4.0",
+  "filelock>=3.7",
 ]
 classifiers = [
   "License :: OSI Approved :: GNU Affero General Public License v3",
@@ -32,13 +30,20 @@ Notice = "https://github.com/Epsilontic/veriscope/blob/main/NOTICE"
 Trademark = "https://github.com/Epsilontic/veriscope/blob/main/TRADEMARK.md"
 
 [project.optional-dependencies]
+# Reporting / analysis surface area (kept out of minimal acceptance installs).
+report = [
+  "pandas>=1.3",
+  "matplotlib>=3.5",
+  "pyarrow>=14.0",
+]
+
 torch = ["torch>=2.1", "torchvision>=0.16"]
 hf = ["torch>=2.1", "torchvision>=0.16", "transformers", "datasets", "accelerate"]
 topo = ["ripser>=0.6.4"]
 
-[project.scripts]  
-veriscope = "veriscope.cli.main:main"  
-veriscope-legacy = "veriscope.fr_integration:main"  
+[project.scripts]
+veriscope = "veriscope.cli.main:main"
+veriscope-legacy = "veriscope.fr_integration:main"
 
 [tool.setuptools.packages.find]
 include = ["veriscope*"]
