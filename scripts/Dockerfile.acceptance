@@ -21,8 +21,9 @@ COPY README* /work/
 COPY veriscope /work/veriscope
 
 # Build + install a wheel (non-editable) so we don't need the full repo to install.
+# Tighten: ensure any torch resolution prefers CPU wheels.
 RUN python -m build --wheel --outdir /tmp/dist \
-  && python -m pip install --no-deps /tmp/dist/*.whl
+  && python -m pip install --extra-index-url https://download.pytorch.org/whl/cpu /tmp/dist/*.whl
 
 # Finally copy the rest of the repo (tests/scripts/etc). Changes here won't invalidate the heavy pip layers.
 COPY . /work
