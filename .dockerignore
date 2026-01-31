@@ -37,7 +37,11 @@ outputs/
 runs/
 wandb/
 
+# CI/container acceptance outputs
+out_container_acceptance/
+
 # Data (nanoGPT / datasets)
+nanoGPT/
 nanoGPT/data/
 data/
 *.bin

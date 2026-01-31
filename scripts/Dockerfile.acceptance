@@ -2,17 +2,29 @@ FROM python:3.11-slim
 
 WORKDIR /work
 
-COPY . /work
-
 RUN apt-get update \
   && apt-get install -y --no-install-recommends bash git \
   && rm -rf /var/lib/apt/lists/*
 
 # Keep the image small and deterministic: GH Actions runners don't have GPUs,
 # so we explicitly use CPU-only torch wheels (avoid pulling CUDA user-space deps).
+# Also: make Docker layer cache stick by installing heavy deps before copying the full repo.
 RUN python -m pip install --upgrade pip \
-  && python -m pip install -e "." \
+  && python -m pip install build \
   && python -m pip install --index-url https://download.pytorch.org/whl/cpu torch \
   && python -m pip install requests
+
+# Copy only packaging metadata + the package sources needed to build a wheel.
+# This keeps the expensive dependency layers above cacheable across most code changes.
+COPY pyproject.toml /work/
+COPY README* /work/
+COPY veriscope /work/veriscope
+
+# Build + install a wheel (non-editable) so we don't need the full repo to install.
+RUN python -m build --wheel --outdir /tmp/dist \
+  && python -m pip install --no-deps /tmp/dist/*.whl
+
+# Finally copy the rest of the repo (tests/scripts/etc). Changes here won't invalidate the heavy pip layers.
+COPY . /work
 
 CMD ["bash"]
