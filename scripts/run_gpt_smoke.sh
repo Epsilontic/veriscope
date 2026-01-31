@@ -15,6 +15,13 @@ extra_args=("$@")
 
 nanogpt_dir="${NANOGPT_DIR:-./nanoGPT}"
 
+# Default dataset for smoke. (If you later add dataset override parsing, update this.)
+smoke_dataset="${VERISCOPE_GPT_SMOKE_DATASET:-shakespeare_char}"
+
+dataset_dir="${nanogpt_dir}/data/${smoke_dataset}"
+train_bin="${dataset_dir}/train.bin"
+prep_py="${dataset_dir}/prepare.py"
+
 force_flag=()
 if [[ -n "${VERISCOPE_FORCE:-}" ]]; then
   force_flag=(--force)
@@ -66,12 +73,25 @@ fi
 echo "[smoke] outdir=${outdir}"
 echo "[smoke] nanogpt_dir=${nanogpt_dir}"
 echo "[smoke] extra_args=${extra_args_str}"
-echo "[smoke] cmd: veriscope run gpt --outdir ${outdir} ${force_flag[*]:-} -- --dataset shakespeare_char --nanogpt_dir ${nanogpt_dir} --device ${smoke_device} --max_iters 200 --no_regime ${extra_args_str}"
+echo "[smoke] cmd: veriscope run gpt --outdir ${outdir} ${force_flag[*]:-} -- --dataset ${smoke_dataset} --nanogpt_dir ${nanogpt_dir} --device ${smoke_device} --max_iters 200 --no_regime ${extra_args_str}"
+
+# Ensure nanoGPT dataset bins exist inside fresh environments (e.g., containers).
+if [[ ! -f "${train_bin}" ]]; then
+  if [[ -f "${prep_py}" ]]; then
+    echo "[smoke] preparing dataset bins: ${train_bin} missing; running ${prep_py}"
+    python "${prep_py}"
+  else
+    echo "[smoke] ERROR: dataset bins missing and prepare script not found:" >&2
+    echo "[smoke]   expected train_bin=${train_bin}" >&2
+    echo "[smoke]   expected prep_py=${prep_py}" >&2
+    exit 2
+  fi
+fi
 
 cmd=(veriscope run gpt --outdir "${outdir}")
 cmd+=("${force_flag[@]}")
 cmd+=(-- \
-  --dataset shakespeare_char \
+  --dataset "${smoke_dataset}" \
   --nanogpt_dir "${nanogpt_dir}" \
   --device "${smoke_device}" \
   --max_iters 200 \
