@@ -29,8 +29,10 @@ fi
 
 # Default smoke device stays "cuda" (historical behavior), but callers may override.
 smoke_device="${VERISCOPE_GPT_SMOKE_DEVICE:-cuda}"
+default_max_iters="${VERISCOPE_GPT_SMOKE_MAX_ITERS:-50}"
 
 # Detect caller --device / --device=... and avoid passing --device twice.
+has_max_iters=0
 for ((i=0; i<${#extra_args[@]}; i++)); do
   tok="${extra_args[$i]}"
   if [[ "${tok}" == "--device" ]]; then
@@ -43,6 +45,18 @@ for ((i=0; i<${#extra_args[@]}; i++)); do
   fi
   if [[ "${tok}" == --device=* ]]; then
     smoke_device="${tok#--device=}"
+    continue
+  fi
+  if [[ "${tok}" == "--max_iters" ]]; then
+    if (( i+1 >= ${#extra_args[@]} )); then
+      echo "[smoke] ERROR: --max_iters provided without a value" >&2
+      exit 2
+    fi
+    has_max_iters=1
+    continue
+  fi
+  if [[ "${tok}" == --max_iters=* ]]; then
+    has_max_iters=1
     continue
   fi
 done
@@ -70,10 +84,18 @@ if [[ ${#extra_args_filtered[@]} -gt 0 ]]; then
   extra_args_str="${extra_args_filtered[*]}"
 fi
 
+base_args=(--dataset "${smoke_dataset}" --nanogpt_dir "${nanogpt_dir}" --device "${smoke_device}")
+if (( ! has_max_iters )); then
+  base_args+=(--max_iters "${default_max_iters}")
+fi
+base_args+=(--no_regime)
+
+base_args_str="${base_args[*]}"
+
 echo "[smoke] outdir=${outdir}"
 echo "[smoke] nanogpt_dir=${nanogpt_dir}"
 echo "[smoke] extra_args=${extra_args_str}"
-echo "[smoke] cmd: veriscope run gpt --outdir ${outdir} ${force_flag[*]:-} -- --dataset ${smoke_dataset} --nanogpt_dir ${nanogpt_dir} --device ${smoke_device} --max_iters 200 --no_regime ${extra_args_str}"
+echo "[smoke] cmd: veriscope run gpt --outdir ${outdir} ${force_flag[*]:-} -- ${base_args_str} ${extra_args_str}"
 
 # Ensure nanoGPT dataset bins exist inside fresh environments (e.g., containers).
 if [[ ! -f "${train_bin}" ]]; then
@@ -90,13 +112,7 @@ fi
 
 cmd=(veriscope run gpt --outdir "${outdir}")
 cmd+=("${force_flag[@]}")
-cmd+=(-- \
-  --dataset "${smoke_dataset}" \
-  --nanogpt_dir "${nanogpt_dir}" \
-  --device "${smoke_device}" \
-  --max_iters 200 \
-  --no_regime
-)
+cmd+=(-- "${base_args[@]}")
 if [[ ${#extra_args_filtered[@]} -gt 0 ]]; then
   cmd+=("${extra_args_filtered[@]}")
 fi

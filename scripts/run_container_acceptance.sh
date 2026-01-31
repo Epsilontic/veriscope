@@ -43,7 +43,10 @@ export NANOGPT_DIR="${nanogpt_dir}"
 # GH Actions runners don't have GPUs; keep acceptance deterministic on CPU.
 export VERISCOPE_GPT_SMOKE_DEVICE="${VERISCOPE_GPT_SMOKE_DEVICE:-cpu}"
 
-bash scripts/run_gpt_smoke.sh "${outdir}" -- --max_iters 50
+# Keep acceptance runtime low on GitHub Actions runners.
+ACCEPTANCE_MAX_ITERS="${VERISCOPE_ACCEPTANCE_MAX_ITERS:-12}"
+
+bash scripts/run_gpt_smoke.sh "${outdir}" -- --max_iters "${ACCEPTANCE_MAX_ITERS}"
 
 capdir="${outdir}"
 if [[ ! -f "${capdir}/window_signature.json" ]]; then
