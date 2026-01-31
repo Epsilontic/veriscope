@@ -8,8 +8,11 @@ RUN apt-get update \
   && apt-get install -y --no-install-recommends bash git \
   && rm -rf /var/lib/apt/lists/*
 
+# Keep the image small and deterministic: GH Actions runners don't have GPUs,
+# so we explicitly use CPU-only torch wheels (avoid pulling CUDA user-space deps).
 RUN python -m pip install --upgrade pip \
-  && python -m pip install -e ".[torch]" \
+  && python -m pip install -e "." \
+  && python -m pip install --index-url https://download.pytorch.org/whl/cpu torch \
   && python -m pip install requests
 
 CMD ["bash"]
