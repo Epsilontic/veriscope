@@ -14,7 +14,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from veriscope.core.governance import append_run_started, build_code_identity
+from veriscope.core.governance import append_run_started, build_code_identity, build_distributed_context
 from veriscope.core.artifacts import (
     CountsV1,
     Decision,
@@ -60,6 +60,7 @@ def _emit_minimal_artifacts(out_dir: Path, *, run_status: RunStatus, runner_exit
             code_identity=build_code_identity(),
             window_signature_ref={"hash": ws_hash, "path": "window_signature.json"},
             entrypoint={"kind": "runner", "name": "scripts.fake_gpt_runner"},
+            distributed=build_distributed_context(),
         )
     except Exception as exc:
         print(f"fake-runner: failed to append governance run_started: {exc}", file=sys.stderr, flush=True)

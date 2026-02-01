@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import veriscope
-from veriscope.core.governance import append_run_started, build_code_identity
+from veriscope.core.governance import append_run_started, build_code_identity, build_distributed_context
 from veriscope.core.artifacts import CountsV1, ProfileV1, ResultsSummaryV1, ResultsV1, WindowSignatureRefV1
 from veriscope.core.jsonutil import (
     atomic_write_json,
@@ -46,6 +46,7 @@ def _emit_minimal_artifacts(outdir: Path, run_id: str, gate_preset: str) -> None
             code_identity=build_code_identity(),
             window_signature_ref={"hash": ws_hash, "path": "window_signature.json"},
             entrypoint={"kind": "runner", "name": "scripts.fake_hf_runner"},
+            distributed=build_distributed_context(),
         )
     except Exception as exc:
         print(f"fake-hf-runner: failed to append governance run_started: {exc}", file=sys.stderr, flush=True)

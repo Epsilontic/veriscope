@@ -11,6 +11,7 @@ import pytest
 from veriscope.cli.governance import (
     GOVERNANCE_EVENT_TYPES,
     append_governance_log,
+    append_run_started,
     read_governance_log,
     resolve_effective_status,
     validate_governance_log,
@@ -201,6 +202,61 @@ def test_governance_log_allows_legacy_entry_hash(tmp_path: Path) -> None:
     legacy_validation = validate_governance_log(log_path, allow_legacy_governance=True)
     assert legacy_validation.ok
     assert any("GOVERNANCE_LOG_ENTRY_HASH_MISSING" in w for w in legacy_validation.warnings)
+
+
+def test_run_started_distributed_payload_is_optional(tmp_path: Path) -> None:
+    outdir = tmp_path / "run"
+    ts_0 = _iso_z(datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc))
+    append_run_started(
+        outdir,
+        run_id="run",
+        outdir_path=outdir,
+        argv=["pytest", "governance_fixture"],
+        code_identity={"package_version": "test"},
+        window_signature_ref={"hash": "deadbeef", "path": "window_signature.json"},
+        entrypoint={"kind": "runner", "name": "tests.governance_fixture"},
+        ts_utc=ts_0,
+    )
+
+    log_path = outdir / "governance_log.jsonl"
+    entry = json.loads(log_path.read_text(encoding="utf-8").splitlines()[0])
+    payload = entry["payload"]
+    assert "distributed" not in payload
+
+
+def test_run_started_distributed_payload_is_emitted(tmp_path: Path) -> None:
+    outdir = tmp_path / "run"
+    ts_0 = _iso_z(datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc))
+    distributed = {
+        "distributed_mode": "single_process",
+        "world_size_observed": 1,
+        "rank_observed": 0,
+        "local_rank_observed": None,
+        "ddp_backend": None,
+        "ddp_active": False,
+    }
+    append_run_started(
+        outdir,
+        run_id="run",
+        outdir_path=outdir,
+        argv=["pytest", "governance_fixture"],
+        code_identity={"package_version": "test"},
+        window_signature_ref={"hash": "deadbeef", "path": "window_signature.json"},
+        entrypoint={"kind": "runner", "name": "tests.governance_fixture"},
+        ts_utc=ts_0,
+        distributed=distributed,
+    )
+
+    log_path = outdir / "governance_log.jsonl"
+    entry = json.loads(log_path.read_text(encoding="utf-8").splitlines()[0])
+    payload = entry["payload"]
+    assert isinstance(payload["distributed"], dict)
+    assert payload["distributed"]["distributed_mode"] == distributed["distributed_mode"]
+    assert payload["distributed"]["world_size_observed"] == distributed["world_size_observed"]
+    assert payload["distributed"]["rank_observed"] == distributed["rank_observed"]
+    assert "local_rank_observed" in payload["distributed"]
+    assert "ddp_backend" in payload["distributed"]
+    assert "ddp_active" in payload["distributed"]
 
 
 def test_precedence_resolver_prefers_jsonl_and_fallbacks(tmp_path: Path) -> None:

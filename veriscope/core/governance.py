@@ -1,6 +1,7 @@
 # veriscope/core/governance.py
 from __future__ import annotations
 
+import os
 import json
 import subprocess
 from dataclasses import dataclass, field
@@ -8,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, List, Optional
 
+from veriscope.core.ddp import ddp_is_active, ddp_rank, ddp_world_size
 from veriscope.core.jsonutil import atomic_append_jsonl, canonical_json_sha256, sanitize_json_value
 
 
@@ -382,6 +384,50 @@ def build_code_identity(*, git_sha: Optional[str] = None) -> dict[str, Any]:
     return code_identity
 
 
+def _parse_optional_int(value: Optional[str]) -> Optional[int]:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def build_distributed_context() -> dict[str, Any]:
+    world_size = ddp_world_size()
+    rank = ddp_rank()
+    ddp_active = ddp_is_active()
+    ddp_backend = None
+    if ddp_active:
+        try:
+            import torch.distributed as dist  # local import
+
+            if getattr(dist, "is_available", lambda: False)() and dist.is_initialized():
+                ddp_backend = dist.get_backend()
+        except Exception:
+            ddp_backend = None
+
+    if world_size <= 1:
+        distributed_mode = "single_process"
+    elif ddp_active and world_size > 1:
+        distributed_mode = "ddp_wrapped"
+    else:
+        distributed_mode = "replicated_single_chief_emit"
+
+    local_rank = None
+    if distributed_mode != "single_process":
+        local_rank = _parse_optional_int(os.environ.get("LOCAL_RANK"))
+
+    return {
+        "distributed_mode": distributed_mode,
+        "world_size_observed": int(world_size),
+        "rank_observed": int(rank),
+        "local_rank_observed": local_rank,
+        "ddp_backend": ddp_backend,
+        "ddp_active": bool(ddp_active),
+    }
+
+
 def append_governance_log(
     outdir: Path,
     *,
@@ -411,21 +457,25 @@ def append_run_started(
     code_identity: dict[str, Any],
     window_signature_ref: dict[str, Any],
     entrypoint: dict[str, Any],
+    distributed: Optional[dict[str, Any]] = None,
     ts_utc: Optional[str] = None,
     actor: Optional[str] = None,
 ) -> tuple[Path, tuple[str, ...]]:
+    payload = {
+        "run_id": str(run_id),
+        "outdir": str(outdir_path),
+        "argv": list(argv),
+        "code_identity": dict(code_identity),
+        "window_signature_ref": dict(window_signature_ref),
+        "entrypoint": dict(entrypoint),
+    }
+    if distributed is not None:
+        payload["distributed"] = dict(distributed)
     entry = {
         "ts_utc": ts_utc or _now_utc_iso(),
         "actor": actor,
         "event": "run_started_v1",
-        "payload": {
-            "run_id": str(run_id),
-            "outdir": str(outdir_path),
-            "argv": list(argv),
-            "code_identity": dict(code_identity),
-            "window_signature_ref": dict(window_signature_ref),
-            "entrypoint": dict(entrypoint),
-        },
+        "payload": payload,
     }
     return _append_governance_entry(outdir, entry)
 

@@ -9,7 +9,12 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 import veriscope
-from veriscope.core.governance import append_gate_decision, append_overrides, append_run_started
+from veriscope.core.governance import (
+    append_gate_decision,
+    append_overrides,
+    append_run_started,
+    build_distributed_context,
+)
 from veriscope.core.artifacts import (
     AuditV1,
     CountsV1,
@@ -329,6 +334,7 @@ def emit_gpt_artifacts_v1(
             code_identity=dict(code_identity),
             window_signature_ref={"hash": ws_hash, "path": "window_signature.json"},
             entrypoint={"kind": "runner", "name": "veriscope.runners.gpt.train_nanogpt"},
+            distributed=build_distributed_context(),
         )
     except Exception as exc:
         logger.warning("Failed to append governance run_started entry: %s", exc)

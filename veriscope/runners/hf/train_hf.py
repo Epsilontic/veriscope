@@ -38,7 +38,12 @@ from veriscope.core.ddp import (
 from veriscope.core.gate import GateEngine
 from veriscope.core.transport import DeclTransport
 from veriscope.core.window import FRWindow, WindowDecl
-from veriscope.core.governance import append_gate_decision, append_run_started, build_code_identity
+from veriscope.core.governance import (
+    append_gate_decision,
+    append_run_started,
+    build_code_identity,
+    build_distributed_context,
+)
 from veriscope.core.jsonutil import atomic_write_json, read_json_obj, window_signature_sha256
 from veriscope.runners.hf.adapter import HFMetricComputer, HFMetricConfig
 from veriscope.runners.hf.emit_artifacts import emit_hf_artifacts_v1
@@ -1263,6 +1268,7 @@ def _run_body(cfg: HFRunConfig, *, argv: List[str]) -> int:
                 code_identity=code_identity,
                 window_signature_ref=window_signature_ref,
                 entrypoint={"kind": "runner", "name": "veriscope.runners.hf.train_hf"},
+                distributed=build_distributed_context(),
             )
         except Exception as exc:
             logger.warning("Failed to append governance run_started entry: %s", exc)

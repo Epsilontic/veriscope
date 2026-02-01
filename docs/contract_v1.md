@@ -59,11 +59,31 @@ Each line is a JSON object with:
   - `run_overrides_applied_v1`
   - `gate_decision_v1`
 - `payload`: event-specific object (required for all events). For run governance:
-  - `run_started_v1`: `run_id`, `outdir`, `argv`, `code_identity`, `window_signature_ref`, `entrypoint`
+  - `run_started_v1`: `run_id`, `outdir`, `argv`, `code_identity`, `window_signature_ref`, `entrypoint`, optional `distributed`
   - `run_overrides_applied_v1`: `run_id`, `outdir`, `overrides`, `profile`, `entrypoint`, optional `argv` (wrappers should record default-divergent `gate_preset` values here)
   - `gate_decision_v1`: `run_id`, `outdir`, `iter`, `decision`, optional `ok`/`warn`, `audit`
 - `prev_hash`: optional hash of previous entry
 - `entry_hash`: optional hash of this entry (writers MUST include; readers MAY accept missing entry_hash for legacy journals and must warn)
+
+### Distributed execution (run_started_v1 payload)
+
+Distributed execution context is an **optional** object under `payload.distributed`. Writers SHOULD include it when known; readers MUST accept its absence.
+
+```
+payload.distributed: {
+  distributed_mode: "single_process" | "replicated_single_chief_emit" | "ddp_wrapped",
+  world_size_observed: int,          # >=1
+  rank_observed: int,                # >=0
+  local_rank_observed: int | null,   # null if unknown/unset
+  ddp_backend: "nccl" | "gloo" | string | null,   # null if not ddp_wrapped
+  ddp_active: bool                   # true iff ddp_wrapped
+}
+```
+
+Semantics:
+- `ddp_wrapped`: torch.distributed is initialized AND world_size > 1 (use `ddp_is_active()` semantics).
+- `replicated_single_chief_emit`: world_size > 1 but no initialized process group; artifacts SHOULD be emitted by rank 0 only (chief = `rank_observed == 0`).
+- `single_process`: world_size == 1 (or distributed env absent).
 
 ## Manual Judgement Artifacts
 
@@ -87,6 +107,8 @@ Runs A and B are comparable iff:
 - `window_signature_ref.hash` matches.
 - `gate_preset` matches (unless explicitly overridden).
   - Override is via CLI flag `--allow-gate-preset-mismatch` (or equivalent API argument).
+
+**NOTE:** Runs with different `payload.distributed.distributed_mode` or `world_size_observed` are still comparable per the predicate above, but comparisons may be misleading. Treat distributed metadata as a comparability warning to surface in report/diff output (no behavior change required here).
 
 ## Exit Codes
 
