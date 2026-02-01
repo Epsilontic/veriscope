@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from veriscope.cli.comparability import ComparableResult, comparable_explain, load_run_metadata
-from veriscope.cli.governance import resolve_effective_status
+from veriscope.cli.governance import load_distributed_meta, resolve_effective_status
 from veriscope.core.governance import get_governance_status
 from veriscope.cli.validate import validate_outdir
 from veriscope.core.artifacts import ResultsSummaryV1, ResultsV1
@@ -36,6 +36,33 @@ def _safe_int(x: Any, default: int = 0) -> int:
         return int(x)
     except Exception:
         return default
+
+
+def _coerce_int(value: Any) -> Optional[int]:
+    try:
+        if value is None:
+            return None
+        return int(value)
+    except Exception:
+        return None
+
+
+def _distributed_banner(meta: Optional[Dict[str, Any]]) -> Optional[str]:
+    if meta is None:
+        return None
+    mode = meta.get("distributed_mode")
+    world_size = _coerce_int(meta.get("world_size_observed"))
+    if mode == "single_process" and (world_size is None or world_size <= 1):
+        return None
+    mode_value = str(mode) if mode is not None else "unknown"
+    world_value = str(world_size) if world_size is not None else "unknown"
+    backend_value = meta.get("ddp_backend")
+    backend_display = str(backend_value) if backend_value is not None else "unknown"
+    return (
+        "WARNING: distributed execution detected "
+        f"(mode={mode_value}, world_size={world_value}, backend={backend_display}). "
+        "Comparisons may be misleading."
+    )
 
 
 def _extract_pass_count(counts: Any) -> int:
@@ -138,9 +165,13 @@ def render_report_md(outdir: Path, *, fmt: str = "md") -> str:
     gate_preset = res.profile.gate_preset if res is not None else summ.profile.gate_preset
     started_ts = res.started_ts_utc if res is not None else summ.started_ts_utc
     ended_ts = res.ended_ts_utc if res is not None else summ.ended_ts_utc
+    distributed_banner = _distributed_banner(load_distributed_meta(outdir))
 
     if fmt == "text":
         lines: List[str] = []
+        if distributed_banner:
+            lines.append(distributed_banner)
+            lines.append("")
         lines.append(f"Veriscope Report: {outdir}")
         lines.append("")
         lines.append(f"Run ID: {run_id}")
@@ -201,6 +232,9 @@ def render_report_md(outdir: Path, *, fmt: str = "md") -> str:
 
     # Default: Markdown
     lines = []
+    if distributed_banner:
+        lines.append(distributed_banner)
+        lines.append("")
     lines.append(f"# Veriscope Report: `{outdir}`")
     lines.append("")
     lines.append("| Field | Value |")
@@ -318,6 +352,44 @@ def _format_comparable(result: ComparableResult) -> List[str]:
     return lines
 
 
+def _distributed_meta_fields(
+    meta: Optional[Dict[str, Any]],
+) -> Optional[tuple[Optional[str], Optional[int], Optional[str]]]:
+    if meta is None:
+        return None
+    mode = meta.get("distributed_mode")
+    world_size = _coerce_int(meta.get("world_size_observed"))
+    backend = meta.get("ddp_backend")
+    mode_value = str(mode) if mode is not None else None
+    backend_value = str(backend) if backend is not None else None
+    return mode_value, world_size, backend_value
+
+
+def _format_distributed_meta(meta: Optional[tuple[Optional[str], Optional[int], Optional[str]]]) -> str:
+    if meta is None:
+        return "mode=unknown,world_size=unknown,backend=unknown"
+    mode, world_size, backend = meta
+    mode_value = mode if mode is not None else "unknown"
+    world_value = str(world_size) if world_size is not None else "unknown"
+    backend_value = backend if backend is not None else "unknown"
+    return f"mode={mode_value},world_size={world_value},backend={backend_value}"
+
+
+def _distributed_mismatch_warning(meta_a: Optional[Dict[str, Any]], meta_b: Optional[Dict[str, Any]]) -> Optional[str]:
+    if meta_a is None or meta_b is None:
+        return None
+    fields_a = _distributed_meta_fields(meta_a)
+    fields_b = _distributed_meta_fields(meta_b)
+    if fields_a is None or fields_b is None:
+        return None
+    if fields_a == fields_b:
+        return None
+    return (
+        "WARNING:DISTRIBUTED_METADATA_MISMATCH "
+        f"A({_format_distributed_meta(fields_a)}) B({_format_distributed_meta(fields_b)})"
+    )
+
+
 def render_report_compare(
     outdirs: List[Path],
     *,
@@ -342,6 +414,12 @@ def render_report_compare(
 
     runs = [load_run_metadata(Path(outdir), v, prefer_jsonl=True) for outdir, v in zip(outdirs, validations)]
     warnings = [f"run={run.run_id}:{w}" for run in runs for w in run.manual.warnings]
+    distributed_metas = [load_distributed_meta(run.outdir) for run in runs]
+    reference_meta = distributed_metas[0] if distributed_metas else None
+    for meta in distributed_metas[1:]:
+        warning = _distributed_mismatch_warning(reference_meta, meta)
+        if warning:
+            warnings.append(warning)
 
     reference = runs[0]
     incompatible: List[tuple[int, ComparableResult]] = []

@@ -18,6 +18,7 @@ try:
 except Exception:  # pragma: no cover
     PydanticCoreValidationError = PydanticValidationError  # type: ignore
 
+from veriscope.cli.governance import load_distributed_meta
 from veriscope.core.governance import read_governance_log, validate_governance_log
 from veriscope.core.artifacts import ManualJudgementV1, ResultsSummaryV1, ResultsV1
 from veriscope.core.jsonutil import window_signature_sha256
@@ -93,6 +94,31 @@ def _format_pydantic_error(e: Exception) -> str:
 
 def _format_identity_token(level: str, field: str, expected: Any, got: Any) -> str:
     return f"{level}:ARTIFACT_IDENTITY_MISMATCH field={field} expected={expected!r} got={got!r}"
+
+
+def _coerce_int(value: Any) -> Optional[int]:
+    try:
+        if value is None:
+            return None
+        return int(value)
+    except Exception:
+        return None
+
+
+def _format_distributed_warning(meta: Optional[dict[str, Any]]) -> Optional[str]:
+    if meta is None:
+        return None
+    mode = meta.get("distributed_mode")
+    world_size = _coerce_int(meta.get("world_size_observed"))
+    if mode == "single_process" and (world_size is None or world_size <= 1):
+        return None
+    mode_value = str(mode) if mode is not None else "unknown"
+    world_value = str(world_size) if world_size is not None else "unknown"
+    backend_value = meta.get("ddp_backend")
+    backend_display = str(backend_value) if backend_value is not None else "unknown"
+    return (
+        f"WARNING:DISTRIBUTED_EXECUTION_DETECTED mode={mode_value} world_size={world_value} backend={backend_display}"
+    )
 
 
 def _check_identity_consistency(
@@ -375,6 +401,10 @@ def validate_outdir(
                             warnings=tuple(warnings),
                             errors=tuple(errors),
                         )
+
+    distributed_warning = _format_distributed_warning(load_distributed_meta(outdir))
+    if distributed_warning:
+        warnings.append(distributed_warning)
 
     # Return the derived truth (the computed hash), not just the referenced one.
     summary_partial = bool(getattr(summ, "partial", False))

@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from veriscope.cli.comparability import ComparableResult, RunMetadata, comparable_explain, load_run_metadata
+from veriscope.cli.governance import load_distributed_meta
 from veriscope.cli.validate import validate_outdir
 
 
@@ -27,6 +28,56 @@ def _short_hash(value: str, *, width: int = 12) -> str:
 
 def _fmt_bool(value: bool) -> str:
     return "yes" if value else "no"
+
+
+def _coerce_int(value: object) -> Optional[int]:
+    try:
+        if value is None:
+            return None
+        return int(value)
+    except Exception:
+        return None
+
+
+def _distributed_meta_fields(
+    meta: Optional[dict[str, object]],
+) -> Optional[tuple[Optional[str], Optional[int], Optional[str]]]:
+    if meta is None:
+        return None
+    mode = meta.get("distributed_mode")
+    world_size = _coerce_int(meta.get("world_size_observed"))
+    backend = meta.get("ddp_backend")
+    mode_value = str(mode) if mode is not None else None
+    backend_value = str(backend) if backend is not None else None
+    return mode_value, world_size, backend_value
+
+
+def _format_distributed_meta(meta: Optional[tuple[Optional[str], Optional[int], Optional[str]]]) -> str:
+    if meta is None:
+        return "mode=unknown,world_size=unknown,backend=unknown"
+    mode, world_size, backend = meta
+    mode_value = mode if mode is not None else "unknown"
+    world_value = str(world_size) if world_size is not None else "unknown"
+    backend_value = backend if backend is not None else "unknown"
+    return f"mode={mode_value},world_size={world_value},backend={backend_value}"
+
+
+def _distributed_mismatch_warning(
+    meta_a: Optional[dict[str, object]],
+    meta_b: Optional[dict[str, object]],
+) -> Optional[str]:
+    if meta_a is None or meta_b is None:
+        return None
+    fields_a = _distributed_meta_fields(meta_a)
+    fields_b = _distributed_meta_fields(meta_b)
+    if fields_a is None or fields_b is None:
+        return None
+    if fields_a == fields_b:
+        return None
+    return (
+        "WARNING:DISTRIBUTED_METADATA_MISMATCH "
+        f"A({_format_distributed_meta(fields_a)}) B({_format_distributed_meta(fields_b)})"
+    )
 
 
 def _format_comparable(result: ComparableResult) -> List[str]:
@@ -146,6 +197,14 @@ def diff_outdirs(
     run_b = load_run_metadata(outdir_b, v_b, prefer_jsonl=True)
 
     comparable_result = comparable_explain(run_a, run_b, allow_gate_preset_mismatch=allow_gate_preset_mismatch)
+    warnings = [f"RUN_A:{w}" for w in run_a.manual.warnings] + [f"RUN_B:{w}" for w in run_b.manual.warnings]
+    distributed_warning = _distributed_mismatch_warning(
+        load_distributed_meta(outdir_a),
+        load_distributed_meta(outdir_b),
+    )
+    if distributed_warning:
+        warnings.append(distributed_warning)
+
     fmt = fmt.strip().lower()
     if fmt == "json":
         payload = json.dumps(
@@ -158,13 +217,12 @@ def diff_outdirs(
             indent=2,
             sort_keys=True,
         )
-        return DiffOutput(exit_code=0 if comparable_result.ok else 2, stdout=payload, stderr="")
+        return DiffOutput(exit_code=0 if comparable_result.ok else 2, stdout=payload, stderr="\n".join(warnings))
     if not comparable_result.ok:
         token = comparable_result.reason or "INCOMPARABLE"
         details = "\n".join(_format_comparable(comparable_result))
         return DiffOutput(exit_code=2, stdout="", stderr="\n".join([f"INCOMPARABLE: {token}", details]))
 
-    warnings = [f"RUN_A:{w}" for w in run_a.manual.warnings] + [f"RUN_B:{w}" for w in run_b.manual.warnings]
     stderr = "\n".join(warnings)
 
     lines: List[str] = []

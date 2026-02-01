@@ -5,7 +5,7 @@ import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from pydantic import ValidationError as PydanticValidationError
 from pydantic_core import ValidationError as PydanticCoreValidationError
@@ -45,6 +45,7 @@ __all__ = [
     "build_code_identity",
     "build_distributed_context",
     "get_governance_status",
+    "load_distributed_meta",
     "read_governance_log",
     "validate_governance_log",
 ]
@@ -216,6 +217,36 @@ def resolve_manual_overlay(outdir: Path, run_id: str, *, prefer_jsonl: bool = Tr
             return ManualJudgementEffective(judgement=None, source="json", warnings=tuple(warnings))
 
     return ManualJudgementEffective(judgement=None, source="-", warnings=tuple(warnings))
+
+
+def load_distributed_meta(outdir: Path) -> Optional[dict[str, Any]]:
+    outdir = Path(outdir)
+    gov_path = outdir / "governance_log.jsonl"
+    if not gov_path.exists():
+        return None
+
+    distributed_meta: Optional[dict[str, Any]] = None
+    for line in gov_path.read_text(encoding="utf-8").splitlines():
+        raw = line.strip()
+        if not raw:
+            continue
+        try:
+            obj = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        event = obj.get("event") or obj.get("event_type")
+        if event != "run_started_v1":
+            continue
+        payload = obj.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        distributed = payload.get("distributed")
+        if isinstance(distributed, dict):
+            distributed_meta = dict(distributed)
+
+    return distributed_meta
 
 
 def resolve_display_status(automated_decision: str, manual: ManualJudgementEffective) -> DisplayStatus:

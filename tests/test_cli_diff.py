@@ -5,7 +5,7 @@ import json
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, Optional
 
 import pytest
 
@@ -47,7 +47,13 @@ def _minimal_window_signature() -> dict[str, Any]:
     }
 
 
-def _make_minimal_artifacts(outdir: Path, *, run_id: str, gate_preset: str = "test") -> None:
+def _make_minimal_artifacts(
+    outdir: Path,
+    *,
+    run_id: str,
+    gate_preset: str = "test",
+    distributed: Optional[Dict[str, Any]] = None,
+) -> None:
     outdir.mkdir(parents=True, exist_ok=True)
 
     ws_path = outdir / "window_signature.json"
@@ -82,6 +88,7 @@ def _make_minimal_artifacts(outdir: Path, *, run_id: str, gate_preset: str = "te
         code_identity={"package_version": "test"},
         window_signature_ref={"hash": ws_hash, "path": "window_signature.json"},
         entrypoint={"kind": "runner", "name": "tests.diff_fixture"},
+        distributed=distributed,
         ts_utc=_iso_z(T0),
     )
 
@@ -338,3 +345,31 @@ def test_diff_warns_on_manual_run_id_mismatch(tmp_path: Path) -> None:
     assert result.exit_code == 0
     assert "manual_status: -" in result.stdout
     assert "RUN_A:WARNING:MANUAL_JUDGEMENT_RUN_ID_MISMATCH" in result.stderr
+
+
+def test_diff_warns_on_distributed_metadata_mismatch(tmp_path: Path) -> None:
+    outdir_a = tmp_path / "run_a"
+    outdir_b = tmp_path / "run_b"
+    distributed_a = {
+        "distributed_mode": "single_process",
+        "world_size_observed": 1,
+        "rank_observed": 0,
+        "local_rank_observed": None,
+        "ddp_backend": None,
+        "ddp_active": False,
+    }
+    distributed_b = {
+        "distributed_mode": "ddp_wrapped",
+        "world_size_observed": 2,
+        "rank_observed": 1,
+        "local_rank_observed": 1,
+        "ddp_backend": "nccl",
+        "ddp_active": True,
+    }
+
+    _make_minimal_artifacts(outdir_a, run_id="run_a", distributed=distributed_a)
+    _make_minimal_artifacts(outdir_b, run_id="run_b", distributed=distributed_b)
+
+    result = diff_outdirs(outdir_a, outdir_b)
+    assert result.exit_code == 0
+    assert "WARNING:DISTRIBUTED_METADATA_MISMATCH" in result.stderr
