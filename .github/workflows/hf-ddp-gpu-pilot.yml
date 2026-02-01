@@ -1,0 +1,101 @@
+name: HF DDP GPU Pilot
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * *"
+
+jobs:
+  hf_ddp_gpu_pilot:
+    name: hf_ddp_gpu_pilot
+    runs-on: [self-hosted, linux, x64, gpu]
+    timeout-minutes: 25
+    env:
+      HF_HUB_DISABLE_TELEMETRY: "1"
+      HF_HUB_DISABLE_PROGRESS_BARS: "1"
+      HF_HOME: ${{ github.workspace }}/.cache/huggingface
+      TRANSFORMERS_CACHE: ${{ github.workspace }}/.cache/huggingface/transformers
+      HF_DATASETS_CACHE: ${{ github.workspace }}/.cache/huggingface/datasets
+      VERISCOPE_HF_DDP_PILOT_TIMEOUT_SECS: "300"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+          cache: pip
+
+      - name: Create venv
+        shell: bash
+        run: |
+          python -m venv --system-site-packages .venv
+          source .venv/bin/activate
+          python -m pip install --upgrade pip
+          mkdir -p out
+
+      - name: Install
+        shell: bash
+        run: |
+          source .venv/bin/activate
+          python -m pip install -e .
+          python -m pip install transformers datasets
+          echo "NOTE: GPU runner is expected to have CUDA-enabled torch available via system site-packages."
+
+      - name: GPU diagnostics
+        shell: bash
+        run: |
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            nvidia-smi
+          else
+            echo "nvidia-smi not found"
+          fi
+          source .venv/bin/activate
+          python - <<'PY'
+          import sys
+          try:
+              import torch
+          except Exception as exc:
+              raise SystemExit(f"ERROR: torch import failed on GPU runner: {exc}")
+
+          print(f"torch_version={torch.__version__}")
+          print(f"cuda_available={torch.cuda.is_available()}")
+          if not torch.cuda.is_available():
+              raise SystemExit("ERROR: torch.cuda.is_available() is False on GPU runner")
+
+          print(f"cuda_device_count={torch.cuda.device_count()}")
+          if torch.cuda.device_count() < 1:
+              raise SystemExit("ERROR: torch reports 0 CUDA devices")
+
+          print(f"cuda_device_name={torch.cuda.get_device_name(0)}")
+          PY
+
+      - name: Run HF DDP pilot
+        shell: bash
+        run: |
+          source .venv/bin/activate
+          bash scripts/pilot/run_hf_ddp.sh
+
+      - name: Locate pilot artifacts
+        if: always()
+        id: pilot_artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          latest_dir=$(ls -dt ./out/pilot_hf_ddp_* 2>/dev/null | head -n 1 || true)
+          if [[ -z "$latest_dir" ]]; then
+            echo "No pilot output directory found."
+            echo "path=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "path=$latest_dir" >> "$GITHUB_OUTPUT"
+
+      - name: Upload pilot artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hf-ddp-gpu-pilot
+          path: ${{ steps.pilot_artifacts.outputs.path || 'out' }}
+          if-no-files-found: warn
