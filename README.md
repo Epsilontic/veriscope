@@ -1,18 +1,19 @@
 <div align="center">
 
-# 🔬 Veriscope
+# Veriscope
 
 **Early-warning detection of neural network training pathologies**
 
-  
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
-[![PyTorch](https://img.shields.io/badge/PyTorch-2.1+-ee4c2c.svg)](https://pytorch.org/)
+[![Extras: torch | hf](https://img.shields.io/badge/extras-torch%20%7C%20hf-orange.svg)](#optional-extras)
 [![License: Dual](https://img.shields.io/badge/License-Dual-brightgreen.svg)](./COMMERCIAL_LICENSE.md)
 [![CI](https://github.com/Epsilontic/veriscope/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Epsilontic/veriscope/actions/workflows/ci.yml)
 
+Runners: **CIFAR (PyTorch)** • **GPT (nanoGPT)** • **HF (transformers)**
+
 *Detect representation collapse before it's too late.*
 
-[Quick Start](#quick-start) • [Pilot kit overview](#pilot-kit-overview) • [Gate Semantics](#gate-semantics) • [Core API](#core-api) • [Output Artifacts](#output-artifacts) • [Contributing](#contributing) • [Governance](#governance--community) • [Citation](#citation)
+[Quick Start](#quick-start) • [Docs](./docs/) • [Pilot kit](#pilot-kit-overview) • [CLI](#capsule-operations) • [Core API](#core-api) • [Artifacts](#output-artifacts) • [License](#license)
 
 </div>
 
@@ -20,14 +21,60 @@
 
 ## Overview
 
-Veriscope is an open research project developing tools to detect early signs of collapse in internal model diversity before they lead to brittle or unsafe behavior. Standard metrics can look healthy while representation structure quietly degrades. Veriscope provides **auditable, reproducible monitoring signals** to surface these risks.
+Veriscope is a CLI-first tool for detecting early signs of training-time failure (representation collapse / drift) *before* loss curves or eval metrics make the issue obvious. It produces **auditable, reproducible capsule artifacts** you can validate, diff, and share.
 
-At a high level, Veriscope turns training-time monitoring into a reproducible decision contract:
+In ~30 seconds, what you get:
 
-- Declare an observable window (Φ_W) via `WindowDecl`.
+- A repeatable way to run training with monitoring and emit a **capsule** (run directory) with stable contracts.
+- A finite-window gate that turns monitored signals into an explicit status enum (`pass | warn | fail | skip`) plus structured audit fields.
+- Validators (`veriscope validate`, `veriscope diff`) and reporting (`veriscope report`) for post-hoc review and sharing.
+
+Pipeline overview:
+
+```
+training loop
+  -> metric snapshots (geometry / dynamics / optional heavy metrics)
+  -> window normalization (declared transport)
+  -> finite-window gate (decision + audit)
+  -> capsule artifacts (results + signature + provenance)
+```
+
+This is formalized as a declared window + transport + gate → capsule artifacts:
+
+- Declare an observable window via `WindowDecl`.
 - Normalize metrics under a declared transport (`DeclTransport`).
 - Evaluate stability via a windowed divergence with finite-evidence uncertainty (`ε_stat`).
 - Emit structured audit fields and artifacts for post-hoc review.
+
+---
+
+## What it detects (operationally)
+
+In this project, “collapse” is operational: it refers to internal representation structure becoming unusually *low-diversity* or *homogeneous* relative to a declared window and calibration, often preceding brittle behavior. Typical modes include:
+
+- Rank/effective-dimension collapse
+- Activation homogenization / dead features
+- Mode dropping / distributional drift in internal features
+
+What Veriscope outputs:
+- A status enum (`pass | warn | fail | skip`) plus audit fields (e.g., `worst_DW`, `eps_eff`, evidence counts).
+- A capsule directory with machine-readable artifacts (see “Output artifacts”).
+- Canonical status fields live in artifacts as per-gate `decision` and summary `final_decision` (optional legacy booleans like `ok`/`warn` may appear).
+
+What it does **not** guarantee:
+- It does not prove safety or correctness of the trained model.
+- It does not replace evals; it is an early-warning and audit surface for training dynamics within a declared window.
+
+---
+
+## Documentation map
+
+| Topic | Where |
+| --- | --- |
+| v0 product/ops contract (CLI semantics, exit codes, invariants) | `docs/productization.md` |
+| Frozen artifact contract (hashing, canonicalization, governance chaining) | `docs/contract_v1.md` |
+| Pilot kit overview (what to run + what to share) | `docs/pilot/README.md` |
+| Pilot harness scripts (exact commands + scoring) | `scripts/pilot/README.md` |
 
 ---
 
@@ -53,58 +100,41 @@ At a high level, Veriscope turns training-time monitoring into a reproducible de
 
 ---
 
-## Gate Semantics
+## Gate semantics (short version)
 
-`GateEngine` evaluates stability by computing `worst_DW` (a windowed divergence across tracked metrics, reduced as “worst over interventions”) and comparing it to an effective threshold `eps_eff`.
+`GateEngine` evaluates stability by computing `worst_DW` (a windowed divergence across tracked metrics) and comparing it to an effective threshold `eps_eff`. The emitted status is an explicit enum (`pass | warn | fail | skip`); `skip` means “not evaluated” and is neutral.
 
-### Windowed divergence
-
-- `w_sum = Σ_m |w[m]|` (defaults to 1.0 if empty)
-- For each intervention `T` (often identity only): compute `TV_m(T(past), T(recent))`
-- Combine per intervention: `DW_T = Σ_m (|w[m]| / w_sum) * TV_m`
-- Reduce: `worst_DW = max_T DW_T` (ignoring non-finite per-metric TVs)
-
-### Effective threshold (as implemented)
-
-- `eps_stat_cap = min(max(eps_stat_value, 0), cap_frac * ε)`
-- `eps_eff = max(0, ε + eps_sens - eps_stat_cap)`
-- Stability exceeds when `worst_DW > eps_eff`
-
-### Policy and optional checks
-
-- **Policy** controls how stability and gain combine (`either`, `conjunction`, `persistence`, `persistence_stability`).
-
-- **Gain**: non-finite gain is treated as “not checked” (audited but does not auto-fail).
-
-- **κ sensitivity**: non-finite κ is treated as “not checked”.
-
-- Multi-metric consensus (`min_metrics_exceeding`): can suppress stability exceedance even when `worst_DW > eps_eff` if too few per-metric TVs exceed `eps_eff`.
-
-For exact decision logic, rely on `GateEngine.check(...).audit`, the calibration CSV fields, and the CLI validators (`veriscope validate`, `veriscope diff`) described in `docs/productization.md`.
+For the authoritative decision and exit-code contract, defer to:
+- `docs/productization.md` (operational semantics)
+- `docs/contract_v1.md` (frozen artifact + hashing rules)
 
 ---
 
-## Status
+## Status & scope
 
 - ✅ CIFAR-10 reproduction suite (PyTorch)
 - ✅ GPT runner with gate presets and spike/corruption injection
+- ✅ HF runner (transformers) smoke workflows
 - 🔜 Extension to additional language-model fine-tuning runs
-- 🔜 Public Python package with verifier + benchmark tools
+
+Stability statement:
+- **Artifact contract (v1)** is intended to be stable and is documented in `docs/contract_v1.md`.
+- The **Python API** may evolve; the CLI + artifacts are the primary interface for pilots.
+- v0 scope is **single-node** by default; distributed workflows are v1+.
 
 ---
 
-## Requirements
+## Requirements & Installation
 
-- Python 3.9+
-- PyTorch ≥ 2.1
-- Optional GPU with CUDA 11/12 (CPU supported; heavy metrics slower)
-- `numpy`, `pandas`, `matplotlib`
-- Optional:
-  - `filelock` (safer dataset downloads)
-  - `ripser` (H0 persistence; falls back to NaN if unavailable)
-  - `pyarrow` or `fastparquet` (for parquet output; CSV fallback automatic)
+### Core install
 
-Example installation (editable install):
+The base package targets Python 3.9+ and keeps dependencies minimal:
+- `numpy`
+- `pydantic`
+- `typing_extensions`
+- `filelock`
+
+Install from source (editable):
 
 ```bash
 python -m venv .venv
@@ -113,13 +143,44 @@ python -m pip install -U pip
 pip install -e .
 ```
 
-Optional extras (if configured in `pyproject.toml`):
+Or install from PyPI (when published):
 
 ```bash
-pip install -e ".[topo]"
+pip install veriscope
 ```
 
-Note: dependencies are declared in `pyproject.toml`, so you normally do not need a `requirements.txt`.
+### Optional extras
+
+Install only the extras you need:
+
+- **GPT/CIFAR runners (PyTorch)**  
+  ```bash
+  pip install -e ".[torch]"
+  ```
+- **HF runner (transformers/datasets/accelerate)**  
+  ```bash
+  pip install -e ".[hf]"
+  ```
+- **Analysis / parquet / plotting helpers (optional)**  
+  ```bash
+  pip install -e ".[report]"
+  ```
+  Installs `pandas`, `matplotlib`, and `pyarrow`.
+- **Topological metrics (`ripser`)**  
+  ```bash
+  pip install -e ".[topo]"
+  ```
+
+If you’re installing from PyPI (once published), you can request extras directly:
+
+```bash
+pip install "veriscope[torch]"
+pip install "veriscope[hf]"
+pip install "veriscope[report]"
+pip install "veriscope[topo]"
+```
+
+Note: all dependencies are declared in `pyproject.toml`, so you typically do not need a `requirements.txt`.
 
 ---
 
@@ -128,6 +189,8 @@ Note: dependencies are declared in `pyproject.toml`, so you normally do not need
 - **CIFAR-10** (train/test) — auto-downloaded into `SCAR_DATA` if missing
 - **STL-10** (test split) — external, label-free monitor stream (with resize); falls back to a clean validation split if unavailable
 - **Shakespeare (char)** — used by the GPT runner; prepared via nanoGPT scripts
+
+Note: `SCAR_*` environment variables are legacy names used across the repository. They remain supported for now; see `docs/productization.md` for the boundary contract.
 
 ---
 
@@ -147,6 +210,27 @@ veriscope run cifar --smoke --outdir ./out/cifar_smoke_$(date +%Y%m%d_%H%M%S)
 
 Runs a small CIFAR sweep (few seeds, short epochs) into the specified outdir.
 
+Expected output (minimum):
+
+```bash
+ls OUTDIR
+# ... results.json results_summary.json window_signature.json run_config_resolved.json ...
+
+cat OUTDIR/results_summary.json | head -n 20
+# {
+#   "schema_version": 1,
+#   "run_id": "...",
+#   "window_signature_ref": {"hash": "...", "path": "window_signature.json"},
+#   "run_status": "success",
+#   "counts": {"evaluated": 1, "skip": 0, "pass": 1, "warn": 0, "fail": 0},
+#   "final_decision": "pass"
+# }
+
+veriscope validate OUTDIR
+echo $?
+# 0 means "valid capsule"
+```
+
 ### Full CIFAR sweep (more seeds/epochs)
 
 ```bash
@@ -159,8 +243,8 @@ veriscope run cifar --outdir ./out/cifar_full_$(date +%Y%m%d_%H%M%S)
 ### HF quick start (transformers runner)
 
 ```bash
-# Requires transformers + datasets
-veriscope run hf --gate-preset tuned_v0 --outdir ./out/hf_smoke_$(date +%Y%m%d_%H%M%S) -- \
+# Requires pip install -e ".[hf]"
+veriscope run hf --gate-preset tuned_v0 --outdir "./out/hf_smoke_$(date +%Y%m%d_%H%M%S)" -- \
   --model gpt2 \
   --dataset wikitext:wikitext-2-raw-v1 \
   --dataset_split train \
@@ -170,6 +254,26 @@ veriscope run hf --gate-preset tuned_v0 --outdir ./out/hf_smoke_$(date +%Y%m%d_%
 
 Runs a short HF training loop and writes a capsule in the specified outdir.
 For a scripted version, see `scripts/run_hf_smoke.sh`.
+
+---
+
+## Capsule operations
+
+Common capsule commands:
+
+```bash
+veriscope validate OUTDIR
+veriscope report OUTDIR --format md
+veriscope report OUTDIR --format text
+veriscope diff OUTDIR_A OUTDIR_B
+veriscope override OUTDIR --status pass --reason "Known infrastructure noise"
+```
+
+Compare multiple capsules:
+
+```bash
+veriscope report --compare OUTDIR_A OUTDIR_B --format md
+```
 
 ---
 
@@ -285,7 +389,20 @@ result = gate.check(
     eps_stat_value=0.01,
 )
 
-print("OK:", result.ok)
+# GateResult exposes legacy booleans; the canonical status is `decision` in artifacts.
+# Contract rule: if audit.evaluated is false, decision == "skip" (neutral).
+evaluated = bool(result.audit.get("evaluated", True))
+decision = (
+    "skip"
+    if not evaluated
+    else (
+        "warn"
+        if bool(getattr(result, "warn", False))
+        else ("pass" if bool(getattr(result, "ok", False)) else "fail")
+    )
+)
+
+print("decision:", decision)
 print("worst_DW:", result.audit.get("worst_DW"))
 print("eps_eff:", result.audit.get("eps_eff"))
 ```
@@ -323,22 +440,38 @@ print("eps_eff:", result.audit.get("eps_eff"))
 
 Writes are atomic where possible; parquet falls back to CSV automatically. Legacy tooling may also respect `SCAR_OUTDIR` if set.
 
-### Pilot capsule outputs (`OUTDIR`)
+### Capsule outputs (`OUTDIR`)
 
-- **Required capsule files**
+Terminology:
+- **Capsule**: a single immutable run directory with signature + results (+ optional governance overlays).
+- **Sweep**: a collection of runs plus aggregated tables/figures and learned-detector artifacts.
+
+**Artifact contract (v1):**
+- **Non-partial capsules (required):**
+  - `results.json`
   - `results_summary.json`
   - `window_signature.json`
+- **Partial capsules (required):**
+  - `window_signature.json`
+  - `results_summary.json` with `partial=true`
+- **Recommended:**
   - `run_config_resolved.json`
-- **CLI outputs captured by the pilot harness**
-  - `validate.txt`
-  - `inspect.txt`
-  - `report.md`
-  - `report_stderr.txt`
-  - `git_sha.txt`
-  - `version.txt`
-- **Calibration outputs (from score.py)**
-  - `calibration.json`
-  - `calibration.md`
+- **Optional governance / overlays (append-only; do not mutate raw artifacts):**
+  - `manual_judgement.json`
+  - `manual_judgement.jsonl`
+  - `governance_log.jsonl`
+
+**Pilot harness outputs (captured in `OUTDIR`):**
+- `validate.txt`
+- `inspect.txt`
+- `report.md`
+- `report_stderr.txt`
+- `git_sha.txt`
+- `version.txt`
+
+**Calibration outputs (from `scripts/pilot/score.py`):**
+- `calibration.json`
+- `calibration.md`
 
 ---
 
@@ -356,8 +489,6 @@ Writes are atomic where possible; parquet falls back to CSV automatically. Legac
 - Broaden modality coverage beyond CIFAR-10
 - Package release with verifiers, scoring scripts, and stable APIs
 - Alternative topology backends (MST-based) for `ripser`-free environments
-
----
 
 ---
 
@@ -382,17 +513,17 @@ Veriscope’s governance and community expectations are documented here:
 
 ## License
 
-This project is dual-licensed:
+Veriscope is dual-licensed. The default license is **AGPL-3.0-only**; **commercial licenses are available**
+for organizations that cannot or do not want to comply with AGPL obligations (including network use).
 
-- **GNU Affero General Public License v3.0 (AGPL-3.0-only)**
-- **Commercial license** (for organizations preferring not to comply with AGPL terms)
+- Open-source license: `LICENSE`
+- Commercial terms: `COMMERCIAL_LICENSE.md`
+- Notices: `NOTICE`
+- Trademark policy: `TRADEMARK.md`
 
-The dual-license model ensures Veriscope remains open and auditable for research and open-source use,
-while also enabling sustainable commercial support and long-term maintenance.
+Package metadata declares SPDX `AGPL-3.0-only`; commercial terms are defined in `COMMERCIAL_LICENSE.md`.
 
-Use AGPL-3.0-only for open-source compliance; obtain a commercial license if you prefer not to comply with AGPL obligations for proprietary or hosted deployments.
-
-See `LICENSE` and `COMMERCIAL_LICENSE.md` for details.
+Commercial licensing contact: see the “Contact” section below.
 
 ---
 
@@ -409,5 +540,5 @@ Use the repository’s `CITATION.cff` (GitHub: “Cite this repository”) and i
 ## Contact
 
 **Maintainer:** Craig Holmander  
-📧 craig.holm@protonmail.com  
-🌐 ORCID: https://orcid.org/0009-0002-3145-8498
+craig.holm@protonmail.com  
+ORCID: https://orcid.org/0009-0002-3145-8498
