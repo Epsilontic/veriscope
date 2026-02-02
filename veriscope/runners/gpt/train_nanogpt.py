@@ -1673,6 +1673,11 @@ if __name__ == "__main__":
         help="Freeze GPT feature normalization when regime reference is established.",
     )
 
+    parser.add_argument(
+        "runner_args",
+        nargs=argparse.REMAINDER,
+        help=argparse.SUPPRESS,
+    )
     args = parser.parse_args()
 
     # ----------------------------
