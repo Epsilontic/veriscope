@@ -1655,7 +1655,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--metric_interval",
         type=int,
-        default=5,
+        default=None,
         help="Compute veriscope metrics every N iterations (controls evidence density).",
     )
 
@@ -1749,15 +1749,15 @@ if __name__ == "__main__":
             "used for the 2500–2900 token-permutation experiments."
         ),
     )
-    parser.add_argument("--gate_window", type=int, default=50)
-    parser.add_argument("--gate_warmup", type=int, default=500)
-    parser.add_argument("--gate_epsilon", type=float, default=0.12)
-    parser.add_argument("--gate_gain_thresh", type=float, default=0.0)
-    parser.add_argument("--gate_min_evidence", type=int, default=16)
+    parser.add_argument("--gate_window", type=int, default=None)
+    parser.add_argument("--gate_warmup", type=int, default=None)
+    parser.add_argument("--gate_epsilon", type=float, default=None)
+    parser.add_argument("--gate_gain_thresh", type=float, default=None)
+    parser.add_argument("--gate_min_evidence", type=int, default=None)
     parser.add_argument(
         "--gate_min_metrics_exceeding",
         type=int,
-        default=1,
+        default=None,
         help="Require >=K metrics exceeding eps_eff before stability WARN/FAIL/persistence engages (1=legacy).",
     )
     parser.add_argument(
@@ -1775,14 +1775,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--gate_eps_stat_max_frac",
         type=float,
-        default=0.25,
+        default=None,
         help="Cap eps_stat as a fraction of epsilon (effective eps = epsilon - eps_stat_capped).",
     )
     parser.add_argument(
         "--gate_policy",
         type=str,
         choices=["either", "conjunction", "persistence", "persistence_stability"],
-        default="either",
+        default=None,
         help=(
             "Gate failure policy. "
             "'either'=fail on gain OR stability (original), "
@@ -1941,50 +1941,73 @@ if __name__ == "__main__":
     # Canonical artifacts directory: colocate with legacy out_json
     artifacts_outdir = out_path.parent
 
-    started_ts_utc_dt = datetime.utcnow()
+    from datetime import timezone
+
+    started_ts_utc_dt = datetime.now(timezone.utc)
     run_status = "success"
     _train_exc: BaseException | None = None
 
-    def _flag_present(name: str) -> bool:
-        """Return True if a flag (or flag=value) is explicitly present in argv."""
-        for a in sys.argv[1:]:
-            if a == name or a.startswith(name + "="):
-                return True
-        return False
+    PRESET_KEYS = [
+        "metric_interval",
+        "gate_window",
+        "gate_warmup",
+        "gate_epsilon",
+        "gate_gain_thresh",
+        "gate_min_evidence",
+        "gate_min_metrics_exceeding",
+        "gate_eps_stat_max_frac",
+        "gate_policy",
+    ]
 
+    cli_gate_overrides = {k: getattr(args, k) for k in PRESET_KEYS if getattr(args, k, None) is not None}
+
+    legacy = {
+        "metric_interval": 5,
+        "gate_window": 50,
+        "gate_warmup": 500,
+        "gate_epsilon": 0.12,
+        "gate_gain_thresh": 0.0,
+        "gate_min_evidence": 16,
+        "gate_min_metrics_exceeding": 1,
+        "gate_eps_stat_max_frac": 0.25,
+        "gate_policy": "either",
+    }
+
+    tuned = {
+        "gate_window": 100,
+        "gate_warmup": 1000,
+        "gate_epsilon": 0.15,
+        "gate_gain_thresh": -0.003,
+        "gate_min_evidence": 20,
+        "gate_eps_stat_max_frac": 0.15,
+    }
+    spike_v1 = {
+        "metric_interval": 2,
+        "gate_window": 75,
+        "gate_warmup": 1500,
+        "gate_epsilon": 0.25,
+        "gate_eps_stat_max_frac": 0.15,
+        "gate_min_evidence": 75,
+        "gate_gain_thresh": -0.002,
+        "gate_policy": "persistence_stability",
+        # Optional but recommended for your “var_out_k heavy-tail nuisance WARNs” case:
+        "gate_min_metrics_exceeding": 2,
+    }
+
+    # Acceptance checks:
+    # - legacy preset with no gate flags resolves to values in legacy dict above.
+    # - resolved_gate_cfg/run_config_resolved reflect these values.
+    # - spike_v1 preset sets gate_min_metrics_exceeding=2 unless CLI overrides it.
+    resolved_gate_args = dict(legacy)
     if gate_preset_effective == "tuned":
-        tuned = {
-            "gate_window": 100,
-            "gate_warmup": 1000,
-            "gate_epsilon": 0.15,
-            "gate_gain_thresh": -0.003,
-            "gate_min_evidence": 20,
-            "gate_eps_stat_max_frac": 0.15,
-        }
-        for k, v in tuned.items():
-            flag = "--" + k
-            if not _flag_present(flag):
-                setattr(args, k, v)
-
+        resolved_gate_args.update(tuned)
     elif gate_preset_effective == "spike_v1":
-        # Canonical, empirically validated spike/corruption smoke config.
-        # Intended for change-focused corruption detection experiments.
-        spike_v1 = {
-            "metric_interval": 2,
-            "gate_window": 75,
-            "gate_warmup": 1500,
-            "gate_epsilon": 0.25,
-            "gate_eps_stat_max_frac": 0.15,
-            "gate_min_evidence": 75,
-            "gate_gain_thresh": -0.002,
-            "gate_policy": "persistence_stability",
-            # Optional but recommended for your “var_out_k heavy-tail nuisance WARNs” case:
-            "gate_min_metrics_exceeding": 2,
-        }
-        for k, v in spike_v1.items():
-            flag = "--" + k
-            if not _flag_present(flag):
-                setattr(args, k, v)
+        resolved_gate_args.update(spike_v1)
+
+    for k in PRESET_KEYS:
+        v = getattr(args, k, None)
+        if v is not None:
+            resolved_gate_args[k] = v
 
     # Set env for meta.pkl discovery
     os.environ["NANOGPT_DIR"] = args.nanogpt_dir
@@ -2004,7 +2027,7 @@ if __name__ == "__main__":
         eval_interval=500,
         log_interval=10,
         device=args.device,
-        metric_interval=args.metric_interval,
+        # metric_interval is set below
         # Logit diagnostics
         log_logit_norm=bool(args.log_logit_norm),
         logit_norm_stride=int(args.logit_norm_stride),
@@ -2021,14 +2044,6 @@ if __name__ == "__main__":
         data_corrupt_mode=args.data_corrupt_mode,
         # Gate config
         gate_enabled=True,
-        gate_window=args.gate_window,
-        gate_warmup=args.gate_warmup,
-        gate_epsilon=args.gate_epsilon,
-        gate_gain_thresh=args.gate_gain_thresh,
-        gate_min_evidence=args.gate_min_evidence,
-        gate_min_metrics_exceeding=int(getattr(args, "gate_min_metrics_exceeding", 1)),
-        gate_eps_stat_max_frac=args.gate_eps_stat_max_frac,
-        gate_policy=args.gate_policy,
         gate_persistence_k=args.gate_persistence_k,
         # Regime config
         regime_enabled=regime_enabled,
@@ -2057,6 +2072,38 @@ if __name__ == "__main__":
         calibration_fail_on_schema_mismatch=True,
     )
 
+    missing_keys = [name for name in PRESET_KEYS if name not in resolved_gate_args]
+    missing_vals = [name for name in PRESET_KEYS if resolved_gate_args.get(name, None) is None]
+    if missing_keys or missing_vals:
+        raise RuntimeError(f"Preset resolution bug: missing gate fields: keys={missing_keys} values={missing_vals}")
+    for name in PRESET_KEYS:
+        setattr(config, name, resolved_gate_args[name])
+    metric_interval = int(config.metric_interval)
+    if metric_interval < 1:
+        raise ValueError(f"metric_interval must be >= 1 (got {metric_interval})")
+    gate_window = int(config.gate_window)
+    if gate_window < 1:
+        raise ValueError(f"gate_window must be >= 1 (got {gate_window})")
+    gate_warmup = int(config.gate_warmup)
+    if gate_warmup < 0:
+        raise ValueError(f"gate_warmup must be >= 0 (got {gate_warmup})")
+    gate_min_evidence = int(config.gate_min_evidence)
+    # gate_min_evidence=0 means "no minimum evidence" and is supported.
+    if gate_min_evidence < 0:
+        raise ValueError(f"gate_min_evidence must be >= 0 (got {gate_min_evidence})")
+    gate_min_metrics_exceeding = int(config.gate_min_metrics_exceeding)
+    if gate_min_metrics_exceeding < 1:
+        raise ValueError(f"gate_min_metrics_exceeding must be >= 1 (got {gate_min_metrics_exceeding})")
+    gate_epsilon = float(config.gate_epsilon)
+    if not math.isfinite(gate_epsilon) or gate_epsilon <= 0:
+        raise ValueError(f"gate_epsilon must be finite and > 0 (got {gate_epsilon})")
+    gate_gain_thresh = float(config.gate_gain_thresh)
+    if not math.isfinite(gate_gain_thresh):
+        raise ValueError(f"gate_gain_thresh must be finite (got {gate_gain_thresh})")
+    gate_eps_stat_max_frac = float(config.gate_eps_stat_max_frac)
+    if not math.isfinite(gate_eps_stat_max_frac) or gate_eps_stat_max_frac < 0 or gate_eps_stat_max_frac > 1:
+        raise ValueError(f"gate_eps_stat_max_frac must be finite and in [0, 1] (got {gate_eps_stat_max_frac})")
+
     data_dir = os.path.join(args.nanogpt_dir, "data", args.dataset)
     get_batch = get_batch_factory(
         data_dir=data_dir,
@@ -2082,7 +2129,7 @@ if __name__ == "__main__":
         except Exception:
             pass
     finally:
-        ended_ts_utc_dt = datetime.utcnow()
+        ended_ts_utc_dt = datetime.now(timezone.utc)
 
         # Build a resolved gate config dict for the artifact signature.
         resolved_gate_cfg: Dict[str, Any] = {
@@ -2115,7 +2162,7 @@ if __name__ == "__main__":
             started_ts_utc=started_ts_utc_dt,
             ended_ts_utc=ended_ts_utc_dt,
             gate_preset=str(args.gate_preset),
-            overrides=None,
+            overrides=dict(cli_gate_overrides),
             resolved_gate_cfg=resolved_gate_cfg,
             metric_interval=int(config.metric_interval),
             metric_pipeline={"transport": "nanoGPT"},
@@ -2137,6 +2184,9 @@ if __name__ == "__main__":
             "artifacts_outdir": str(artifacts_outdir),
             "argv": safe_argv,
             "gate_preset": str(args.gate_preset),
+            "gate_preset_effective": gate_preset_effective,
+            "cli_gate_overrides": dict(cli_gate_overrides),
+            "resolved_gate_args": dict(resolved_gate_args),
             "resolved_gate_cfg": dict(resolved_gate_cfg),
             "metric_pipeline": {"transport": "nanoGPT"},
             "window_signature_ref": {
