@@ -115,6 +115,192 @@ def compute_window_spans(
     return Wm, window_span_iters, stride_iters
 
 
+def _coerce_float(value: Any, default: float = float("nan")) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _needs_fill(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        s = value.strip()
+        return (s == "") or (s.lower() == "none")
+    try:
+        return str(value).strip().lower() == "none"
+    except Exception:
+        return False
+
+
+def _coerce_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return int(default)
+
+
+def _compute_metrics_exceeding(per_metric_tv: Dict[str, Any], eps_eff: float) -> Tuple[List[str], str]:
+    if not isinstance(per_metric_tv, dict) or not per_metric_tv:
+        return [], "combined_only_no_tv"
+    try:
+        eps_eff_f = float(eps_eff)
+    except Exception:
+        return [], "combined_only_no_tv"
+    if not np.isfinite(eps_eff_f):
+        return [], "combined_only_no_tv"
+    exceeding: List[str] = []
+    for name, val in per_metric_tv.items():
+        try:
+            if isinstance(val, dict) and "tv" in val:
+                tv = float(val["tv"])
+            else:
+                tv = float(val)
+        except Exception:
+            continue
+        if np.isfinite(tv) and tv > eps_eff_f:
+            exceeding.append(str(name))
+    if not exceeding:
+        return [], "combined_only"
+    return sorted(exceeding), "per_metric_threshold"
+
+
+def _normalize_gate_audit(
+    audit_in: Dict[str, Any],
+    *,
+    config: "TrainConfig",
+    gain_bits: float,
+    row_reason: str,
+    row_base_reason: str,
+    row_change_reason: str,
+) -> Dict[str, Any]:
+    audit: Dict[str, Any] = dict(audit_in or {})
+    audit["evaluated"] = bool(audit.get("evaluated", True))
+    audit["policy"] = str(audit.get("policy", getattr(config, "gate_policy", "either")) or "either")
+    audit["reason"] = row_reason
+    audit["base_reason"] = row_base_reason
+    audit["change_reason"] = row_change_reason
+    audit.setdefault("per_metric_tv", {})
+
+    gain_thresh = float(getattr(config, "gate_gain_thresh", 0.0))
+    audit["gain_thresh"] = gain_thresh
+    if _needs_fill(audit.get("gain_thr")):
+        audit["gain_thr"] = gain_thresh
+
+    gain_bits_val = _coerce_float(audit.get("gain_bits", gain_bits))
+    audit["gain_bits"] = gain_bits_val
+    gain_ok_val = audit.get("gain_ok", audit.get("ok_gain", None))
+    if gain_ok_val is None:
+        if np.isfinite(gain_bits_val) and np.isfinite(gain_thresh):
+            gain_ok_val = gain_bits_val >= gain_thresh
+        else:
+            gain_ok_val = True
+    audit["gain_ok"] = bool(gain_ok_val)
+
+    worst_dw = _coerce_float(audit.get("worst_DW", audit.get("worst_dw", float("nan"))))
+    eps_eff = _coerce_float(audit.get("eps_eff", float("nan")))
+    audit["worst_DW"] = worst_dw
+    audit["eps_eff"] = eps_eff
+
+    dw_exceeds = audit.get("dw_exceeds_threshold", None)
+    if dw_exceeds is None:
+        dw_exceeds = bool(np.isfinite(worst_dw) and np.isfinite(eps_eff) and worst_dw > eps_eff)
+    audit["dw_exceeds_threshold"] = bool(dw_exceeds)
+
+    per_metric_tv = audit.get("per_metric_tv")
+    if not isinstance(per_metric_tv, dict):
+        per_metric_tv = {}
+        audit["per_metric_tv"] = per_metric_tv
+
+    metrics_exceeding, exceedance_mode = _compute_metrics_exceeding(per_metric_tv, eps_eff)
+    if audit["evaluated"]:
+        audit["exceedance_mode"] = exceedance_mode
+    else:
+        audit.setdefault("exceedance_mode", "not_evaluated")
+    if not metrics_exceeding:
+        existing = audit.get("metrics_exceeding")
+        if isinstance(existing, list) and existing:
+            metrics_exceeding = sorted(str(m) for m in existing)
+    audit["metrics_exceeding"] = metrics_exceeding
+
+    min_metrics_exceeding = audit.get("min_metrics_exceeding", getattr(config, "gate_min_metrics_exceeding", 1))
+    audit["min_metrics_exceeding"] = _coerce_int(min_metrics_exceeding, default=1)
+
+    if "evidence_total" not in audit:
+        audit["evidence_total"] = _coerce_int(audit.get("total_evidence", 0), default=0)
+    audit["min_evidence"] = _coerce_int(audit.get("min_evidence", getattr(config, "gate_min_evidence", 0)), default=0)
+
+    if audit["dw_exceeds_threshold"] and not audit["metrics_exceeding"]:
+        items: List[Tuple[str, float]] = []
+        for name, val in per_metric_tv.items():
+            try:
+                if isinstance(val, dict) and "tv" in val:
+                    tv = float(val["tv"])
+                else:
+                    tv = float(val)
+            except Exception:
+                continue
+            if np.isfinite(tv):
+                items.append((str(name), float(tv)))
+        items.sort(key=lambda kv: kv[1], reverse=True)
+        audit["metrics_exceeding"] = [name for name, _ in items[:5]]
+        audit["exceedance_mode"] = "topk_contributors" if items else exceedance_mode
+
+    return audit
+
+
+def _derive_gate_decision(evaluated: bool, ok: bool, warn: bool) -> str:
+    if not evaluated:
+        return "skip"
+    if warn:
+        return "warn"
+    if ok:
+        return "pass"
+    return "fail"
+
+
+def _validate_gate_row(row: Dict[str, Any]) -> None:
+    if not __debug__:
+        return
+    decision = row.get("decision")
+    assert decision in {"pass", "warn", "fail", "skip"}
+    audit = row.get("audit", {})
+    required = {
+        "reason",
+        "evaluated",
+        "policy",
+        "gain_bits",
+        "gain_thresh",
+        "gain_ok",
+        "worst_DW",
+        "eps_eff",
+        "dw_exceeds_threshold",
+        "metrics_exceeding",
+        "min_metrics_exceeding",
+        "evidence_total",
+        "min_evidence",
+    }
+    missing = [k for k in required if k not in audit]
+    assert not missing, f"missing audit keys: {missing}"
+    if audit.get("dw_exceeds_threshold"):
+        mode = audit.get("exceedance_mode")
+        if mode not in {"combined_only_no_tv", "not_evaluated"}:
+            assert audit.get("metrics_exceeding")
+
+
+# Sanity check for emitted gate rows (example one-liner):
+# python - <<'PY'
+# import json, sys
+# data = json.load(open(sys.argv[1]))
+# gates = data.get("gate_history") or data.get("gates") or data.get("gate_checks") or []
+# bad = [g for g in gates if g.get("audit", {}).get("dw_exceeds_threshold") and not g.get("audit", {}).get("metrics_exceeding")]
+# modes = {g.get("audit", {}).get("exceedance_mode") for g in gates}
+# print("bad_dw_exceeds_rows=", len(bad))
+# print("exceedance_modes=", sorted(m for m in modes if m))
+# PY
+
+
 # Your veriscope imports
 from veriscope.runners.gpt.adapter import (
     GPTMetricConfig,
@@ -756,19 +942,27 @@ class VeriscopeGatedTrainer:
             # Not enough history to form past/recent windows => not evaluated.
             # Include iter for downstream overlap analysis (analyze_gates.py).
             reason = "not_evaluated_insufficient_history"
-            return {
+            audit = _normalize_gate_audit(
+                {
+                    "evaluated": False,
+                    "policy": str(getattr(cfg, "gate_policy", "either")),
+                },
+                config=cfg,
+                gain_bits=float("nan"),
+                row_reason=reason,
+                row_base_reason=reason,
+                row_change_reason=reason,
+            )
+            decision = _derive_gate_decision(evaluated=False, ok=True, warn=False)
+            gate_row = {
                 "ok": True,
                 "warn": False,
+                "decision": decision,
                 "iter": int(self.iter_num),
                 "reason": reason,
                 "base_reason": reason,
                 "change_reason": reason,
-                "audit": {
-                    "evaluated": False,
-                    "reason": reason,
-                    "base_reason": reason,
-                    "change_reason": reason,
-                },
+                "audit": audit,
                 # keep schema stable
                 "gain_bits": float("nan"),
                 "change_ok": True,
@@ -790,6 +984,8 @@ class VeriscopeGatedTrainer:
                 "spike_overlap_recent": False,
                 "spike_any_overlap": False,
             }
+            _validate_gate_row(gate_row)
+            return gate_row
 
         # Get past and recent windows (in metric snapshots)
         recent = self.metric_history[-(2 * Wm) :]
@@ -874,17 +1070,6 @@ class VeriscopeGatedTrainer:
         # Regime tri-state: only meaningful if the regime check actually ran.
         regime_ok_tri = audit.get("regime_ok", None) if regime_check_ran else None
 
-        def _needs_fill(x: Any) -> bool:
-            if x is None:
-                return True
-            if isinstance(x, str):
-                s = x.strip()
-                return (s == "") or (s.lower() == "none")
-            try:
-                return str(x).strip().lower() == "none"
-            except Exception:
-                return False
-
         # Harden runner even if someone swaps gate_engine without regime wrapper.
         evaluated = bool(audit.get("evaluated", True))
         row_reason = audit.get("reason", None)
@@ -906,9 +1091,38 @@ class VeriscopeGatedTrainer:
         v_regime_ok = audit.get("regime_ok", True)
         legacy_regime_ok = True if v_regime_ok is None else bool(v_regime_ok)
 
-        return {
-            "ok": result.ok,
-            "warn": getattr(result, "warn", False),
+        audit = _normalize_gate_audit(
+            audit,
+            config=cfg,
+            gain_bits=gain_bits,
+            row_reason=row_reason,
+            row_base_reason=row_base_reason,
+            row_change_reason=row_change_reason,
+        )
+
+        ok = bool(result.ok)
+        warn = bool(getattr(result, "warn", False))
+        evaluated = bool(audit.get("evaluated", True))
+        policy = str(audit.get("policy", "either"))
+        dw_exceeds = bool(audit.get("dw_exceeds_threshold", False))
+        gain_ok = bool(audit.get("gain_ok", True))
+
+        if evaluated and policy == "either" and (not dw_exceeds) and legacy_regime_ok and (not gain_ok):
+            ok = True
+            warn = True
+            row_reason = "gain_warn_only"
+            row_base_reason = row_reason
+            row_change_reason = row_reason
+            audit["reason"] = row_reason
+            audit["base_reason"] = row_reason
+            audit["change_reason"] = row_reason
+
+        decision = _derive_gate_decision(evaluated=evaluated, ok=ok, warn=warn)
+
+        gate_row = {
+            "ok": ok,
+            "warn": warn,
+            "decision": decision,
             "audit": audit,
             "gain_bits": gain_bits,
             "iter": self.iter_num,
@@ -937,6 +1151,8 @@ class VeriscopeGatedTrainer:
             "spike_overlap_recent": spike_overlap_recent,
             "spike_any_overlap": spike_any_overlap,
         }
+        _validate_gate_row(gate_row)
+        return gate_row
 
     def _compute_logit_diagnostics(self, logits: torch.Tensor) -> Dict[str, Any]:
         """
@@ -1193,6 +1409,18 @@ class VeriscopeGatedTrainer:
                 consec_after = audit.get("consecutive_exceedances_after", 0)
                 pers_k = audit.get("persistence_k", 2)
                 was_evaluated = audit.get("evaluated", True)
+                decision = str(gate_result["decision"])
+                reason = str(gate_result.get("reason", audit.get("reason", "")))
+                gain_bits = _coerce_float(audit.get("gain_bits", gate_result.get("gain_bits", float("nan"))))
+                gain_thresh = _coerce_float(audit.get("gain_thresh", audit.get("gain_thr", cfg.gate_gain_thresh)))
+                worst_dw = _coerce_float(audit.get("worst_DW", float("nan")))
+                eps_eff = _coerce_float(audit.get("eps_eff", float("nan")))
+                metrics_exceeding = audit.get("metrics_exceeding", []) or []
+                metrics_exceeding_count = len(metrics_exceeding) if isinstance(metrics_exceeding, list) else 0
+                min_metrics_exceeding = _coerce_int(
+                    audit.get("min_metrics_exceeding", cfg.gate_min_metrics_exceeding),
+                    default=int(cfg.gate_min_metrics_exceeding),
+                )
 
                 # Format regime status
                 if gate_result.get("ref_just_established"):
@@ -1207,16 +1435,17 @@ class VeriscopeGatedTrainer:
                     regime_status = " [regime disabled]"
 
                 if not gate_result["ok"]:
-                    worst_dw = audit.get("worst_DW", float("nan"))
-                    eps_eff = audit.get("eps_eff", float("nan"))
                     eval_tag = "" if was_evaluated else " [NOT EVALUATED]"
                     print(
-                        f"\n[GATE] iter={self.iter_num} FAIL: "
+                        f"\n[GATE] iter={self.iter_num} {decision.upper()}: "
+                        f"reason={reason}, "
+                        f"gain={gain_bits:.4f}/{gain_thresh:.4f}, "
+                        f"D_W={worst_dw:.4f}/eps_eff={eps_eff:.4f}, "
+                        f"exceeding={metrics_exceeding_count}/{min_metrics_exceeding}, "
                         f"change_ok={gate_result.get('change_ok')}, "
                         f"regime_ok={gate_result.get('regime_ok')}{regime_status} "
                         f"[{policy}, {consec_before}->{consec_after}/{pers_k}]{eval_tag}"
                     )
-                    print(f"       D_W={worst_dw:.4f}, eps_eff={eps_eff:.4f}")
 
                     # Print per-metric breakdown for debugging
                     _audit = gate_result.get("audit", {}) or {}
@@ -1230,11 +1459,12 @@ class VeriscopeGatedTrainer:
                         print(f"       regime_per_metric: {rpm_str}")
                 elif gate_result.get("warn"):
                     # Log WARN: threshold exceeded but not yet FAIL under persistence
-                    worst_dw = audit.get("worst_DW", float("nan"))
-                    eps_eff = audit.get("eps_eff", float("nan"))
                     print(
-                        f"[GATE] iter={self.iter_num} WARN: "
-                        f"D_W={worst_dw:.4f} > eps_eff={eps_eff:.4f}, "
+                        f"[GATE] iter={self.iter_num} {decision.upper()}: "
+                        f"reason={reason}, "
+                        f"gain={gain_bits:.4f}/{gain_thresh:.4f}, "
+                        f"D_W={worst_dw:.4f}/eps_eff={eps_eff:.4f}, "
+                        f"exceeding={metrics_exceeding_count}/{min_metrics_exceeding}, "
                         f"consec={consec_before}->{consec_after}/{pers_k}{regime_status}"
                     )
                     # Attribution on WARN too (top-k so logs don't explode)
@@ -1270,8 +1500,11 @@ class VeriscopeGatedTrainer:
                             print(f"       worst_metric: {wm}")
                 elif self.iter_num % (cfg.gate_window * 10) == 0:
                     print(
-                        f"[GATE] iter={self.iter_num} OK, "
-                        f"gain={gate_result['gain_bits']:.4f} bits{regime_status} "
+                        f"[GATE] iter={self.iter_num} {decision.upper()}: "
+                        f"reason={reason}, "
+                        f"gain={gain_bits:.4f}/{gain_thresh:.4f}, "
+                        f"D_W={worst_dw:.4f}/eps_eff={eps_eff:.4f}, "
+                        f"exceeding={metrics_exceeding_count}/{min_metrics_exceeding}{regime_status} "
                         f"[{policy}]"
                     )
 
