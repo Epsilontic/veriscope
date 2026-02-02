@@ -1132,6 +1132,12 @@ def _cmd_diff(args: argparse.Namespace) -> int:
     return int(result.exit_code)
 
 
+def _cmd_calibrate(args: argparse.Namespace) -> int:
+    from veriscope.cli.calibrate import run_calibrate
+
+    return run_calibrate(args)
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
@@ -1262,6 +1268,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="Allow comparisons across different gate_preset values",
     )
     p_diff.set_defaults(_handler=_cmd_diff)
+
+    p_calibrate = sub.add_parser("calibrate", help="Calibrate pilot control/injected runs")
+    p_calibrate.add_argument("--control-dir", required=True, help="Control capsule OUTDIR")
+    p_calibrate.add_argument("--injected-dir", required=True, help="Injected capsule OUTDIR")
+    p_calibrate.add_argument("--out", default="calibration.json", help="Output JSON path")
+    p_calibrate.add_argument("--out-md", default="calibration.md", help="Output Markdown path")
+    p_calibrate.set_defaults(_handler=_cmd_calibrate)
 
     p_override = sub.add_parser("override", help="Write a manual judgement artifact to an OUTDIR")
     p_override.add_argument("outdir", type=str, help="Artifact directory (OUTDIR)")

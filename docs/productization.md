@@ -194,7 +194,28 @@ Clarification: manual judgement does not change raw gate records; it is an opera
 
 ⸻
 
-2.6 Exit codes (CI-friendly and unambiguous)
+2.6 veriscope calibrate (pilot control/injected, read-only)
+
+veriscope calibrate --control-dir OUTDIR --injected-dir OUTDIR \
+  [--out calibration.json] [--out-md calibration.md]
+
+Reads two capsule directories and emits a calibration summary (JSON + Markdown) without mutating artifacts. Output schema matches `scripts/pilot/score.py`:
+	•	policy_rev
+	•	W, W_source
+	•	K, warmup_source
+	•	FAR, FAR_source
+	•	Delay_W
+	•	overhead
+	•	missing_fields
+	•	redactions_applied
+	•	calibration_status
+
+Defaults write to the current working directory (not inside OUTDIRs). The command exits with code 2 on missing/invalid required inputs and produces deterministic, stable JSON (sorted keys, no timestamps).
+Exit codes: 0 success, 2 invalid/missing input, 3 internal error.
+
+⸻
+
+2.7 Exit codes (CI-friendly and unambiguous)
 
 veriscope run
 
