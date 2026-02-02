@@ -276,6 +276,8 @@ def _validate_gate_row(row: Dict[str, Any]) -> None:
         return
     decision = row.get("decision")
     assert decision in {"pass", "warn", "fail", "skip"}
+    if row.get("warn"):
+        assert row.get("reason") not in {"none_ok", "", None}
     audit = row.get("audit", {})
     required = {
         "reason",
@@ -294,6 +296,7 @@ def _validate_gate_row(row: Dict[str, Any]) -> None:
     }
     missing = [k for k in required if k not in audit]
     assert not missing, f"missing audit keys: {missing}"
+    assert audit.get("reason") == row.get("reason")
     if audit.get("dw_exceeds_threshold"):
         mode = audit.get("exceedance_mode")
         if mode not in {"combined_only_no_tv", "not_evaluated"}:
@@ -1069,7 +1072,9 @@ class VeriscopeGatedTrainer:
             iter_num=self.iter_num,  # Pass iteration for regime reference timing
         )
 
-        audit = result.audit or {}
+        audit = dict(result.audit or {})
+        ok = bool(result.ok)
+        warn = bool(getattr(result, "warn", False))
 
         # Tri-state exports: represent "not evaluated" as None.
         # Regime checks may be enabled but not run on a given check.
@@ -1086,7 +1091,16 @@ class VeriscopeGatedTrainer:
         row_reason = audit.get("reason", None)
         if _needs_fill(row_reason):
             row_reason = "evaluated_unknown" if evaluated else "not_evaluated"
-
+        rr = str(row_reason)
+        if evaluated and warn and rr in {"none_ok", "change_ok", "regime_ok", "evaluated_unknown"}:
+            if audit.get("regime_warn", False):
+                row_reason = "regime_warn_pending"
+            elif audit.get("change_warn", False):
+                row_reason = "change_warn_pending"
+            elif audit.get("warn_pending", False):
+                row_reason = "warn_pending"
+            else:
+                row_reason = "warn"
         row_base_reason = audit.get("base_reason", None)
         if _needs_fill(row_base_reason):
             row_base_reason = row_reason
@@ -1110,9 +1124,6 @@ class VeriscopeGatedTrainer:
             row_base_reason=row_base_reason,
             row_change_reason=row_change_reason,
         )
-
-        ok = bool(result.ok)
-        warn = bool(getattr(result, "warn", False))
         evaluated = bool(audit.get("evaluated", True))
         policy = str(audit.get("policy", "either"))
         dw_exceeds = bool(audit.get("dw_exceeds_threshold", False))
@@ -1127,6 +1138,10 @@ class VeriscopeGatedTrainer:
             audit["reason"] = row_reason
             audit["base_reason"] = row_reason
             audit["change_reason"] = row_reason
+
+        audit["reason"] = row_reason
+        audit["base_reason"] = row_base_reason
+        audit["change_reason"] = row_change_reason
 
         decision = _derive_gate_decision(evaluated=evaluated, ok=ok, warn=warn)
 
