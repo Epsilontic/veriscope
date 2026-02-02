@@ -214,10 +214,21 @@ def _normalize_gate_audit(
         audit["per_metric_tv"] = per_metric_tv
 
     metrics_exceeding, exceedance_mode = _compute_metrics_exceeding(per_metric_tv, eps_eff)
+
+    # If combined D_W is within tolerance, do not advertise a per-metric "exceedance" mode.
+    # We may still keep metrics_exceeding as a diagnostic/probe signal, but it is not an exceedance.
+    if not bool(audit.get("dw_exceeds_threshold", False)):
+        if exceedance_mode == "per_metric_threshold":
+            exceedance_mode = "combined_ok_metric_probe"
+        elif exceedance_mode == "combined_only":
+            exceedance_mode = "combined_ok"
+
     if audit["evaluated"]:
         audit["exceedance_mode"] = exceedance_mode
     else:
         audit.setdefault("exceedance_mode", "not_evaluated")
+
+    # Keep the list (diagnostic). Decision logic should still key off dw_exceeds_threshold.
     if not metrics_exceeding:
         existing = audit.get("metrics_exceeding")
         if isinstance(existing, list) and existing:
