@@ -20,7 +20,12 @@ done
 
 gate_args=()
 if [[ "$inject_gate_preset" == "true" ]]; then
-  gate_args=(--gate_preset tuned_v0)
+  run_kind="gpt"
+  if [[ "${run_kind}" == "gpt" ]]; then
+    gate_args=(--gate_preset tuned)
+  else
+    gate_args=(--gate_preset tuned_v0)
+  fi
 fi
 
 mkdir -p "$outdir"

@@ -1494,12 +1494,13 @@ if __name__ == "__main__":
     # Gate configuration
     parser.add_argument(
         "--gate_preset",
-        choices=["legacy", "tuned", "spike_v1"],
+        choices=["legacy", "tuned", "tuned_v0", "spike_v1"],
         default="legacy",
         help=(
             "Gate parameter preset. 'legacy' preserves existing defaults. "
             "'tuned' applies empirically safer defaults for GPT drift, without "
             "overriding any gate_* flags you explicitly pass on the CLI. "
+            "'tuned_v0' is a backward-compatible alias for 'tuned' (same defaults). "
             "'spike_v1' applies the canonical spike/corruption config (change-focused) "
             "used for the 2500–2900 token-permutation experiments."
         ),
@@ -1680,6 +1681,8 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
+    gate_preset_effective = "tuned" if args.gate_preset == "tuned_v0" else args.gate_preset
+
     # ----------------------------
     # Resolve output paths up-front
     # (needed so artifacts can be emitted even if training errors)
@@ -1705,7 +1708,7 @@ if __name__ == "__main__":
                 return True
         return False
 
-    if args.gate_preset == "tuned":
+    if gate_preset_effective == "tuned":
         tuned = {
             "gate_window": 100,
             "gate_warmup": 1000,
@@ -1719,7 +1722,7 @@ if __name__ == "__main__":
             if not _flag_present(flag):
                 setattr(args, k, v)
 
-    elif args.gate_preset == "spike_v1":
+    elif gate_preset_effective == "spike_v1":
         # Canonical, empirically validated spike/corruption smoke config.
         # Intended for change-focused corruption detection experiments.
         spike_v1 = {
