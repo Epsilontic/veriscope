@@ -8,6 +8,7 @@ import sys
 import textwrap
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import List, Optional, Tuple
 
 import numpy as np
 import pytest
@@ -148,8 +149,16 @@ def _write_minimal_nanogpt(tmp_path: Path, dataset: str = "tiny") -> Path:
     return nanogpt_dir
 
 
-def _run_gpt(tmp_path: Path, nanogpt_dir: Path, dataset: str, seed: int) -> Path:
-    out_dir = tmp_path / f"gpt_seed_{seed}"
+def _run_gpt(
+    tmp_path: Path,
+    nanogpt_dir: Path,
+    dataset: str,
+    seed: int,
+    max_iters: int = 10,
+    run_tag: Optional[str] = None,
+) -> Path:
+    dir_suffix = f"{seed}_{run_tag}" if run_tag else str(seed)
+    out_dir = tmp_path / f"gpt_seed_{dir_suffix}"
     out_dir.mkdir(parents=True, exist_ok=True)
     cmd = [
         sys.executable,
@@ -162,7 +171,7 @@ def _run_gpt(tmp_path: Path, nanogpt_dir: Path, dataset: str, seed: int) -> Path
         "--device",
         "cpu",
         "--max_iters",
-        "10",
+        str(max_iters),
         "--metric_interval",
         "1",
         "--out_dir",
@@ -179,11 +188,70 @@ def _run_gpt(tmp_path: Path, nanogpt_dir: Path, dataset: str, seed: int) -> Path
     env.setdefault("VECLIB_MAXIMUM_THREADS", "1")
     pythonpath = env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = os.pathsep.join([str(REPO_ROOT), pythonpath]) if pythonpath else str(REPO_ROOT)
-    subprocess.run(cmd, env=env, check=True, capture_output=True, text=True)
+    try:
+        subprocess.run(cmd, env=env, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as exc:
+        stdout = exc.stdout or ""
+        stderr = exc.stderr or ""
+        raise RuntimeError(
+            "nanoGPT runner failed.\n"
+            f"returncode: {exc.returncode}\n"
+            f"cmd: {' '.join(cmd)}\n"
+            f"stdout:\n{stdout}\n"
+            f"stderr:\n{stderr}"
+        ) from exc
     return out_dir
 
 
-def _run_hf_wrapper(outdir: Path, runner_args: list[str], fake_deps_dir: Path) -> subprocess.CompletedProcess:
+def _quantize_losses(losses: List[float], ndigits: int = 8) -> List[float]:
+    return [round(float(loss), ndigits) for loss in losses]
+
+
+def _first_divergence(
+    losses_a: List[float],
+    losses_b: List[float],
+    tol: float = 0.0,
+) -> Optional[Tuple[int, float, float]]:
+    for idx, (left, right) in enumerate(zip(losses_a, losses_b)):
+        if abs(left - right) > tol:
+            return idx, left, right
+    return None
+
+
+def _filtered_run_config(run_config_path: Path) -> dict[str, object]:
+    run_config = json.loads(run_config_path.read_text(encoding="utf-8"))
+    selected: dict[str, object] = {}
+    keep_keys = {
+        "resolved_seed",
+        "gate_preset_effective",
+        "resolved_gate_cfg",
+        "metric_pipeline",
+        "provenance",
+    }
+    for key in keep_keys:
+        if key in run_config:
+            selected[key] = run_config[key]
+
+    window_signature_ref = run_config.get("window_signature_ref")
+    if isinstance(window_signature_ref, dict):
+        window_hash = window_signature_ref.get("hash")
+        if window_hash is not None:
+            selected["window_signature_hash"] = window_hash
+
+    provenance = selected.get("provenance")
+    if isinstance(provenance, dict):
+        filtered_provenance = {}
+        for key in ("policy_rev", "resolved_seed"):
+            if key in provenance:
+                filtered_provenance[key] = provenance[key]
+        selected["provenance"] = filtered_provenance
+
+    return selected
+
+
+def _run_hf_wrapper(
+    outdir: Path, runner_args: List[str], fake_deps_dir: Path
+) -> subprocess.CompletedProcess:
     cmd = [
         sys.executable,
         "-c",
@@ -208,7 +276,7 @@ def _run_hf_wrapper(outdir: Path, runner_args: list[str], fake_deps_dir: Path) -
 def test_gpt_seed_resolved_and_recorded(tmp_path: Path) -> None:
     dataset = "tiny"
     nanogpt_dir = _write_minimal_nanogpt(tmp_path, dataset=dataset)
-    out_dir = _run_gpt(tmp_path, nanogpt_dir, dataset, seed=123)
+    out_dir = _run_gpt(tmp_path, nanogpt_dir, dataset, seed=123, max_iters=10)
 
     run_cfg = json.loads((out_dir / "run_config_resolved.json").read_text(encoding="utf-8"))
     assert run_cfg.get("resolved_seed") == 123
@@ -222,9 +290,9 @@ def test_gpt_seed_changes_metrics(tmp_path: Path) -> None:
     dataset = "tiny"
     nanogpt_dir = _write_minimal_nanogpt(tmp_path, dataset=dataset)
 
-    out_dir_a = _run_gpt(tmp_path, nanogpt_dir, dataset, seed=111)
-    out_dir_b = _run_gpt(tmp_path, nanogpt_dir, dataset, seed=222)
-    out_dir_c = _run_gpt(tmp_path, nanogpt_dir, dataset, seed=111)
+    out_dir_a = _run_gpt(tmp_path, nanogpt_dir, dataset, seed=111, max_iters=50, run_tag="a")
+    out_dir_b = _run_gpt(tmp_path, nanogpt_dir, dataset, seed=222, max_iters=50, run_tag="b")
+    out_dir_c = _run_gpt(tmp_path, nanogpt_dir, dataset, seed=111, max_iters=50, run_tag="c")
 
     metrics_a = json.loads((out_dir_a / "run.json").read_text(encoding="utf-8"))["metrics"]
     metrics_b = json.loads((out_dir_b / "run.json").read_text(encoding="utf-8"))["metrics"]
@@ -235,8 +303,38 @@ def test_gpt_seed_changes_metrics(tmp_path: Path) -> None:
     losses_c = [m["loss"] for m in metrics_c]
 
     assert len(losses_a) == len(losses_b) == len(losses_c)
-    assert any(abs(a - b) > 1e-9 * max(1.0, abs(a), abs(b)) for a, b in zip(losses_a, losses_b))
-    assert losses_a == pytest.approx(losses_c, rel=1e-6, abs=1e-6)
+    quantized_a = _quantize_losses(losses_a)
+    quantized_c = _quantize_losses(losses_c)
+
+    divergence_ac = _first_divergence(losses_a, losses_c, tol=1e-8)
+    if divergence_ac is not None:
+        idx, left, right = divergence_ac
+        start = max(idx - 2, 0)
+        end = idx + 3
+        pytest.fail(
+            "Expected identical loss trajectories; first divergence at index "
+            f"{idx}: {left} vs {right}. "
+            f"Context A[{start}:{end}]={quantized_a[start:end]} "
+            f"C[{start}:{end}]={quantized_c[start:end]}"
+        )
+
+    divergence_ab = _first_divergence(losses_a, losses_b, tol=1e-8)
+    if divergence_ab is None:
+        pytest.fail("Expected different loss trajectories but found none.")
+
+    filtered_a = _filtered_run_config(out_dir_a / "run_config_resolved.json")
+    filtered_c = _filtered_run_config(out_dir_c / "run_config_resolved.json")
+    if filtered_a != filtered_c:
+        keys = sorted(set(filtered_a) | set(filtered_c))
+        diffs = [
+            f"{key}: {filtered_a.get(key)!r} != {filtered_c.get(key)!r}"
+            for key in keys
+            if filtered_a.get(key) != filtered_c.get(key)
+        ]
+        pytest.fail(
+            "Expected semantic run config matches. Differences:\n"
+            + "\n".join(diffs)
+        )
 
 
 def test_hf_seed_resolved_in_wrapper(tmp_path: Path) -> None:
