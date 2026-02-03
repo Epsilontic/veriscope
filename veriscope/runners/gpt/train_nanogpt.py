@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import os
 import sys
+import random
 from datetime import datetime, timezone
 from pathlib import Path
 import time
@@ -74,6 +75,28 @@ def _ensure_nanogpt_on_path(nanogpt_dir: str) -> None:
     p = str(Path(nanogpt_dir).resolve())
     if p not in sys.path:
         sys.path.insert(0, p)
+
+
+def _resolve_seed(cli_seed: Optional[int], env: Dict[str, str], default_seed: int) -> int:
+    if cli_seed is not None:
+        return int(cli_seed)
+    raw = (env.get("VERISCOPE_SEED") or "").strip()
+    if raw:
+        try:
+            return int(raw)
+        except ValueError:
+            warnings.warn(f"Ignoring invalid VERISCOPE_SEED={raw!r}; using default seed {default_seed}.")
+    return int(default_seed)
+
+
+def _seed_all(seed: int) -> None:
+    seed_int = int(seed)
+    seed32 = seed_int % (2**32)
+    random.seed(seed_int)
+    np.random.seed(seed32)
+    torch.manual_seed(seed_int)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed_int)
 
 
 def _iso_utc(dt: datetime) -> str:
@@ -442,6 +465,7 @@ class TrainConfig:
     calibration_only_healthy: bool = False
     calibration_main_process_only: bool = True
     calibration_fail_on_schema_mismatch: bool = True
+    base_seed: int = 42
 
 
 class VeriscopeGatedTrainer:
@@ -716,9 +740,10 @@ class VeriscopeGatedTrainer:
     def _get_autocast_context(self):
         """Get appropriate autocast context."""
         cfg = self.config
-        if cfg.dtype == "bfloat16":
+        use_cuda = "cuda" in str(cfg.device) and torch.cuda.is_available()
+        if use_cuda and cfg.dtype == "bfloat16":
             return torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
-        elif cfg.dtype == "float16":
+        elif use_cuda and cfg.dtype == "float16":
             return torch.amp.autocast(device_type="cuda", dtype=torch.float16)
         else:
             return nullcontext()
@@ -818,11 +843,12 @@ class VeriscopeGatedTrainer:
             {"params": no_decay_params, "weight_decay": 0.0},
         ]
 
+        use_fused = "cuda" in str(cfg.device) and torch.cuda.is_available()
         return torch.optim.AdamW(
             optim_groups,
             lr=cfg.learning_rate,
             betas=(cfg.beta1, cfg.beta2),
-            fused=True,  # H100 optimization
+            fused=use_fused,  # H100 optimization (CUDA only)
         )
 
     def _get_lr(self, it: int) -> float:
@@ -891,7 +917,7 @@ class VeriscopeGatedTrainer:
 
         # deterministic per-iteration generator
         gen = torch.Generator(device=X.device)
-        gen.manual_seed(int(self.iter_num) * 31337 + 42)
+        gen.manual_seed(int(self.config.base_seed) + int(self.iter_num) * 31337)
 
         mode = str(cfg.data_corrupt_mode).lower().strip()
         if mode not in ("permute", "random", "mask"):
@@ -1317,7 +1343,7 @@ class VeriscopeGatedTrainer:
         if self.iter_num % max(1, int(self.config.metric_interval)) == 0:
             metrics = self.metric_computer.compute_all(
                 input_ids,
-                run_key=42,
+                run_key=self.config.base_seed,
                 epoch=self.iter_num,
                 prev_H_jl=self._prev_H_jl,
             )
@@ -1668,6 +1694,12 @@ if __name__ == "__main__":
         help="Max training iterations (default 5000).",
     )
     parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Base RNG seed (default: 42; env VERISCOPE_SEED, CLI wins).",
+    )
+    parser.add_argument(
         "--metric_interval",
         type=int,
         default=None,
@@ -1940,6 +1972,9 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
+    resolved_seed = _resolve_seed(args.seed, os.environ, default_seed=42)
+    _seed_all(resolved_seed)
+
     gate_preset_effective = "tuned" if args.gate_preset == "tuned_v0" else args.gate_preset
 
     # ----------------------------
@@ -2085,6 +2120,7 @@ if __name__ == "__main__":
         calibration_only_healthy=bool(args.calibration_only_healthy),
         calibration_main_process_only=True,
         calibration_fail_on_schema_mismatch=True,
+        base_seed=int(resolved_seed),
     )
 
     missing_keys = [name for name in PRESET_KEYS if name not in resolved_gate_args]
@@ -2195,6 +2231,7 @@ if __name__ == "__main__":
             "run_status": str(run_status),
             "started_ts_utc": _iso_utc(started_ts_utc_dt),
             "ended_ts_utc": _iso_utc(ended_ts_utc_dt),
+            "resolved_seed": int(resolved_seed),
             "out_json": str(out_path),
             "artifacts_outdir": str(artifacts_outdir),
             "argv": safe_argv,
@@ -2210,7 +2247,7 @@ if __name__ == "__main__":
             },
             "env": env_safe,
             "env_capture": env_capture,
-            "provenance": {"policy_rev": POLICY_REV},
+            "provenance": {"policy_rev": POLICY_REV, "resolved_seed": int(resolved_seed)},
         }
 
         if _train_exc is not None:
@@ -2313,6 +2350,7 @@ if __name__ == "__main__":
         pass
 
     config_snapshot = {
+        "seed": {"resolved_seed": int(resolved_seed)},
         "gate": {
             "metric_interval": config.metric_interval,
             "gate_window": config.gate_window,
@@ -2358,6 +2396,7 @@ if __name__ == "__main__":
                 "gates": gates,
                 "reference": reference_info,
                 "config": config_snapshot,
+                "resolved_seed": int(resolved_seed),
             },
             f,
             indent=2,

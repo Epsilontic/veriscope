@@ -119,6 +119,22 @@ def _default_outdir() -> Path:
     return base / f"veriscope_hf_{ts}_{os.getpid()}"
 
 
+def _resolve_seed(cli_seed: Optional[int], default_seed: int = 1337) -> int:
+    if cli_seed is not None:
+        return int(cli_seed)
+    raw = (os.environ.get("VERISCOPE_SEED") or "").strip()
+    if raw:
+        try:
+            return int(raw)
+        except ValueError:
+            logger.warning("Ignoring invalid VERISCOPE_SEED=%r; using default seed %d.", raw, default_seed)
+    return int(default_seed)
+
+
+def _seed_for_rank(base_seed: int, rank: int) -> int:
+    return int(base_seed) + 1000 * int(rank)
+
+
 def _get_rank_and_world() -> tuple[int, int]:
     """Determine (rank, world_size) without being confused by unrelated env vars.
 
@@ -172,10 +188,13 @@ def _is_chief() -> bool:
 
 
 def _set_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    seed_int = int(seed)
+    seed32 = seed_int % (2**32)
+    random.seed(seed_int)
+    np.random.seed(seed32)
+    torch.manual_seed(seed_int)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed_int)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
@@ -656,6 +675,10 @@ def _build_run_manifest(
     runner_signal: Optional[str],
     failure_reason: Optional[str],
     failure_traceback: Optional[str],
+    seed_rank: int,
+    seed_rank_scheme: str,
+    rank: int,
+    world_size: int,
     rank_used_for_corrupt_seed: Optional[int],
     world_size_used_for_corrupt_seed: Optional[int],
 ) -> Dict[str, Any]:
@@ -729,10 +752,14 @@ def _build_run_manifest(
             "OMP_NUM_THREADS": env.get("OMP_NUM_THREADS"),
         },
         "seeds": {
-            "seed": cfg.seed,
-            "torch_manual_seed": cfg.seed,
-            "numpy_seed": cfg.seed,
-            "python_random_seed": cfg.seed,
+            "base_seed": cfg.seed,
+            "seed_rank": int(seed_rank),
+            "rank_seed_scheme": seed_rank_scheme,
+            "rank": int(rank),
+            "world_size": int(world_size),
+            "torch_manual_seed": int(seed_rank),
+            "numpy_seed": int(seed_rank),
+            "python_random_seed": int(seed_rank),
         },
         "determinism": {
             "cudnn_deterministic": bool(torch.backends.cudnn.deterministic),
@@ -1090,7 +1117,14 @@ def _force_cleanup_outdir(outdir: Path) -> None:
             pass
 
 
-def _run_body(cfg: HFRunConfig, *, argv: List[str]) -> int:
+def _run_body(
+    cfg: HFRunConfig,
+    *,
+    argv: List[str],
+    rank: int,
+    world_size: int,
+    seed_rank: int,
+) -> int:
     if _is_chief():
         # If any outer wrapper pre-created capsule markers (esp window_signature.json),
         # force mode must ensure the runner is authoritative.
@@ -1347,7 +1381,6 @@ def _run_body(cfg: HFRunConfig, *, argv: List[str]) -> int:
 
     step = 0
     batch_idx = 0
-    rank, world_size = _get_rank_and_world()
     data_iter = iter(data_loader)
     try:
         while step < cfg.max_steps:
@@ -1623,6 +1656,10 @@ def _run_body(cfg: HFRunConfig, *, argv: List[str]) -> int:
                 runner_signal=runner_signal,
                 failure_reason=failure_reason,
                 failure_traceback=failure_traceback,
+                seed_rank=seed_rank,
+                seed_rank_scheme="base_seed+1000*rank",
+                rank=rank,
+                world_size=world_size,
                 rank_used_for_corrupt_seed=rank,
                 world_size_used_for_corrupt_seed=world_size,
             )
@@ -1636,9 +1673,11 @@ def _run_body(cfg: HFRunConfig, *, argv: List[str]) -> int:
 
 def _run(cfg: HFRunConfig, *, argv: List[str]) -> int:
     initialized_here = _maybe_init_ddp()
-    _set_seed(cfg.seed)
+    rank, world_size = _get_rank_and_world()
+    seed_rank = _seed_for_rank(cfg.seed, rank)
+    _set_seed(seed_rank)
     try:
-        return _run_body(cfg, argv=argv)
+        return _run_body(cfg, argv=argv, rank=rank, world_size=world_size, seed_rank=seed_rank)
     finally:
         if _should_cleanup_ddp(initialized_here):
             ddp_destroy_process_group()
@@ -1671,7 +1710,12 @@ def _parse_args() -> HFRunConfig:
         action="store_true",
         help="Log LR spike verification ratio when spike begins",
     )
-    parser.add_argument("--seed", type=int, default=1337, help="Random seed")
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Base RNG seed (default: 1337; env VERISCOPE_SEED, CLI wins)",
+    )
     parser.add_argument("--cadence", type=int, default=10, help="Instrumentation cadence (steps)")
     parser.add_argument("--block_size", type=int, default=128, help="Sequence length for training")
     parser.add_argument(
@@ -1773,6 +1817,7 @@ def _parse_args() -> HFRunConfig:
         raise ValueError("--data_corrupt_target must be one of: clean, same")
     # Honor either runner --force or wrapper-side VERISCOPE_FORCE=1
     force = bool(args.force) or env_truthy("VERISCOPE_FORCE")
+    resolved_seed = _resolve_seed(args.seed, default_seed=1337)
     return HFRunConfig(
         model=args.model,
         dataset_name=dataset_name,
@@ -1786,7 +1831,7 @@ def _parse_args() -> HFRunConfig:
         max_steps=int(args.max_steps),
         batch_size=int(args.batch_size),
         lr=float(args.lr),
-        seed=int(args.seed),
+        seed=int(resolved_seed),
         cadence=int(args.cadence),
         block_size=int(args.block_size),
         device=str(args.device),

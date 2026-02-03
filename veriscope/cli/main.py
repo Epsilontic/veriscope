@@ -94,6 +94,7 @@ def _build_resolved_payload(
     normalized_forwarded_args: List[str],
     cmd: List[str],
     env: Dict[str, str],
+    resolved_seed: Optional[int] = None,
     overrides: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     payload: Dict[str, Any] = {
@@ -117,6 +118,8 @@ def _build_resolved_payload(
         "started_ts_utc": lifecycle.started_ts_utc.isoformat(),
         "ended_ts_utc": None,
     }
+    if resolved_seed is not None:
+        payload["resolved_seed"] = int(resolved_seed)
     if overrides:
         payload["overrides"] = overrides
     return payload
@@ -230,6 +233,45 @@ def _extract_gate_preset(args: List[str]) -> str:
         if arg in ("--gate_preset", "--gate-preset") and idx + 1 < len(args):
             return args[idx + 1]
     return "unknown"
+
+
+def _extract_seed_arg(args: List[str]) -> Optional[int]:
+    for idx, arg in enumerate(args):
+        if arg.startswith("--seed="):
+            raw = arg.split("=", 1)[1]
+            try:
+                return int(raw)
+            except ValueError:
+                return None
+        if arg == "--seed" and idx + 1 < len(args):
+            raw = args[idx + 1]
+            try:
+                return int(raw)
+            except ValueError:
+                return None
+    return None
+
+
+def _resolve_seed_from_args(
+    args: List[str],
+    env: Dict[str, str],
+    *,
+    default_seed: int,
+) -> tuple[int, bool]:
+    cli_seed = _extract_seed_arg(args)
+    if cli_seed is not None:
+        return int(cli_seed), True
+    raw = (env.get("VERISCOPE_SEED") or "").strip()
+    if raw:
+        try:
+            return int(raw), True
+        except ValueError:
+            print(
+                f"[veriscope] WARNING: invalid VERISCOPE_SEED={raw!r}; using default seed {default_seed}.",
+                file=sys.stderr,
+            )
+            return int(default_seed), False
+    return int(default_seed), False
 
 
 def _write_partial_summary(
@@ -439,6 +481,7 @@ def _run_subprocess_wrapper(
     veriscope_argv: List[str],
     env: Dict[str, str],
     force: bool,
+    resolved_seed: Optional[int] = None,
     overrides: Optional[Dict[str, Any]] = None,
 ) -> int:
     lifecycle = RunLifecycle(run_id=run_id, run_kind=run_kind)
@@ -480,6 +523,7 @@ def _run_subprocess_wrapper(
         normalized_forwarded_args=normalized_forwarded_args,
         cmd=cmd,
         env=env,
+        resolved_seed=resolved_seed,
         overrides=overrides,
     )
     _write_resolved_config(outdir, resolved)
@@ -796,12 +840,15 @@ def _cmd_run_gpt(args: argparse.Namespace) -> int:
         gpt_args = ["--out_json", f"veriscope_gpt_{time.strftime('%Y%m%d_%H%M%S')}.json"] + gpt_args
 
     override_cmd = (os.environ.get("VERISCOPE_GPT_RUNNER_CMD") or "").strip()
+    runner_overridden = bool(override_cmd)
     if override_cmd:
         cmd = shlex.split(override_cmd) + gpt_args
     else:
         cmd = [sys.executable, "-m", "veriscope.runners.gpt.train_nanogpt"] + gpt_args
 
     gate_preset = _extract_gate_preset(gpt_args)
+    resolved_seed, seed_provided = _resolve_seed_from_args(gpt_args, env, default_seed=42)
+    seed_for_payload = resolved_seed if seed_provided or not runner_overridden else None
     overrides_payload = None
     veriscope_argv = ["veriscope", "run", "gpt"]
     if outdir_str:
@@ -819,6 +866,7 @@ def _cmd_run_gpt(args: argparse.Namespace) -> int:
         veriscope_argv=veriscope_argv,
         env=env,
         force=bool(args.force),
+        resolved_seed=seed_for_payload,
         overrides=overrides_payload,
     )
 
@@ -860,12 +908,15 @@ def _cmd_run_hf(args: argparse.Namespace) -> int:
         env["VERISCOPE_FORCE"] = "1"
 
     override_cmd = (os.environ.get("VERISCOPE_HF_RUNNER_CMD") or "").strip()
+    runner_overridden = bool(override_cmd)
     if override_cmd:
         cmd = shlex.split(override_cmd) + hf_args
     else:
         cmd = [sys.executable, "-m", "veriscope.runners.hf.train_hf"] + hf_args
 
     gate_preset = args.gate_preset or _extract_gate_preset(hf_args)
+    resolved_seed, seed_provided = _resolve_seed_from_args(hf_args, env, default_seed=1337)
+    seed_for_payload = resolved_seed if seed_provided or not runner_overridden else None
     overrides_payload = None
     if args.gate_preset and args.gate_preset != "tuned_v0":
         overrides_payload = {"gate_preset": args.gate_preset}
@@ -904,6 +955,7 @@ def _cmd_run_hf(args: argparse.Namespace) -> int:
             normalized_forwarded_args=list(hf_args),
             cmd=cmd,
             env=env,
+            resolved_seed=seed_for_payload,
             overrides=overrides_payload,
         )
         _write_resolved_config(outdir, resolved)
@@ -947,6 +999,7 @@ def _cmd_run_hf(args: argparse.Namespace) -> int:
         veriscope_argv=veriscope_argv,
         env=env,
         force=bool(args.force),
+        resolved_seed=seed_for_payload,
         overrides=overrides_payload,
     )
 
