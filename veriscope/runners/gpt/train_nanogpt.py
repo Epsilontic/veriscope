@@ -2256,6 +2256,15 @@ if __name__ == "__main__":
                 "message": str(_train_exc),
             }
 
+        if getattr(config, "data_corrupt_at", None) is not None:
+            run_cfg_obj["data_corrupt_at"] = int(config.data_corrupt_at)
+        if getattr(config, "data_corrupt_len", None) is not None:
+            run_cfg_obj["data_corrupt_len"] = int(config.data_corrupt_len)
+        if getattr(config, "data_corrupt_frac", None) is not None:
+            run_cfg_obj["data_corrupt_frac"] = float(config.data_corrupt_frac)
+        if getattr(config, "data_corrupt_mode", None) is not None:
+            run_cfg_obj["data_corrupt_mode"] = str(config.data_corrupt_mode)
+
         run_cfg_path = artifacts_outdir / "run_config_resolved.json"
 
         # Write once to normalize serialization (datetimes -> ISO strings, etc.), then hash what is on disk.

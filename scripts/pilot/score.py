@@ -13,12 +13,22 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Score pilot control/injected runs.")
     parser.add_argument("--control-dir", required=True, help="Control capsule OUTDIR")
     parser.add_argument("--injected-dir", required=True, help="Injected capsule OUTDIR")
+    parser.add_argument(
+        "--injection-onset-iter",
+        type=int,
+        default=None,
+        help="Fallback injection onset iteration (used if run_config_resolved.json lacks data_corrupt_at).",
+    )
     parser.add_argument("--out", default="calibration.json", help="Output JSON path")
     parser.add_argument("--out-md", default="calibration.md", help="Output Markdown path")
     args = parser.parse_args(argv)
 
     try:
-        output = calibrate_pilot(Path(args.control_dir), Path(args.injected_dir))
+        output = calibrate_pilot(
+            Path(args.control_dir),
+            Path(args.injected_dir),
+            injection_onset_iter=args.injection_onset_iter,
+        )
         out_path = Path(args.out)
         out_path.write_text(json.dumps(output, indent=2, sort_keys=True), encoding="utf-8")
         Path(args.out_md).write_text(render_calibration_md(output), encoding="utf-8")

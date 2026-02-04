@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import os
 import random
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -17,11 +18,33 @@ def _build_window_signature() -> dict:
     }
 
 
+def _early_validate_fail_rank() -> tuple[int | None, int]:
+    fail_rank_env = os.environ.get("VS_FAIL_RANK")
+    world_size_env = os.environ.get("WORLD_SIZE", os.environ.get("LOCAL_WORLD_SIZE", "1"))
+    try:
+        world_size = int(world_size_env)
+    except (TypeError, ValueError):
+        world_size = 1
+    if fail_rank_env is None:
+        return None, world_size
+    try:
+        fail_rank = int(fail_rank_env)
+    except (TypeError, ValueError):
+        sys.stderr.write(f"VS_FAIL_RANK must be int, got {fail_rank_env!r}\n")
+        raise SystemExit(2)
+    if fail_rank < 0 or fail_rank >= world_size:
+        sys.stderr.write(f"ERROR: VS_FAIL_RANK out of range: {fail_rank} (world_size={world_size})\n")
+        sys.stderr.write(f"VS_FAIL_RANK must be in [0, {world_size - 1}], got {fail_rank}\n")
+        raise SystemExit(2)
+    return fail_rank, world_size
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Minimal DDP smoke that emits veriscope artifacts.")
     parser.add_argument("--outdir", type=Path, required=True)
     parser.add_argument("--run-id", default="ddp-smoke")
     args = parser.parse_args()
+    fail_rank, _ = _early_validate_fail_rank()
     args.outdir.mkdir(parents=True, exist_ok=True)
 
     import torch
@@ -40,18 +63,7 @@ def main() -> int:
         world_size = dist.get_world_size()
         if world_size != 2:
             raise RuntimeError(f"Expected world_size=2, got {world_size}")
-
-        fail_rank_env = os.environ.get("VS_FAIL_RANK")
-        if fail_rank_env is not None:
-            try:
-                fail_rank = int(fail_rank_env)
-            except ValueError as exc:
-                raise RuntimeError(f"VS_FAIL_RANK must be int, got {fail_rank_env!r}") from exc
-            if not 0 <= fail_rank < world_size:
-                raise RuntimeError(f"VS_FAIL_RANK must be in [0, {world_size - 1}], got {fail_rank}")
-            should_fail = fail_rank == rank
-        else:
-            should_fail = False
+        should_fail = fail_rank is not None and fail_rank == rank
 
         if rank == 0:
             # Best-effort policy: rank 0 may emit artifacts even if another rank fails.
@@ -73,7 +85,7 @@ def main() -> int:
         if should_fail:
             raise RuntimeError(f"Intentional failure on rank {rank}")
 
-        if fail_rank_env is None:
+        if fail_rank is None:
             dist.barrier()
     finally:
         dist.destroy_process_group()

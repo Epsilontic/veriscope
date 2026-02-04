@@ -38,7 +38,7 @@ python scripts/pilot/score.py \
   --out-md calibration.md
 ```
 
-Delay semantics: `Delay_W` is measured in gate-evaluation steps after warmup, normalized by the gate window size.
+Delay semantics: delays are measured in iterations after t0=max(injection onset, warmup) where onset is `data_corrupt_at` from `run_config_resolved.json` (or `--injection-onset-iter` when missing). `Delay_W` reports delay in units of `gate_window`. Gate events are read from `governance_log.jsonl` (`gate_decision_v1`) with a fallback to `results.json`. FAR is computed as warn+fail rate post-warmup (FAR_warnfail).
 
 ## negative_controls.sh
 

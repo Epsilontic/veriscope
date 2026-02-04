@@ -16,7 +16,11 @@ def run_calibrate(args: Any) -> int:
     out_md_path = Path(str(args.out_md)).expanduser()
 
     try:
-        output: Dict[str, Any] = calibrate_pilot(control_dir, injected_dir)
+        output: Dict[str, Any] = calibrate_pilot(
+            control_dir,
+            injected_dir,
+            injection_onset_iter=getattr(args, "injection_onset_iter", None),
+        )
         out_path.write_text(json.dumps(output, indent=2, sort_keys=True), encoding="utf-8")
         out_md_path.write_text(render_calibration_md(output), encoding="utf-8")
     except CalibrationError as exc:

@@ -1325,6 +1325,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_calibrate = sub.add_parser("calibrate", help="Calibrate pilot control/injected runs")
     p_calibrate.add_argument("--control-dir", required=True, help="Control capsule OUTDIR")
     p_calibrate.add_argument("--injected-dir", required=True, help="Injected capsule OUTDIR")
+    p_calibrate.add_argument(
+        "--injection-onset-iter",
+        type=int,
+        default=None,
+        help="Fallback injection onset iteration (used if run_config_resolved.json lacks data_corrupt_at).",
+    )
     p_calibrate.add_argument("--out", default="calibration.json", help="Output JSON path")
     p_calibrate.add_argument("--out-md", default="calibration.md", help="Output Markdown path")
     p_calibrate.set_defaults(_handler=_cmd_calibrate)
