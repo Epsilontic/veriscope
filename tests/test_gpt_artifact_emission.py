@@ -103,6 +103,43 @@ def test_emit_gpt_artifacts_writes_and_validates(tmp_path: Path) -> None:
     assert "git_sha" not in ws_obj["code_identity"]
 
 
+def test_emit_skipped_gate_sanitizes_nonfinite_audit_values(tmp_path: Path) -> None:
+    outdir = tmp_path / "out"
+
+    emitted = emit_gpt_artifacts_v1(
+        outdir=outdir,
+        run_id="run_test_skip_nan",
+        started_ts_utc=datetime(2026, 1, 1, 0, 0, 0),
+        ended_ts_utc=None,
+        gate_preset="tuned_v0",
+        overrides=None,
+        resolved_gate_cfg={},
+        gate_history=[
+            {
+                "iter": 1,
+                "decision": "skip",
+                "audit": {
+                    "evaluated": False,
+                    "reason": "not_evaluated",
+                    "policy": "either",
+                    "worst_DW": float("nan"),
+                    "eps_eff": float("nan"),
+                    "per_metric_tv": {},
+                },
+            }
+        ],
+    )
+
+    from veriscope.core.artifacts import ResultsV1
+
+    res = ResultsV1.model_validate_json((outdir / "results.json").read_text(encoding="utf-8"))
+    assert res.window_signature_ref.hash == emitted.window_signature_hash
+    assert res.gates[0].decision == "skip"
+    assert res.gates[0].audit.evaluated is False
+    assert res.gates[0].audit.worst_DW == 0.0
+    assert res.gates[0].audit.eps_eff == 0.0
+
+
 def test_emit_defaults_per_metric_tv_when_missing(tmp_path: Path) -> None:
     outdir = tmp_path / "out"
 
@@ -149,3 +186,36 @@ def test_emit_rejects_non_string_policy(tmp_path: Path) -> None:
             resolved_gate_cfg={},
             gate_history=[{"iter": 1, "audit": {"evaluated": True, "policy": {"not": "a string"}}}],
         )
+
+
+def test_emit_sanitizes_unevaluated_nonfinite(tmp_path: Path) -> None:
+    outdir = tmp_path / "out"
+
+    emitted = emit_gpt_artifacts_v1(
+        outdir=outdir,
+        run_id="run_test_unevaluated_nonfinite",
+        started_ts_utc=datetime(2026, 1, 1, 0, 0, 0),
+        ended_ts_utc=None,
+        gate_preset="tuned_v0",
+        overrides=None,
+        resolved_gate_cfg={},
+        gate_history=[
+            {
+                "iter": 1,
+                "audit": {
+                    "evaluated": False,
+                    "worst_DW": float("nan"),
+                    "eps_eff": float("nan"),
+                    "per_metric_tv": {"m1": float("nan")},
+                },
+            }
+        ],
+    )
+
+    from veriscope.core.artifacts import ResultsV1
+
+    res = ResultsV1.model_validate_json((outdir / "results.json").read_text(encoding="utf-8"))
+    assert res.window_signature_ref.hash == emitted.window_signature_hash
+    assert res.gates[0].audit.worst_DW == 0.0
+    assert res.gates[0].audit.eps_eff == 0.0
+    assert res.gates[0].audit.per_metric_tv["m1"] == 0.0

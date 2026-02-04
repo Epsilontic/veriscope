@@ -1,7 +1,9 @@
+# veriscope/runners/gpt/emit_artifacts.py
 from __future__ import annotations
 
 import json
 import logging
+import math
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -195,6 +197,30 @@ def _normalize_audit_dict(ev: Mapping[str, Any]) -> Dict[str, Any]:
     return a
 
 
+def _sanitize_audit_nonfinite(audit: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Sanitize non-finite numeric values when audit.evaluated is False.
+
+    For skip decisions, replace any non-finite floats with 0.0 while preserving structure.
+    """
+    if audit.get("evaluated", True) is not False:
+        return audit
+
+    def _is_nonfinite(value: Any) -> bool:
+        return isinstance(value, float) and not math.isfinite(value)
+
+    def _sanitize_value(value: Any) -> Any:
+        if _is_nonfinite(value):
+            return 0.0
+        if isinstance(value, Mapping):
+            return {key: _sanitize_value(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [_sanitize_value(item) for item in value]
+        return value
+
+    return _sanitize_value(dict(audit))
+
+
 def _derive_decision(ev: Mapping[str, Any], audit: AuditV1) -> str:
     """
     Deterministic gate decision derivation.
@@ -360,6 +386,7 @@ def emit_gpt_artifacts_v1(
         try:
             it = _get_event_iter(ev)
             audit_dict = _normalize_audit_dict(ev)
+            audit_dict = _sanitize_audit_nonfinite(audit_dict)
 
             # Validation boundary (Pydantic)
             audit = AuditV1(**audit_dict)

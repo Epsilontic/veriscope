@@ -1,3 +1,4 @@
+# tests/test_seed_intervention.py
 from __future__ import annotations
 
 import json
@@ -15,7 +16,17 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
+
 from veriscope.runners.hf.train_hf import HFRunConfig, _build_run_manifest, _seed_for_rank
+
+
+# Helper: check if an environment variable is set "truthy"
+def _env_truthy(name: str) -> bool:
+    val = os.environ.get(name)
+    if val is None:
+        return False
+    s = str(val).strip().lower()
+    return s not in {"", "0", "false", "no", "off"}
 
 
 RUNNER_SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "fake_hf_runner.py"
@@ -249,9 +260,7 @@ def _filtered_run_config(run_config_path: Path) -> dict[str, object]:
     return selected
 
 
-def _run_hf_wrapper(
-    outdir: Path, runner_args: List[str], fake_deps_dir: Path
-) -> subprocess.CompletedProcess:
+def _run_hf_wrapper(outdir: Path, runner_args: List[str], fake_deps_dir: Path) -> subprocess.CompletedProcess:
     cmd = [
         sys.executable,
         "-c",
@@ -287,6 +296,8 @@ def test_gpt_seed_resolved_and_recorded(tmp_path: Path) -> None:
 
 
 def test_gpt_seed_changes_metrics(tmp_path: Path) -> None:
+    if not _env_truthy("VERISCOPE_SLOW"):
+        pytest.skip("slow: set VERISCOPE_SLOW=1 to run")
     dataset = "tiny"
     nanogpt_dir = _write_minimal_nanogpt(tmp_path, dataset=dataset)
 
@@ -331,10 +342,7 @@ def test_gpt_seed_changes_metrics(tmp_path: Path) -> None:
             for key in keys
             if filtered_a.get(key) != filtered_c.get(key)
         ]
-        pytest.fail(
-            "Expected semantic run config matches. Differences:\n"
-            + "\n".join(diffs)
-        )
+        pytest.fail("Expected semantic run config matches. Differences:\n" + "\n".join(diffs))
 
 
 def test_hf_seed_resolved_in_wrapper(tmp_path: Path) -> None:
