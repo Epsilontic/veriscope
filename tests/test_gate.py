@@ -59,6 +59,50 @@ class TestGateEngineSemantics:
         assert np.isfinite(r.audit["worst_DW"])
         assert np.isclose(r.audit["worst_DW"], 0.0, atol=1e-12)
 
+    def test_single_metric_exceedance_populates_metrics_exceeding(
+        self, make_window_decl, make_fr_window, make_gate_engine
+    ):
+        wd = make_window_decl(
+            ["test_metric"],
+            epsilon=0.13,
+            weights={"test_metric": 1.0},
+            bins=10,
+            cal_ranges={"test_metric": (0.0, 1.0)},
+        )
+        fr = make_fr_window(wd)
+        ge = make_gate_engine(
+            fr,
+            min_evidence=0,
+            policy="either",
+            gain_thresh=0.0,
+            eps_sens=0.0,
+            min_metrics_exceeding=1,
+        )
+
+        past = {"test_metric": np.full(200, 0.1, dtype=float)}
+        recent = {"test_metric": np.full(200, 0.9, dtype=float)}
+        counts = {"test_metric": 200}
+
+        r = ge.check(past, recent, counts, gain_bits=0.1, kappa_sens=0.0, eps_stat_value=0.0)
+        a = r.audit
+        assert a["evaluated"] is True
+        assert a["metrics_exceeding"] == ["test_metric"]
+        assert a["n_metrics_exceeding"] == 1
+
+        per_metric_tv = a["per_metric_tv"]
+        values = []
+        for v in per_metric_tv.values():
+            if isinstance(v, dict) and "tv" in v:
+                tv = float(v["tv"])
+            else:
+                tv = float(v)
+            if np.isfinite(tv):
+                values.append(tv)
+        expected = max(values, default=0.0)
+        assert np.isclose(a["worst_DW"], expected, atol=1e-12)
+        assert np.isfinite(float(a["eps_eff"]))
+        assert a["worst_DW"] > float(a["eps_eff"])
+
     def test_persistence_k2_warn_then_fail(self, fr_window, make_gate_engine):
         ge = make_gate_engine(
             fr_window,
