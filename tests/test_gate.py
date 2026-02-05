@@ -145,17 +145,63 @@ class TestGateEngineSemantics:
         assert r2.audit["persistence_fail"] is True
         assert r2.audit["consecutive_exceedances_after"] == 2
 
-    def test_gain_fail_resets_persistence_counter(self, fr_window, make_gate_engine):
+    def test_gain_below_threshold_is_warn_not_fail(self, fr_window, make_gate_engine):
+        ge = make_gate_engine(
+            fr_window,
+            min_evidence=0,
+            policy="persistence",
+            persistence_k=1,
+            gain_thresh=0.0,  # gain warning if gain_bits < 0.0
+            eps_sens=0.0,
+        )
+
+        past = {"test_metric": np.full(200, 0.5, dtype=float)}
+        recent = {"test_metric": np.full(200, 0.5, dtype=float)}
+        counts = {"test_metric": 200}
+
+        r = ge.check(past, recent, counts, gain_bits=-0.1, kappa_sens=0.0, eps_stat_value=0.0)
+        assert r.audit["evaluated"] is True
+        assert r.audit["dw_exceeds_threshold"] is False
+        assert r.audit["persistence_fail"] is False
+        assert r.audit["gain_below_threshold"] is True
+        assert r.ok is True
+        assert r.warn is True
+        assert r.audit.get("reason") == "gain_below_threshold"
+
+    def test_drift_fail_still_fails_even_if_gain_below_threshold(self, fr_window, make_gate_engine):
+        ge = make_gate_engine(
+            fr_window,
+            min_evidence=0,
+            policy="persistence",
+            persistence_k=1,
+            gain_thresh=0.0,  # gain warning if gain_bits < 0.0
+            eps_sens=0.0,
+        )
+
+        past = {"test_metric": np.full(200, 0.1, dtype=float)}
+        recent = {"test_metric": np.full(200, 0.9, dtype=float)}
+        counts = {"test_metric": 200}
+
+        r = ge.check(past, recent, counts, gain_bits=-0.1, kappa_sens=0.0, eps_stat_value=0.0)
+        assert r.audit["evaluated"] is True
+        assert r.audit["dw_exceeds_threshold"] is True
+        assert r.audit["persistence_fail"] is True
+        assert r.audit["gain_below_threshold"] is True
+        assert r.ok is False
+        assert r.warn is False
+
+    def test_gain_below_threshold_does_not_reset_persistence_counter(self, fr_window, make_gate_engine):
         ge = make_gate_engine(
             fr_window,
             min_evidence=0,
             policy="persistence",
             persistence_k=3,
-            gain_thresh=0.0,  # gain failure if gain_bits < 0.0
+            gain_thresh=0.0,  # gain warning if gain_bits < 0.0
             eps_sens=0.0,
         )
 
         past = {"test_metric": np.full(200, 0.1, dtype=float)}
+        same_recent = {"test_metric": np.full(200, 0.1, dtype=float)}
         counts = {"test_metric": 200}
         drift_recent = {"test_metric": np.full(200, 0.9, dtype=float)}
 
@@ -164,12 +210,90 @@ class TestGateEngineSemantics:
         assert r1.audit["dw_exceeds_threshold"] is True
         assert r1.audit["consecutive_exceedances_after"] == 1
 
-        r2 = ge.check(past, drift_recent, counts, gain_bits=-0.1, kappa_sens=0.0, eps_stat_value=0.0)
+        # Gain-only warning (no drift) must NOT reset persistence counter.
+        r2 = ge.check(past, same_recent, counts, gain_bits=-0.1, kappa_sens=0.0, eps_stat_value=0.0)
         assert r2.audit["evaluated"] is True
-        assert r2.audit["dw_exceeds_threshold"] is True  # ensure reset attribution
+        assert r2.audit["dw_exceeds_threshold"] is False
         assert r2.audit["gain_below_threshold"] is True
-        assert r2.ok is False
-        assert r2.audit["consecutive_exceedances_after"] == 0
+        assert r2.ok is True
+        assert r2.warn is True
+        assert r2.audit["persistence_fail"] is False
+        assert r2.audit["consecutive_exceedances_after"] == 1
+
+        r3 = ge.check(past, drift_recent, counts, gain_bits=0.1, kappa_sens=0.0, eps_stat_value=0.0)
+        assert r3.audit["evaluated"] is True
+        assert r3.audit["dw_exceeds_threshold"] is True
+        assert r3.audit["persistence_fail"] is False
+        assert r3.ok is True
+        assert r3.warn is True
+        assert r3.audit["consecutive_exceedances_after"] == 2
+
+        r4 = ge.check(past, drift_recent, counts, gain_bits=0.1, kappa_sens=0.0, eps_stat_value=0.0)
+        assert r4.audit["evaluated"] is True
+        assert r4.audit["dw_exceeds_threshold"] is True
+        assert r4.audit["persistence_fail"] is True
+        assert r4.ok is False
+        assert r4.warn is False
+        assert r4.audit["consecutive_exceedances_after"] == 3
+
+    def test_gain_nan_does_not_warn(self, fr_window, make_gate_engine):
+        ge = make_gate_engine(
+            fr_window,
+            min_evidence=0,
+            policy="persistence",
+            persistence_k=2,
+            gain_thresh=0.0,
+            eps_sens=0.0,
+        )
+
+        past = {"test_metric": np.full(200, 0.5, dtype=float)}
+        recent = {"test_metric": np.full(200, 0.5, dtype=float)}
+        counts = {"test_metric": 200}
+
+        r = ge.check(past, recent, counts, gain_bits=np.nan, kappa_sens=0.0, eps_stat_value=0.0)
+        assert r.audit["evaluated"] is True
+        assert r.audit["dw_exceeds_threshold"] is False
+        assert r.audit["gain_below_threshold"] is False
+        assert r.ok is True
+        assert r.warn is False
+
+    def test_gain_below_threshold_not_evaluated_does_not_warn(self, fr_window, make_gate_engine):
+        ge = make_gate_engine(
+            fr_window,
+            min_evidence=999,
+            policy="persistence",
+            persistence_k=2,
+            gain_thresh=0.0,
+            eps_sens=0.0,
+        )
+
+        past = {"test_metric": np.full(200, 0.5, dtype=float)}
+        recent = {"test_metric": np.full(200, 0.5, dtype=float)}
+        counts = {"test_metric": 200}
+
+        r = ge.check(past, recent, counts, gain_bits=-0.1, kappa_sens=0.0, eps_stat_value=0.0)
+        assert r.audit["evaluated"] is False
+        assert r.audit["gain_below_threshold"] is True
+        assert r.ok is True
+        assert r.warn is False
+        assert r.audit.get("reason") != "gain_below_threshold"
+
+    def test_either_and_conjunction_gain_semantics_unchanged(self, fr_window, make_gate_engine):
+        past = {"test_metric": np.full(200, 0.5, dtype=float)}
+        recent = {"test_metric": np.full(200, 0.5, dtype=float)}
+        counts = {"test_metric": 200}
+
+        ge_either = make_gate_engine(fr_window, min_evidence=0, policy="either", gain_thresh=0.0, eps_sens=0.0)
+        r_either = ge_either.check(past, recent, counts, gain_bits=-0.1, kappa_sens=0.0, eps_stat_value=0.0)
+        assert r_either.audit["dw_exceeds_threshold"] is False
+        assert r_either.ok is False
+        assert r_either.warn is False
+
+        ge_conj = make_gate_engine(fr_window, min_evidence=0, policy="conjunction", gain_thresh=0.0, eps_sens=0.0)
+        r_conj = ge_conj.check(past, recent, counts, gain_bits=-0.1, kappa_sens=0.0, eps_stat_value=0.0)
+        assert r_conj.audit["dw_exceeds_threshold"] is False
+        assert r_conj.ok is True
+        assert r_conj.warn is False
 
     def test_multi_metric_consensus_filter_blocks_single_metric_drift(
         self, make_window_decl, make_fr_window, make_gate_engine

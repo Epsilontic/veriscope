@@ -109,7 +109,7 @@ class GatePolicy(Enum):
 class GateResult:
     ok: bool
     audit: Dict[str, Any]
-    warn: bool = False  # Threshold exceeded but not yet FAIL (persistence mode)
+    warn: bool = False  # Non-fatal warning (e.g., persistence warn-pending or gain below threshold)
 
 
 class GateEngine:
@@ -489,6 +489,11 @@ class GateEngine:
 
         # Policy-based decision
         warn = False
+        warn_stab = False
+        persistence_fail = False
+        persistence_fail_flag = False
+        gain_warn_raw = bool(gain_is_finite and gain_below)
+        gain_warn = bool(evaluated and gain_warn_raw)
         consecutive_before = self._consecutive_exceedances
 
         if self.policy == GatePolicy.EITHER:
@@ -508,22 +513,21 @@ class GateEngine:
                 if dw_exceeds:
                     self._consecutive_exceedances += 1
                 else:
-                    self._consecutive_exceedances = 0
+                    # Gain-only warnings do not reset the persistence counter.
+                    if not gain_warn_raw:
+                        self._consecutive_exceedances = 0
             # else: don't touch counter (no finite metrics to evaluate)
 
             persistence_fail = self._consecutive_exceedances >= self.persistence_k
             persistence_fail_flag = bool(persistence_fail)
 
-            # Stability check uses persistence; gain and kappa still immediate
+            # Stability check uses persistence; kappa veto remains immediate; gain is WARN-only.
             ok_stab_persist = not persistence_fail
-            ok = bool(ok_gain and ok_stab_persist and ok_k)
+            ok = bool(ok_stab_persist and ok_k)
 
-            # Warn on exceedance that hasn't yet triggered fail
-            warn = dw_exceeds and not persistence_fail
-
-            # If gain fails immediately, reset persistence counter (clean semantics)
-            if gain_below:
-                self._consecutive_exceedances = 0
+            # Warn only when evaluated=True.
+            warn_stab = bool(dw_exceeds and (not persistence_fail))
+            warn = bool(ok and evaluated and (warn_stab or gain_warn))
 
         elif self.policy == GatePolicy.PERSISTENCE_STABILITY:
             # Only update persistence counter on evaluated checks
@@ -531,22 +535,26 @@ class GateEngine:
                 if dw_exceeds:
                     self._consecutive_exceedances += 1
                 else:
-                    self._consecutive_exceedances = 0
+                    # Gain-only warnings do not reset the persistence counter.
+                    if not gain_warn_raw:
+                        self._consecutive_exceedances = 0
 
             persistence_fail = self._consecutive_exceedances >= self.persistence_k
             persistence_fail_flag = bool(persistence_fail)
 
-            # Gain is ignored for ok/warn/fail. Kappa veto remains immediate.
+            # Kappa veto remains immediate. Gain is WARN-only (never FAIL-capable).
             ok = bool((not persistence_fail) and ok_k)
 
             # Warn = current exceedance before sustained fail (consistent with persistence)
-            warn = bool(dw_exceeds and (not persistence_fail))
+            warn_stab = bool(dw_exceeds and (not persistence_fail))
+            warn = bool(ok and evaluated and (warn_stab or gain_warn))
 
         else:
             # Fallback to EITHER
             ok = bool(ok_gain and ok_stab and ok_k)
 
         consecutive_after = self._consecutive_exceedances
+        reason_gain_only = bool(warn and gain_warn and (not warn_stab))
 
         return GateResult(
             ok=ok,
@@ -610,6 +618,7 @@ class GateEngine:
                 margin_change_rel_eff=float(margin_change_rel_eff),
                 # Regime state (string); margin_regime* injected by regime engine
                 regime_state=rs,
+                **({"reason": "gain_below_threshold"} if reason_gain_only else {}),
             ),
         )
 
