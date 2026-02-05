@@ -237,7 +237,7 @@ class RegimeConfig:
 
     Quality Gates:
     -------------
-    Additional gates beyond "base check passed" for extra safety:
+    Additional gates applied when establishing a reference (accumulation is broader):
     - reference_build_max_dw: worst D_W must be well below epsilon
     - reference_build_min_gain: learning must be progressing (not stalled/diverging)
     - If worst_DW is missing/non-finite, quality gate FAILS (conservative)
@@ -484,14 +484,17 @@ class RegimeAnchoredGateEngine:
 
     Decision: FAIL if EITHER check fails.
 
+    Reference Building:
+    - Within the configured reference build phase [min_iter, max_iter), each COMPLETE
+      window is accumulated as a candidate (even if the base check fails).
+    - This avoids bootstrap deadlock when change detection is noisy early on.
+
     Reference Establishment (all conditions must be met):
     1. Within configured reference build phase [min_iter, max_iter)
-    2. Base check was actually evaluated (not skipped due to insufficient evidence)
-    3. Base check passed (ok=True)
-    4. Base check worst_DW is present, finite, and <= reference_build_max_dw
-    5. Gain is finite and >= reference_build_min_gain (learning health gate)
-    6. All tracked metrics have >= min_evidence_per_metric samples accumulated
-    7. At least min_windows_for_reference COMPLETE windows accumulated
+    2. Base check worst_DW is present, finite, and <= reference_build_max_dw
+    3. Gain is finite and >= reference_build_min_gain (learning health gate)
+    4. All tracked metrics have >= min_evidence_per_metric samples accumulated
+    5. At least min_windows_for_reference COMPLETE windows accumulated
 
     A window is "complete" if ALL tracked metrics have at least one finite sample.
     Incomplete windows are skipped and do not count toward min_windows_for_reference.
@@ -707,6 +710,8 @@ class RegimeAnchoredGateEngine:
         # Statistics for debugging
         self._n_checks: int = 0
         self._n_ref_attempts: int = 0
+        self._ref_candidate_windows_seen: int = 0
+        self._ref_last_reject_reason: Optional[str] = None
 
         # ---- Multi-regime state ----
         self._enable_multi_regime = bool(getattr(self.config, "enable_multi_regime", False))
@@ -1132,23 +1137,17 @@ class RegimeAnchoredGateEngine:
 
         return True, "", gate_values
 
-    def _try_establish_reference(
+    def _accumulate_reference_window(
         self,
         recent: Dict[str, np.ndarray],
-        iter_num: int,
-        quality_audit: Dict[str, Any],
     ) -> Tuple[bool, str]:
         """
-        Accumulate healthy samples; establish reference once ALL metrics
-        have sufficient evidence AND minimum COMPLETE windows accumulated.
+        Attempt to add the current COMPLETE window to the reference accumulator.
 
-        A window is "complete" if ALL tracked metrics have at least one finite sample.
-        Incomplete windows are SKIPPED (not added to accumulator) and recorded
-        in _ref_incomplete_windows_skipped for observability.
-
-        Returns (established, reason_if_not).
+        Returns (added, reason_if_not_added).
         """
         self._n_ref_attempts += 1
+        self._ref_candidate_windows_seen += 1
 
         # Check for incomplete window: any tracked metric missing or with no finite samples
         missing: List[str] = []
@@ -1174,14 +1173,26 @@ class RegimeAnchoredGateEngine:
             return False, f"incomplete_window_skipped: missing={sorted(missing)}"
 
         # Window is complete - proceed with accumulation
-
         # Bound accumulator growth (drop oldest window if at capacity)
         if len(self._accumulating) >= self.config.max_accumulator_windows:
             self._accumulating.pop(0)
 
         # Add current COMPLETE window to accumulator
         self._accumulating.append(snapshot)
+        return True, ""
 
+    def _maybe_establish_reference(
+        self,
+        iter_num: int,
+        quality_audit: Dict[str, Any],
+    ) -> Tuple[bool, str]:
+        """
+        Establish reference once ALL metrics have sufficient evidence AND
+        minimum COMPLETE windows accumulated. Assumes accumulator already
+        contains the current window.
+
+        Returns (established, reason_if_not).
+        """
         # Minimum temporal coverage requirement (COMPLETE windows, not just any windows).
         # This ensures temporal coverage across the tracked metric set.
         # Use the effective (possibly clamped) value from __init__.
@@ -1258,6 +1269,22 @@ class RegimeAnchoredGateEngine:
         self._accumulating = []
         return True, ""
 
+    def _try_establish_reference(
+        self,
+        recent: Dict[str, np.ndarray],
+        iter_num: int,
+        quality_audit: Dict[str, Any],
+    ) -> Tuple[bool, str]:
+        """
+        Back-compat wrapper: accumulate a COMPLETE window and attempt to establish.
+
+        Returns (established, reason_if_not).
+        """
+        added, reason = self._accumulate_reference_window(recent)
+        if not added:
+            return False, reason
+        return self._maybe_establish_reference(iter_num, quality_audit)
+
     def set_regime(
         self,
         regime_id: str,
@@ -1302,6 +1329,8 @@ class RegimeAnchoredGateEngine:
             self._accumulating = []
             self._ref_incomplete_windows_skipped = 0
             self._ref_last_incomplete_missing = []
+            self._ref_candidate_windows_seen = 0
+            self._ref_last_reject_reason = None
             summary["accumulator_reset"] = True
 
         return summary
@@ -1382,6 +1411,7 @@ class RegimeAnchoredGateEngine:
         # GET CURRENT REFERENCE (handles single vs multi-regime)
         # =========================================================================
         current_ref = self.current_reference
+        had_reference = current_ref is not None
 
         # =========================================================================
         # COMPUTE ELIGIBILITY FIRST (needed for regime_state_str)
@@ -1627,6 +1657,10 @@ class RegimeAnchoredGateEngine:
                     "regime_shadow_mode": shadow_mode,
                     "regime_check_ran": False,
                     "regime_id": None,
+                    "regime_build_window": [int(self._build_min_iter), int(self._build_max_iter)],
+                    "regime_ref_windows_built": 0,
+                    "regime_ref_candidate_windows_seen": 0,
+                    "regime_ref_last_reject_reason": None,
                     # Placeholder regime margin fields for schema stability
                     "regime_margin_raw": None,
                     "regime_margin_eff": None,
@@ -1790,33 +1824,38 @@ class RegimeAnchoredGateEngine:
 
         if current_ref is None:
             if getattr(self, "_ref_build_forced_block", None) is not None:
-                ref_build_status["blocked"] = str(self._ref_build_forced_block)
+                blocked = str(self._ref_build_forced_block)
+                ref_build_status["blocked"] = blocked
+                self._ref_last_reject_reason = blocked
             else:
                 in_phase, phase_reason = self._in_reference_build_phase(iter_num)
                 ref_build_status["in_build_phase"] = in_phase
 
                 if not in_phase:
-                    ref_build_status["blocked"] = f"not_in_build_phase: {phase_reason}"
-                elif change_dw_ok is not True:
-                    ref_build_status["blocked"] = "base_stability_not_ok_or_not_evaluated"
+                    blocked = f"not_in_build_phase: {phase_reason}"
+                    ref_build_status["blocked"] = blocked
                 else:
-                    if not bool(base_evaluated):
-                        ref_build_status["blocked"] = "base_not_evaluated"
-                    elif not bool(base_ok):
-                        ref_build_status["blocked"] = "base_check_failed"
+                    # Always accumulate complete windows during build phase to avoid bootstrap deadlock.
+                    added, add_reason = self._accumulate_reference_window(recent)
+                    if not added:
+                        ref_build_status["blocked"] = add_reason
+                        self._ref_last_reject_reason = add_reason
                     else:
                         quality_ok, quality_reason, quality_audit = self._meets_quality_gates(base_result, gain_bits)
                         ref_build_status["quality_gates"] = quality_audit
                         ref_build_status["quality_ok"] = quality_ok
                         if not quality_ok:
-                            ref_build_status["blocked"] = f"quality_gate: {quality_reason}"
+                            blocked = f"quality_gate: {quality_reason}"
+                            ref_build_status["blocked"] = blocked
+                            self._ref_last_reject_reason = blocked
                         else:
-                            established, establish_reason = self._try_establish_reference(
-                                recent, iter_num, quality_audit
-                            )
+                            established, establish_reason = self._maybe_establish_reference(iter_num, quality_audit)
                             ref_newly_established = established
-                            if not established:
+                            if established:
+                                self._ref_last_reject_reason = None
+                            else:
                                 ref_build_status["blocked"] = establish_reason
+                                self._ref_last_reject_reason = establish_reason
 
             ref_build_status.update(
                 {
@@ -1835,6 +1874,14 @@ class RegimeAnchoredGateEngine:
         current_ref = self.current_reference
         regime_has_reference = current_ref is not None
         regime_active_effective = bool(regime_has_reference and regime_eligible and (not shadow_mode))
+
+        if current_ref is not None:
+            try:
+                ref_windows_built = int((current_ref.build_audit or {}).get("windows_used", 0))
+            except Exception:
+                ref_windows_built = 0
+        else:
+            ref_windows_built = len(self._accumulating)
 
         audit.update(
             {
@@ -1855,6 +1902,10 @@ class RegimeAnchoredGateEngine:
                 "regime_eligible": bool(regime_eligible),
                 "regime_eligible_reason": regime_eligible_reason,
                 "regime_shadow_mode": shadow_mode,
+                "regime_build_window": [int(self._build_min_iter), int(self._build_max_iter)],
+                "regime_ref_windows_built": int(ref_windows_built),
+                "regime_ref_candidate_windows_seen": int(self._ref_candidate_windows_seen),
+                "regime_ref_last_reject_reason": self._ref_last_reject_reason,
                 # regime_id: always present for schema stability
                 "regime_id": current_ref.regime_id if current_ref else None,
             }
@@ -1968,6 +2019,16 @@ class RegimeAnchoredGateEngine:
                 rr = f"{ds}_ok"
             audit["reason"] = rr
 
+        # Bootstrap policy: while no reference exists (at start of check), do not hard-fail
+        # on the specific "change_warn_pending" pathway. Emit WARN instead to avoid deadlock.
+        bootstrap_warn = bool(
+            (not had_reference)
+            and self._enabled_effective
+            and (str(audit.get("reason") or "").strip() == "change_warn_pending")
+        )
+        if bootstrap_warn:
+            combined_ok = True
+
         per_metric = audit.get("per_metric_tv") or audit.get("drifts") or {}
         wk, wv = _pick_worst_metric(per_metric)
         if _needs_fill(audit.get("worst_metric")):
@@ -2072,6 +2133,9 @@ class RegimeAnchoredGateEngine:
                 self._calibration_recorder.write(cal_record)
 
         combined_warn = base_warn or (regime_warn if regime_check_ran else False)
+        if bootstrap_warn:
+            combined_warn = True
+            combined_ok = True
         return GateResult(ok=combined_ok, warn=combined_warn, audit=audit)
 
     def reset_reference(self, *, clear_all_regimes: bool = False) -> Dict[str, Any]:
@@ -2110,6 +2174,8 @@ class RegimeAnchoredGateEngine:
         self._accumulating = []
         self._ref_incomplete_windows_skipped = 0
         self._ref_last_incomplete_missing = []
+        self._ref_candidate_windows_seen = 0
+        self._ref_last_reject_reason = None
         return summary
 
     def get_reference_stats(self) -> Optional[Dict[str, Any]]:

@@ -54,3 +54,59 @@ class TestRegimeGatingSemantics:
         assert r.audit["regime_has_reference"] is False
         if "regime_state" in r.audit:
             assert isinstance(r.audit["regime_state"], str)
+
+    def test_regime_bootstrap_warn_and_builds_reference(self, gate_engine, fr_window):
+        cfg = RegimeConfig(
+            enabled=True,
+            reference_build_min_iter=0,
+            reference_build_max_iter=100,
+            reference_build_max_dw=2.0,
+            reference_build_min_gain=-1.0,
+            min_evidence_per_metric=1,
+            min_windows_for_reference=2,
+        )
+        rag = RegimeAnchoredGateEngine(
+            base_engine=gate_engine,
+            fr_win=fr_window,
+            config=cfg,
+            gate_warmup=0,
+            gate_window=10,
+        )
+
+        past = {"test_metric": np.full(50, 0.0)}
+        recent = {"test_metric": np.full(50, 1.0)}
+        counts = {"test_metric": 50}
+
+        r1 = rag.check(
+            past=past,
+            recent=recent,
+            counts_by_metric=counts,
+            gain_bits=0.1,
+            kappa_sens=0.0,
+            eps_stat_value=0.01,
+            iter_num=10,
+        )
+        assert r1.warn is True
+        assert r1.ok is True
+        assert r1.audit.get("reason") == "change_warn_pending"
+        assert r1.audit.get("regime_ref_candidate_windows_seen") == 1
+        assert r1.audit.get("regime_ref_windows_built", 0) >= 1
+        assert r1.audit.get("regime_has_reference") is False
+        assert "regime_build_window" in r1.audit
+        assert r1.audit.get("regime_ref_last_reject_reason", "").startswith("insufficient_complete_windows")
+
+        r2 = rag.check(
+            past=past,
+            recent=recent,
+            counts_by_metric=counts,
+            gain_bits=0.1,
+            kappa_sens=0.0,
+            eps_stat_value=0.01,
+            iter_num=20,
+        )
+        assert r2.warn is True
+        assert r2.ok is True
+        assert r2.audit.get("regime_ref_candidate_windows_seen") == 2
+        assert r2.audit.get("regime_ref_windows_built", 0) >= 2
+        assert r2.audit.get("regime_has_reference") is True
+        assert r2.audit.get("regime_ref_last_reject_reason") in (None, "")
