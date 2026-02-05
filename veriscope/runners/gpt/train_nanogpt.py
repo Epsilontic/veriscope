@@ -1158,7 +1158,9 @@ class VeriscopeGatedTrainer:
         if evaluated and policy == "either" and (not dw_exceeds) and legacy_regime_ok and (not gain_ok):
             ok = True
             warn = True
-            row_reason = "gain_warn_only"
+            # Downgrade gain-only FAIL -> WARN, but keep the *canonical* gate reason.
+            # GateEngine emits "gain_below_threshold" for this case.
+            row_reason = str(audit.get("reason") or "gain_below_threshold")
             row_base_reason = row_reason
             row_change_reason = row_reason
             audit["reason"] = row_reason
