@@ -1158,9 +1158,13 @@ class VeriscopeGatedTrainer:
         if evaluated and policy == "either" and (not dw_exceeds) and legacy_regime_ok and (not gain_ok):
             ok = True
             warn = True
-            # Downgrade gain-only FAIL -> WARN, but keep the *canonical* gate reason.
-            # GateEngine emits "gain_below_threshold" for this case.
-            row_reason = str(audit.get("reason") or "gain_below_threshold")
+            # Downgrade gain-only FAIL -> WARN.
+            # In EITHER mode the core gate may not emit a reason; runner must canonicalize.
+            _r = audit.get("reason", None)
+            if (_r is None) or (_r == "") or (str(_r) == "evaluated_unknown"):
+                row_reason = "gain_below_threshold"
+            else:
+                row_reason = str(_r)
             row_base_reason = row_reason
             row_change_reason = row_reason
             audit["reason"] = row_reason
