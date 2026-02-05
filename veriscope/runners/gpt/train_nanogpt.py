@@ -1171,6 +1171,33 @@ class VeriscopeGatedTrainer:
             audit["base_reason"] = row_reason
             audit["change_reason"] = row_reason
 
+        # Canonicalize runner sentinel: evaluated rows should never emit "evaluated_unknown".
+        if evaluated and (row_reason is None or str(row_reason) == "" or str(row_reason) == "evaluated_unknown"):
+            if warn:
+                # If we don't have a specific warn reason, at least mark it as warn.
+                row_reason = "warn"
+            elif not ok:
+                # FAIL: choose the most specific invariant we have.
+                if bool(audit.get("dw_exceeds_threshold", False)):
+                    row_reason = "dw_exceeds_threshold"
+                elif (not bool(audit.get("gain_ok", True))) or bool(audit.get("gain_below_threshold", False)):
+                    row_reason = "gain_below_threshold"
+                else:
+                    row_reason = "fail"
+            else:
+                # PASS, evaluated, no warn.
+                row_reason = "none_ok"
+
+            # Only overwrite base/change reasons if they are also unknown-ish.
+            if row_base_reason is None or str(row_base_reason) in ("", "evaluated_unknown"):
+                row_base_reason = row_reason
+            if row_change_reason is None or str(row_change_reason) in ("", "evaluated_unknown"):
+                row_change_reason = row_reason
+
+            audit["reason"] = row_reason
+            audit["base_reason"] = row_base_reason
+            audit["change_reason"] = row_change_reason
+
         audit["reason"] = row_reason
         audit["base_reason"] = row_base_reason
         audit["change_reason"] = row_change_reason
