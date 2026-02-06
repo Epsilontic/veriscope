@@ -13,6 +13,7 @@ from veriscope.core.artifacts import (
     ResultsSummaryV1,
     ResultsV1,
     WindowSignatureRefV1,
+    derive_gate_decision,
 )
 
 pytestmark = pytest.mark.unit
@@ -199,6 +200,55 @@ def test_temporal_order_violation_raises() -> None:
             gates=(gate,),
             metrics=(),
         )
+
+
+def test_derive_gate_decision_fail_dominates_warn() -> None:
+    truth_table = [
+        (False, False, False, "skip"),
+        (False, False, True, "skip"),
+        (False, True, False, "skip"),
+        (False, True, True, "skip"),
+        (True, False, False, "fail"),
+        (True, False, True, "fail"),
+        (True, True, False, "pass"),
+        (True, True, True, "warn"),
+    ]
+    for evaluated, ok, warn, expected in truth_table:
+        assert derive_gate_decision(evaluated=evaluated, ok=ok, warn=warn) == expected
+
+
+def test_gate_record_rejects_warn_when_ok_false() -> None:
+    audit = AuditV1(
+        evaluated=True,
+        reason="evaluated_fail",
+        policy="persistence",
+        per_metric_tv={},
+        evidence_total=1,
+        min_evidence=1,
+    )
+    with pytest.raises(ValueError, match="gate.ok cannot be False when decision=='warn'"):
+        GateRecordV1(iter=0, decision="warn", audit=audit, ok=False, warn=True)
+
+
+@pytest.mark.parametrize(
+    ("decision", "ok_value", "message"),
+    [
+        ("pass", False, "gate.ok cannot be False when decision=='pass'"),
+        ("warn", False, "gate.ok cannot be False when decision=='warn'"),
+        ("fail", True, "gate.ok cannot be True when decision=='fail'"),
+    ],
+)
+def test_gate_record_enforces_decision_ok_implications(decision: str, ok_value: bool, message: str) -> None:
+    audit = AuditV1(
+        evaluated=True,
+        reason="evaluated_state",
+        policy="persistence",
+        per_metric_tv={},
+        evidence_total=1,
+        min_evidence=1,
+    )
+    with pytest.raises(ValueError, match=message):
+        GateRecordV1(iter=0, decision=decision, audit=audit, ok=ok_value, warn=(decision == "warn"))
 
 
 def test_hash_normalization_and_validation() -> None:

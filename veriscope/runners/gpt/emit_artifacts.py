@@ -25,6 +25,7 @@ from veriscope.core.artifacts import (
     ResultsSummaryV1,
     ResultsV1,
     WindowSignatureRefV1,
+    derive_gate_decision,
     derive_final_decision,
 )
 from veriscope.core.jsonutil import (
@@ -228,7 +229,7 @@ def _derive_decision(ev: Mapping[str, Any], audit: AuditV1) -> str:
     Contract:
       - if audit.evaluated == False => skip
       - prefer explicit ev["decision"] if present
-      - else fallback to legacy booleans: warn > ok > fail
+      - else fallback to legacy booleans via canonical fail-dominant precedence
 
     Observability:
       - warn once per event when legacy booleans are used (no explicit decision).
@@ -238,7 +239,27 @@ def _derive_decision(ev: Mapping[str, Any], audit: AuditV1) -> str:
 
     explicit = ev.get("decision")
     if explicit is not None:
-        return str(explicit)
+        explicit_decision = str(explicit).strip().lower()
+        if explicit_decision not in {"pass", "warn", "fail", "skip"}:
+            raise ValueError(f"Invalid explicit gate decision={explicit!r}")
+        if ("warn" in ev) or ("ok" in ev):
+            derived = derive_gate_decision(
+                evaluated=True,
+                ok=bool(ev.get("ok", explicit_decision in {"pass", "warn"})),
+                warn=bool(ev.get("warn", explicit_decision == "warn")),
+            )
+            if explicit_decision != derived:
+                logger.warning(
+                    "Explicit gate decision=%r disagrees with legacy booleans (ok=%r warn=%r) at iter_hint=%r; "
+                    "using canonical decision=%r",
+                    explicit_decision,
+                    ev.get("ok", None),
+                    ev.get("warn", None),
+                    ev.get("iter", ev.get("iter_num", None)),
+                    derived,
+                )
+                return derived
+        return explicit_decision
 
     warn = bool(ev.get("warn", False))
     ok = bool(ev.get("ok", False))
@@ -252,11 +273,7 @@ def _derive_decision(ev: Mapping[str, Any], audit: AuditV1) -> str:
             ev.get("iter", ev.get("iter_num", None)),
         )
 
-    if warn:
-        return "warn"
-    if ok:
-        return "pass"
-    return "fail"
+    return derive_gate_decision(evaluated=True, ok=ok, warn=warn)
 
 
 def _counts_from_gate_records(gates: Sequence[GateRecordV1]) -> CountsV1:
@@ -392,11 +409,22 @@ def emit_gpt_artifacts_v1(
             audit = AuditV1(**audit_dict)
             decision = _derive_decision(ev, audit)
 
-            rec_kwargs: Dict[str, Any] = {"iter": it, "decision": decision, "audit": audit}
-            if "ok" in ev:
-                rec_kwargs["ok"] = bool(ev.get("ok"))
-            if "warn" in ev:
-                rec_kwargs["warn"] = bool(ev.get("warn"))
+            if decision == "skip":
+                ok_value = bool(ev.get("ok", True))
+                warn_value = False
+            else:
+                ok_value = bool(ev.get("ok", decision in {"pass", "warn"}))
+                warn_value = bool(ev.get("warn", decision == "warn"))
+                if not ok_value:
+                    warn_value = False
+
+            rec_kwargs: Dict[str, Any] = {
+                "iter": it,
+                "decision": decision,
+                "audit": audit,
+                "ok": ok_value,
+                "warn": warn_value,
+            }
 
             record = GateRecordV1(**rec_kwargs)
             gate_records.append(record)

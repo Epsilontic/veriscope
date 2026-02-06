@@ -24,7 +24,7 @@ import torch
 from torch.utils.data import DataLoader
 
 import veriscope
-from veriscope.core.artifacts import AuditV1, GateRecordV1, MetricRecordV1
+from veriscope.core.artifacts import AuditV1, GateRecordV1, MetricRecordV1, derive_gate_decision
 from veriscope.core.calibration import aggregate_epsilon_stat
 from veriscope.core.ddp import (
     ddp_barrier,
@@ -1078,16 +1078,13 @@ def _gate_from_history(
         audit_payload.setdefault("reason", "not_evaluated")
     audit = AuditV1(**audit_payload)
 
-    if not audit.evaluated:
-        decision = "skip"
-    elif result.warn:
-        decision = "warn"
-    elif result.ok:
-        decision = "pass"
-    else:
-        decision = "fail"
+    ok = bool(result.ok)
+    warn = bool(result.warn)
+    if not ok:
+        warn = False
+    decision = derive_gate_decision(evaluated=audit.evaluated, ok=ok, warn=warn)
 
-    return GateRecordV1(iter=iter_num, decision=decision, audit=audit, ok=result.ok, warn=result.warn)
+    return GateRecordV1(iter=iter_num, decision=decision, audit=audit, ok=ok, warn=warn)
 
 
 def _exit_code_for_signal(signal_name: Optional[str]) -> Optional[int]:

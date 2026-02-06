@@ -285,23 +285,38 @@ def _normalize_gate_audit(
 
 
 def _derive_gate_decision(evaluated: bool, ok: bool, warn: bool) -> str:
-    if not evaluated:
-        return "skip"
-    if warn:
-        return "warn"
-    if ok:
-        return "pass"
-    return "fail"
+    return _derive_gate_decision_v1(evaluated=evaluated, ok=ok, warn=warn)
 
 
 def _validate_gate_row(row: Dict[str, Any]) -> None:
-    if not __debug__:
-        return
     decision = row.get("decision")
-    assert decision in {"pass", "warn", "fail", "skip"}
-    if row.get("warn"):
-        assert row.get("reason") not in {"none_ok", "", None}
+    if decision not in {"pass", "warn", "fail", "skip"}:
+        raise ValueError(f"invalid gate decision={decision!r}")
     audit = row.get("audit", {})
+    if not isinstance(audit, dict):
+        raise ValueError("gate row audit must be an object")
+    evaluated = bool(audit.get("evaluated", True))
+    if not evaluated:
+        if decision != "skip":
+            raise ValueError("decision must be 'skip' when audit.evaluated=False")
+    else:
+        if decision == "warn":
+            if row.get("ok") is not True:
+                raise ValueError("decision='warn' requires ok=True")
+        elif decision == "pass":
+            if row.get("ok") is not True:
+                raise ValueError("decision='pass' requires ok=True")
+        elif decision == "fail":
+            if row.get("ok") is not False:
+                raise ValueError("decision='fail' requires ok=False")
+    if row.get("ok") is False:
+        if row.get("warn") is True:
+            raise ValueError("warn cannot be True when ok=False")
+    if row.get("warn"):
+        if decision != "warn":
+            raise ValueError("warn=True requires decision='warn'")
+        if row.get("reason") in {"none_ok", "", None}:
+            raise ValueError("warn rows require a non-empty non-'none_ok' reason")
     required = {
         "reason",
         "evaluated",
@@ -318,12 +333,17 @@ def _validate_gate_row(row: Dict[str, Any]) -> None:
         "min_evidence",
     }
     missing = [k for k in required if k not in audit]
-    assert not missing, f"missing audit keys: {missing}"
-    assert audit.get("reason") == row.get("reason")
+    if missing:
+        raise ValueError(f"missing audit keys: {missing}")
+    if audit.get("reason") != row.get("reason"):
+        raise ValueError(
+            f"audit.reason mismatch: audit.reason={audit.get('reason')!r} row.reason={row.get('reason')!r}"
+        )
     if audit.get("dw_exceeds_threshold"):
         mode = audit.get("exceedance_mode")
         if mode not in {"combined_only_no_tv", "not_evaluated"}:
-            assert audit.get("metrics_exceeding")
+            if not audit.get("metrics_exceeding"):
+                raise ValueError("dw_exceeds_threshold rows must include metrics_exceeding for this exceedance_mode")
 
 
 # Sanity check for emitted gate rows (example one-liner):
@@ -348,6 +368,7 @@ from veriscope.runners.gpt.adapter import (
 )
 from veriscope.core.calibration import aggregate_epsilon_stat
 from veriscope.runners.gpt.emit_artifacts import emit_gpt_artifacts_v1
+from veriscope.core.artifacts import derive_gate_decision as _derive_gate_decision_v1
 from veriscope.core.jsonutil import atomic_write_json, canonical_json_sha256
 from veriscope.core.redaction_policy import POLICY_REV, prepare_env_capture, redact_argv
 
@@ -1118,7 +1139,7 @@ class VeriscopeGatedTrainer:
         if _needs_fill(row_reason):
             row_reason = "evaluated_unknown" if evaluated else "not_evaluated"
         rr = str(row_reason)
-        if evaluated and warn and rr in {"none_ok", "change_ok", "regime_ok", "evaluated_unknown"}:
+        if evaluated and ok and warn and rr in {"none_ok", "change_ok", "regime_ok", "evaluated_unknown"}:
             if audit.get("regime_warn", False):
                 row_reason = "regime_warn_pending"
             elif audit.get("change_warn", False):
@@ -1171,12 +1192,12 @@ class VeriscopeGatedTrainer:
             audit["base_reason"] = row_reason
             audit["change_reason"] = row_reason
 
+        if evaluated and not ok:
+            warn = False
+
         # Canonicalize runner sentinel: evaluated rows should never emit "evaluated_unknown".
         if evaluated and (row_reason is None or str(row_reason) == "" or str(row_reason) == "evaluated_unknown"):
-            if warn:
-                # If we don't have a specific warn reason, at least mark it as warn.
-                row_reason = "warn"
-            elif not ok:
+            if not ok:
                 # FAIL: choose the most specific invariant we have.
                 if bool(audit.get("dw_exceeds_threshold", False)):
                     row_reason = "dw_exceeds_threshold"
@@ -1184,6 +1205,9 @@ class VeriscopeGatedTrainer:
                     row_reason = "gain_below_threshold"
                 else:
                     row_reason = "fail"
+            elif warn:
+                # If we don't have a specific warn reason, at least mark it as warn.
+                row_reason = "warn"
             else:
                 # PASS, evaluated, no warn.
                 row_reason = "none_ok"

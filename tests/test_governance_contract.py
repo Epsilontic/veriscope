@@ -10,6 +10,7 @@ import pytest
 
 from veriscope.cli.governance import (
     GOVERNANCE_EVENT_TYPES,
+    append_gate_decision,
     append_governance_log,
     append_run_started,
     read_governance_log,
@@ -169,6 +170,30 @@ def test_governance_log_prev_hash_mismatch_is_invalid(tmp_path: Path) -> None:
     validation = validate_governance_log(log_path)
     assert not validation.ok
     assert any("GOVERNANCE_LOG_PREV_HASH_MISMATCH" in w for w in validation.errors)
+
+
+@pytest.mark.parametrize(
+    ("decision", "ok", "warn"),
+    [
+        ("warn", False, True),
+        ("pass", False, False),
+        ("fail", True, False),
+    ],
+)
+def test_append_gate_decision_rejects_inconsistent_decision_tuples(
+    tmp_path: Path, decision: str, ok: bool, warn: bool
+) -> None:
+    outdir = tmp_path / "run"
+    with pytest.raises(ValueError, match="Inconsistent gate decision payload"):
+        append_gate_decision(
+            outdir,
+            run_id="run",
+            iter_num=10,
+            decision=decision,
+            ok=ok,
+            warn=warn,
+            audit={"evaluated": True, "reason": "change_persistence_fail", "policy": "persistence"},
+        )
 
 
 def test_governance_log_allows_legacy_entry_hash(tmp_path: Path) -> None:

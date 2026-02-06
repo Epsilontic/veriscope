@@ -1468,7 +1468,7 @@ class RegimeAnchoredGateEngine:
         # =========================================================================
         audit_base = base_result.audit or {}
         audit: Dict[str, Any] = dict(audit_base)
-        base_warn = getattr(base_result, "warn", False)
+        base_warn = bool(bool(base_result.ok) and bool(getattr(base_result, "warn", False)))
 
         # =========================================================================
         # SET REGIME_STATE IMMEDIATELY (required for calibration recorder)
@@ -1747,7 +1747,7 @@ class RegimeAnchoredGateEngine:
             )
 
             regime_ok = regime_result.ok
-            regime_warn = getattr(regime_result, "warn", False)
+            regime_warn = bool(bool(regime_result.ok) and bool(getattr(regime_result, "warn", False)))
 
             # Diagnostic: transport saturation
             if (not regime_ok) and self.config.enabled:
@@ -2136,6 +2136,7 @@ class RegimeAnchoredGateEngine:
         if bootstrap_warn:
             combined_warn = True
             combined_ok = True
+        combined_warn = bool(combined_ok and combined_warn)
         return GateResult(ok=combined_ok, warn=combined_warn, audit=audit)
 
     def reset_reference(self, *, clear_all_regimes: bool = False) -> Dict[str, Any]:

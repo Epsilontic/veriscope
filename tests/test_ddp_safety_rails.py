@@ -346,6 +346,68 @@ def test_ddp_gate_skips_when_env_active_but_no_comms(monkeypatch: pytest.MonkeyP
     assert record.audit.per_metric_tv == {}
 
 
+def test_hf_gate_fail_dominates_warn(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_fake_torch_ddp_init(monkeypatch)
+    sys.modules.pop("veriscope.runners.hf.train_hf", None)
+    train_hf = importlib.import_module("veriscope.runners.hf.train_hf")
+    _gate_from_history = train_hf._gate_from_history
+
+    for key in (
+        "WORLD_SIZE",
+        "RANK",
+        "MASTER_ADDR",
+        "MASTER_PORT",
+        "LOCAL_RANK",
+        "LOCAL_WORLD_SIZE",
+        "TORCHELASTIC_RUN_ID",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    class _FakeGateEngine:
+        def check(self, **_kwargs: object) -> object:
+            return types.SimpleNamespace(
+                ok=False,
+                warn=True,
+                audit={
+                    "evaluated": True,
+                    "reason": "change_persistence_fail",
+                    "policy": "persistence",
+                    "worst_DW": 0.24,
+                    "eps_eff": 0.08,
+                    "per_metric_tv": {"var_out_k": 0.24},
+                },
+            )
+
+    window_decl = WindowDecl(
+        epsilon=0.12,
+        metrics=["var_out_k", "eff_dim"],
+        weights={"var_out_k": 0.5, "eff_dim": 0.5},
+        bins=16,
+    )
+    transport = DeclTransport(window_decl)
+    window_decl.attach_transport(transport)
+
+    metric_history = [
+        {"iter": 0, "var_out_k": 0.1, "eff_dim": 0.2},
+        {"iter": 1, "var_out_k": 0.12, "eff_dim": 0.22},
+        {"iter": 2, "var_out_k": 0.11, "eff_dim": 0.21},
+        {"iter": 3, "var_out_k": 0.13, "eff_dim": 0.23},
+    ]
+    record = _gate_from_history(
+        _FakeGateEngine(),
+        window_decl,
+        metric_history,
+        gate_window=2,
+        iter_num=3,
+        gate_policy="persistence",
+        gate_min_evidence=1,
+    )
+
+    assert record.decision == "fail"
+    assert record.ok is False
+    assert record.warn is False
+
+
 def test_hf_ddp_init_shim_calls_process_group(monkeypatch: pytest.MonkeyPatch) -> None:
     calls = _install_fake_torch_ddp_init(monkeypatch)
     initialized = {"value": False}

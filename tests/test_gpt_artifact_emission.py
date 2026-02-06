@@ -1,6 +1,7 @@
 # tests/test_gpt_artifact_emission.py
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -219,3 +220,56 @@ def test_emit_sanitizes_unevaluated_nonfinite(tmp_path: Path) -> None:
     assert res.gates[0].audit.worst_DW == 0.0
     assert res.gates[0].audit.eps_eff == 0.0
     assert res.gates[0].audit.per_metric_tv["m1"] == 0.0
+
+
+def test_emit_legacy_bool_conflict_normalizes_to_fail(tmp_path: Path) -> None:
+    outdir = tmp_path / "out"
+
+    emit_gpt_artifacts_v1(
+        outdir=outdir,
+        run_id="run_test_fail_dominates_warn",
+        started_ts_utc=datetime(2026, 1, 1, 0, 0, 0),
+        ended_ts_utc=None,
+        gate_preset="tuned_v0",
+        overrides=None,
+        resolved_gate_cfg={},
+        gate_history=[
+            {
+                "iter": 16,
+                # Regression fixture: old precedence bug could emit warn with ok=False.
+                "decision": "warn",
+                "ok": False,
+                "warn": True,
+                "audit": {
+                    "evaluated": True,
+                    "reason": "change_persistence_fail",
+                    "policy": "persistence",
+                    "worst_DW": 0.22,
+                    "eps_eff": 0.08,
+                    "per_metric_tv": {"m1": 0.22},
+                    "evidence_total": 32,
+                    "min_evidence": 16,
+                    "persistence_fail": True,
+                    "regime_warn": True,
+                },
+            }
+        ],
+    )
+
+    from veriscope.core.artifacts import ResultsV1
+
+    results = ResultsV1.model_validate_json((outdir / "results.json").read_text(encoding="utf-8"))
+    gate = results.gates[0]
+    assert gate.decision == "fail"
+    assert gate.ok is False
+    assert gate.warn is False
+
+    gov_lines = [
+        json.loads(line) for line in (outdir / "governance_log.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    gate_events = [line for line in gov_lines if (line.get("event") or line.get("event_type")) == "gate_decision_v1"]
+    assert gate_events
+    payload = gate_events[-1]["payload"]
+    assert payload["decision"] == "fail"
+    assert payload["ok"] is False
+    assert payload["warn"] is False

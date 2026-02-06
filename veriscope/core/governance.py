@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, List, Optional
 
+from veriscope.core.artifacts import derive_gate_decision
 from veriscope.core.ddp import ddp_is_active, ddp_rank, ddp_world_size
 from veriscope.core.jsonutil import atomic_append_jsonl, canonical_json_sha256, sanitize_json_value
 
@@ -521,6 +522,30 @@ def append_gate_decision(
     ts_utc: Optional[str] = None,
     actor: Optional[str] = None,
 ) -> tuple[Path, tuple[str, ...]]:
+    decision_norm = str(decision).strip().lower()
+    if decision_norm not in {"pass", "warn", "fail", "skip"}:
+        raise ValueError(f"Invalid gate decision={decision!r}")
+
+    audit_payload = dict(audit)
+    if decision_norm == "skip":
+        ok_value = bool(ok) if ok is not None else True
+        warn_value = False
+    else:
+        if ok is None:
+            raise ValueError("gate_decision_v1 payload requires ok for non-skip decisions")
+        ok_value = bool(ok)
+        warn_value = bool(warn)
+        if not ok_value:
+            warn_value = False
+
+    evaluated = bool(audit_payload.get("evaluated", decision_norm != "skip"))
+    expected = derive_gate_decision(evaluated=evaluated, ok=ok_value, warn=warn_value)
+    if decision_norm != expected:
+        raise ValueError(
+            "Inconsistent gate decision payload: "
+            f"decision={decision_norm!r} expected={expected!r} evaluated={evaluated!r} ok={ok_value!r} warn={warn_value!r}"
+        )
+
     entry = {
         "ts_utc": ts_utc or _now_utc_iso(),
         "actor": actor,
@@ -529,10 +554,10 @@ def append_gate_decision(
             "run_id": str(run_id),
             "outdir": str(outdir),
             "iter": int(iter_num),
-            "decision": str(decision),
-            "ok": ok,
-            "warn": warn,
-            "audit": dict(audit),
+            "decision": decision_norm,
+            "ok": ok_value,
+            "warn": warn_value,
+            "audit": audit_payload,
         },
     }
     return _append_governance_entry(outdir, entry)

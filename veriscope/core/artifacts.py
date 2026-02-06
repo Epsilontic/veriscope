@@ -49,6 +49,7 @@ __all__ = [
     "CountsV1",
     "ResultsSummaryV1",
     "ManualJudgementV1",
+    "derive_gate_decision",
     "derive_final_decision",
     "decision_from_audit",
     "export_schemas_v1",
@@ -208,9 +209,15 @@ class GateRecordV1(VSModel):
 
         Intentional scope:
         - Forbid clear contradictions.
-        - Do NOT attempt full reconstruction of decision semantics from legacy fields.
+        - Enforce fail-dominant decision implications when legacy bools are present.
         """
-        if self.ok is True and self.decision == "fail":
+        if self.audit.evaluated and self.decision == "skip":
+            raise ValueError("gate.decision cannot be 'skip' when audit.evaluated=True")
+        if (not self.audit.evaluated) and self.decision != "skip":
+            raise ValueError("gate.decision must be 'skip' when audit.evaluated=False")
+        if self.decision in {"pass", "warn"} and self.ok is False:
+            raise ValueError(f"gate.ok cannot be False when decision=='{self.decision}'")
+        if self.decision == "fail" and self.ok is True:
             raise ValueError("gate.ok cannot be True when decision=='fail'")
         if self.warn is True and self.decision != "warn":
             raise ValueError("gate.warn cannot be True when decision!='warn'")
@@ -320,6 +327,25 @@ class ManualJudgementV1(VSModel):
 
 
 # ---- Enforcement helpers (unit-testable, runner-agnostic) ----
+
+
+def derive_gate_decision(*, evaluated: bool, ok: bool, warn: bool) -> Decision:
+    """
+    Canonical gate decision derivation for legacy boolean inputs.
+
+    Precedence:
+      - not evaluated -> "skip"
+      - evaluated and ok=False -> "fail"  (FAIL dominates WARN)
+      - evaluated and ok=True and warn=True -> "warn"
+      - evaluated and ok=True and warn=False -> "pass"
+    """
+    if not bool(evaluated):
+        return "skip"
+    if not bool(ok):
+        return "fail"
+    if bool(warn):
+        return "warn"
+    return "pass"
 
 
 def derive_final_decision(counts: CountsV1) -> Decision:
