@@ -8,6 +8,11 @@ repo_root="$(cd "${script_dir}/.." && pwd)"
 ts="$(date +%Y%m%d_%H%M%S)"
 outdir="${1:-./out/hf_micro_smoke_${ts}}"
 
+if [[ "${CUDA_VISIBLE_DEVICES+x}" == "x" && -z "${CUDA_VISIBLE_DEVICES}" ]]; then
+  echo "[micro-smoke] ERROR: CUDA_VISIBLE_DEVICES is set but empty. Unset it to preserve default GPU visibility, or set a concrete value like 0." >&2
+  exit 2
+fi
+
 # Allow forwarding extra runner args after a `--` sentinel.
 # Usage: bash scripts/run_hf_micro_smoke.sh <outdir> -- --device cuda --max_steps 12 ...
 extra_args=()

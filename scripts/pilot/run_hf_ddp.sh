@@ -11,6 +11,11 @@ if [[ $# -gt 0 ]]; then
   shift
 fi
 
+if [[ "${CUDA_VISIBLE_DEVICES+x}" == "x" && -z "${CUDA_VISIBLE_DEVICES}" ]]; then
+  echo "[pilot-hf-ddp] ERROR: CUDA_VISIBLE_DEVICES is set but empty. Unset it to preserve default GPU visibility, or set a concrete value like 0." >&2
+  exit 2
+fi
+
 python_bin="${VERISCOPE_PYTHON_BIN:-python}"
 veriscope_bin="${VERISCOPE_BIN:-veriscope}"
 

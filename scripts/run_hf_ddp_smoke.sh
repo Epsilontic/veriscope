@@ -9,6 +9,11 @@ repo_root="$(cd "${script_dir}/.." && pwd)"
 
 ts="$(date +%Y%m%d_%H%M%S)"
 
+if [[ "${CUDA_VISIBLE_DEVICES+x}" == "x" && -z "${CUDA_VISIBLE_DEVICES}" ]]; then
+  echo "[hf-ddp-smoke] ERROR: CUDA_VISIBLE_DEVICES is set but empty. Unset it to preserve default GPU visibility, or set a concrete value like 0." >&2
+  exit 2
+fi
+
 # Hard bound the DDP smoke so CI/local runs don't hang for 10 minutes on rendezvous.
 # Use GNU timeout when available, else run unbounded.
 ddp_timeout_secs="${VERISCOPE_HF_DDP_SMOKE_TIMEOUT_SECS:-240}"
@@ -126,7 +131,9 @@ if [[ -z "${GLOO_SOCKET_IFNAME:-}" ]]; then
 fi
 export TP_SOCKET_IFNAME="${TP_SOCKET_IFNAME:-${GLOO_SOCKET_IFNAME}}"
 
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-}"
+if [[ "${CUDA_VISIBLE_DEVICES+x}" == "x" ]]; then
+  export CUDA_VISIBLE_DEVICES
+fi
 export VERISCOPE_OUT_BASE="${VERISCOPE_OUT_BASE:-${outdir}}"
 export VERISCOPE_FORCE="${VERISCOPE_FORCE:-1}"
 # Important: ensure we don't suppress DDP init in the runner.

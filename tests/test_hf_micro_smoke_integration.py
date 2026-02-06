@@ -73,7 +73,7 @@ def _hf_smoke_env(tmp_path: Path) -> dict[str, str]:
         extra_paths.append(pythonpath)
     env["PYTHONPATH"] = os.pathsep.join(extra_paths)
     env["VERISCOPE_PYTHON_BIN"] = sys.executable
-    env["CUDA_VISIBLE_DEVICES"] = ""
+    env.pop("CUDA_VISIBLE_DEVICES", None)
     env["HF_HOME"] = str(tmp_path / "hf_home")
     env["TRANSFORMERS_CACHE"] = str(tmp_path / "hf_cache")
     env["HF_DATASETS_CACHE"] = str(tmp_path / "hf_datasets_cache")

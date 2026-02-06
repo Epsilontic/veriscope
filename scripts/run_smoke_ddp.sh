@@ -5,6 +5,11 @@ set -euo pipefail
 
 outdir=${1:-"./out/ddp_smoke_$(date -u +%Y%m%d_%H%M%S)"}
 
+if [[ "${CUDA_VISIBLE_DEVICES+x}" == "x" && -z "${CUDA_VISIBLE_DEVICES}" ]]; then
+  echo "[ddp-smoke] ERROR: CUDA_VISIBLE_DEVICES is set but empty. Unset it to preserve default GPU visibility, or set a concrete value like 0." >&2
+  exit 2
+fi
+
 if [[ -n "${PYTHONPATH:-}" ]]; then
   export PYTHONPATH="${PYTHONPATH}:$PWD"
 else
