@@ -92,6 +92,16 @@ def _gain_flags(gain_bits: Any, gain_thr: float) -> tuple[bool, bool, bool, floa
     return (True, gb >= thr, gb < thr, float(gb))
 
 
+def _array_equal_nan_safe(a: np.ndarray, b: np.ndarray) -> bool:
+    """NaN-safe array equality helper with backward-compatible NumPy fallback."""
+    try:
+        return bool(np.array_equal(a, b, equal_nan=True))
+    except TypeError:
+        if a.shape != b.shape:
+            return False
+        return bool(np.all((a == b) | (np.isnan(a) & np.isnan(b))))
+
+
 class GatePolicy(Enum):
     """Gate failure policy."""
 
@@ -287,6 +297,32 @@ class GateEngine:
         worst_any = False
         worst_per_metric_tv: Dict[str, float] = {}
         worst_per_metric_n: Dict[str, Tuple[int, int]] = {}
+        raw_windows: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+        raw_window_debug: Dict[str, Dict[str, Any]] = {}
+
+        # Raw window diagnostics are interval-invariant (pre-transform), so compute once per metric.
+        for m in wd.weights.keys():
+            past_obj = past.get(m, np.array([], float))
+            recent_obj = recent.get(m, np.array([], float))
+            past_raw = np.asarray(past_obj, float)
+            recent_raw = np.asarray(recent_obj, float)
+            raw_windows[m] = (past_raw, recent_raw)
+            past_f = past_raw[np.isfinite(past_raw)]
+            recent_f = recent_raw[np.isfinite(recent_raw)]
+            raw_n_points = {"past": int(past_raw.size), "recent": int(recent_raw.size)}
+            finite_n_points = {"past": int(past_f.size), "recent": int(recent_f.size)}
+            raw_window_debug[m] = {
+                "raw_empty_strict": raw_n_points["past"] == 0 and raw_n_points["recent"] == 0,
+                "raw_exact_match": past_f.size == recent_f.size and _array_equal_nan_safe(past_f, recent_f),
+                "raw_n_points": raw_n_points,
+                "finite_n_points": finite_n_points,
+                "raw_ranges": {
+                    "past": [float(np.min(past_f)), float(np.max(past_f))] if past_f.size > 0 else None,
+                    "recent": [float(np.min(recent_f)), float(np.max(recent_f))] if recent_f.size > 0 else None,
+                },
+                # Debug-only alias hint (identity only; do NOT treat as hard failure).
+                "raw_identity_alias": past_obj is recent_obj,
+            }
 
         for T in intervs:
             tv_sum = 0.0
@@ -295,12 +331,11 @@ class GateEngine:
             this_per_metric_n: Dict[str, Tuple[int, int]] = {}
 
             for m, w in wd.weights.items():
-                past_arr = past.get(m, np.array([], float))
-                recent_arr = recent.get(m, np.array([], float))
+                past_raw, recent_raw = raw_windows[m]
 
                 # Ensure arrays after transport + intervention
-                a = np.asarray(T(_apply(m, past_arr)), float)
-                b = np.asarray(T(_apply(m, recent_arr)), float)
+                a = np.asarray(T(_apply(m, past_raw)), float)
+                b = np.asarray(T(_apply(m, recent_raw)), float)
 
                 tv = tv_hist_fixed(a, b, wd.bins)
 
@@ -383,6 +418,22 @@ class GateEngine:
                     regime_state=rs,
                 ),
             )
+
+        # Guardrail intent: if all per-metric TVs collapse to ~0, fail loudly unless raw windows are truly identical.
+        per_metric_vals = list(worst_per_metric_tv.values())
+        all_zero_tv = bool(per_metric_vals) and all(
+            np.isfinite(float(v)) and np.isclose(float(v), 0.0, atol=1e-12) for v in per_metric_vals
+        )
+        empty_metrics = sorted(str(m) for m, dbg in raw_window_debug.items() if dbg.get("raw_empty_strict", False))
+        nonidentical_metrics = sorted(
+            str(m) for m, dbg in raw_window_debug.items() if not dbg.get("raw_exact_match", True)
+        )
+        degenerate_reason: Optional[str] = None
+        if all_zero_tv:
+            if raw_window_debug and (len(empty_metrics) == len(raw_window_debug)):
+                degenerate_reason = "empty_window"
+            elif nonidentical_metrics:
+                degenerate_reason = "zero_tv_nonidentical_windows"
 
         eps_cap = float(wd.epsilon) * float(min(max(self.cap_frac, 0.0), 1.0))
         eps_stat = float(min(max(0.0, eps_stat_value), eps_cap))
@@ -550,71 +601,107 @@ class GateEngine:
 
         consecutive_after = self._consecutive_exceedances
         reason_gain_only = bool(warn and gain_warn and (not warn_stab))
+        if degenerate_reason is not None:
+            # Degenerate all-zero TV checks are hard failures.
+            # Keep persistence behavior monotone by counting this as an exceedance-like failure.
+            if self.policy in (GatePolicy.PERSISTENCE, GatePolicy.PERSISTENCE_STABILITY):
+                self._consecutive_exceedances = int(consecutive_before) + 1
+                consecutive_after = self._consecutive_exceedances
+                persistence_fail_flag = bool(consecutive_after >= self.persistence_k)
+            ok = False
+            warn = False
+            ok_stab = False
+            ok_stab_raw = False
 
-        return GateResult(
-            ok=ok,
-            warn=warn,
-            audit=dict(
-                # Existing fields (UNCHANGED)
-                gain_bits=float(gain_bits_f),
-                gain_thr=float(self.gain_thr),
-                gain_evaluated=bool(gain_is_finite),
-                ok_gain=bool(ok_gain),
-                # Use the same weighted aggregate that drives dw_exceeds_threshold / decision logic.
-                worst_DW=(float(worst) if np.isfinite(worst) else float("nan")),
-                eps=float(wd.epsilon),
-                eps_sens=float(self.eps_sens),
-                eps_stat=float(eps_stat),
-                eps_eff=float(eps_eff),
-                kappa_sens=(float(kappa_sens) if bool(kappa_is_finite) else float("nan")),
-                kappa_checked=bool(kappa_is_finite),
-                counts_by_metric={k: int(v) for k, v in (counts_by_metric or {}).items()},
-                evidence_total=int(evidence_n),
-                total_evidence=int(evidence_n),
-                min_evidence=int(self.min_evidence),
-                eps_aggregation="cap_to_frac",
-                # Existing per-metric diagnostics (TUPLE FORMAT PRESERVED)
-                per_metric_tv=worst_per_metric_tv,
-                per_metric_n=worst_per_metric_n,
-                drifts=worst_per_metric_tv,  # backward-compat alias for regime.py
-                # NEW fields (additive only)
-                evaluated=evaluated,
-                policy=self.policy.value,
-                dw_exceeds_threshold=bool(dw_exceeds),
-                dw_exceeds_threshold_raw=bool(dw_exceeds_raw),
-                gain_below_threshold=bool(gain_below),
-                ok_stab=bool(ok_stab),
-                ok_stab_raw=bool(ok_stab_raw),
-                # Multi-metric consensus audit
-                min_metrics_exceeding=int(min_m_req),
-                min_metrics_exceeding_effective=int(min_m_eff),
-                n_metrics_exceeding=int(len(exceeding)),
-                metrics_exceeding=sorted(exceeding),
-                multi_metric_filtered=bool(multi_metric_filtered),
-                worst_metric=worst_metric,
-                worst_metric_tv=worst_metric_tv,
-                persistence_fail=bool(persistence_fail_flag),
-                consecutive_exceedances=consecutive_after,
-                consecutive_exceedances_before=consecutive_before,
-                consecutive_exceedances_after=consecutive_after,
-                persistence_k=self.persistence_k,
-                # Margin/trend (explicit naming + legacy aliases)
-                trend_x=int(t_idx),
-                trend_x_source=t_idx_source,
-                trend_n=int(self._trend_n),
-                check_idx=int(check_idx),
-                margin_change_raw=float(margin_change_raw),
-                margin_change_eff=float(margin_change_eff),
-                margin_change_slope_eff=float(margin_change_slope_eff),
-                margin_change=float(margin_change_eff),  # legacy alias
-                margin_change_slope=float(margin_change_slope_eff),  # legacy alias
-                margin_change_rel_raw=float(margin_change_rel_raw),
-                margin_change_rel_eff=float(margin_change_rel_eff),
-                # Regime state (string); margin_regime* injected by regime engine
-                regime_state=rs,
-                **({"reason": "gain_below_threshold"} if reason_gain_only else {}),
-            ),
+        audit = dict(
+            # Existing fields (UNCHANGED)
+            gain_bits=float(gain_bits_f),
+            gain_thr=float(self.gain_thr),
+            gain_evaluated=bool(gain_is_finite),
+            ok_gain=bool(ok_gain),
+            # Use the same weighted aggregate that drives dw_exceeds_threshold / decision logic.
+            worst_DW=(float(worst) if np.isfinite(worst) else float("nan")),
+            eps=float(wd.epsilon),
+            eps_sens=float(self.eps_sens),
+            eps_stat=float(eps_stat),
+            eps_eff=float(eps_eff),
+            kappa_sens=(float(kappa_sens) if bool(kappa_is_finite) else float("nan")),
+            kappa_checked=bool(kappa_is_finite),
+            counts_by_metric={k: int(v) for k, v in (counts_by_metric or {}).items()},
+            evidence_total=int(evidence_n),
+            total_evidence=int(evidence_n),
+            min_evidence=int(self.min_evidence),
+            eps_aggregation="cap_to_frac",
+            # Existing per-metric diagnostics (TUPLE FORMAT PRESERVED)
+            per_metric_tv=worst_per_metric_tv,
+            per_metric_n=worst_per_metric_n,
+            drifts=worst_per_metric_tv,  # backward-compat alias for regime.py
+            # NEW fields (additive only)
+            evaluated=evaluated,
+            policy=self.policy.value,
+            dw_exceeds_threshold=bool(dw_exceeds),
+            dw_exceeds_threshold_raw=bool(dw_exceeds_raw),
+            gain_below_threshold=bool(gain_below),
+            ok_stab=bool(ok_stab),
+            ok_stab_raw=bool(ok_stab_raw),
+            # Multi-metric consensus audit
+            min_metrics_exceeding=int(min_m_req),
+            min_metrics_exceeding_effective=int(min_m_eff),
+            n_metrics_exceeding=int(len(exceeding)),
+            metrics_exceeding=sorted(exceeding),
+            multi_metric_filtered=bool(multi_metric_filtered),
+            worst_metric=worst_metric,
+            worst_metric_tv=worst_metric_tv,
+            persistence_fail=bool(persistence_fail_flag),
+            consecutive_exceedances=consecutive_after,
+            consecutive_exceedances_before=consecutive_before,
+            consecutive_exceedances_after=consecutive_after,
+            persistence_k=self.persistence_k,
+            # Margin/trend (explicit naming + legacy aliases)
+            trend_x=int(t_idx),
+            trend_x_source=t_idx_source,
+            trend_n=int(self._trend_n),
+            check_idx=int(check_idx),
+            margin_change_raw=float(margin_change_raw),
+            margin_change_eff=float(margin_change_eff),
+            margin_change_slope_eff=float(margin_change_slope_eff),
+            margin_change=float(margin_change_eff),  # legacy alias
+            margin_change_slope=float(margin_change_slope_eff),  # legacy alias
+            margin_change_rel_raw=float(margin_change_rel_raw),
+            margin_change_rel_eff=float(margin_change_rel_eff),
+            # Regime state (string); margin_regime* injected by regime engine
+            regime_state=rs,
+            **({"reason": "gain_below_threshold"} if reason_gain_only else {}),
         )
+
+        if degenerate_reason is not None:
+            # `evaluated` is already correct from the normal audit path; evidence-insufficient
+            # cases return before reaching this point.
+            audit["reason"] = str(degenerate_reason)
+            audit["degenerate_window"] = True
+            audit["ok_stab"] = False
+            audit["ok_stab_raw"] = False
+            # Minimal debug payload for proving raw-window degeneracy.
+            audit["window_debug_n_points"] = {
+                str(m): dict(dbg.get("finite_n_points", {"past": 0, "recent": 0}))
+                for m, dbg in raw_window_debug.items()
+            }
+            audit["window_debug_raw_n_points"] = {
+                str(m): dict(dbg.get("raw_n_points", {"past": 0, "recent": 0})) for m, dbg in raw_window_debug.items()
+            }
+            audit["window_debug_raw_ranges"] = {
+                str(m): dict(dbg.get("raw_ranges", {"past": None, "recent": None}))
+                for m, dbg in raw_window_debug.items()
+            }
+            audit["window_debug_nonidentical_metrics"] = list(nonidentical_metrics)
+            audit["window_debug_empty_metrics"] = list(empty_metrics)
+            identity_alias_metrics = sorted(
+                str(m) for m, dbg in raw_window_debug.items() if dbg.get("raw_identity_alias", False)
+            )
+            if identity_alias_metrics:
+                audit["window_debug_identity_alias_metrics"] = identity_alias_metrics
+
+        return GateResult(ok=ok, warn=warn, audit=audit)
 
     def reset_persistence(self) -> int:
         """Reset persistence counter. Returns previous count.

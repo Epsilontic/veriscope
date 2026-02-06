@@ -59,6 +59,65 @@ class TestGateEngineSemantics:
         assert np.isfinite(r.audit["worst_DW"])
         assert np.isclose(r.audit["worst_DW"], 0.0, atol=1e-12)
 
+    def test_zero_tv_nonidentical_windows_fail_loudly(self, fr_window, make_gate_engine, force_zero_tv):
+        ge = make_gate_engine(fr_window, min_evidence=0, policy="either", gain_thresh=0.0, eps_sens=0.0)
+
+        # Raw windows differ, but TV is collapsed to 0.0 by the stubbed comparator.
+        past = {"test_metric": np.array([0.10, 0.20, 0.30], dtype=float)}
+        recent = {"test_metric": np.array([0.70, 0.80, 0.90], dtype=float)}
+        counts = {"test_metric": 3}
+
+        r = ge.check(past, recent, counts, gain_bits=0.1, kappa_sens=np.nan, eps_stat_value=0.0)
+        assert r.ok is False
+        assert r.warn is False
+        assert r.audit["evaluated"] is True
+        assert r.audit["reason"] == "zero_tv_nonidentical_windows"
+        assert "test_metric" in r.audit.get("window_debug_nonidentical_metrics", [])
+        assert "test_metric" not in r.audit.get("window_debug_empty_metrics", [])
+
+    def test_empty_window_fail_loudly(self, fr_window, make_gate_engine, force_zero_tv):
+        ge = make_gate_engine(fr_window, min_evidence=0, policy="either", gain_thresh=0.0, eps_sens=0.0)
+
+        past = {"test_metric": np.array([], dtype=float)}
+        recent = {"test_metric": np.array([], dtype=float)}
+        counts = {"test_metric": 10}
+
+        r = ge.check(past, recent, counts, gain_bits=0.1, kappa_sens=np.nan, eps_stat_value=0.0)
+        assert r.ok is False
+        assert r.warn is False
+        assert r.audit["evaluated"] is True
+        assert r.audit["reason"] == "empty_window"
+        npts = r.audit.get("window_debug_n_points", {}).get("test_metric", {})
+        assert npts.get("past") == 0
+        assert npts.get("recent") == 0
+        assert "test_metric" in r.audit.get("window_debug_empty_metrics", [])
+
+    def test_degenerate_window_persistence_counter_monotone(self, fr_window, make_gate_engine, force_zero_tv):
+        ge = make_gate_engine(
+            fr_window,
+            min_evidence=0,
+            policy="persistence",
+            persistence_k=2,
+            gain_thresh=0.0,
+            eps_sens=0.0,
+        )
+
+        past = {"test_metric": np.array([0.1, 0.2], dtype=float)}
+        recent = {"test_metric": np.array([0.8, 0.9], dtype=float)}
+        counts = {"test_metric": 2}
+
+        r1 = ge.check(past, recent, counts, gain_bits=0.1, kappa_sens=np.nan, eps_stat_value=0.0)
+        assert r1.audit["consecutive_exceedances_after"] == 1
+        assert r1.audit["persistence_fail"] is False
+        assert r1.audit["reason"] == "zero_tv_nonidentical_windows"
+        assert r1.audit["degenerate_window"] is True
+
+        r2 = ge.check(past, recent, counts, gain_bits=0.1, kappa_sens=np.nan, eps_stat_value=0.0)
+        assert r2.audit["consecutive_exceedances_after"] == 2
+        assert r2.audit["persistence_fail"] is True
+        assert r2.audit["reason"] == "zero_tv_nonidentical_windows"
+        assert r2.audit["degenerate_window"] is True
+
     def test_single_metric_exceedance_populates_metrics_exceeding(
         self, make_window_decl, make_fr_window, make_gate_engine
     ):

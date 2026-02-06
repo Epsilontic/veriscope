@@ -20,6 +20,18 @@ def rng():
 
 
 @pytest.fixture
+def force_zero_tv(monkeypatch):
+    """Patch gate TV comparator to always report zero TV."""
+
+    def _force_zero_tv(a: np.ndarray, b: np.ndarray, bins: int) -> float:
+        _ = (a, b, bins)
+        return 0.0
+
+    monkeypatch.setattr("veriscope.core.gate.tv_hist_fixed", _force_zero_tv)
+    return _force_zero_tv
+
+
+@pytest.fixture
 def make_window_decl() -> Callable[..., object]:
     """
     Minimal-valid WindowDecl factory pinned to the explicit dataclass signature.

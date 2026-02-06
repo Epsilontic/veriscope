@@ -288,6 +288,14 @@ def _derive_gate_decision(evaluated: bool, ok: bool, warn: bool) -> str:
     return _derive_gate_decision_v1(evaluated=evaluated, ok=ok, warn=warn)
 
 
+def _strip_regime_audit_fields(audit_in: Dict[str, Any]) -> Dict[str, Any]:
+    audit = dict(audit_in or {})
+    for key in list(audit.keys()):
+        if str(key).startswith("regime_"):
+            audit.pop(key, None)
+    return audit
+
+
 def _validate_gate_row(row: Dict[str, Any]) -> None:
     decision = row.get("decision")
     if decision not in {"pass", "warn", "fail", "skip"}:
@@ -630,17 +638,36 @@ class VeriscopeGatedTrainer:
             # If rmw <= 0, don't add to kwargs; RegimeConfig default applies
 
         regime_config = RegimeConfig(**regime_kwargs)
+        self._regime_wrapper_enabled = bool(regime_enabled)
 
-        # Wrap with regime-anchored detection
-        self.gate_engine = RegimeAnchoredGateEngine(
-            base_engine=base_gate_engine,
-            fr_win=self.fr_win,
-            config=regime_config,
-            gate_warmup=int(config.gate_warmup),
-            gate_window=int(config.gate_window),
-            pathology_start=pathology_start,
-            default_gap_iters=int(default_gap_iters),
-        )
+        if self._regime_wrapper_enabled:
+            # Wrap with regime-anchored detection only when explicitly enabled.
+            self.gate_engine = RegimeAnchoredGateEngine(
+                base_engine=base_gate_engine,
+                fr_win=self.fr_win,
+                config=regime_config,
+                gate_warmup=int(config.gate_warmup),
+                gate_window=int(config.gate_window),
+                pathology_start=pathology_start,
+                default_gap_iters=int(default_gap_iters),
+            )
+            build_min, build_max = self.gate_engine.build_window
+            regime_epsilon = float(self.gate_engine.regime_epsilon)
+            regime_enabled_effective = bool(getattr(self.gate_engine, "enabled", False))
+        else:
+            self.gate_engine = base_gate_engine
+            # Keep reference-build metadata deterministic even when regime wrapper is disabled.
+            build_min, build_max = compute_build_window(
+                regime_config,
+                gate_warmup=int(config.gate_warmup),
+                gate_window=int(config.gate_window),
+                pathology_start=pathology_start,
+                default_gap_iters=int(default_gap_iters),
+            )
+            regime_epsilon = float("nan")
+            regime_enabled_effective = False
+
+        self.build_window = (int(build_min), int(build_max))
 
         # ---------------------------------------------------------------------
         # Optional calibration recorder attachment
@@ -663,7 +690,8 @@ class VeriscopeGatedTrainer:
                 fail_on_schema_mismatch=bool(getattr(config, "calibration_fail_on_schema_mismatch", True)),
             )
             self._calibration_recorder = CalibrationRecorder(rec_cfg)
-            self.gate_engine.set_calibration_recorder(self._calibration_recorder)
+            if hasattr(self.gate_engine, "set_calibration_recorder"):
+                self.gate_engine.set_calibration_recorder(self._calibration_recorder)
 
             if getattr(self._calibration_recorder, "is_active", False):
                 print(f"[CAL] calibration recorder enabled -> {rec_cfg.output_path}")
@@ -677,17 +705,19 @@ class VeriscopeGatedTrainer:
         self._freeze_metric_gauge_min_ref_updates: int = int(getattr(config, "freeze_metric_gauge_min_ref_updates", 0))
         self._freeze_defer_log_every: int = 500
 
-        # Log computed build window and effective status
-        build_min, build_max = self.gate_engine.build_window
-        print(
-            f"[REGIME] enabled={self.gate_engine.enabled}, "
-            f"build_window=[{build_min}, {build_max}), "
-            f"epsilon={self.gate_engine.regime_epsilon:.4f}"
-        )
+        # Log computed build window and effective status.
+        if self._regime_wrapper_enabled:
+            print(
+                f"[REGIME] enabled={regime_enabled_effective}, "
+                f"build_window=[{build_min}, {build_max}), "
+                f"epsilon={regime_epsilon:.4f}"
+            )
+        else:
+            print(f"[REGIME] enabled=False (wrapper not instantiated), build_window=[{build_min}, {build_max})")
         # Freeze gauge BEFORE the first eligible reference-building gate check uses "recent" samples.
         # Gate checks happen at iter multiples of gate_window. Metric snapshots happen every metric_interval.
         # We freeze at window_start so that all metric snapshots used to build the reference are in the frozen gauge.
-        if bool(config.freeze_metric_gauge_on_ref) and bool(self.gate_engine.enabled):
+        if bool(config.freeze_metric_gauge_on_ref) and bool(regime_enabled_effective):
             gw = max(1, int(config.gate_window))
             mi = max(1, int(config.metric_interval))
             first_check = ((int(build_min) + gw - 1) // gw) * gw
@@ -704,7 +734,7 @@ class VeriscopeGatedTrainer:
 
         # If explicit override was requested, warn about tightness (few gate checks / insufficient evidence).
         explicit_override = (int(config.regime_build_min_iter) >= 0) or (int(config.regime_build_max_iter) >= 0)
-        if explicit_override and self.gate_engine.enabled:
+        if explicit_override and bool(regime_enabled_effective):
             gw = max(1, int(config.gate_window))
             first_check = ((build_min + gw - 1) // gw) * gw
             last_check = ((build_max - 1) // gw) * gw
@@ -719,22 +749,23 @@ class VeriscopeGatedTrainer:
                     f"Reference establishment may never trigger."
                 )
 
-        # Hardening: independently compute build window and warn on mismatch
-        try:
-            bm2, bx2 = compute_build_window(
-                regime_config,
-                gate_warmup=int(config.gate_warmup),
-                gate_window=int(config.gate_window),
-                pathology_start=pathology_start,
-                default_gap_iters=int(default_gap_iters),
-            )
-            if (int(bm2), int(bx2)) != (int(build_min), int(build_max)):
-                warnings.warn(
-                    f"[REGIME] build_window mismatch: engine=[{build_min},{build_max}) vs compute=[{bm2},{bx2})",
-                    RuntimeWarning,
+        # Hardening: independently compute build window and warn on mismatch.
+        if self._regime_wrapper_enabled:
+            try:
+                bm2, bx2 = compute_build_window(
+                    regime_config,
+                    gate_warmup=int(config.gate_warmup),
+                    gate_window=int(config.gate_window),
+                    pathology_start=pathology_start,
+                    default_gap_iters=int(default_gap_iters),
                 )
-        except Exception:
-            pass
+                if (int(bm2), int(bx2)) != (int(build_min), int(build_max)):
+                    warnings.warn(
+                        f"[REGIME] build_window mismatch: engine=[{build_min},{build_max}) vs compute=[{bm2},{bx2})",
+                        RuntimeWarning,
+                    )
+            except Exception:
+                pass
 
         # Metric history for gating
         self.metric_history: List[Dict[str, Any]] = []
@@ -1171,6 +1202,8 @@ class VeriscopeGatedTrainer:
             row_base_reason=row_base_reason,
             row_change_reason=row_change_reason,
         )
+        if not getattr(self, "_regime_wrapper_enabled", False):
+            audit = _strip_regime_audit_fields(audit)
         evaluated = bool(audit.get("evaluated", True))
         policy = str(audit.get("policy", "either"))
         dw_exceeds = bool(audit.get("dw_exceeds_threshold", False))
@@ -2368,7 +2401,9 @@ if __name__ == "__main__":
         # Keep last 100 + padded ranges around reference build and configured pathologies.
         # compute_window_spans() is defined in this module.
         Wm, window_span_iters, _ = compute_window_spans(config.gate_window, config.metric_interval)
-        build_min, build_max = trainer.gate_engine.build_window
+        build_min, build_max = getattr(trainer, "build_window", (None, None))
+        if build_min is None or build_max is None:
+            build_min, build_max = (0, 0)
         pad = 2 * int(window_span_iters)
         ranges: List[Tuple[int, int]] = []
         ranges.append((max(0, int(build_min) - pad), min(int(config.max_iters), int(build_max) + pad)))
@@ -2410,7 +2445,7 @@ if __name__ == "__main__":
 
     # Always persist the effective build window / epsilon from the constructed engine.
     try:
-        reference_info["build_window"] = list(getattr(trainer.gate_engine, "build_window", (None, None)))
+        reference_info["build_window"] = list(getattr(trainer, "build_window", (None, None)))
         reference_info["regime_epsilon"] = float(getattr(trainer.gate_engine, "regime_epsilon", float("nan")))
     except Exception:
         pass
