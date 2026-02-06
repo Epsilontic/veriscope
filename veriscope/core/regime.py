@@ -1749,8 +1749,8 @@ class RegimeAnchoredGateEngine:
             regime_ok = regime_result.ok
             regime_warn = bool(bool(regime_result.ok) and bool(getattr(regime_result, "warn", False)))
 
-            # Diagnostic: transport saturation
-            if (not regime_ok) and self.config.enabled:
+            # Diagnostic: transport saturation (always check when regime logic is enabled).
+            if self.config.enabled:
                 cal_ranges = getattr(self._regime_decl, "cal_ranges", {})
                 for m in self._metrics_tracked:
                     if m not in recent:
@@ -1773,19 +1773,36 @@ class RegimeAnchoredGateEngine:
             except Exception:
                 dw_val = float("nan")
 
-            if np.isfinite(dw_val) and (dw_val > 0.5):
+            clip_diag_threshold = 0.10
+            force_clip_diag = bool(np.isfinite(dw_val) and (dw_val > 0.5))
+            if force_clip_diag or self.config.enabled:
                 _tr = getattr(self._regime_fr_win, "transport", None)
                 _clip = getattr(_tr, "clip_diagnostics", None)
                 if callable(_clip):
                     for m in self._metrics_tracked:
                         try:
-                            clip_diag_recent[m] = _clip(m, recent.get(m, np.array([], float)))
+                            recent_diag = _clip(m, recent.get(m, np.array([], float)))
                         except Exception:
-                            clip_diag_recent[m] = {"error": "clip_diag_failed"}
+                            recent_diag = {"error": "clip_diag_failed"}
                         try:
-                            clip_diag_ref[m] = _clip(m, current_ref.metrics.get(m, np.array([], float)))
+                            ref_diag = _clip(m, current_ref.metrics.get(m, np.array([], float)))
                         except Exception:
-                            clip_diag_ref[m] = {"error": "clip_diag_failed"}
+                            ref_diag = {"error": "clip_diag_failed"}
+
+                        clip_total = None
+                        if isinstance(recent_diag, dict):
+                            try:
+                                clip_total = float(recent_diag.get("clip_lo_frac", 0.0)) + float(
+                                    recent_diag.get("clip_hi_frac", 0.0)
+                                )
+                            except Exception:
+                                clip_total = None
+                        include_diag = force_clip_diag
+                        if (clip_total is not None) and np.isfinite(clip_total) and (clip_total >= clip_diag_threshold):
+                            include_diag = True
+                        if include_diag:
+                            clip_diag_recent[m] = recent_diag
+                            clip_diag_ref[m] = ref_diag
 
             ra = regime_result.audit or {}
             _per_metric = ra.get("per_metric_tv") or ra.get("drifts") or {}
@@ -1808,7 +1825,7 @@ class RegimeAnchoredGateEngine:
             }
 
             if clip_diag_recent:
-                regime_audit["regime_clip_diag_threshold"] = 0.5
+                regime_audit["regime_clip_diag_threshold"] = clip_diag_threshold
                 regime_audit["regime_clip_diag_recent"] = clip_diag_recent
                 regime_audit["regime_clip_diag_ref"] = clip_diag_ref
 

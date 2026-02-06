@@ -426,12 +426,10 @@ class GateEngine:
         min_m_eff = min(min_m_req, n_metrics_total)
 
         exceeding: list[str] = []
-        audit_worst_dw: Optional[float] = None
+        worst_metric: Optional[str] = None
+        worst_metric_tv: Optional[float] = None
         per_metric_tv = worst_per_metric_tv if isinstance(worst_per_metric_tv, dict) else None
         if per_metric_tv is not None and np.isfinite(float(eps_eff)):
-            # Contract-safe audit fix: compute per-metric exceedance even for a single metric.
-            # This only affects audit attribution/coherence, not decision logic or thresholds.
-            max_tv: Optional[float] = None
             for m, v in per_metric_tv.items():
                 try:
                     # tolerate structured payloads like {"tv": ...}
@@ -443,14 +441,11 @@ class GateEngine:
                     continue
                 if not np.isfinite(tv):
                     continue
-                if (max_tv is None) or (tv > max_tv):
-                    max_tv = tv
+                if (worst_metric_tv is None) or (tv > worst_metric_tv):
+                    worst_metric_tv = float(tv)
+                    worst_metric = str(m)
                 if tv > float(eps_eff):
                     exceeding.append(str(m))
-
-            # If we have at least one finite per-metric TV, ensure audit worst_DW matches it.
-            if max_tv is not None:
-                audit_worst_dw = float(max_tv)
 
         # Preserve raw exceedance for debugging/auditing
         dw_exceeds_raw = bool(dw_exceeds)
@@ -565,11 +560,8 @@ class GateEngine:
                 gain_thr=float(self.gain_thr),
                 gain_evaluated=bool(gain_is_finite),
                 ok_gain=bool(ok_gain),
-                worst_DW=(
-                    float(audit_worst_dw)
-                    if audit_worst_dw is not None
-                    else (float(worst) if np.isfinite(worst) else float("nan"))
-                ),
+                # Use the same weighted aggregate that drives dw_exceeds_threshold / decision logic.
+                worst_DW=(float(worst) if np.isfinite(worst) else float("nan")),
                 eps=float(wd.epsilon),
                 eps_sens=float(self.eps_sens),
                 eps_stat=float(eps_stat),
@@ -599,6 +591,8 @@ class GateEngine:
                 n_metrics_exceeding=int(len(exceeding)),
                 metrics_exceeding=sorted(exceeding),
                 multi_metric_filtered=bool(multi_metric_filtered),
+                worst_metric=worst_metric,
+                worst_metric_tv=worst_metric_tv,
                 persistence_fail=bool(persistence_fail_flag),
                 consecutive_exceedances=consecutive_after,
                 consecutive_exceedances_before=consecutive_before,

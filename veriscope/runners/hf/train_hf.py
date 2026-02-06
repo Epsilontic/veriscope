@@ -845,7 +845,8 @@ def _metric_snapshot(
 ) -> tuple[list[Dict[str, Any]], list[Dict[str, Any]]]:
     if gate_window <= 0:
         return [], []
-    if len(metric_history) < gate_window:
+    # Require full past+recent windows before evaluating.
+    if len(metric_history) < (2 * gate_window):
         return [], list(metric_history)
     past = metric_history[-2 * gate_window : -gate_window]
     recent = metric_history[-gate_window:]

@@ -89,3 +89,14 @@ class TestCalibrationMath:
             assert np.isfinite(eps)
 
         assert eps_large <= eps_small
+
+    def test_aggregate_epsilon_stat_normalizes_by_abs_weights(self, make_window_decl):
+        wd = make_window_decl(["m1", "m2"], weights={"m1": 1.0, "m2": -1.0}, bins=16)
+        counts = {"m1": 50, "m2": 200}
+
+        got = aggregate_epsilon_stat(wd, counts, alpha=0.05)
+
+        eps_m1 = epsilon_statistic_bhc(n=50, k=16, alpha=0.05)
+        eps_m2 = epsilon_statistic_bhc(n=200, k=16, alpha=0.05)
+        expected = 0.5 * eps_m1 + 0.5 * eps_m2
+        np.testing.assert_allclose(got, expected, atol=1e-12)

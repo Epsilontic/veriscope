@@ -220,6 +220,10 @@ def test_emit_sanitizes_unevaluated_nonfinite(tmp_path: Path) -> None:
     assert res.gates[0].audit.worst_DW == 0.0
     assert res.gates[0].audit.eps_eff == 0.0
     assert res.gates[0].audit.per_metric_tv["m1"] == 0.0
+    raw = json.loads((outdir / "results.json").read_text(encoding="utf-8"))
+    audit_raw = raw["gates"][0]["audit"]
+    assert audit_raw["sanitized_nonfinite"] is True
+    assert audit_raw["sanitized_nonfinite_count"] >= 1
 
 
 def test_emit_legacy_bool_conflict_normalizes_to_fail(tmp_path: Path) -> None:
@@ -273,3 +277,22 @@ def test_emit_legacy_bool_conflict_normalizes_to_fail(tmp_path: Path) -> None:
     assert payload["decision"] == "fail"
     assert payload["ok"] is False
     assert payload["warn"] is False
+
+
+def test_emit_rejects_non_monotonic_gate_iterations(tmp_path: Path) -> None:
+    outdir = tmp_path / "out_non_monotonic"
+
+    with pytest.raises(ValueError, match="strictly increasing"):
+        emit_gpt_artifacts_v1(
+            outdir=outdir,
+            run_id="run_test_non_monotonic",
+            started_ts_utc=datetime(2026, 1, 1, 0, 0, 0),
+            ended_ts_utc=None,
+            gate_preset="tuned_v0",
+            overrides=None,
+            resolved_gate_cfg={},
+            gate_history=[
+                {"iter": 16, "audit": {"evaluated": False, "reason": "not_evaluated", "policy": "either"}},
+                {"iter": 8, "audit": {"evaluated": False, "reason": "not_evaluated", "policy": "either"}},
+            ],
+        )

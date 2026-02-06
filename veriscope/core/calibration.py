@@ -50,5 +50,6 @@ def aggregate_epsilon_stat(window: "WindowDecl", counts_by_metric: Dict[str, int
     for m, w in weights.items():
         n_m = int(counts_by_metric.get(m, 0))
         eps_m = epsilon_statistic_bhc(n=n_m, k=bins, alpha=alpha)
-        total += (float(w) / s) * eps_m
+        # Keep epsilon-stat scaling aligned with GateEngine aggregation semantics.
+        total += (abs(float(w)) / s) * eps_m
     return float(total)

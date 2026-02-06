@@ -346,6 +346,22 @@ def test_ddp_gate_skips_when_env_active_but_no_comms(monkeypatch: pytest.MonkeyP
     assert record.audit.per_metric_tv == {}
 
 
+def test_hf_metric_snapshot_requires_full_past_and_recent_windows(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_fake_torch_ddp_init(monkeypatch)
+    sys.modules.pop("veriscope.runners.hf.train_hf", None)
+    train_hf = importlib.import_module("veriscope.runners.hf.train_hf")
+
+    history = [{"iter": 0}, {"iter": 1}, {"iter": 2}]
+    past, recent = train_hf._metric_snapshot(history, gate_window=2)
+    assert past == []
+    assert recent == history
+
+    history_full = [{"iter": 0}, {"iter": 1}, {"iter": 2}, {"iter": 3}]
+    past_full, recent_full = train_hf._metric_snapshot(history_full, gate_window=2)
+    assert [row["iter"] for row in past_full] == [0, 1]
+    assert [row["iter"] for row in recent_full] == [2, 3]
+
+
 def test_hf_gate_fail_dominates_warn(monkeypatch: pytest.MonkeyPatch) -> None:
     _install_fake_torch_ddp_init(monkeypatch)
     sys.modules.pop("veriscope.runners.hf.train_hf", None)

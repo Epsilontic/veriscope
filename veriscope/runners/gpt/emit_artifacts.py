@@ -210,16 +210,33 @@ def _sanitize_audit_nonfinite(audit: Dict[str, Any]) -> Dict[str, Any]:
     def _is_nonfinite(value: Any) -> bool:
         return isinstance(value, float) and not math.isfinite(value)
 
-    def _sanitize_value(value: Any) -> Any:
+    def _sanitize_value(value: Any) -> tuple[Any, int]:
         if _is_nonfinite(value):
-            return 0.0
+            return 0.0, 1
         if isinstance(value, Mapping):
-            return {key: _sanitize_value(item) for key, item in value.items()}
+            out: Dict[str, Any] = {}
+            replaced = 0
+            for key, item in value.items():
+                sanitized, n = _sanitize_value(item)
+                out[str(key)] = sanitized
+                replaced += n
+            return out, replaced
         if isinstance(value, list):
-            return [_sanitize_value(item) for item in value]
-        return value
+            out_list: List[Any] = []
+            replaced = 0
+            for item in value:
+                sanitized, n = _sanitize_value(item)
+                out_list.append(sanitized)
+                replaced += n
+            return out_list, replaced
+        return value, 0
 
-    return _sanitize_value(dict(audit))
+    sanitized, replaced = _sanitize_value(dict(audit))
+    if replaced > 0 and isinstance(sanitized, dict):
+        sanitized.setdefault("sanitized_nonfinite", True)
+        sanitized.setdefault("sanitized_nonfinite_count", int(replaced))
+        logger.warning("Sanitized %d non-finite audit value(s) for unevaluated gate row", replaced)
+    return sanitized
 
 
 def _derive_decision(ev: Mapping[str, Any], audit: AuditV1) -> str:
@@ -399,9 +416,15 @@ def emit_gpt_artifacts_v1(
     logger.debug("Processing %d gate_history events", n_events)
 
     gate_records: List[GateRecordV1] = []
+    prev_iter: Optional[int] = None
     for i, ev in enumerate(gate_history):
         try:
             it = _get_event_iter(ev)
+            if prev_iter is not None and it <= prev_iter:
+                raise ValueError(
+                    f"gate_history iterations must be strictly increasing: index={i} iter={it} prev_iter={prev_iter}"
+                )
+            prev_iter = it
             audit_dict = _normalize_audit_dict(ev)
             audit_dict = _sanitize_audit_nonfinite(audit_dict)
 

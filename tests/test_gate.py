@@ -103,6 +103,41 @@ class TestGateEngineSemantics:
         assert np.isfinite(float(a["eps_eff"]))
         assert a["worst_DW"] > float(a["eps_eff"])
 
+    def test_worst_dw_uses_weighted_aggregate_not_per_metric_max(
+        self, make_window_decl, make_fr_window, make_gate_engine
+    ):
+        wd = make_window_decl(
+            ["m1", "m2"],
+            epsilon=0.15,
+            weights={"m1": 0.9, "m2": 0.1},
+            bins=10,
+            cal_ranges={"m1": (0.0, 1.0), "m2": (0.0, 1.0)},
+        )
+        fr = make_fr_window(wd)
+        ge = make_gate_engine(
+            fr,
+            min_evidence=0,
+            policy="either",
+            gain_thresh=0.0,
+            eps_sens=0.0,
+            min_metrics_exceeding=1,
+        )
+
+        past = {"m1": np.full(400, 0.1, dtype=float), "m2": np.full(400, 0.1, dtype=float)}
+        recent = {"m1": np.full(400, 0.1, dtype=float), "m2": np.full(400, 0.9, dtype=float)}
+        counts = {"m1": 400, "m2": 400}
+
+        r = ge.check(past, recent, counts, gain_bits=0.1, kappa_sens=np.nan, eps_stat_value=0.0)
+        a = r.audit
+
+        m1_tv = float(a["per_metric_tv"]["m1"])
+        m2_tv = float(a["per_metric_tv"]["m2"])
+        expected_weighted = 0.9 * m1_tv + 0.1 * m2_tv
+
+        assert np.isclose(float(a["worst_DW"]), expected_weighted, atol=1e-12)
+        assert float(a["worst_DW"]) < float(max(m1_tv, m2_tv))
+        assert a["dw_exceeds_threshold"] is False
+
     def test_persistence_k2_warn_then_fail(self, fr_window, make_gate_engine):
         ge = make_gate_engine(
             fr_window,

@@ -4,7 +4,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from veriscope.core.regime import RegimeAnchoredGateEngine, RegimeConfig
+from veriscope.core.regime import RegimeAnchoredGateEngine, RegimeConfig, RegimeReference
 
 pytestmark = pytest.mark.unit
 
@@ -110,3 +110,41 @@ class TestRegimeGatingSemantics:
         assert r2.audit.get("regime_ref_windows_built", 0) >= 2
         assert r2.audit.get("regime_has_reference") is True
         assert r2.audit.get("regime_ref_last_reject_reason") in (None, "")
+
+    def test_regime_emits_clip_diagnostics_on_saturation_even_when_dw_small(self, gate_engine, fr_window):
+        cfg = RegimeConfig(
+            enabled=True,
+            reference_build_min_iter=0,
+            reference_build_max_iter=100,
+            min_evidence_per_metric=1,
+            min_windows_for_reference=1,
+        )
+        rag = RegimeAnchoredGateEngine(
+            base_engine=gate_engine,
+            fr_win=fr_window,
+            config=cfg,
+            gate_warmup=0,
+            gate_window=10,
+        )
+
+        rag._ref = RegimeReference(  # type: ignore[attr-defined]
+            metrics={"test_metric": np.full(200, 2.0)},
+            counts={"test_metric": 200},
+            established_at=0,
+            n_samples_per_metric={"test_metric": 200},
+        )
+
+        r = rag.check(
+            past={"test_metric": np.full(200, 2.0)},
+            recent={"test_metric": np.full(200, 2.5)},
+            counts_by_metric={"test_metric": 200},
+            gain_bits=0.1,
+            kappa_sens=0.0,
+            eps_stat_value=0.01,
+            iter_num=200,
+        )
+
+        assert r.audit.get("regime_check_ran") is True
+        assert r.audit.get("regime_clip_diag_threshold") == 0.10
+        clip_recent = r.audit.get("regime_clip_diag_recent") or {}
+        assert "test_metric" in clip_recent
