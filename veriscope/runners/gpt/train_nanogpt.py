@@ -55,18 +55,26 @@ from __future__ import annotations
 import os
 import sys
 import random
+import math
+import json
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 import time
-import math
 import warnings
 from contextlib import nullcontext
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Set
+from dataclasses import asdict, dataclass, is_dataclass
+from typing import Any, Dict, List, Optional, Tuple, Set, cast
 
 import numpy as np
 import torch
 import torch.nn as nn
+
+_log = logging.getLogger(__name__)
+_DECL_TRANSPORT_KEY = "_DECL_TRANSPORT"
+_MAX_DEPTH = 64
+_MAX_WINDOW_SIGNATURE_BYTES = 10 * 1024 * 1024
+_MAX_SERIALIZE_ARRAY_SIZE = 10_000
 
 
 # Helper to ensure nanoGPT is importable
@@ -105,6 +113,211 @@ def _iso_utc(dt: datetime) -> str:
     else:
         dt = dt.astimezone(timezone.utc)
     return dt.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _callable_name(fn: Any) -> str:
+    qualname = getattr(fn, "__qualname__", None)
+    name = getattr(fn, "__name__", None)
+    mod = getattr(fn, "__module__", None)
+    if mod and (qualname or name):
+        return f"{mod}.{qualname or name}"
+    if qualname:
+        return str(qualname)
+    if name:
+        return str(name)
+    return repr(fn)
+
+
+def _to_jsonable(value: Any, _seen: Optional[Set[int]] = None, _depth: int = 0) -> Any:
+    """Best-effort conversion to JSON-compatible primitives."""
+    if _depth > _MAX_DEPTH:
+        return "<max_depth>"
+
+    if _seen is None:
+        _seen = set()
+
+    if value is None or isinstance(value, (bool, str)):
+        return value
+    if isinstance(value, int):
+        return int(value)
+    if isinstance(value, float):
+        if math.isfinite(value):
+            return float(value)
+        _log.debug("Replacing non-finite float %r with None", value)
+        return None
+    if isinstance(value, np.generic):
+        try:
+            return _to_jsonable(value.item(), _seen, _depth + 1)
+        except Exception:
+            _log.debug(
+                "_to_jsonable: failed to convert numpy scalar (value_type=%s)",
+                type(value).__name__,
+                exc_info=True,
+            )
+            return None
+    if isinstance(value, np.ndarray):
+        if int(value.size) > _MAX_SERIALIZE_ARRAY_SIZE:
+            return {
+                "__type__": "ndarray",
+                "shape": list(value.shape),
+                "dtype": str(value.dtype),
+            }
+        return [_to_jsonable(v, _seen, _depth + 1) for v in value.tolist()]
+    if isinstance(value, torch.Tensor):
+        if int(value.numel()) > _MAX_SERIALIZE_ARRAY_SIZE:
+            return {
+                "__type__": "ndarray",
+                "shape": list(value.shape),
+                "dtype": str(value.dtype),
+            }
+        try:
+            return _to_jsonable(value.detach().cpu().tolist(), _seen, _depth + 1)
+        except Exception:
+            _log.debug(
+                "_to_jsonable: failed to convert torch.Tensor (shape=%s dtype=%s)",
+                tuple(value.shape),
+                value.dtype,
+                exc_info=True,
+            )
+            return None
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, datetime):
+        return _iso_utc(value)
+    if callable(value):
+        return _callable_name(value)
+
+    if isinstance(value, dict):
+        obj_id = id(value)
+        if obj_id in _seen:
+            return "<recursive_ref>"
+        _seen.add(obj_id)
+        try:
+            return {str(k): _to_jsonable(v, _seen, _depth + 1) for k, v in value.items()}
+        finally:
+            _seen.discard(obj_id)
+
+    if isinstance(value, (list, tuple, set)):
+        obj_id = id(value)
+        if obj_id in _seen:
+            return "<recursive_ref>"
+        _seen.add(obj_id)
+        try:
+            return [_to_jsonable(v, _seen, _depth + 1) for v in value]
+        finally:
+            _seen.discard(obj_id)
+
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        try:
+            return _to_jsonable(model_dump(mode="json"), _seen, _depth + 1)
+        except TypeError:
+            try:
+                return _to_jsonable(model_dump(), _seen, _depth + 1)
+            except Exception:
+                _log.debug(
+                    "_to_jsonable: model_dump() fallback failed (value_type=%s)",
+                    type(value).__name__,
+                    exc_info=True,
+                )
+        except Exception:
+            _log.debug(
+                "_to_jsonable: model_dump(mode='json') failed (value_type=%s)",
+                type(value).__name__,
+                exc_info=True,
+            )
+
+    if is_dataclass(value) and not isinstance(value, type):
+        try:
+            payload = asdict(value)
+            if isinstance(payload, dict):
+                payload.pop(_DECL_TRANSPORT_KEY, None)
+            return _to_jsonable(payload, _seen, _depth + 1)
+        except Exception:
+            _log.debug(
+                "_to_jsonable: dataclass conversion failed (value_type=%s)",
+                type(value).__name__,
+                exc_info=True,
+            )
+
+    raw = getattr(value, "__dict__", None)
+    if isinstance(raw, dict):
+        obj_id = id(value)
+        if obj_id in _seen:
+            return "<recursive_ref>"
+        _seen.add(obj_id)
+        try:
+            payload: Dict[str, Any] = {}
+            for k, v in raw.items():
+                key = str(k)
+                if key == _DECL_TRANSPORT_KEY:
+                    continue
+                payload[key] = _to_jsonable(v, _seen, _depth + 1)
+            return payload
+        finally:
+            _seen.discard(obj_id)
+
+    return str(value)
+
+
+def _window_meta_from_decl(window_decl: Any) -> Dict[str, Any]:
+    if window_decl is None:
+        return {}
+
+    meta: Dict[str, Any] = {}
+    bins = getattr(window_decl, "bins", None)
+    if bins is not None:
+        meta["bins"] = int(bins)
+
+    eps_raw = getattr(window_decl, "epsilon", None)
+    if eps_raw is not None:
+        eps = float(eps_raw)
+        meta["epsilon"] = eps if math.isfinite(eps) else None
+
+    weights = getattr(window_decl, "weights", None)
+    if isinstance(weights, dict):
+        try:
+            meta["weights"] = {str(k): float(v) for k, v in weights.items()}
+        except Exception:
+            _log.debug(
+                "_window_meta_from_decl: failed to coerce weights to floats (value_type=%s)",
+                type(weights).__name__,
+                exc_info=True,
+            )
+            meta["weights"] = _to_jsonable(weights)
+
+    cal_ranges = getattr(window_decl, "cal_ranges", None)
+    if isinstance(cal_ranges, dict):
+        meta["cal_ranges"] = _to_jsonable(cal_ranges)
+
+    return meta
+
+
+def _read_window_signature(path: Any) -> Optional[Dict[str, Any]]:
+    try:
+        p = Path(path)
+        if not p.exists():
+            return None
+        stat_result = p.stat()
+        if stat_result.st_size > _MAX_WINDOW_SIGNATURE_BYTES:
+            _log.warning(
+                "_read_window_signature: refusing oversized file path=%s size_bytes=%s max_bytes=%s",
+                p,
+                stat_result.st_size,
+                _MAX_WINDOW_SIGNATURE_BYTES,
+            )
+            return None
+        obj = json.loads(p.read_text(encoding="utf-8"))
+        if isinstance(obj, dict):
+            return cast(Dict[str, Any], _to_jsonable(obj))
+        return None
+    except Exception:
+        _log.debug(
+            "_read_window_signature: failed to read/parse window signature (path_type=%s)",
+            type(path).__name__,
+            exc_info=True,
+        )
+        return None
 
 
 def compute_window_spans(
@@ -763,7 +976,10 @@ class VeriscopeGatedTrainer:
                         RuntimeWarning,
                     )
             except Exception:
-                pass
+                _log.debug(
+                    "VeriscopeGatedTrainer.__init__: compute_build_window hardening check failed",
+                    exc_info=True,
+                )
 
         # Metric history for gating
         self.metric_history: List[Dict[str, Any]] = []
@@ -979,7 +1195,11 @@ class VeriscopeGatedTrainer:
             if hasattr(self.model, "config") and hasattr(self.model.config, "vocab_size"):
                 vocab_size = int(self.model.config.vocab_size)
         except Exception:
-            pass
+            _log.debug(
+                "_maybe_corrupt_batch: failed to infer vocab_size from model config (model_type=%s)",
+                type(self.model).__name__,
+                exc_info=True,
+            )
 
         for b in range(bsz):
             pos = torch.randperm(seq_len, generator=gen, device=X.device)[:n_corrupt]
@@ -1522,7 +1742,11 @@ class VeriscopeGatedTrainer:
             try:
                 self._lr_trace.append((int(self.iter_num), float(lr)))
             except Exception:
-                pass
+                _log.debug(
+                    "train_step: failed to append lr trace (lr_type=%s)",
+                    type(lr).__name__,
+                    exc_info=True,
+                )
 
         # Forward pass
         with self.ctx:
@@ -1733,7 +1957,11 @@ class VeriscopeGatedTrainer:
                         f"[CAL] calibration recorder closed (records_written={self._calibration_recorder.records_written})"
                     )
                 except Exception:
-                    pass
+                    _log.debug(
+                        "train: failed to close calibration recorder (recorder_type=%s)",
+                        type(getattr(self, "_calibration_recorder", None)).__name__,
+                        exc_info=True,
+                    )
 
     @torch.no_grad()
     def _evaluate(self, get_batch_fn):
@@ -2294,7 +2522,11 @@ if __name__ == "__main__":
                 gates = list(getattr(trainer, "gate_history", []) or [])
                 metrics = list(getattr(trainer, "metric_history", []) or [])
         except Exception:
-            pass
+            _log.debug(
+                "__main__: failed to snapshot partial trainer histories after exception (trainer_type=%s)",
+                type(trainer).__name__,
+                exc_info=True,
+            )
     finally:
         ended_ts_utc_dt = datetime.now(timezone.utc)
 
@@ -2393,7 +2625,11 @@ if __name__ == "__main__":
             atomic_write_json(run_cfg_path, run_cfg_obj)
         except Exception:
             # Non-fatal: if hashing fails for any reason, keep the base artifact.
-            pass
+            _log.debug(
+                "__main__: failed hashing run_config_resolved artifact (path=%s)",
+                run_cfg_path,
+                exc_info=True,
+            )
 
         if _train_exc is not None:
             raise _train_exc
@@ -2467,14 +2703,21 @@ if __name__ == "__main__":
                     reference_info["established_at"] = ra
                     break
     except Exception:
-        pass
+        _log.debug(
+            "__main__: failed deriving reference established_at from gate audit stream",
+            exc_info=True,
+        )
 
     # Always persist the effective build window / epsilon from the constructed engine.
     try:
         reference_info["build_window"] = list(getattr(trainer, "build_window", (None, None)))
         reference_info["regime_epsilon"] = float(getattr(trainer.gate_engine, "regime_epsilon", float("nan")))
     except Exception:
-        pass
+        _log.debug(
+            "__main__: failed to persist reference build_window/regime_epsilon (trainer_type=%s)",
+            type(trainer).__name__,
+            exc_info=True,
+        )
 
     config_snapshot = {
         "seed": {"resolved_seed": int(resolved_seed)},
@@ -2516,19 +2759,60 @@ if __name__ == "__main__":
         "argv": list(sys.argv),
     }
 
-    with out_path.open("w") as f:
-        json.dump(
-            {
-                "metrics": metrics_out,
-                "gates": gates,
-                "reference": reference_info,
-                "config": config_snapshot,
-                "resolved_seed": int(resolved_seed),
-            },
-            f,
-            indent=2,
-            default=str,
+    window_decl_payload = None
+    window_meta: Dict[str, Any] = {}
+    try:
+        window_decl_payload = _to_jsonable(getattr(trainer, "window_decl", None))
+        window_meta = _window_meta_from_decl(getattr(trainer, "window_decl", None))
+    except Exception:
+        _log.debug(
+            "__main__: failed serializing window declaration payload/meta (window_decl_type=%s)",
+            type(getattr(trainer, "window_decl", None)).__name__,
+            exc_info=True,
         )
+
+    window_signature_payload: Optional[Dict[str, Any]] = None
+    window_signature_path: Optional[Any] = None
+    window_signature_ref_payload: Dict[str, Any] = {"hash": None, "path": "window_signature.json"}
+    try:
+        window_signature_payload = _read_window_signature(getattr(emitted, "window_signature_path", None))
+        window_signature_path = getattr(emitted, "window_signature_path", None)
+        window_signature_ref_path = (
+            Path(window_signature_path).name if window_signature_path is not None else "window_signature.json"
+        )
+        window_signature_hash = getattr(emitted, "window_signature_hash", None)
+        window_signature_ref_payload = {
+            "hash": (str(window_signature_hash) if window_signature_hash is not None else None),
+            "path": window_signature_ref_path,
+        }
+    except NameError:
+        _log.debug(
+            "__main__: emitted artifacts object is unavailable; using default window_signature_ref payload",
+            exc_info=True,
+        )
+    except Exception:
+        _log.debug(
+            "__main__: failed constructing window signature payload/ref; using defaults",
+            exc_info=True,
+        )
+
+    out_payload: Dict[str, Any] = {
+        "metrics": metrics_out,
+        "gates": gates,
+        "reference": reference_info,
+        "config": config_snapshot,
+        "resolved_seed": int(resolved_seed),
+        "window_signature_ref": window_signature_ref_payload,
+    }
+    if window_decl_payload is not None:
+        out_payload["window_decl"] = window_decl_payload
+    if window_signature_payload is not None:
+        out_payload["window_signature"] = window_signature_payload
+    if window_meta:
+        out_payload["window_meta"] = window_meta
+
+    with out_path.open("w") as f:
+        json.dump(out_payload, f, indent=2, default=str)
 
     print(f"Saved {len(metrics)} metric snapshots, {len(gates)} gate checks")
     print(

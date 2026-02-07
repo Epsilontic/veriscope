@@ -1,11 +1,20 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import pytest
 
 np = pytest.importorskip("numpy")
-pytest.importorskip("torch")
+torch = pytest.importorskip("torch")
 
-from veriscope.runners.gpt.train_nanogpt import TrainConfig, VeriscopeGatedTrainer, _validate_gate_row
+from veriscope.runners.gpt.train_nanogpt import (
+    TrainConfig,
+    VeriscopeGatedTrainer,
+    _DECL_TRANSPORT_KEY,
+    _MAX_DEPTH,
+    _to_jsonable,
+    _validate_gate_row,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -116,3 +125,72 @@ def test_compute_gate_check_no_regime_strips_regime_audit_and_avoids_zero_tv_pla
             assert row["decision"] == "fail"
             assert audit.get("reason") in {"empty_window", "zero_tv_nonidentical_windows"}
     assert all_zero_rows >= 1
+
+
+def test_to_jsonable_detects_recursive_cycles() -> None:
+    recursive_dict: dict[str, object] = {}
+    recursive_dict["self"] = recursive_dict
+    assert _to_jsonable(recursive_dict) == {"self": "<recursive_ref>"}
+
+    recursive_list: list[object] = []
+    recursive_list.append(recursive_list)
+    assert _to_jsonable(recursive_list) == ["<recursive_ref>"]
+
+
+def test_to_jsonable_limits_depth() -> None:
+    nested: object = "leaf"
+    for _ in range(_MAX_DEPTH + 2):
+        nested = [nested]
+
+    converted = _to_jsonable(nested)
+    cursor = converted
+    for _ in range(_MAX_DEPTH + 1):
+        assert isinstance(cursor, list)
+        assert len(cursor) == 1
+        cursor = cursor[0]
+    assert cursor == "<max_depth>"
+
+
+def test_to_jsonable_replaces_non_finite_floats() -> None:
+    assert _to_jsonable(float("nan")) is None
+    assert _to_jsonable(float("inf")) is None
+    assert _to_jsonable(float("-inf")) is None
+
+
+def test_to_jsonable_summarizes_large_ndarray() -> None:
+    arr = np.zeros((101, 100), dtype=np.float32)  # size=10100 (>10_000)
+    converted = _to_jsonable(arr)
+    assert converted == {"__type__": "ndarray", "shape": [101, 100], "dtype": "float32"}
+
+
+def test_to_jsonable_handles_torch_tensor() -> None:
+    small = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32)
+    assert _to_jsonable(small) == [[1.0, 2.0], [3.0, 4.0]]
+
+    large = torch.zeros((101, 100), dtype=torch.float32)  # numel=10100 (>10_000)
+    converted = _to_jsonable(large)
+    assert converted == {"__type__": "ndarray", "shape": [101, 100], "dtype": str(large.dtype)}
+
+
+def test_to_jsonable_uses_pydantic_model_dump() -> None:
+    pydantic = pytest.importorskip("pydantic")
+    if not hasattr(pydantic.BaseModel, "model_dump"):
+        pytest.skip("requires pydantic v2 model_dump")
+
+    class Payload(pydantic.BaseModel):
+        a: int
+        b: float
+
+    converted = _to_jsonable(Payload(a=1, b=2.5))
+    assert converted == {"a": 1, "b": 2.5}
+
+
+def test_to_jsonable_strips_decl_transport_from_dataclass() -> None:
+    @dataclass
+    class DeclLike:
+        bins: int
+        _DECL_TRANSPORT: object = object()
+
+    converted = _to_jsonable(DeclLike(bins=16))
+    assert converted["bins"] == 16
+    assert _DECL_TRANSPORT_KEY not in converted
