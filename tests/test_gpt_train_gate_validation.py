@@ -65,6 +65,28 @@ def test_validate_gate_row_allows_fail_without_warn() -> None:
     _validate_gate_row(row)
 
 
+def test_validate_gate_row_reason_sync_warn_fail_only() -> None:
+    row_warn = _gate_row(
+        decision="warn",
+        ok=True,
+        warn=True,
+        reason="none_ok",
+    )
+    row_warn["audit"]["reason"] = "gain_below_threshold"
+    _validate_gate_row(row_warn)
+    assert row_warn["reason"] == "gain_below_threshold"
+
+    row_pass = _gate_row(
+        decision="pass",
+        ok=True,
+        warn=False,
+        reason="none_ok",
+    )
+    row_pass["audit"]["reason"] = "change_ok"
+    _validate_gate_row(row_pass)
+    assert row_pass["reason"] == "none_ok"
+
+
 def test_compute_gate_check_no_regime_strips_regime_audit_and_avoids_zero_tv_plateau(
     make_window_decl,
     make_fr_window,

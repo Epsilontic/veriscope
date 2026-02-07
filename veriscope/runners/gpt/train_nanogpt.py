@@ -516,8 +516,13 @@ def _validate_gate_row(row: Dict[str, Any]) -> None:
     audit = row.get("audit", {})
     if not isinstance(audit, dict):
         raise ValueError("gate row audit must be an object")
-    if "reason" in audit and audit.get("reason") != row.get("reason"):
-        row["reason"] = audit.get("reason")
+    # Keep warn/fail row reason aligned with evaluated audit reason when it is concrete.
+    if decision in {"warn", "fail"}:
+        audit_reason = audit.get("reason")
+        if isinstance(audit_reason, str):
+            audit_reason = audit_reason.strip()
+            if audit_reason and audit_reason != "none_ok" and audit_reason != row.get("reason"):
+                row["reason"] = audit_reason
     evaluated = bool(audit.get("evaluated", True))
     if not evaluated:
         if decision != "skip":
@@ -1506,6 +1511,31 @@ class VeriscopeGatedTrainer:
         audit["change_reason"] = row_change_reason
 
         decision = _derive_gate_decision(evaluated=evaluated, ok=ok, warn=warn)
+        audit_reason = audit.get("reason", None)
+        if isinstance(audit_reason, str):
+            audit_reason = audit_reason.strip()
+        else:
+            audit_reason = ""
+
+        result_reason = getattr(result, "reason", None)
+        if isinstance(result_reason, str):
+            result_reason = result_reason.strip()
+        else:
+            result_reason = ""
+
+        if decision in {"warn", "fail"}:
+            # Warn/fail rows must carry a concrete evaluated reason.
+            # Prefer the engine-audit reason, then result/runner fallbacks.
+            row_reason_fallback = row_reason.strip() if isinstance(row_reason, str) else ""
+            row_reason = audit_reason or result_reason or row_reason_fallback
+            if row_reason in {"", "none_ok", "evaluated_unknown"}:
+                row_reason = "evaluated"
+            audit["reason"] = row_reason
+        elif decision == "pass":
+            # "none_ok" is reserved for pass rows.
+            row_reason = "none_ok"
+        elif not row_reason:
+            row_reason = "not_evaluated"
 
         gate_row = {
             "ok": ok,
@@ -1539,6 +1569,15 @@ class VeriscopeGatedTrainer:
             "spike_overlap_recent": spike_overlap_recent,
             "spike_any_overlap": spike_any_overlap,
         }
+        # Hardening: do not validate warn/fail rows with sentinel pass reason.
+        dec = str(gate_row.get("decision", "")).strip().lower()
+        rea = str(gate_row.get("reason", "")).strip()
+        if dec in {"warn", "fail"} and rea in {"", "none_ok"}:
+            ar = str(audit.get("reason", "")).strip()
+            if not ar or ar == "none_ok":
+                ar = "evaluated"
+            gate_row["reason"] = ar
+            audit["reason"] = ar
         _validate_gate_row(gate_row)
         return gate_row
 
