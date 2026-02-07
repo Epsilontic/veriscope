@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import pytest
 
-np = pytest.importorskip("numpy")
+pytest.importorskip("numpy")
+import numpy as np
+
 torch = pytest.importorskip("torch")
 
 from veriscope.runners.gpt.train_nanogpt import (
@@ -147,6 +150,89 @@ def test_compute_gate_check_no_regime_strips_regime_audit_and_avoids_zero_tv_pla
             assert row["decision"] == "fail"
             assert audit.get("reason") in {"empty_window", "zero_tv_nonidentical_windows"}
     assert all_zero_rows >= 1
+
+
+def test_compute_gate_check_regime_dw_alias_backcompat_and_strip_behavior(make_window_decl) -> None:
+    decl = make_window_decl(
+        ["m1"],
+        weights={"m1": 1.0},
+        bins=16,
+        epsilon=0.12,
+        cal_ranges={"m1": (0.0, 1.0)},
+    )
+
+    cfg = TrainConfig(
+        regime_enabled=True,
+        gate_window=4,
+        metric_interval=1,
+        gate_min_evidence=1,
+        gate_policy="persistence",
+        gate_persistence_k=2,
+    )
+
+    metric_history = [
+        {"iter": 0, "m1": 0.10, "loss": 1.00, "ewma_loss": 1.10},
+        {"iter": 1, "m1": 0.10, "loss": 0.99, "ewma_loss": 1.09},
+        {"iter": 2, "m1": 0.10, "loss": 0.98, "ewma_loss": 1.08},
+        {"iter": 3, "m1": 0.10, "loss": 0.97, "ewma_loss": 1.07},
+        {"iter": 4, "m1": 0.95, "loss": 0.96, "ewma_loss": 1.06},
+        {"iter": 5, "m1": 0.95, "loss": 0.95, "ewma_loss": 1.05},
+        {"iter": 6, "m1": 0.95, "loss": 0.94, "ewma_loss": 1.04},
+        {"iter": 7, "m1": 0.95, "loss": 0.93, "ewma_loss": 1.03},
+    ]
+
+    def _build_row(*, regime_wrapper_enabled: bool) -> dict[str, object]:
+        trainer = object.__new__(VeriscopeGatedTrainer)
+        trainer.config = cfg
+        trainer.window_decl = decl
+        trainer._regime_wrapper_enabled = regime_wrapper_enabled
+        trainer.metric_history = list(metric_history)
+        trainer.iter_num = 8
+
+        class _StubGateEngine:
+            def check(self, **kwargs):
+                _ = kwargs
+                return SimpleNamespace(
+                    ok=False,
+                    warn=False,
+                    reason="regime_fail",
+                    audit={
+                        "evaluated": True,
+                        "reason": "regime_fail",
+                        "base_reason": "regime_fail",
+                        "change_reason": "regime_fail",
+                        "policy": "persistence",
+                        "worst_DW": 0.95,
+                        "eps_eff": 0.10,
+                        "per_metric_tv": {"m1": 0.95},
+                        "evidence_total": 8,
+                        "min_evidence": 1,
+                        "regime_check_ran": True,
+                        "regime_ok": False,
+                        "regime_warn": False,
+                        "regime_enabled": True,
+                        "regime_active": True,
+                        "regime_worst_DW": 0.95,
+                    },
+                )
+
+        trainer.gate_engine = _StubGateEngine()
+        return trainer._compute_gate_check()
+
+    row_regime_on = _build_row(regime_wrapper_enabled=True)
+    row_regime_off = _build_row(regime_wrapper_enabled=False)
+    produced = {"gates": [row_regime_on, row_regime_off]}
+
+    regime_fail_row = produced["gates"][0]
+    assert regime_fail_row["decision"] == "fail"
+    audit = regime_fail_row["audit"]
+    assert "regime_worst_DW" in audit
+    assert np.isfinite(float(audit["regime_worst_DW"]))
+    assert "regime_D_W" in audit
+    assert audit["regime_D_W"] == audit["regime_worst_DW"]
+
+    audit_disabled = produced["gates"][1]["audit"]
+    assert all(not str(key).startswith("regime_") for key in audit_disabled.keys())
 
 
 def test_to_jsonable_detects_recursive_cycles() -> None:

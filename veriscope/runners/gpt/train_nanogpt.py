@@ -1455,6 +1455,8 @@ class VeriscopeGatedTrainer:
         )
         if not getattr(self, "_regime_wrapper_enabled", False):
             audit = _strip_regime_audit_fields(audit)
+        if audit.get("regime_D_W") is None and audit.get("regime_worst_DW") is not None:
+            audit["regime_D_W"] = audit.get("regime_worst_DW")
         evaluated = bool(audit.get("evaluated", True))
         policy = str(audit.get("policy", "either"))
         dw_exceeds = bool(audit.get("dw_exceeds_threshold", False))
