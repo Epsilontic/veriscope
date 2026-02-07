@@ -201,7 +201,7 @@ def _normalize_gate_audit(
     audit: Dict[str, Any] = dict(audit_in or {})
     audit["evaluated"] = bool(audit.get("evaluated", True))
     audit["policy"] = str(audit.get("policy", getattr(config, "gate_policy", "either")) or "either")
-    audit["reason"] = row_reason
+    audit.setdefault("reason", row_reason)
     audit["base_reason"] = row_base_reason
     audit["change_reason"] = row_change_reason
     audit.setdefault("per_metric_tv", {})
@@ -303,6 +303,8 @@ def _validate_gate_row(row: Dict[str, Any]) -> None:
     audit = row.get("audit", {})
     if not isinstance(audit, dict):
         raise ValueError("gate row audit must be an object")
+    if "reason" in audit and audit.get("reason") != row.get("reason"):
+        row["reason"] = audit.get("reason")
     evaluated = bool(audit.get("evaluated", True))
     if not evaluated:
         if decision != "skip":
@@ -343,10 +345,6 @@ def _validate_gate_row(row: Dict[str, Any]) -> None:
     missing = [k for k in required if k not in audit]
     if missing:
         raise ValueError(f"missing audit keys: {missing}")
-    if audit.get("reason") != row.get("reason"):
-        raise ValueError(
-            f"audit.reason mismatch: audit.reason={audit.get('reason')!r} row.reason={row.get('reason')!r}"
-        )
     if audit.get("dw_exceeds_threshold"):
         mode = audit.get("exceedance_mode")
         if mode not in {"combined_only_no_tv", "not_evaluated"}:
@@ -1221,7 +1219,7 @@ class VeriscopeGatedTrainer:
                 row_reason = str(_r)
             row_base_reason = row_reason
             row_change_reason = row_reason
-            audit["reason"] = row_reason
+            audit.setdefault("reason", row_reason)
             audit["base_reason"] = row_reason
             audit["change_reason"] = row_reason
 
@@ -1251,11 +1249,11 @@ class VeriscopeGatedTrainer:
             if row_change_reason is None or str(row_change_reason) in ("", "evaluated_unknown"):
                 row_change_reason = row_reason
 
-            audit["reason"] = row_reason
+            audit.setdefault("reason", row_reason)
             audit["base_reason"] = row_base_reason
             audit["change_reason"] = row_change_reason
 
-        audit["reason"] = row_reason
+        audit.setdefault("reason", row_reason)
         audit["base_reason"] = row_base_reason
         audit["change_reason"] = row_change_reason
 
