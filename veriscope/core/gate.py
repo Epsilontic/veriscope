@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 from collections import deque
-from enum import Enum
 from dataclasses import dataclass
-from typing import Any, Deque, Dict, Iterable, Optional, Sequence, Tuple, TYPE_CHECKING
+from enum import Enum
+import hashlib
 import warnings
+from typing import TYPE_CHECKING, Any, Deque, Dict, Iterable, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -102,6 +103,146 @@ def _array_equal_nan_safe(a: np.ndarray, b: np.ndarray) -> bool:
         return bool(np.all((a == b) | (np.isnan(a) & np.isnan(b))))
 
 
+def _rescue_zero_tv_from_bin_collapse(
+    tv: float,
+    a: np.ndarray,
+    b: np.ndarray,
+    bins: int,
+    *,
+    cal_range: Optional[Tuple[float, float]] = None,
+) -> float:
+    """
+    Preserve fixed-bin TV as primary, but rescue all-zero collapse on nonidentical windows.
+
+    This is only active when fixed-bin TV returns exactly 0 while finite transformed arrays are
+    nonempty and not elementwise identical.
+    """
+    try:
+        tv0 = float(tv)
+    except Exception:
+        return float("nan")
+    if not (np.isfinite(tv0) and np.isclose(tv0, 0.0, atol=1e-12)):
+        return tv0
+
+    a_f = np.asarray(a, float)
+    b_f = np.asarray(b, float)
+    a_f = a_f[np.isfinite(a_f)]
+    b_f = b_f[np.isfinite(b_f)]
+
+    if a_f.size == 0 and b_f.size == 0:
+        return 0.0
+    if a_f.size == 0 or b_f.size == 0:
+        return float("nan")
+    if a_f.size == b_f.size and _array_equal_nan_safe(a_f, b_f):
+        return 0.0
+
+    lo = float(min(np.min(a_f), np.min(b_f)))
+    hi = float(max(np.max(a_f), np.max(b_f)))
+    if cal_range is not None:
+        try:
+            cal_lo = float(cal_range[0])
+            cal_hi = float(cal_range[1])
+        except Exception:
+            cal_lo = float("nan")
+            cal_hi = float("nan")
+        if np.isfinite(cal_lo) and np.isfinite(cal_hi) and (cal_hi > cal_lo):
+            # Clamp to intersection of observed span and cal range so we don't widen
+            # bins beyond where data lives.
+            obs_lo, obs_hi = lo, hi
+            lo = max(obs_lo, cal_lo)
+            hi = min(obs_hi, cal_hi)
+            if not (np.isfinite(lo) and np.isfinite(hi) and (hi > lo)):
+                lo, hi = obs_lo, obs_hi
+    if np.isfinite(lo) and np.isfinite(hi) and (hi > lo):
+        fine_bins = int(max(256, 8 * max(1, int(bins))))
+        fine_bins = min(fine_bins, 4096)
+        ha, _ = np.histogram(a_f, bins=fine_bins, range=(lo, hi), density=False)
+        hb, _ = np.histogram(b_f, bins=fine_bins, range=(lo, hi), density=False)
+        sa = int(np.sum(ha))
+        sb = int(np.sum(hb))
+        if sa > 0 and sb > 0:
+            pa = ha / float(sa)
+            pb = hb / float(sb)
+            tv_fine = 0.5 * float(np.abs(pa - pb).sum())
+            if np.isfinite(tv_fine) and tv_fine > 0.0:
+                return float(min(max(tv_fine, 0.0), 1.0))
+
+    # KS distance is a different metric than TV; mixing them into a TV-calibrated
+    # threshold is unsound.
+    return 0.0
+
+
+def _sha16_of_values(arr: np.ndarray) -> str:
+    """sha256 over repr(value) joined by newlines; return 16-char prefix."""
+    vals = np.asarray(arr, float).ravel()
+    payload = "\n".join(repr(float(v)) for v in vals.tolist())
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _head_tail(arr: np.ndarray, n: int = 5) -> tuple[list[float], list[float]]:
+    vals = np.asarray(arr, float).ravel()
+    head = [float(v) for v in vals[:n].tolist()]
+    tail = [float(v) for v in vals[-n:].tolist()]
+    return head, tail
+
+
+def _finite_min_max(arr: np.ndarray) -> tuple[Optional[float], Optional[float]]:
+    vals = np.asarray(arr, float).ravel()
+    vals = vals[np.isfinite(vals)]
+    if vals.size == 0:
+        return None, None
+    return float(np.min(vals)), float(np.max(vals))
+
+
+def _tv_input_fingerprint_payload(past_arr: np.ndarray, recent_arr: np.ndarray) -> Dict[str, Any]:
+    p = np.asarray(past_arr, float)
+    q = np.asarray(recent_arr, float)
+    p_head, p_tail = _head_tail(p, n=5)
+    q_head, q_tail = _head_tail(q, n=5)
+    p_min, p_max = _finite_min_max(p)
+    q_min, q_max = _finite_min_max(q)
+    return {
+        "tv_input_dtype": {"past": str(p.dtype), "recent": str(q.dtype)},
+        "tv_input_shape": {"past": list(p.shape), "recent": list(q.shape)},
+        "tv_input_head": {"past": p_head, "recent": q_head},
+        "tv_input_tail": {"past": p_tail, "recent": q_tail},
+        "tv_input_sha16": {"past": _sha16_of_values(p), "recent": _sha16_of_values(q)},
+        "tv_input_min": {"past": p_min, "recent": q_min},
+        "tv_input_max": {"past": p_max, "recent": q_max},
+    }
+
+
+def _derive_window_ranges_from_counts(
+    per_metric_n: Dict[str, Tuple[int, int]],
+    t_idx: int,
+) -> tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    if not isinstance(per_metric_n, dict) or not per_metric_n:
+        return None, None
+    recent_n = max((int(v[1]) for v in per_metric_n.values()), default=0)
+    past_n = max((int(v[0]) for v in per_metric_n.values()), default=0)
+    if recent_n <= 0:
+        return None, None
+    cur_end = int(t_idx)
+    cur_start = int(cur_end - recent_n + 1)
+    cur = {
+        "start_idx": cur_start,
+        "end_idx": cur_end,
+        "n_points": int(recent_n),
+        "source": "derived_from_iter_num_and_counts",
+    }
+    if past_n <= 0:
+        return None, cur
+    ref_end = int(cur_start - 1)
+    ref_start = int(ref_end - past_n + 1)
+    ref = {
+        "start_idx": ref_start,
+        "end_idx": ref_end,
+        "n_points": int(past_n),
+        "source": "derived_from_iter_num_and_counts",
+    }
+    return ref, cur
+
+
 class GatePolicy(Enum):
     """Gate failure policy."""
 
@@ -192,6 +333,10 @@ class GateEngine:
         *,
         regime_state: Any = None,
         iter_num: Optional[int] = None,
+        window_ref_range: Optional[Dict[str, Any]] = None,
+        window_cur_range: Optional[Dict[str, Any]] = None,
+        ref_window_id: Optional[str] = None,
+        cur_window_id: Optional[str] = None,
     ) -> GateResult:
         wd = self.win.decl
 
@@ -297,6 +442,7 @@ class GateEngine:
         worst_any = False
         worst_per_metric_tv: Dict[str, float] = {}
         worst_per_metric_n: Dict[str, Tuple[int, int]] = {}
+        worst_tv_inputs: Dict[str, Dict[str, np.ndarray]] = {}
         raw_windows: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
         raw_window_debug: Dict[str, Dict[str, Any]] = {}
 
@@ -329,6 +475,7 @@ class GateEngine:
             tv_finite = 0
             this_per_metric_tv: Dict[str, float] = {}
             this_per_metric_n: Dict[str, Tuple[int, int]] = {}
+            this_tv_inputs: Dict[str, Dict[str, np.ndarray]] = {}
 
             for m, w in wd.weights.items():
                 past_raw, recent_raw = raw_windows[m]
@@ -344,6 +491,14 @@ class GateEngine:
                 n_recent = int(np.sum(np.isfinite(b)))
                 this_per_metric_n[m] = (n_past, n_recent)
                 this_per_metric_tv[m] = float(tv) if np.isfinite(tv) else float("nan")
+                if (
+                    np.isfinite(tv)
+                    and float(tv) == 0.0
+                    and n_past > 0
+                    and n_recent > 0
+                    and (not _array_equal_nan_safe(a, b))
+                ):
+                    this_tv_inputs[m] = {"past": np.array(a, copy=True), "recent": np.array(b, copy=True)}
 
                 if np.isfinite(tv):
                     tv_sum += (abs(float(w)) / w_sum) * float(tv)
@@ -354,6 +509,7 @@ class GateEngine:
                     worst = float(tv_sum)
                     worst_per_metric_tv = dict(this_per_metric_tv)
                     worst_per_metric_n = dict(this_per_metric_n)
+                    worst_tv_inputs = dict(this_tv_inputs)
                 worst_any = True
 
         if not worst_any:
@@ -419,20 +575,75 @@ class GateEngine:
                 ),
             )
 
+        empty_metrics = sorted(str(m) for m, dbg in raw_window_debug.items() if dbg.get("raw_empty_strict", False))
+        nonidentical_metrics = sorted(
+            str(m) for m, dbg in raw_window_debug.items() if not dbg.get("raw_exact_match", True)
+        )
+        nonidentical_with_points = sorted(
+            str(m)
+            for m in nonidentical_metrics
+            if (
+                int((raw_window_debug.get(m, {}).get("finite_n_points", {}) or {}).get("past", 0)) > 0
+                and int((raw_window_debug.get(m, {}).get("finite_n_points", {}) or {}).get("recent", 0)) > 0
+            )
+        )
+
+        # Gate rescue so the normal path remains unchanged and cheap.
+        per_metric_vals_pre = list(worst_per_metric_tv.values())
+        finite_tv_vals_pre: list[float] = []
+        for v in per_metric_vals_pre:
+            try:
+                fv = float(v)
+            except Exception:
+                continue
+            if np.isfinite(fv):
+                finite_tv_vals_pre.append(fv)
+        all_finite_zero_tv = bool(finite_tv_vals_pre) and all(
+            np.isclose(v, 0.0, atol=1e-12) for v in finite_tv_vals_pre
+        )
+        impossible_zero_tv_pre = bool(all_finite_zero_tv and nonidentical_with_points)
+        if impossible_zero_tv_pre and worst_tv_inputs:
+            cal_ranges = getattr(wd, "cal_ranges", {}) or {}
+            for m in wd.weights:
+                if m not in worst_tv_inputs:
+                    continue
+                payload = worst_tv_inputs[m]
+                prior_tv = worst_per_metric_tv.get(m, float("nan"))
+                past_arr = np.asarray(payload.get("past", np.array([], float)), float)
+                recent_arr = np.asarray(payload.get("recent", np.array([], float)), float)
+                cal_range = cal_ranges.get(m) if isinstance(cal_ranges, dict) else None
+                rescued = _rescue_zero_tv_from_bin_collapse(
+                    prior_tv,
+                    past_arr,
+                    recent_arr,
+                    wd.bins,
+                    cal_range=cal_range,
+                )
+                worst_per_metric_tv[m] = float(rescued) if np.isfinite(rescued) else float("nan")
+
+            rescued_sum = 0.0
+            rescued_finite = 0
+            for m, w in wd.weights.items():
+                try:
+                    tv_m = float(worst_per_metric_tv.get(m, float("nan")))
+                except Exception:
+                    continue
+                if np.isfinite(tv_m):
+                    rescued_sum += (abs(float(w)) / w_sum) * tv_m
+                    rescued_finite += 1
+            if rescued_finite > 0 and np.isfinite(rescued_sum):
+                worst = float(rescued_sum)
+
         # Guardrail intent: if all per-metric TVs collapse to ~0, fail loudly unless raw windows are truly identical.
         per_metric_vals = list(worst_per_metric_tv.values())
         all_zero_tv = bool(per_metric_vals) and all(
             np.isfinite(float(v)) and np.isclose(float(v), 0.0, atol=1e-12) for v in per_metric_vals
         )
-        empty_metrics = sorted(str(m) for m, dbg in raw_window_debug.items() if dbg.get("raw_empty_strict", False))
-        nonidentical_metrics = sorted(
-            str(m) for m, dbg in raw_window_debug.items() if not dbg.get("raw_exact_match", True)
-        )
         degenerate_reason: Optional[str] = None
         if all_zero_tv:
             if raw_window_debug and (len(empty_metrics) == len(raw_window_debug)):
                 degenerate_reason = "empty_window"
-            elif nonidentical_metrics:
+            elif nonidentical_with_points:
                 degenerate_reason = "zero_tv_nonidentical_windows"
 
         eps_cap = float(wd.epsilon) * float(min(max(self.cap_frac, 0.0), 1.0))
@@ -694,12 +905,63 @@ class GateEngine:
                 for m, dbg in raw_window_debug.items()
             }
             audit["window_debug_nonidentical_metrics"] = list(nonidentical_metrics)
+            audit["window_debug_nonidentical_with_points_metrics"] = list(nonidentical_with_points)
             audit["window_debug_empty_metrics"] = list(empty_metrics)
             identity_alias_metrics = sorted(
                 str(m) for m, dbg in raw_window_debug.items() if dbg.get("raw_identity_alias", False)
             )
             if identity_alias_metrics:
                 audit["window_debug_identity_alias_metrics"] = identity_alias_metrics
+
+            derived_ref_range, derived_cur_range = _derive_window_ranges_from_counts(worst_per_metric_n, int(t_idx))
+            ref_range_payload: Any = window_ref_range if window_ref_range is not None else derived_ref_range
+            cur_range_payload: Any = window_cur_range if window_cur_range is not None else derived_cur_range
+
+            if "window_ref_range" not in audit and ref_range_payload is not None:
+                audit["window_ref_range"] = ref_range_payload
+            if "window_cur_range" not in audit and cur_range_payload is not None:
+                audit["window_cur_range"] = cur_range_payload
+
+            if "ref_window_id" not in audit:
+                if ref_window_id is not None:
+                    audit["ref_window_id"] = str(ref_window_id)
+                elif isinstance(ref_range_payload, dict):
+                    rs = ref_range_payload.get("start_iter", ref_range_payload.get("start_idx"))
+                    r_end = ref_range_payload.get("end_iter", ref_range_payload.get("end_idx"))
+                    if rs is not None and r_end is not None:
+                        audit["ref_window_id"] = f"window:{rs}:{r_end}"
+                    else:
+                        audit["ref_window_id"] = f"window_ref_check:{check_idx}"
+                else:
+                    audit["ref_window_id"] = f"window_ref_check:{check_idx}"
+
+            if "cur_window_id" not in audit:
+                if cur_window_id is not None:
+                    audit["cur_window_id"] = str(cur_window_id)
+                elif isinstance(cur_range_payload, dict):
+                    cs = cur_range_payload.get("start_iter", cur_range_payload.get("start_idx"))
+                    c_end = cur_range_payload.get("end_iter", cur_range_payload.get("end_idx"))
+                    if cs is not None and c_end is not None:
+                        audit["cur_window_id"] = f"window:{cs}:{c_end}"
+                    else:
+                        audit["cur_window_id"] = f"window_cur_check:{check_idx}"
+                else:
+                    audit["cur_window_id"] = f"window_cur_check:{check_idx}"
+
+            impossible_zero_tv = (
+                str(degenerate_reason) == "zero_tv_nonidentical_windows"
+                and bool(nonidentical_with_points)
+                and bool(all_zero_tv)
+            )
+            if impossible_zero_tv:
+                tv_fp: Dict[str, Dict[str, Any]] = {}
+                for m in sorted(worst_tv_inputs.keys()):
+                    payload = worst_tv_inputs.get(m, {})
+                    past_arr = np.asarray(payload.get("past", np.array([], float)), float)
+                    recent_arr = np.asarray(payload.get("recent", np.array([], float)), float)
+                    tv_fp[str(m)] = _tv_input_fingerprint_payload(past_arr, recent_arr)
+                if tv_fp:
+                    audit["window_debug_tv_input_fingerprint"] = tv_fp
 
         return GateResult(ok=ok, warn=warn, audit=audit)
 

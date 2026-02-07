@@ -27,7 +27,22 @@ def force_zero_tv(monkeypatch):
         _ = (a, b, bins)
         return 0.0
 
+    # Neutralize the rescue so force_zero_tv tests still trigger the
+    # impossible branch. This must match _rescue_zero_tv_from_bin_collapse's
+    # signature exactly.
+    def _keep_zero_tv(
+        tv: float,
+        a: np.ndarray,
+        b: np.ndarray,
+        bins: int,
+        *,
+        cal_range: Optional[Tuple[float, float]] = None,
+    ) -> float:
+        _ = (a, b, bins, cal_range)
+        return float(tv)
+
     monkeypatch.setattr("veriscope.core.gate.tv_hist_fixed", _force_zero_tv)
+    monkeypatch.setattr("veriscope.core.gate._rescue_zero_tv_from_bin_collapse", _keep_zero_tv)
     return _force_zero_tv
 
 

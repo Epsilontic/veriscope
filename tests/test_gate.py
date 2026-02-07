@@ -74,6 +74,85 @@ class TestGateEngineSemantics:
         assert r.audit["reason"] == "zero_tv_nonidentical_windows"
         assert "test_metric" in r.audit.get("window_debug_nonidentical_metrics", [])
         assert "test_metric" not in r.audit.get("window_debug_empty_metrics", [])
+        assert "window_ref_range" in r.audit
+        assert "window_cur_range" in r.audit
+        assert "ref_window_id" in r.audit
+        assert "cur_window_id" in r.audit
+
+        fp = r.audit.get("window_debug_tv_input_fingerprint", {})
+        assert "test_metric" in fp
+        mfp = fp["test_metric"]
+        for key in (
+            "tv_input_dtype",
+            "tv_input_shape",
+            "tv_input_head",
+            "tv_input_tail",
+            "tv_input_sha16",
+            "tv_input_min",
+            "tv_input_max",
+        ):
+            assert key in mfp
+
+    def test_nonidentical_windows_do_not_collapse_to_zero_tv_under_wide_calibration_ranges(
+        self, make_window_decl, make_fr_window, make_gate_engine
+    ):
+        wd = make_window_decl(
+            ["var_out_k", "eff_dim", "rankme", "cos_disp"],
+            epsilon=0.5,
+            weights={
+                "var_out_k": 0.25,
+                "eff_dim": 0.25,
+                "rankme": 0.25,
+                "cos_disp": 0.25,
+            },
+            bins=16,
+            cal_ranges={
+                "var_out_k": (0.0, 1.0),
+                "eff_dim": (0.0, 10000.0),
+                "rankme": (1.0, 10000.0),
+                "cos_disp": (0.0, 1.0),
+            },
+        )
+        fr = make_fr_window(wd)
+        ge = make_gate_engine(fr, min_evidence=0, policy="either", gain_thresh=0.0, eps_sens=0.0)
+
+        n = 37
+        past = {
+            # With bins=16 and very wide cal_ranges, fixed-bin TV collapses to 0.0 here.
+            "var_out_k": np.full(n, 0.5001, dtype=float),
+            "eff_dim": np.linspace(2500.0001, 2500.0037, n, dtype=float),
+            "rankme": np.linspace(1800.0001, 1800.0037, n, dtype=float),
+            "cos_disp": np.full(n, 0.4001, dtype=float),
+        }
+        recent = {
+            "var_out_k": np.full(n, 0.5002, dtype=float),
+            "eff_dim": np.linspace(2500.0002, 2500.0038, n, dtype=float),
+            "rankme": np.linspace(1800.0002, 1800.0038, n, dtype=float),
+            "cos_disp": np.full(n, 0.4002, dtype=float),
+        }
+        counts = {m: n for m in wd.weights.keys()}
+
+        r = ge.check(past, recent, counts, gain_bits=0.1, kappa_sens=np.nan, eps_stat_value=0.0, iter_num=3300)
+        a = r.audit
+        assert a["evaluated"] is True
+        assert a.get("reason") != "zero_tv_nonidentical_windows"
+        per_metric_tv = {}
+        finite_tvs = []
+        for name, val in a.get("per_metric_tv", {}).items():
+            tv = float(val.get("tv")) if isinstance(val, dict) and "tv" in val else float(val)
+            per_metric_tv[str(name)] = tv
+            if np.isfinite(tv):
+                finite_tvs.append(tv)
+        assert finite_tvs
+        assert max(finite_tvs) > 0.0
+        rescued_metrics = [
+            m
+            for m in ("var_out_k", "eff_dim", "rankme", "cos_disp")
+            if np.isfinite(per_metric_tv.get(m, float("nan")))
+            and per_metric_tv[m] > 0.0
+            and (not np.array_equal(past[m], recent[m]))
+        ]
+        assert rescued_metrics
 
     def test_empty_window_fail_loudly(self, fr_window, make_gate_engine, force_zero_tv):
         ge = make_gate_engine(fr_window, min_evidence=0, policy="either", gain_thresh=0.0, eps_sens=0.0)

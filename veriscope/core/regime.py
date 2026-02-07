@@ -1382,6 +1382,11 @@ class RegimeAnchoredGateEngine:
         kappa_sens: float,
         eps_stat_value: float,
         iter_num: int = 0,
+        *,
+        window_ref_range: Optional[Dict[str, Any]] = None,
+        window_cur_range: Optional[Dict[str, Any]] = None,
+        ref_window_id: Optional[str] = None,
+        cur_window_id: Optional[str] = None,
     ) -> GateResult:
         """
         Combined check: change detection AND regime detection.
@@ -1461,6 +1466,10 @@ class RegimeAnchoredGateEngine:
             eps_stat_value=eps_stat_value,
             iter_num=iter_num,
             regime_state=regime_state_str,
+            window_ref_range=window_ref_range,
+            window_cur_range=window_cur_range,
+            ref_window_id=ref_window_id,
+            cur_window_id=cur_window_id,
         )
 
         # =========================================================================

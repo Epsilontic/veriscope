@@ -1082,6 +1082,30 @@ class VeriscopeGatedTrainer:
         past_slice = recent[:Wm]
         recent_slice = recent[Wm:]
 
+        def _slice_window_identity(slice_data: List[Dict[str, Any]]) -> Tuple[Optional[Dict[str, int]], Optional[str]]:
+            iters: List[int] = []
+            for d in slice_data:
+                it = d.get("iter", None)
+                if it is None:
+                    continue
+                try:
+                    iters.append(int(it))
+                except Exception:
+                    continue
+            if not iters:
+                return None, None
+            start_iter = int(min(iters))
+            end_iter = int(max(iters))
+            meta = {
+                "start_iter": start_iter,
+                "end_iter": end_iter,
+                "n_snapshots": int(len(iters)),
+            }
+            return meta, f"window:{start_iter}:{end_iter}"
+
+        ref_window_range, ref_window_id = _slice_window_identity(past_slice)
+        cur_window_range, cur_window_id = _slice_window_identity(recent_slice)
+
         # --- Spike attribution (overlap-based, not check-iter-based) ---
         spike_active = False
         spike_overlap_past = False
@@ -1146,6 +1170,10 @@ class VeriscopeGatedTrainer:
             kappa_sens=0.0,  # Skip κ_sens for now
             eps_stat_value=aggregate_epsilon_stat(self.window_decl, counts, alpha=0.05),
             iter_num=self.iter_num,  # Pass iteration for regime reference timing
+            window_ref_range=ref_window_range,
+            window_cur_range=cur_window_range,
+            ref_window_id=ref_window_id,
+            cur_window_id=cur_window_id,
         )
 
         audit = dict(result.audit or {})
