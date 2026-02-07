@@ -293,6 +293,108 @@ def _window_meta_from_decl(window_decl: Any) -> Dict[str, Any]:
     return meta
 
 
+def _canonical_signature_float(value: Any, default: float = 1.0) -> float:
+    """Normalize signature floats to deterministic finite JSON numbers."""
+    fval = _coerce_float(value, default=default)
+    if not math.isfinite(fval):
+        fval = float(default)
+    if fval == 0.0:
+        return 0.0
+    # 17 significant digits round-trips IEEE-754 doubles deterministically.
+    return float(f"{fval:.17g}")
+
+
+def _metric_names_from_any(raw: Any) -> List[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, dict):
+        items = raw.keys()
+    elif isinstance(raw, (list, tuple, set)):
+        items = raw
+    else:
+        return []
+    out: List[str] = []
+    for item in items:
+        name = str(item).strip()
+        if name:
+            out.append(name)
+    return out
+
+
+def _build_window_signature_metrics(
+    window_decl: Any,
+    *,
+    metric_pipeline: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Build deterministic metric identity payload for window signatures.
+
+    Preference order:
+      1) actual runtime window declaration
+      2) metric pipeline hints
+      3) default weight=1.0 for names without explicit weights
+    """
+    decl_metrics = _metric_names_from_any(getattr(window_decl, "metrics", None))
+
+    decl_weights_raw = getattr(window_decl, "weights", None)
+    decl_weights: Dict[str, Any] = {}
+    if isinstance(decl_weights_raw, dict):
+        decl_weights = {str(k): v for k, v in decl_weights_raw.items()}
+
+    pipeline_metrics: List[str] = []
+    pipeline_weights: Dict[str, Any] = {}
+    if isinstance(metric_pipeline, dict):
+        metrics_spec = metric_pipeline.get("metrics")
+        if isinstance(metrics_spec, dict):
+            pipeline_metrics = _metric_names_from_any(metrics_spec.get("names"))
+            weights_spec = metrics_spec.get("weights")
+            if isinstance(weights_spec, dict):
+                pipeline_weights = {str(k): v for k, v in weights_spec.items()}
+        else:
+            pipeline_metrics = _metric_names_from_any(metrics_spec)
+
+        if not pipeline_weights:
+            for key in ("metric_weights", "weights"):
+                weights_spec = metric_pipeline.get(key)
+                if isinstance(weights_spec, dict):
+                    pipeline_weights = {str(k): v for k, v in weights_spec.items()}
+                    break
+
+    decl_name_set = set(decl_metrics) | set(decl_weights.keys())
+    using_decl_identity = bool(decl_name_set)
+    if using_decl_identity:
+        # Prefer runtime WindowDecl identity exclusively when present.
+        all_names = sorted(decl_name_set)
+    else:
+        all_names = sorted(set(pipeline_metrics) | set(pipeline_weights.keys()))
+
+    weights: Dict[str, float] = {}
+    for name in all_names:
+        if using_decl_identity:
+            # When a declaration exists, missing weights default to 1.0 (do not backfill from pipeline hints).
+            raw_weight = decl_weights.get(name, 1.0)
+        else:
+            raw_weight = pipeline_weights.get(name, 1.0)
+        weights[name] = _canonical_signature_float(raw_weight, default=1.0)
+
+    return {
+        "names": all_names,
+        "weights": weights,
+    }
+
+
+def _gpt_dw_aggregator_signature() -> Dict[str, str]:
+    """Describe how gate D_W is aggregated for comparability identity."""
+    # IMPORTANT: update this signature if GateEngine aggregation semantics change.
+    return {
+        "name": "weighted_sum_product_tv",
+        "per_metric": "tv_hist_fixed",
+        "weight_normalization": "sum_abs_weights",
+        "intervention_reduction": "max",
+        "metric_source": "window_decl.weights",
+    }
+
+
 def _read_window_signature(path: Any) -> Optional[Dict[str, Any]]:
     try:
         p = Path(path)
@@ -2571,6 +2673,33 @@ if __name__ == "__main__":
     finally:
         ended_ts_utc_dt = datetime.now(timezone.utc)
 
+        window_decl_for_signature: Any = getattr(trainer, "window_decl", None) if trainer is not None else None
+        if window_decl_for_signature is None:
+            try:
+                # Fallback for partial/error runs: use create_gpt_window_decl defaults (no local hardcoded maxima).
+                window_decl_for_signature = create_gpt_window_decl(
+                    epsilon=float(config.gate_epsilon),
+                    bins=16,
+                    cos_disp_max=float(config.cos_disp_max),
+                )
+            except TypeError:
+                try:
+                    window_decl_for_signature = create_gpt_window_decl(
+                        epsilon=float(config.gate_epsilon),
+                        bins=16,
+                    )
+                except Exception:
+                    window_decl_for_signature = None
+            except Exception:
+                window_decl_for_signature = None
+
+        metric_pipeline_payload: Dict[str, Any] = {"transport": "nanoGPT"}
+        window_signature_metrics = _build_window_signature_metrics(
+            window_decl_for_signature,
+            metric_pipeline=metric_pipeline_payload,
+        )
+        dw_aggregator_payload = _gpt_dw_aggregator_signature()
+
         # Build a resolved gate config dict for the artifact signature.
         resolved_gate_cfg: Dict[str, Any] = {
             "metric_interval": int(config.metric_interval),
@@ -2605,7 +2734,9 @@ if __name__ == "__main__":
             overrides=dict(cli_gate_overrides),
             resolved_gate_cfg=resolved_gate_cfg,
             metric_interval=int(config.metric_interval),
-            metric_pipeline={"transport": "nanoGPT"},
+            metric_pipeline=dict(metric_pipeline_payload),
+            signature_metrics=dict(window_signature_metrics),
+            dw_aggregator=dict(dw_aggregator_payload),
             gate_history=gate_history_for_emit,
             run_status=run_status,
         )
@@ -2629,7 +2760,8 @@ if __name__ == "__main__":
             "cli_gate_overrides": dict(cli_gate_overrides),
             "resolved_gate_args": dict(resolved_gate_args),
             "resolved_gate_cfg": dict(resolved_gate_cfg),
-            "metric_pipeline": {"transport": "nanoGPT"},
+            "metric_pipeline": dict(metric_pipeline_payload),
+            "dw_aggregator": dict(dw_aggregator_payload),
             "window_signature_ref": {
                 "hash": emitted.window_signature_hash,
                 "path": "window_signature.json",

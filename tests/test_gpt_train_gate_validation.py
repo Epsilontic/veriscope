@@ -15,6 +15,8 @@ from veriscope.runners.gpt.train_nanogpt import (
     VeriscopeGatedTrainer,
     _DECL_TRANSPORT_KEY,
     _MAX_DEPTH,
+    _build_window_signature_metrics,
+    _gpt_dw_aggregator_signature,
     _to_jsonable,
     _validate_gate_row,
 )
@@ -302,3 +304,53 @@ def test_to_jsonable_strips_decl_transport_from_dataclass() -> None:
     converted = _to_jsonable(DeclLike(bins=16))
     assert converted["bins"] == 16
     assert _DECL_TRANSPORT_KEY not in converted
+
+
+def test_build_window_signature_metrics_prefers_decl_and_defaults_missing_weights() -> None:
+    decl = SimpleNamespace(
+        metrics=["rankme", "cos_disp", "eff_dim"],
+        weights={"rankme": 0.2, "eff_dim": 0.35},
+    )
+
+    payload = _build_window_signature_metrics(
+        decl,
+        metric_pipeline={
+            "metrics": {
+                "names": ["should_not_override"],
+                "weights": {"should_not_override": 9.9, "cos_disp": 0.42},
+            }
+        },
+    )
+
+    assert payload["names"] == ["cos_disp", "eff_dim", "rankme"]
+    assert payload["weights"] == {
+        "cos_disp": 1.0,
+        "eff_dim": 0.35,
+        "rankme": 0.2,
+    }
+
+
+def test_build_window_signature_metrics_falls_back_to_pipeline_and_is_sorted() -> None:
+    payload = _build_window_signature_metrics(
+        window_decl=None,
+        metric_pipeline={
+            "metrics": {
+                "names": ["zeta", "alpha"],
+                "weights": {"zeta": 0.5},
+            }
+        },
+    )
+
+    assert payload["names"] == ["alpha", "zeta"]
+    assert payload["weights"] == {"alpha": 1.0, "zeta": 0.5}
+
+
+def test_gpt_dw_aggregator_signature_is_stable() -> None:
+    agg = _gpt_dw_aggregator_signature()
+    assert agg == {
+        "name": "weighted_sum_product_tv",
+        "per_metric": "tv_hist_fixed",
+        "weight_normalization": "sum_abs_weights",
+        "intervention_reduction": "max",
+        "metric_source": "window_decl.weights",
+    }

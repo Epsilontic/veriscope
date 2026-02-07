@@ -294,6 +294,26 @@ def test_gpt_seed_resolved_and_recorded(tmp_path: Path) -> None:
     run_json = json.loads((out_dir / "run.json").read_text(encoding="utf-8"))
     assert run_json.get("resolved_seed") == 123
 
+    window_signature = json.loads((out_dir / "window_signature.json").read_text(encoding="utf-8"))
+    metrics_sig = window_signature.get("metrics")
+    assert isinstance(metrics_sig, dict)
+    assert isinstance(metrics_sig.get("names"), list) and metrics_sig["names"]
+    assert metrics_sig["names"] == sorted(metrics_sig["names"])
+    assert isinstance(metrics_sig.get("weights"), dict)
+    assert sorted(metrics_sig["weights"].keys()) == metrics_sig["names"]
+
+    window_decl = run_json.get("window_decl", {})
+    decl_metrics = sorted(str(m) for m in (window_decl.get("metrics") or []))
+    decl_weights = window_decl.get("weights", {})
+    assert metrics_sig["names"] == decl_metrics
+    for name in metrics_sig["names"]:
+        expected = float(decl_weights.get(name, 1.0))
+        assert float(metrics_sig["weights"][name]) == pytest.approx(expected, abs=1e-12)
+
+    dw_aggregator = window_signature.get("dw_aggregator")
+    assert isinstance(dw_aggregator, dict)
+    assert dw_aggregator.get("name") == "weighted_sum_product_tv"
+
 
 def test_gpt_seed_changes_metrics(tmp_path: Path) -> None:
     if not _env_truthy("VERISCOPE_SLOW"):

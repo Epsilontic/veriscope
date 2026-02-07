@@ -5,6 +5,7 @@ import json
 import logging
 import math
 import sys
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -342,6 +343,8 @@ def emit_gpt_artifacts_v1(
     gate_history: Sequence[Mapping[str, Any]],
     metric_interval: Optional[int] = None,
     metric_pipeline: Optional[Dict[str, Any]] = None,
+    signature_metrics: Optional[Dict[str, Any]] = None,
+    dw_aggregator: Optional[Dict[str, Any]] = None,
     run_status: str = "success",
     runner_exit_code: Optional[int] = None,
     runner_signal: Optional[str] = None,
@@ -376,6 +379,10 @@ def emit_gpt_artifacts_v1(
         window_sig["metric_interval"] = int(metric_interval)
     if metric_pipeline is not None:
         window_sig["metric_pipeline"] = dict(metric_pipeline)
+    if signature_metrics is not None:
+        window_sig["metrics"] = deepcopy(signature_metrics)
+    if dw_aggregator is not None:
+        window_sig["dw_aggregator"] = deepcopy(dw_aggregator)
 
     window_signature_path = outdir / "window_signature.json"
     atomic_write_json(window_signature_path, window_sig)
