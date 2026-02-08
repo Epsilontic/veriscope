@@ -290,9 +290,22 @@ def test_gpt_seed_resolved_and_recorded(tmp_path: Path) -> None:
     run_cfg = json.loads((out_dir / "run_config_resolved.json").read_text(encoding="utf-8"))
     assert run_cfg.get("resolved_seed") == 123
     assert run_cfg.get("provenance", {}).get("resolved_seed") == 123
+    assert run_cfg.get("max_iters") == 10
+    assert run_cfg.get("gate_enabled") is True
+    assert isinstance(run_cfg.get("gate_warmup"), int)
+    assert isinstance(run_cfg.get("gate_window"), int)
+    assert run_cfg.get("metric_interval") == 1
 
     run_json = json.loads((out_dir / "run.json").read_text(encoding="utf-8"))
     assert run_json.get("resolved_seed") == 123
+
+    results_json = json.loads((out_dir / "results.json").read_text(encoding="utf-8"))
+    metrics_ref = results_json.get("metrics_ref")
+    assert isinstance(metrics_ref, dict)
+    assert metrics_ref.get("format") == "legacy_v0"
+    expected_relpath = os.path.relpath(str(run_cfg["out_json"]), str(run_cfg["artifacts_outdir"]))
+    assert metrics_ref.get("path") == expected_relpath
+    assert metrics_ref.get("count") == len(run_json.get("metrics", []))
 
     window_signature = json.loads((out_dir / "window_signature.json").read_text(encoding="utf-8"))
     metrics_sig = window_signature.get("metrics")

@@ -349,6 +349,7 @@ def emit_gpt_artifacts_v1(
     runner_exit_code: Optional[int] = None,
     runner_signal: Optional[str] = None,
     argv: Optional[Iterable[str]] = None,
+    metrics_ref: Optional[Mapping[str, Any]] = None,
 ) -> EmittedArtifactsV1:
     """
     Emit standardized Veriscope artifacts (V1):
@@ -494,18 +495,37 @@ def emit_gpt_artifacts_v1(
     # ProfileV1.overrides is a mapping with a default_factory; do not pass None.
     profile = ProfileV1(gate_preset=gate_preset, overrides=(overrides or {}))
 
+    results_kwargs: Dict[str, Any] = {
+        "schema_version": 1,
+        "run_id": run_id,
+        "window_signature_ref": ws_ref,
+        "profile": profile,
+        "run_status": run_status,
+        "runner_exit_code": runner_exit_code,
+        "runner_signal": runner_signal,
+        "started_ts_utc": _iso_z(started_ts_utc),
+        "ended_ts_utc": _iso_z(ended_ts_utc) if ended_ts_utc is not None else None,
+        "gates": gate_records,  # list is the natural JSON shape
+        # Canonical V1 is intentionally gates-first; metric snapshots stay in legacy out_json.
+        "metrics": [],
+    }
+    if metrics_ref is not None:
+        ref_path = str(metrics_ref.get("path", "")).strip()
+        if not ref_path:
+            raise ValueError("metrics_ref.path must be a non-empty string when metrics_ref is provided")
+        ref_payload: Dict[str, Any] = {
+            "path": ref_path,
+            "format": str(metrics_ref.get("format", "legacy_v0")).strip() or "legacy_v0",
+        }
+        if metrics_ref.get("count", None) is not None:
+            ref_count = _coerce_int(metrics_ref.get("count"), field="metrics_ref.count")
+            if ref_count < 0:
+                raise ValueError("metrics_ref.count must be >= 0")
+            ref_payload["count"] = ref_count
+        results_kwargs["metrics_ref"] = ref_payload
+
     results = ResultsV1(
-        schema_version=1,
-        run_id=run_id,
-        window_signature_ref=ws_ref,
-        profile=profile,
-        run_status=run_status,
-        runner_exit_code=runner_exit_code,
-        runner_signal=runner_signal,
-        started_ts_utc=_iso_z(started_ts_utc),
-        ended_ts_utc=_iso_z(ended_ts_utc) if ended_ts_utc is not None else None,
-        gates=gate_records,  # list is the natural JSON shape
-        metrics=[],  # Phase 1.5: gates-first
+        **results_kwargs,
     )
 
     counts = _counts_from_gate_records(gate_records)

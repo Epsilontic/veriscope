@@ -58,6 +58,7 @@ def test_emit_gpt_artifacts_writes_and_validates(tmp_path: Path) -> None:
         resolved_gate_cfg={"gate_window": 16, "min_evidence": 16, "gate_epsilon": 0.08},
         metric_interval=16,
         metric_pipeline={"transport": "DeclTransport"},
+        metrics_ref={"path": "run.json", "format": "legacy_v0", "count": 2},
         gate_history=gate_history,
     )
 
@@ -102,6 +103,11 @@ def test_emit_gpt_artifacts_writes_and_validates(tmp_path: Path) -> None:
 
     # git_sha omission behavior: absent when not provided
     assert "git_sha" not in ws_obj["code_identity"]
+
+    # V1 stays gates-first, with an explicit pointer to the legacy metrics stream.
+    raw_results = json.loads((outdir / "results.json").read_text(encoding="utf-8"))
+    assert raw_results["metrics"] == []
+    assert raw_results["metrics_ref"] == {"path": "run.json", "format": "legacy_v0", "count": 2}
 
 
 def test_emit_skipped_gate_sanitizes_nonfinite_audit_values(tmp_path: Path) -> None:

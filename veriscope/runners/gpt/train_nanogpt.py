@@ -2491,6 +2491,7 @@ if __name__ == "__main__":
 
     # Canonical artifacts directory: colocate with legacy out_json
     artifacts_outdir = out_path.parent
+    metrics_ref_relpath = os.path.relpath(str(out_path), str(artifacts_outdir))
 
     from datetime import timezone
 
@@ -2668,6 +2669,30 @@ if __name__ == "__main__":
     trainer: VeriscopeGatedTrainer | None = None
     metrics: List[Dict[str, Any]] = []
     gates: List[Dict[str, Any]] = []
+
+    # Keep legacy out_json compact by default while preserving signal around key windows.
+    def _select_metrics_for_output(
+        all_metrics: List[Dict[str, Any]],
+        keep_last_n: int,
+        extra_ranges: List[Tuple[int, int]],
+    ) -> List[Dict[str, Any]]:
+        if not all_metrics:
+            return []
+        keep: Set[int] = set(range(max(0, len(all_metrics) - int(keep_last_n)), len(all_metrics)))
+        for i, m in enumerate(all_metrics):
+            it = m.get("iter", None)
+            if it is None:
+                continue
+            try:
+                it_i = int(it)
+            except Exception:
+                continue
+            for a, b in extra_ranges:
+                if int(a) <= it_i < int(b):
+                    keep.add(i)
+                    break
+        return [all_metrics[i] for i in sorted(keep)]
+
     try:
         trainer = VeriscopeGatedTrainer(config)
         metrics, gates = trainer.train(get_batch)
@@ -2740,6 +2765,13 @@ if __name__ == "__main__":
         else:
             gate_history_for_emit = list(gates or [])
 
+        metrics_ref_for_emit: Dict[str, Any] | None = None
+        if _train_exc is None:
+            metrics_ref_for_emit = {
+                "path": metrics_ref_relpath,
+                "format": "legacy_v0",
+            }
+
         # Emit canonical artifacts (V1). This is intentionally CPU-light.
         emitted = emit_gpt_artifacts_v1(
             outdir=artifacts_outdir,
@@ -2755,6 +2787,7 @@ if __name__ == "__main__":
             dw_aggregator=dict(dw_aggregator_payload),
             gate_history=gate_history_for_emit,
             run_status=run_status,
+            metrics_ref=metrics_ref_for_emit,
         )
 
         # --- Resolved run config artifact (canonical, stable) ---
@@ -2768,6 +2801,12 @@ if __name__ == "__main__":
             "started_ts_utc": _iso_utc(started_ts_utc_dt),
             "ended_ts_utc": _iso_utc(ended_ts_utc_dt),
             "resolved_seed": int(resolved_seed),
+            # Convenience mirrors for quick jq/inspection; source-of-truth remains resolved_gate_cfg.
+            "max_iters": int(config.max_iters),
+            "gate_enabled": bool(config.gate_enabled),
+            "gate_warmup": int(config.gate_warmup),
+            "gate_window": int(config.gate_window),
+            "metric_interval": int(config.metric_interval),
             "out_json": str(out_path),
             "artifacts_outdir": str(artifacts_outdir),
             "argv": safe_argv,
@@ -2823,36 +2862,13 @@ if __name__ == "__main__":
         if _train_exc is not None:
             raise _train_exc
 
-    # --- select a compact but relevant metric subset for JSON output ---
-    def _select_metrics_for_output(
-        all_metrics: List[Dict[str, Any]],
-        keep_last_n: int,
-        extra_ranges: List[Tuple[int, int]],
-    ) -> List[Dict[str, Any]]:
-        if not all_metrics:
-            return []
-        keep: Set[int] = set(range(max(0, len(all_metrics) - int(keep_last_n)), len(all_metrics)))
-        for i, m in enumerate(all_metrics):
-            it = m.get("iter", None)
-            if it is None:
-                continue
-            try:
-                it_i = int(it)
-            except Exception:
-                continue
-            for a, b in extra_ranges:
-                if int(a) <= it_i < int(b):
-                    keep.add(i)
-                    break
-        return [all_metrics[i] for i in sorted(keep)]
-
     if bool(args.save_all_metrics):
         metrics_out = metrics
     else:
         # Keep last 100 + padded ranges around reference build and configured pathologies.
         # compute_window_spans() is defined in this module.
-        Wm, window_span_iters, _ = compute_window_spans(config.gate_window, config.metric_interval)
-        build_min, build_max = getattr(trainer, "build_window", (None, None))
+        window_span_iters = compute_window_spans(config.gate_window, config.metric_interval)[1]
+        build_min, build_max = getattr(trainer, "build_window", (None, None)) if trainer is not None else (0, 0)
         if build_min is None or build_max is None:
             build_min, build_max = (0, 0)
         pad = 2 * int(window_span_iters)
@@ -3003,6 +3019,16 @@ if __name__ == "__main__":
 
     with out_path.open("w") as f:
         json.dump(out_payload, f, indent=2, default=str)
+
+    # Canonical V1 stays gates-first (`metrics=[]`); write exact legacy stream count after out_json is finalized.
+    results_path = artifacts_outdir / "results.json"
+    results_obj = json.loads(results_path.read_text(encoding="utf-8"))
+    results_obj["metrics_ref"] = {
+        "path": metrics_ref_relpath,
+        "format": "legacy_v0",
+        "count": int(len(metrics_out)),
+    }
+    atomic_write_json(results_path, results_obj)
 
     print(f"Saved {len(metrics)} metric snapshots, {len(gates)} gate checks")
     print(

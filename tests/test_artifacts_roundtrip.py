@@ -9,6 +9,7 @@ from veriscope.core.artifacts import (
     AuditV1,
     CountsV1,
     GateRecordV1,
+    MetricsRefV1,
     ProfileV1,
     ResultsSummaryV1,
     ResultsV1,
@@ -260,6 +261,30 @@ def test_hash_normalization_and_validation() -> None:
 
     with pytest.raises(ValueError):
         WindowSignatureRefV1(hash="g" * 64, path="x")  # non-hex
+
+
+def test_results_v1_metrics_ref_schema_and_validation() -> None:
+    results_schema = ResultsV1.model_json_schema(by_alias=True)
+    assert "metrics_ref" in results_schema.get("properties", {})
+
+    metrics_ref_schema = MetricsRefV1.model_json_schema(by_alias=True)
+    assert set(metrics_ref_schema.get("required", [])) == {"path"}
+    assert metrics_ref_schema["properties"]["path"]["type"] == "string"
+    assert metrics_ref_schema["properties"]["format"]["type"] == "string"
+    assert metrics_ref_schema["properties"]["format"]["default"] == "legacy_v0"
+    count_anyof = metrics_ref_schema["properties"]["count"]["anyOf"]
+    integer_branch = next(x for x in count_anyof if x.get("type") == "integer")
+    assert integer_branch["minimum"] == 0
+
+    ref = MetricsRefV1(path="run.json")
+    assert ref.format == "legacy_v0"
+    assert ref.count is None
+
+    with pytest.raises(ValueError):
+        MetricsRefV1(path="", format="legacy_v0")
+
+    with pytest.raises(ValueError):
+        MetricsRefV1(path="run.json", count=-1)
 
 
 def test_immutability_of_tuples_and_mappings() -> None:

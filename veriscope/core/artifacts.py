@@ -45,6 +45,7 @@ __all__ = [
     "AuditV1",
     "GateRecordV1",
     "MetricRecordV1",
+    "MetricsRefV1",
     "ResultsV1",
     "CountsV1",
     "ResultsSummaryV1",
@@ -245,6 +246,19 @@ class MetricRecordV1(VSModel):
         return v
 
 
+class MetricsRefV1(VSModel):
+    """
+    Pointer to an external metrics stream for gates-first results payloads.
+
+    Canonical V1 results remain lightweight (`metrics=[]`) while this reference indicates
+    where the legacy snapshot stream is stored.
+    """
+
+    path: str = Field(min_length=1)
+    format: str = Field(default="legacy_v0", min_length=1)
+    count: Optional[NonNegInt] = None
+
+
 class _ResultsHeaderV1(VSModel):
     """Shared header fields for results artifacts (DRY base)."""
 
@@ -276,6 +290,7 @@ class ResultsV1(_ResultsHeaderV1):
     # Tuples reduce accidental mutation even under frozen=True.
     gates: tuple[GateRecordV1, ...] = Field(default_factory=tuple, repr=False)
     metrics: tuple[MetricRecordV1, ...] = Field(default_factory=tuple, repr=False)
+    metrics_ref: Optional[MetricsRefV1] = Field(default=None)
 
 
 class CountsV1(VSModel):
@@ -397,4 +412,5 @@ def export_schemas_v1() -> dict[str, Any]:
         "ProfileV1": ProfileV1.model_json_schema(by_alias=True),
         "WindowSignatureRefV1": WindowSignatureRefV1.model_json_schema(by_alias=True),
         "MetricRecordV1": MetricRecordV1.model_json_schema(by_alias=True),
+        "MetricsRefV1": MetricsRefV1.model_json_schema(by_alias=True),
     }
