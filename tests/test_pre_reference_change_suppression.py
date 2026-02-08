@@ -13,6 +13,7 @@ def _run_pre_reference_persistence_pair(
     make_gate_engine,
     fr_window,
     pre_reference_change_policy: str | None,
+    regime_enabled: bool = True,
 ):
     base_engine = make_gate_engine(
         fr_window,
@@ -22,7 +23,7 @@ def _run_pre_reference_persistence_pair(
     )
 
     cfg_kwargs = {
-        "enabled": True,
+        "enabled": regime_enabled,
         "reference_build_min_iter": 10_000,
         "reference_build_max_iter": 10_100,
         "min_evidence_per_metric": 1,
@@ -69,6 +70,7 @@ def test_pre_reference_warn_only_suppresses_change_persistence_fail(make_gate_en
         make_gate_engine=make_gate_engine,
         fr_window=fr_window,
         pre_reference_change_policy=None,  # use RegimeConfig default
+        regime_enabled=True,
     )
 
     assert second.ok is True
@@ -78,6 +80,10 @@ def test_pre_reference_warn_only_suppresses_change_persistence_fail(make_gate_en
     assert second.audit.get("pre_reference_change_suppressed") is True
     assert second.audit.get("pre_reference_original_ok") is False
     assert "change_persistence_fail" in str(second.audit.get("pre_reference_original_reason", ""))
+    assert second.audit.get("ref_ready") is False
+    assert second.audit.get("regime_ref_ready") is False
+    assert isinstance(second.audit.get("ref_windows_built"), int)
+    assert isinstance(second.audit.get("regime_ref_windows_built"), int)
 
 
 def test_pre_reference_enforce_preserves_change_persistence_fail(make_gate_engine, fr_window) -> None:
@@ -85,6 +91,7 @@ def test_pre_reference_enforce_preserves_change_persistence_fail(make_gate_engin
         make_gate_engine=make_gate_engine,
         fr_window=fr_window,
         pre_reference_change_policy="enforce",
+        regime_enabled=True,
     )
 
     assert second.ok is False
@@ -100,6 +107,7 @@ def test_pre_reference_ignore_suppresses_change_and_persistence(make_gate_engine
         make_gate_engine=make_gate_engine,
         fr_window=fr_window,
         pre_reference_change_policy="ignore",
+        regime_enabled=True,
     )
 
     assert second.ok is True
@@ -111,3 +119,25 @@ def test_pre_reference_ignore_suppresses_change_and_persistence(make_gate_engine
     assert int(second.audit.get("consecutive_exceedances", -1)) == 1
     assert int(second.audit.get("consecutive_exceedances_before", -1)) == 1
     assert int(second.audit.get("consecutive_exceedances_after", -1)) == 1
+
+
+def test_pre_reference_warn_only_suppresses_change_persistence_fail_when_regime_disabled(
+    make_gate_engine, fr_window
+) -> None:
+    _, second = _run_pre_reference_persistence_pair(
+        make_gate_engine=make_gate_engine,
+        fr_window=fr_window,
+        pre_reference_change_policy="warn_only",
+        regime_enabled=False,
+    )
+
+    assert second.ok is True
+    assert second.warn is True
+    assert second.audit.get("pre_reference") is True
+    assert second.audit.get("pre_reference_change_policy") == "warn_only"
+    assert second.audit.get("pre_reference_change_suppressed") is True
+    assert str(second.audit.get("reason", "")).startswith("pre_reference_suppressed:")
+    assert second.audit.get("ref_ready") is False
+    assert second.audit.get("regime_ref_ready") is None
+    assert isinstance(second.audit.get("ref_windows_built"), int)
+    assert second.audit.get("regime_ref_windows_built") is None

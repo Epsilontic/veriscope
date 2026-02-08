@@ -958,34 +958,22 @@ class VeriscopeGatedTrainer:
             # If rmw <= 0, don't add to kwargs; RegimeConfig default applies
 
         regime_config = RegimeConfig(**regime_kwargs)
-        self._regime_wrapper_enabled = bool(regime_enabled)
-
-        if self._regime_wrapper_enabled:
-            # Wrap with regime-anchored detection only when explicitly enabled.
-            self.gate_engine = RegimeAnchoredGateEngine(
-                base_engine=base_gate_engine,
-                fr_win=self.fr_win,
-                config=regime_config,
-                gate_warmup=int(config.gate_warmup),
-                gate_window=int(config.gate_window),
-                pathology_start=pathology_start,
-                default_gap_iters=int(default_gap_iters),
-            )
-            build_min, build_max = self.gate_engine.build_window
-            regime_epsilon = float(self.gate_engine.regime_epsilon)
-            regime_enabled_effective = bool(getattr(self.gate_engine, "enabled", False))
-        else:
-            self.gate_engine = base_gate_engine
-            # Keep reference-build metadata deterministic even when regime wrapper is disabled.
-            build_min, build_max = compute_build_window(
-                regime_config,
-                gate_warmup=int(config.gate_warmup),
-                gate_window=int(config.gate_window),
-                pathology_start=pathology_start,
-                default_gap_iters=int(default_gap_iters),
-            )
-            regime_epsilon = float("nan")
-            regime_enabled_effective = False
+        # Always use the wrapper so pre-reference suppression semantics stay consistent
+        # across --no_regime and regime-enabled runs. `RegimeConfig.enabled` controls
+        # whether the regime channel actually contributes to decisions.
+        self._regime_wrapper_enabled = True
+        self.gate_engine = RegimeAnchoredGateEngine(
+            base_engine=base_gate_engine,
+            fr_win=self.fr_win,
+            config=regime_config,
+            gate_warmup=int(config.gate_warmup),
+            gate_window=int(config.gate_window),
+            pathology_start=pathology_start,
+            default_gap_iters=int(default_gap_iters),
+        )
+        build_min, build_max = self.gate_engine.build_window
+        regime_epsilon = float(self.gate_engine.regime_epsilon)
+        regime_enabled_effective = bool(getattr(self.gate_engine, "enabled", False))
 
         self.build_window = (int(build_min), int(build_max))
 
@@ -1026,14 +1014,11 @@ class VeriscopeGatedTrainer:
         self._freeze_defer_log_every: int = 500
 
         # Log computed build window and effective status.
-        if self._regime_wrapper_enabled:
-            print(
-                f"[REGIME] enabled={regime_enabled_effective}, "
-                f"build_window=[{build_min}, {build_max}), "
-                f"epsilon={regime_epsilon:.4f}"
-            )
-        else:
-            print(f"[REGIME] enabled=False (wrapper not instantiated), build_window=[{build_min}, {build_max})")
+        print(
+            f"[REGIME] enabled={regime_enabled_effective}, "
+            f"build_window=[{build_min}, {build_max}), "
+            f"epsilon={regime_epsilon:.4f}"
+        )
         # Freeze gauge BEFORE the first eligible reference-building gate check uses "recent" samples.
         # Gate checks happen at iter multiples of gate_window. Metric snapshots happen every metric_interval.
         # We freeze at window_start so that all metric snapshots used to build the reference are in the frozen gauge.

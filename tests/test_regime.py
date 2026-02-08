@@ -29,6 +29,33 @@ class TestRegimeGatingSemantics:
         )
         assert r.audit["regime_enabled"] is False
         assert r.audit["regime_has_reference"] is False
+        # Schema stability: keep placeholder regime diagnostics present when disabled.
+        for key in (
+            "regime_margin_raw",
+            "regime_margin_eff",
+            "regime_margin_slope_eff",
+            "regime_margin_rel_raw",
+            "regime_margin_rel_eff",
+            "regime_trend_x",
+            "regime_trend_x_source",
+            "regime_trend_n",
+            "regime_check_idx",
+            "regime_worst_DW",
+            "regime_eps_eff",
+            "regime_eps_stat",
+            "regime_per_metric",
+            "regime_per_metric_n",
+            "regime_counts",
+            "ref_ready",
+            "ref_windows_built",
+            "regime_ref_ready",
+            "regime_ref_windows_built",
+        ):
+            assert key in r.audit
+        assert r.audit.get("ref_ready") is False
+        assert isinstance(r.audit.get("ref_windows_built"), int)
+        assert r.audit.get("regime_ref_ready") is None
+        assert r.audit.get("regime_ref_windows_built") is None
         if "regime_state" in r.audit:
             assert isinstance(r.audit["regime_state"], str)
 
@@ -148,3 +175,89 @@ class TestRegimeGatingSemantics:
         assert r.audit.get("regime_clip_diag_threshold") == 0.10
         clip_recent = r.audit.get("regime_clip_diag_recent") or {}
         assert "test_metric" in clip_recent
+
+    def test_persistence_stability_treats_regime_only_fail_as_warn(self, make_gate_engine, fr_window):
+        base_engine = make_gate_engine(
+            fr_window,
+            min_evidence=1,
+            policy="persistence_stability",
+            persistence_k=1,
+        )
+        cfg = RegimeConfig(
+            enabled=True,
+            reference_build_min_iter=0,
+            reference_build_max_iter=0,
+            min_evidence_per_metric=1,
+            min_windows_for_reference=1,
+        )
+        rag = RegimeAnchoredGateEngine(
+            base_engine=base_engine,
+            fr_win=fr_window,
+            config=cfg,
+            gate_warmup=0,
+            gate_window=10,
+        )
+
+        rag._ref = RegimeReference(  # type: ignore[attr-defined]
+            metrics={"test_metric": np.full(64, 1.0)},
+            counts={"test_metric": 64},
+            established_at=0,
+            n_samples_per_metric={"test_metric": 64},
+        )
+
+        result = rag.check(
+            past={"test_metric": np.full(64, 0.0)},
+            recent={"test_metric": np.full(64, 0.0)},
+            counts_by_metric={"test_metric": 64},
+            gain_bits=0.1,
+            kappa_sens=0.0,
+            eps_stat_value=0.01,
+            iter_num=200,
+        )
+
+        assert result.ok is True
+        assert result.warn is True
+        assert result.audit.get("change_ok") is True
+        assert result.audit.get("regime_ok") is False
+        assert result.audit.get("reason") == "regime_fail_suppressed"
+        assert result.audit.get("regime_fail_suppressed") is True
+        assert result.audit.get("ref_ready") is True
+        assert result.audit.get("regime_ref_ready") is True
+
+    def test_persistence_stability_keeps_fail_when_change_channel_fails(self, make_gate_engine, fr_window):
+        base_engine = make_gate_engine(
+            fr_window,
+            min_evidence=1,
+            policy="persistence_stability",
+            persistence_k=1,
+        )
+        rag = RegimeAnchoredGateEngine(
+            base_engine=base_engine,
+            fr_win=fr_window,
+            config=RegimeConfig(enabled=True, reference_build_min_iter=0, reference_build_max_iter=0),
+            gate_warmup=0,
+            gate_window=10,
+        )
+
+        rag._ref = RegimeReference(  # type: ignore[attr-defined]
+            metrics={"test_metric": np.full(64, 0.0)},
+            counts={"test_metric": 64},
+            established_at=0,
+            n_samples_per_metric={"test_metric": 64},
+        )
+
+        result = rag.check(
+            past={"test_metric": np.full(64, 0.0)},
+            recent={"test_metric": np.full(64, 1.0)},
+            counts_by_metric={"test_metric": 64},
+            gain_bits=0.1,
+            kappa_sens=0.0,
+            eps_stat_value=0.01,
+            iter_num=200,
+        )
+
+        assert result.ok is False
+        assert result.warn is False
+        assert result.audit.get("change_ok") is False
+        assert result.audit.get("regime_ok") is False
+        assert result.audit.get("regime_fail_suppressed") is not True

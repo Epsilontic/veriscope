@@ -1686,48 +1686,6 @@ class RegimeAnchoredGateEngine:
         audit["change_gain_failed"] = bool(change_gain_failed)
 
         # =========================================================================
-        # EARLY RETURN IF REGIME DISABLED (regime_state already set above)
-        # =========================================================================
-        if not self._enabled_effective:
-            audit.update(
-                {
-                    "regime_enabled": False,
-                    "regime_auto_disabled": not self.config.enabled or not self._metrics_tracked,
-                    "change_warn": base_warn,
-                    "change_evaluated": bool(base_evaluated),
-                    "regime_ok": True,
-                    "regime_warn": False,
-                    "regime_has_reference": False,
-                    "regime_active": False,
-                    "regime_active_effective": False,
-                    "regime_eligible": False,
-                    "regime_eligible_reason": "disabled",
-                    "regime_shadow_mode": shadow_mode,
-                    "regime_check_ran": False,
-                    "regime_id": None,
-                    "regime_build_window": [int(self._build_min_iter), int(self._build_max_iter)],
-                    "regime_ref_windows_built": 0,
-                    "regime_ref_candidate_windows_seen": 0,
-                    "regime_ref_last_reject_reason": None,
-                    # Placeholder regime margin fields for schema stability
-                    "regime_margin_raw": None,
-                    "regime_margin_eff": None,
-                    "regime_margin_slope_eff": None,
-                    "regime_margin_rel_raw": None,
-                    "regime_margin_rel_eff": None,
-                    "regime_trend_x": None,
-                    "regime_trend_x_source": None,
-                    "regime_trend_n": None,
-                    "regime_check_idx": None,
-                    # Headline margins default to change
-                    "margin_raw": audit.get("change_margin_raw"),
-                    "margin_eff": audit.get("change_margin_eff"),
-                    "margin_slope_eff": audit.get("change_margin_slope_eff"),
-                }
-            )
-            return GateResult(ok=base_result.ok, warn=base_warn, audit=audit)
-
-        # =========================================================================
         # 2. REGIME DETECTION (only if reference established AND eligible)
         # =========================================================================
         regime_result: Optional[GateResult] = None
@@ -1939,6 +1897,7 @@ class RegimeAnchoredGateEngine:
         current_ref = self.current_reference
         regime_has_reference = current_ref is not None
         regime_active_effective = bool(regime_has_reference and regime_eligible and (not shadow_mode))
+        ref_ready = bool(regime_has_reference)
 
         if current_ref is not None:
             try:
@@ -1948,6 +1907,15 @@ class RegimeAnchoredGateEngine:
         else:
             ref_windows_built = len(self._accumulating)
 
+        regime_ref_ready: Optional[bool]
+        regime_ref_windows_built: Optional[int]
+        if self._enabled_effective:
+            regime_ref_ready = bool(ref_ready)
+            regime_ref_windows_built = int(ref_windows_built)
+        else:
+            regime_ref_ready = None
+            regime_ref_windows_built = None
+
         audit.update(
             {
                 "change_warn": base_warn,
@@ -1956,8 +1924,9 @@ class RegimeAnchoredGateEngine:
                 "regime_warn": regime_warn,
                 "regime_check_ran": regime_check_ran,
                 "regime_enabled": self._enabled_effective,
+                "regime_auto_disabled": not self.config.enabled or not self._metrics_tracked,
                 "regime_has_reference": regime_has_reference,
-                "regime_active": regime_has_reference,
+                "regime_active": bool(regime_has_reference and self._enabled_effective),
                 "regime_active_effective": regime_active_effective,
                 "regime_epsilon": self._regime_epsilon,
                 "regime_policy": getattr(self, "_regime_policy", ""),
@@ -1968,9 +1937,13 @@ class RegimeAnchoredGateEngine:
                 "regime_eligible_reason": regime_eligible_reason,
                 "regime_shadow_mode": shadow_mode,
                 "regime_build_window": [int(self._build_min_iter), int(self._build_max_iter)],
-                "regime_ref_windows_built": int(ref_windows_built),
+                "regime_ref_windows_built": regime_ref_windows_built,
+                "regime_ref_ready": regime_ref_ready,
                 "regime_ref_candidate_windows_seen": int(self._ref_candidate_windows_seen),
                 "regime_ref_last_reject_reason": self._ref_last_reject_reason,
+                # Change-side suppression keys off reference readiness, regardless of regime enablement.
+                "ref_ready": bool(ref_ready),
+                "ref_windows_built": int(ref_windows_built),
                 # regime_id: always present for schema stability
                 "regime_id": current_ref.regime_id if current_ref else None,
             }
@@ -2099,7 +2072,9 @@ class RegimeAnchoredGateEngine:
         )
         change_only_persistence_failure = bool(change_only_failure and pfail)
 
-        if pre_reference and self._enabled_effective:
+        # Pre-reference suppression is controlled by reference readiness itself,
+        # not by whether regime checks are enabled.
+        if pre_reference:
             if pre_reference_policy == "ignore":
                 # Keep telemetry, but neutralize change-driven decisioning before reference.
                 if _as_opt_bool(audit.get("change_ok")) is not True:
@@ -2158,6 +2133,25 @@ class RegimeAnchoredGateEngine:
         )
         if bootstrap_warn:
             combined_ok = True
+
+        regime_fail_suppressed = False
+        policy_norm = str(audit.get("base_policy") or audit.get("policy") or "").strip().lower().replace("-", "_")
+        regime_advisory_policy = policy_norm == "persistence_stability"
+        regime_only_failure = bool(
+            evaluated
+            and (not bool(combined_ok))
+            and (decision_source_gate_norm == "regime")
+            and (_as_opt_bool(audit.get("change_ok")) is True)
+            and (_as_opt_bool(audit.get("regime_ok")) is False)
+        )
+        # Under persistence_stability, regime is advisory unless corroborated by change.
+        if regime_advisory_policy and regime_only_failure:
+            original_reason = str(audit.get("reason") or "regime_fail").strip() or "regime_fail"
+            audit["regime_fail_suppressed"] = True
+            audit["regime_fail_original_reason"] = original_reason
+            audit["reason"] = "regime_fail_suppressed"
+            combined_ok = True
+            regime_fail_suppressed = True
 
         per_metric = audit.get("per_metric_tv") or audit.get("drifts") or {}
         wk, wv = _pick_worst_metric(per_metric)
@@ -2269,6 +2263,9 @@ class RegimeAnchoredGateEngine:
         if pre_reference_ignore_change_warn:
             combined_warn = False
         if pre_reference_force_warn:
+            combined_warn = True
+            combined_ok = True
+        if regime_fail_suppressed:
             combined_warn = True
             combined_ok = True
         combined_warn = bool(combined_ok and combined_warn)
