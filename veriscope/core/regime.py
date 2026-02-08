@@ -54,6 +54,9 @@ _SATURATION_WARN_LIMIT = 5
 _SANITY_WARN_COUNT: Dict[str, int] = {}
 _SANITY_WARN_LIMIT = 5
 
+_PRE_REFERENCE_CHANGE_POLICY_ALLOWED: frozenset[str] = frozenset({"ignore", "warn_only", "enforce"})
+_PRE_REFERENCE_CHANGE_POLICY_ALLOWED_SORTED: tuple[str, ...] = tuple(sorted(_PRE_REFERENCE_CHANGE_POLICY_ALLOWED))
+
 
 def _is_main_process() -> bool:
     """Check if we're in the main process (stdlib, no torch dependency)."""
@@ -323,6 +326,11 @@ class RegimeConfig:
     # Regime decision policy. "inherit" = use base GateEngine policy/persistence_k.
     policy: str = "inherit"
     persistence_k: int = 2
+    # Pre-reference change handling:
+    # - ignore: suppress change-driven warn/fail before reference
+    # - warn_only: suppress only hard FAIL from change persistence before reference
+    # - enforce: keep existing behavior
+    pre_reference_change_policy: str = "warn_only"
 
     # ---- Multi-regime support ----
     # If False (default), single-regime behavior (existing self._ref)
@@ -345,6 +353,20 @@ def _policy_to_str(x: Any) -> str:
         return x
     v = getattr(x, "value", None)
     return str(v) if v is not None else str(x)
+
+
+def _normalize_pre_reference_change_policy(policy_in: Any) -> str:
+    """Normalize pre-reference change policy; invalid values fallback to warn_only."""
+    s = str(policy_in or "").strip().lower()
+    if s in _PRE_REFERENCE_CHANGE_POLICY_ALLOWED:
+        return s
+    warnings.warn(
+        f"Unknown pre_reference_change_policy={policy_in!r}. "
+        f"Defaulting to 'warn_only'. Valid={list(_PRE_REFERENCE_CHANGE_POLICY_ALLOWED_SORTED)}.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+    return "warn_only"
 
 
 def _not_evaluated_from_reason(reason: str) -> bool:
@@ -531,6 +553,11 @@ class RegimeAnchoredGateEngine:
         self.base = base_engine
         self.fr_win = fr_win
         self.config = config or RegimeConfig()
+        self._pre_reference_change_policy = _normalize_pre_reference_change_policy(
+            getattr(self.config, "pre_reference_change_policy", "warn_only")
+        )
+        # Keep config object canonical so downstream serialization can use a stable value.
+        self.config.pre_reference_change_policy = self._pre_reference_change_policy
 
         # Reference-build starvation diagnostics (observability only)
         # Counts windows where one or more tracked metrics are missing/empty in `recent`.
@@ -1417,6 +1444,8 @@ class RegimeAnchoredGateEngine:
         # =========================================================================
         current_ref = self.current_reference
         had_reference = current_ref is not None
+        pre_reference = current_ref is None
+        pre_reference_policy = str(getattr(self, "_pre_reference_change_policy", "warn_only")).strip().lower()
 
         # =========================================================================
         # COMPUTE ELIGIBILITY FIRST (needed for regime_state_str)
@@ -1457,6 +1486,16 @@ class RegimeAnchoredGateEngine:
             regime_state_str = "active"
 
         # 1. Base change detection (existing behavior, unchanged)
+        base_persistence_state: Any = None
+        if pre_reference and pre_reference_policy == "ignore":
+            # Snapshot persistence state so suppressed pre-reference failures can rollback.
+            try:
+                _save_state = getattr(self.base, "save_persistence_state", None)
+                if callable(_save_state):
+                    base_persistence_state = _save_state()
+            except Exception:
+                base_persistence_state = None
+
         base_result = self.base.check(
             past=past,
             recent=recent,
@@ -2003,6 +2042,9 @@ class RegimeAnchoredGateEngine:
         evaluated = bool(audit.get("evaluated", True))
         ds = str(audit.get("decision_source") or "none").strip().lower() or "none"
         pfail = bool(audit.get("persistence_fail", False))
+        if pre_reference:
+            audit["pre_reference"] = True
+            audit["pre_reference_change_policy"] = pre_reference_policy
 
         dw_ex_final = _as_opt_bool(audit.get("dw_exceeds_threshold", None))
         if dw_ex_final is None:
@@ -2045,11 +2087,73 @@ class RegimeAnchoredGateEngine:
                 rr = f"{ds}_ok"
             audit["reason"] = rr
 
+        pre_reference_force_warn = False
+        pre_reference_ignore_change_warn = False
+        decision_source_gate_norm = str(decision_source_gate).strip().lower()
+        change_gain_failed_now = bool(audit.get("change_gain_failed", False))
+        change_only_failure = bool(
+            evaluated
+            and (not bool(combined_ok))
+            and (decision_source_gate_norm == "change")
+            and (not change_gain_failed_now)
+        )
+        change_only_persistence_failure = bool(change_only_failure and pfail)
+
+        if pre_reference and self._enabled_effective:
+            if pre_reference_policy == "ignore":
+                # Keep telemetry, but neutralize change-driven decisioning before reference.
+                if _as_opt_bool(audit.get("change_ok")) is not True:
+                    audit["change_ok"] = "suppressed"
+                if change_only_failure:
+                    original_reason = str(audit.get("reason") or "change_fail").strip() or "change_fail"
+                    audit["pre_reference_change_suppressed"] = True
+                    audit["pre_reference_original_ok"] = bool(combined_ok)
+                    audit["pre_reference_original_reason"] = original_reason
+                    audit["reason"] = f"pre_reference_suppressed:{original_reason}"
+
+                    baseline_consecutive: Optional[int] = None
+                    try:
+                        _restore_state = getattr(self.base, "restore_persistence_state", None)
+                        if callable(_restore_state) and (base_persistence_state is not None):
+                            _restore_state(base_persistence_state)
+                        if isinstance(base_persistence_state, dict):
+                            baseline_raw = base_persistence_state.get("consecutive_exceedances")
+                        else:
+                            baseline_raw = base_persistence_state
+                        if baseline_raw is not None:
+                            baseline_consecutive = int(baseline_raw)
+                    except Exception:
+                        baseline_consecutive = None
+
+                    if baseline_consecutive is not None:
+                        # Keep reported counters aligned with restored pre-check baseline.
+                        audit["consecutive_exceedances"] = int(baseline_consecutive)
+                        audit["consecutive_exceedances_before"] = int(baseline_consecutive)
+                        audit["consecutive_exceedances_after"] = int(baseline_consecutive)
+
+                    combined_ok = True
+                # "ignore" also suppresses non-fatal warn-only change alerts.
+                pre_reference_ignore_change_warn = bool(warn_pending and (not change_gain_failed_now))
+            elif pre_reference_policy == "warn_only":
+                # Allow telemetry/persistence tracking, but suppress hard FAILs from change persistence.
+                if change_only_persistence_failure:
+                    original_reason = str(audit.get("reason") or "change_persistence_fail").strip()
+                    if not original_reason:
+                        original_reason = "change_persistence_fail"
+                    audit["pre_reference_change_suppressed"] = True
+                    audit["pre_reference_original_ok"] = bool(combined_ok)
+                    audit["pre_reference_original_reason"] = original_reason
+                    audit["reason"] = f"pre_reference_suppressed:{original_reason}"
+                    combined_ok = True
+                    pre_reference_force_warn = True
+            # "enforce" intentionally keeps existing behavior.
+
         # Bootstrap policy: while no reference exists (at start of check), do not hard-fail
         # on the specific "change_warn_pending" pathway. Emit WARN instead to avoid deadlock.
         bootstrap_warn = bool(
             (not had_reference)
             and self._enabled_effective
+            and (pre_reference_policy != "ignore")
             and (str(audit.get("reason") or "").strip() == "change_warn_pending")
         )
         if bootstrap_warn:
@@ -2162,6 +2266,11 @@ class RegimeAnchoredGateEngine:
         if bootstrap_warn:
             combined_warn = True
             combined_ok = True
+        if pre_reference_ignore_change_warn:
+            combined_warn = False
+        if pre_reference_force_warn:
+            combined_warn = True
+            combined_ok = True
         combined_warn = bool(combined_ok and combined_warn)
         return GateResult(ok=combined_ok, warn=combined_warn, audit=audit)
 
@@ -2260,6 +2369,7 @@ class RegimeAnchoredGateEngine:
                     "max_dw": self.config.reference_build_max_dw,
                     "min_gain": self.config.reference_build_min_gain,
                 },
+                "pre_reference_change_policy": self._pre_reference_change_policy,
                 "min_evidence_per_metric": self.config.min_evidence_per_metric,
                 "min_windows_for_reference": self._min_windows_for_reference_effective,
             },

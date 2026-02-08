@@ -790,6 +790,7 @@ class TrainConfig:
     regime_min_windows: int = 5
     freeze_metric_gauge_min_ref_updates: int = 25
     regime_build_gap_iters: int = -1  # explicit gap override (-1 = auto)
+    pre_reference_change_policy: str = "warn_only"
 
     # Optional: freeze GPT feature normalization once regime reference is established.
     # This makes anchored regime comparisons use a fixed metric gauge.
@@ -936,6 +937,7 @@ class VeriscopeGatedTrainer:
             reference_build_max_dw=float(config.regime_build_max_dw),
             reference_build_min_gain=float(config.regime_build_min_gain),
             min_evidence_per_metric=int(config.regime_min_evidence),
+            pre_reference_change_policy=str(config.pre_reference_change_policy),
             eps_stat_alpha=0.05,
             eps_stat_max_frac=float(config.gate_eps_stat_max_frac),
             max_reference_samples=10000,
@@ -2429,6 +2431,18 @@ if __name__ == "__main__":
         default=50,
         help="Min samples per metric before reference can be established.",
     )
+    parser.add_argument(
+        "--pre_reference_change_policy",
+        type=str,
+        choices=["ignore", "warn_only", "enforce"],
+        default="warn_only",
+        help=(
+            "Behavior before regime reference exists: "
+            "'ignore' suppresses change warn/fail and persistence accumulation, "
+            "'warn_only' suppresses hard change-persistence FAILs only, "
+            "'enforce' keeps full change enforcement."
+        ),
+    )
 
     parser.add_argument(
         "--regime_build_gap_iters",
@@ -2594,6 +2608,7 @@ if __name__ == "__main__":
         regime_min_windows=args.regime_min_windows,
         freeze_metric_gauge_min_ref_updates=args.freeze_metric_gauge_min_ref_updates,
         regime_build_gap_iters=args.regime_build_gap_iters,
+        pre_reference_change_policy=str(args.pre_reference_change_policy),
         cos_disp_max=args.cos_disp_max,
         freeze_metric_gauge_on_ref=bool(args.freeze_metric_gauge_on_ref),
         # Safer default for initial hook validation
@@ -2713,6 +2728,7 @@ if __name__ == "__main__":
             "gate_eps_stat_max_frac": float(config.gate_eps_stat_max_frac),
             "gate_gain_thresh": float(config.gate_gain_thresh),
             "regime_enabled": bool(config.regime_enabled),
+            "pre_reference_change_policy": str(config.pre_reference_change_policy),
         }
 
         gate_history_for_emit: List[Dict[str, Any]] = []
@@ -2916,6 +2932,7 @@ if __name__ == "__main__":
             "regime_build_max_dw": config.regime_build_max_dw,
             "regime_build_min_gain": config.regime_build_min_gain,
             "regime_min_evidence": config.regime_min_evidence,
+            "pre_reference_change_policy": config.pre_reference_change_policy,
             "freeze_metric_gauge_on_ref": config.freeze_metric_gauge_on_ref,
             "regime_min_windows": config.regime_min_windows,
             "freeze_metric_gauge_min_ref_updates": int(config.freeze_metric_gauge_min_ref_updates),

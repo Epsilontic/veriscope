@@ -965,6 +965,24 @@ class GateEngine:
 
         return GateResult(ok=ok, warn=warn, audit=audit)
 
+    def save_persistence_state(self) -> Dict[str, int]:
+        """Snapshot all persistence counters for temporary override/rollback flows."""
+        return {
+            "consecutive_exceedances": int(self._consecutive_exceedances),
+        }
+
+    def restore_persistence_state(self, state: Any) -> None:
+        """Restore persistence counters from a previous save_persistence_state() snapshot."""
+        if isinstance(state, dict):
+            val = state.get("consecutive_exceedances", self._consecutive_exceedances)
+        else:
+            val = state
+        try:
+            self._consecutive_exceedances = max(0, int(val))
+        except Exception:
+            # Ignore malformed snapshots to keep gating robust under mixed callers.
+            return
+
     def reset_persistence(self) -> int:
         """Reset persistence counter. Returns previous count.
         Call after intentional intervention or regime change."""
