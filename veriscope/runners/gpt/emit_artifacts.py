@@ -5,11 +5,12 @@ import json
 import logging
 import math
 import sys
+from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import veriscope
 from veriscope.core.governance import (
@@ -32,6 +33,7 @@ from veriscope.core.artifacts import (
 from veriscope.core.jsonutil import (
     atomic_write_json,
     atomic_write_pydantic_json,
+    atomic_write_text,
     window_signature_sha256,
 )
 
@@ -322,6 +324,76 @@ def _counts_from_gate_records(gates: Sequence[GateRecordV1]) -> CountsV1:
     return CountsV1(evaluated=evaluated, skip=skip, pass_=pass_n, warn=warn, fail=fail)
 
 
+def _flatten_gate_events(raw: Sequence[Any]) -> List[Any]:
+    """Unwrap top-level or per-element {"gates": [...]} wrappers, one level deep."""
+    source: Sequence[Any] = raw
+    if isinstance(raw, Mapping) and "gates" in raw:
+        candidate = raw["gates"]
+        if isinstance(candidate, (list, tuple)):
+            source = candidate
+    out: List[Any] = []
+    for item in source:
+        if isinstance(item, Mapping) and "gates" in item:
+            nested = item["gates"]
+            if isinstance(nested, (list, tuple)):
+                out.extend(nested)
+                continue
+        out.append(item)
+    return out
+
+
+def _first_fail_iter_from_events(events: Sequence[Any]) -> Optional[int]:
+    """
+    Compute earliest fail iteration from a heterogeneous legacy event stream.
+
+    Rules:
+      - ignore non-object entries
+      - decision precedence:
+          event["decision"] OR event["audit"]["decision"] OR event["audit"]["final_decision"]
+      - iter precedence:
+          event["iter"] OR event["audit"]["iter"] OR event["audit"]["step"]
+      - accept iter only when it is an int (bool excluded)
+      - return min(iter) for decision=="fail", else None
+
+    Callers should pre-flatten via _flatten_gate_events if the input may contain
+    {"gates": [...]} wrappers.
+    """
+    first_fail_iter: Optional[int] = None
+
+    for event in events:
+        if not isinstance(event, Mapping):
+            continue
+
+        audit_raw = event.get("audit", {})
+        audit = audit_raw if isinstance(audit_raw, Mapping) else {}
+
+        decision_raw = event.get("decision")
+        if decision_raw is None:
+            decision_raw = audit.get("decision")
+        if decision_raw is None:
+            decision_raw = audit.get("final_decision")
+        if decision_raw is None:
+            continue
+
+        decision = str(decision_raw).strip().lower()
+        if decision != "fail":
+            continue
+
+        iter_raw = event.get("iter")
+        if iter_raw is None:
+            iter_raw = audit.get("iter")
+        if iter_raw is None:
+            iter_raw = audit.get("step")
+
+        if isinstance(iter_raw, bool) or not isinstance(iter_raw, int):
+            continue
+
+        if first_fail_iter is None or iter_raw < first_fail_iter:
+            first_fail_iter = int(iter_raw)
+
+    return first_fail_iter
+
+
 def _read_json_obj(path: Path) -> Dict[str, Any]:
     """Read JSON file and parse to an object, with a tighter error message."""
     try:
@@ -340,7 +412,7 @@ def emit_gpt_artifacts_v1(
     gate_preset: str,
     overrides: Optional[Dict[str, Any]],
     resolved_gate_cfg: Dict[str, Any],
-    gate_history: Sequence[Mapping[str, Any]],
+    gate_history: Sequence[Any],
     metric_interval: Optional[int] = None,
     metric_pipeline: Optional[Dict[str, Any]] = None,
     signature_metrics: Optional[Dict[str, Any]] = None,
@@ -423,9 +495,14 @@ def emit_gpt_artifacts_v1(
     n_events = len(gate_history)
     logger.debug("Processing %d gate_history events", n_events)
 
+    gate_events = _flatten_gate_events(gate_history)
     gate_records: List[GateRecordV1] = []
     prev_iter: Optional[int] = None
-    for i, ev in enumerate(gate_history):
+    for i, raw_event in enumerate(gate_events):
+        if not isinstance(raw_event, Mapping):
+            logger.debug("Skipping non-object gate_history entry at index=%d (type=%s)", i, type(raw_event).__name__)
+            continue
+        ev = raw_event
         try:
             it = _get_event_iter(ev)
             if prev_iter is not None and it <= prev_iter:
@@ -530,6 +607,22 @@ def emit_gpt_artifacts_v1(
 
     counts = _counts_from_gate_records(gate_records)
     final_decision = derive_final_decision(counts)
+    first_fail_iter = _first_fail_iter_from_events(gate_events)
+
+    if counts.fail == 0:
+        if first_fail_iter is not None:
+            logger.warning(
+                "Computed first_fail_iter=%s but counts.fail=0; forcing first_fail_iter to null",
+                first_fail_iter,
+            )
+        first_fail_iter = None
+    elif first_fail_iter is None:
+        msg = (
+            "Invariant violation: counts.fail > 0 but first_fail_iter could not be derived "
+            "from gate_history events."
+        )
+        logger.error(msg)
+        raise ValueError(msg)
 
     summary = ResultsSummaryV1(
         schema_version=1,
@@ -543,6 +636,7 @@ def emit_gpt_artifacts_v1(
         ended_ts_utc=_iso_z(ended_ts_utc) if ended_ts_utc is not None else None,
         counts=counts,
         final_decision=final_decision,
+        first_fail_iter=first_fail_iter,
     )
 
     # --- 4) Write output ---
@@ -553,7 +647,17 @@ def emit_gpt_artifacts_v1(
     atomic_write_pydantic_json(results_path, results, by_alias=True, exclude_none=True, fsync=True)
 
     logger.debug("Writing %s", results_summary_path)
-    atomic_write_pydantic_json(results_summary_path, summary, by_alias=True, exclude_none=True, fsync=True)
+    summary_payload = summary.model_dump(mode="json", by_alias=True, exclude_none=True)
+    # Keep the key explicit so downstream finite-window checks can distinguish null vs missing.
+    summary_payload["first_fail_iter"] = first_fail_iter
+    atomic_write_json(results_summary_path, summary_payload, fsync=True)
+
+    first_fail_iter_path = outdir / "first_fail_iter.txt"
+    if first_fail_iter is None:
+        if first_fail_iter_path.exists():
+            first_fail_iter_path.unlink()
+    else:
+        atomic_write_text(first_fail_iter_path, f"{int(first_fail_iter)}\n", fsync=True)
 
     logger.info("Artifacts generated successfully (final_decision=%s)", final_decision)
 

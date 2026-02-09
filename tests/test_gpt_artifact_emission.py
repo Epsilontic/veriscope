@@ -8,7 +8,11 @@ from pathlib import Path
 import pytest
 
 from veriscope.core.jsonutil import canonical_json_sha256
-from veriscope.runners.gpt.emit_artifacts import emit_gpt_artifacts_v1
+from veriscope.runners.gpt.emit_artifacts import (
+    _first_fail_iter_from_events,
+    _flatten_gate_events,
+    emit_gpt_artifacts_v1,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -93,6 +97,7 @@ def test_emit_gpt_artifacts_writes_and_validates(tmp_path: Path) -> None:
     assert summary.counts.pass_ == 1
     assert summary.counts.warn == 0
     assert summary.counts.fail == 0
+    assert summary.first_fail_iter is None
 
     # timestamp serialization policy (naive treated as UTC)
     assert res.started_ts_utc == datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
@@ -300,5 +305,156 @@ def test_emit_rejects_non_monotonic_gate_iterations(tmp_path: Path) -> None:
             gate_history=[
                 {"iter": 16, "audit": {"evaluated": False, "reason": "not_evaluated", "policy": "either"}},
                 {"iter": 8, "audit": {"evaluated": False, "reason": "not_evaluated", "policy": "either"}},
+            ],
+        )
+
+
+def test_first_fail_iter_extractor_handles_heterogeneous_events() -> None:
+    events: list[object] = [
+        "noise",
+        ["non-object"],
+        None,
+        {"decision": "warn", "iter": 900},
+        {"decision": "fail", "audit": {"iter": "940"}},  # ignored (iter must be int)
+        {"audit": {"final_decision": "fail", "step": "945"}},  # ignored (step must be int)
+        {"audit": {"decision": "fail", "iter": 975}},
+        {"decision": "fail", "iter": 950},
+    ]
+    assert _first_fail_iter_from_events(_flatten_gate_events(events)) == 950
+
+
+def test_flatten_gate_events_unwraps_nested_gates() -> None:
+    from veriscope.runners.gpt.emit_artifacts import _flatten_gate_events
+
+    flat = [{"iter": 1, "decision": "pass"}, {"iter": 2, "decision": "fail"}]
+    assert _flatten_gate_events(flat) == flat
+
+    wrapped = [{"gates": [{"iter": 3, "decision": "pass"}]}, {"iter": 4, "decision": "warn"}]
+    assert _flatten_gate_events(wrapped) == [{"iter": 3, "decision": "pass"}, {"iter": 4, "decision": "warn"}]
+
+    top_level = {"gates": [{"iter": 5, "decision": "fail"}]}
+    assert _flatten_gate_events(top_level) == [{"iter": 5, "decision": "fail"}]
+
+
+@pytest.mark.parametrize(
+    ("gate_history", "expected_first_fail_iter"),
+    [
+        (
+            [
+                {
+                    "iter": 900,
+                    "decision": "pass",
+                    "audit": {
+                        "evaluated": True,
+                        "reason": "evaluated_ok",
+                        "policy": "either",
+                        "per_metric_tv": {},
+                        "evidence_total": 16,
+                        "min_evidence": 16,
+                    },
+                },
+                {
+                    "iter": 950,
+                    "audit": {
+                        "decision": "fail",
+                        "evaluated": True,
+                        "reason": "evaluated_fail",
+                        "policy": "either",
+                        "per_metric_tv": {"m1": 0.12},
+                        "evidence_total": 16,
+                        "min_evidence": 16,
+                    },
+                },
+            ],
+            950,
+        ),
+        (
+            [
+                {
+                    "iter": 900,
+                    "decision": "pass",
+                    "audit": {
+                        "evaluated": True,
+                        "reason": "evaluated_ok",
+                        "policy": "either",
+                        "per_metric_tv": {},
+                        "evidence_total": 16,
+                        "min_evidence": 16,
+                    },
+                },
+                {
+                    "iter": 950,
+                    "decision": "skip",
+                    "audit": {
+                        "evaluated": False,
+                        "reason": "insufficient_evidence",
+                        "policy": "either",
+                        "per_metric_tv": {},
+                    },
+                },
+            ],
+            None,
+        ),
+    ],
+)
+def test_emit_first_fail_iter_summary_and_marker_file(
+    tmp_path: Path,
+    gate_history: list[dict[str, object]],
+    expected_first_fail_iter: int | None,
+) -> None:
+    outdir = tmp_path / "out_first_fail"
+    outdir.mkdir(parents=True, exist_ok=True)
+    marker_path = outdir / "first_fail_iter.txt"
+    marker_path.write_text("stale\n", encoding="utf-8")
+
+    emit_gpt_artifacts_v1(
+        outdir=outdir,
+        run_id="run_test_first_fail_iter",
+        started_ts_utc=datetime(2026, 1, 1, 0, 0, 0),
+        ended_ts_utc=datetime(2026, 1, 1, 0, 1, 0),
+        gate_preset="tuned_v0",
+        overrides=None,
+        resolved_gate_cfg={"gate_window": 16, "min_evidence": 16, "gate_epsilon": 0.08},
+        metric_interval=16,
+        metric_pipeline={"transport": "DeclTransport"},
+        gate_history=gate_history,
+    )
+
+    summary_obj = json.loads((outdir / "results_summary.json").read_text(encoding="utf-8"))
+    assert "first_fail_iter" in summary_obj
+    assert summary_obj["first_fail_iter"] == expected_first_fail_iter
+
+    if expected_first_fail_iter is None:
+        assert not marker_path.exists()
+    else:
+        assert marker_path.exists()
+        assert marker_path.read_text(encoding="utf-8") == f"{expected_first_fail_iter}\n"
+
+
+def test_emit_raises_when_fail_count_present_but_first_fail_iter_missing(tmp_path: Path) -> None:
+    outdir = tmp_path / "out_bad_first_fail_iter"
+    with pytest.raises(ValueError, match=r"counts\.fail > 0"):
+        emit_gpt_artifacts_v1(
+            outdir=outdir,
+            run_id="run_test_missing_first_fail_iter",
+            started_ts_utc=datetime(2026, 1, 1, 0, 0, 0),
+            ended_ts_utc=None,
+            gate_preset="tuned_v0",
+            overrides=None,
+            resolved_gate_cfg={"gate_window": 16, "min_evidence": 16, "gate_epsilon": 0.08},
+            gate_history=[
+                {
+                    # Coercible by _get_event_iter -> counts.fail > 0, but extractor ignores non-int raw iter.
+                    "iter": "950",
+                    "decision": "fail",
+                    "audit": {
+                        "evaluated": True,
+                        "reason": "evaluated_fail",
+                        "policy": "either",
+                        "per_metric_tv": {"m1": 0.2},
+                        "evidence_total": 16,
+                        "min_evidence": 16,
+                    },
+                }
             ],
         )

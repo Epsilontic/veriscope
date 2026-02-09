@@ -325,6 +325,7 @@ class CountsV1(VSModel):
 class ResultsSummaryV1(_ResultsHeaderV1):
     counts: CountsV1
     final_decision: Decision
+    first_fail_iter: Optional[NonNegInt] = None
 
 
 class ManualJudgementV1(VSModel):

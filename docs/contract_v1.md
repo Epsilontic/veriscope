@@ -18,6 +18,7 @@ without breaking this contract, but new semantics must be documented here first.
 
 **Recommended:**
 - `run_config_resolved.json`
+- `first_fail_iter.txt` (present when `results_summary.first_fail_iter` is non-null; integer with trailing newline)
 
 **Governance artifacts (optional, append-only unless noted):**
 - `manual_judgement.json` (snapshot overlay)
@@ -99,6 +100,15 @@ Semantics:
 | **Manual overlay** | Last valid `manual_judgement.jsonl` entry matching run_id; else `manual_judgement.json` if valid and matching run_id; else none. |
 | **Displayed Final Status** | Manual overlay if present; else automated outcome. |
 | **Comparisons** | If partial: compare only header-level fields + overlay; never compare counts/gates. If non-partial: compare counts + decisions + overlay, but only when `Comparable(A,B)` holds. |
+
+## Optional Summary Diagnostics
+
+`results_summary.json` may include optional diagnostics for downstream automation:
+- `first_fail_iter`: integer iteration of the earliest fail gate, or `null` when no fail occurred.
+
+Finite-window invariant:
+- If `counts.fail > 0`, `first_fail_iter` must be an integer.
+- If `counts.fail == 0`, `first_fail_iter` must be `null`.
 
 ## Comparable(A,B)
 
