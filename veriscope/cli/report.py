@@ -408,7 +408,7 @@ def render_report_compare(
             allow_partial=True,
             strict_identity=True,
             allow_missing_governance=True,
-            allow_invalid_governance=True,
+            allow_invalid_governance=False,
         )
         if not v.ok:
             return ReportCompareOutput(exit_code=2, stdout="", stderr=f"INVALID: {v.message}")

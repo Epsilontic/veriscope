@@ -39,6 +39,19 @@ def _read_json_dict(path: Path) -> dict[str, Any]:
     return obj
 
 
+def _tamper_governance_log(outdir: Path) -> None:
+    log_path = outdir / "governance_log.jsonl"
+    lines = log_path.read_text(encoding="utf-8").splitlines()
+    if not lines:
+        raise AssertionError("governance_log.jsonl unexpectedly empty")
+    first = json.loads(lines[0])
+    payload = first.get("payload")
+    if isinstance(payload, dict):
+        payload["run_id"] = "tampered"
+    lines[0] = json.dumps(first, sort_keys=True)
+    log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def _minimal_window_signature() -> dict[str, Any]:
     return {
         "schema_version": 1,
@@ -224,6 +237,18 @@ def test_report_compare_rejects_intra_capsule_identity_mismatch(tmp_path: Path) 
     assert "ARTIFACT_IDENTITY_MISMATCH" in result.stderr
 
 
+def test_report_compare_rejects_invalid_governance(tmp_path: Path) -> None:
+    outdir_a = tmp_path / "run_a"
+    outdir_b = tmp_path / "run_b"
+    _make_minimal_artifacts(outdir_a, run_id="run_a")
+    _make_minimal_artifacts(outdir_b, run_id="run_b")
+    _tamper_governance_log(outdir_b)
+
+    result = render_report_compare([outdir_a, outdir_b], fmt="text")
+    assert result.exit_code == 2
+    assert "governance_log.jsonl invalid" in result.stderr
+
+
 def test_comparable_rejects_schema_mismatch(tmp_path: Path) -> None:
     outdir_a = tmp_path / "run_a"
     outdir_b = tmp_path / "run_b"
@@ -297,7 +322,36 @@ def test_comparable_rejects_missing_window_hash(tmp_path: Path) -> None:
     assert reason == "WINDOW_HASH_MISSING"
 
 
-def test_diff_partial_emits_note(tmp_path: Path) -> None:
+def test_comparable_rejects_partial_capsules(tmp_path: Path) -> None:
+    outdir_a = tmp_path / "run_a"
+    outdir_b = tmp_path / "run_b"
+    _make_minimal_artifacts(outdir_a, run_id="run_a")
+    _make_minimal_artifacts(outdir_b, run_id="run_b")
+
+    (outdir_b / "results.json").unlink()
+    marker_path = outdir_b / "first_fail_iter.txt"
+    if marker_path.exists():
+        marker_path.unlink()
+    summ_path = outdir_b / "results_summary.json"
+    summ_obj = _read_json_dict(summ_path)
+    summ_obj["partial"] = True
+    summ_obj["counts"] = {"evaluated": 0, "skip": 0, "pass": 0, "warn": 0, "fail": 0}
+    summ_obj["final_decision"] = "skip"
+    summ_obj["first_fail_iter"] = None
+    _write_json(summ_path, summ_obj)
+
+    v_a = validate_outdir(outdir_a, allow_partial=True)
+    v_b = validate_outdir(outdir_b, allow_partial=True)
+    assert v_b.ok, v_b.message
+    run_a = load_run_metadata(outdir_a, v_a, prefer_jsonl=True)
+    run_b = load_run_metadata(outdir_b, v_b, prefer_jsonl=True)
+
+    result = comparable_explain(run_a, run_b)
+    assert not result.ok
+    assert result.reason == "PARTIAL_CAPSULE"
+
+
+def test_diff_rejects_partial_capsule(tmp_path: Path) -> None:
     outdir_a = tmp_path / "run_a"
     outdir_b = tmp_path / "run_b"
     _make_minimal_artifacts(outdir_a, run_id="run_a")
@@ -307,12 +361,14 @@ def test_diff_partial_emits_note(tmp_path: Path) -> None:
     summ_path = outdir_b / "results_summary.json"
     summ_obj = _read_json_dict(summ_path)
     summ_obj["partial"] = True
+    summ_obj["counts"] = {"evaluated": 0, "skip": 0, "pass": 0, "warn": 0, "fail": 0}
+    summ_obj["final_decision"] = "skip"
+    summ_obj["first_fail_iter"] = None
     _write_json(summ_path, summ_obj)
 
     result = diff_outdirs(outdir_a, outdir_b)
-    assert result.exit_code == 0
-    assert "NOTE:PARTIAL_MODE decision-only" in result.stdout
-    assert "counts_differs" not in result.stdout
+    assert result.exit_code == 2
+    assert "PARTIAL_CAPSULE" in result.stderr
 
 
 def test_diff_prefers_jsonl_manual_judgement(tmp_path: Path) -> None:

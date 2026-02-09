@@ -142,6 +142,22 @@ def comparable_explain(
 ) -> ComparableResult:
     policy = {"allow_gate_preset_mismatch": allow_gate_preset_mismatch}
 
+    if a.partial or b.partial:
+        return ComparableResult(
+            ok=False,
+            reason="PARTIAL_CAPSULE",
+            details={
+                "partial": {
+                    "expected": False,
+                    "got": {
+                        "run_a": bool(a.partial),
+                        "run_b": bool(b.partial),
+                    },
+                }
+            },
+            warnings=tuple(),
+            policy=policy,
+        )
     if not a.window_signature_hash or not b.window_signature_hash:
         return ComparableResult(
             ok=False,

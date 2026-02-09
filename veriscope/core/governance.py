@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, List, Optional
 
-from veriscope.core.artifacts import derive_gate_decision
+from veriscope.core.artifacts import AuditV1, derive_gate_decision
 from veriscope.core.ddp import ddp_is_active, ddp_rank, ddp_world_size
 from veriscope.core.jsonutil import atomic_append_jsonl, canonical_json_sha256, sanitize_json_value
 
@@ -196,6 +196,7 @@ def _validate_required_payload_fields(event: str, payload: dict[str, Any], *, li
 
     if event == "gate_decision_v1":
         decision = payload.get("decision")
+        decision_norm: Optional[str] = None
         if isinstance(decision, str):
             decision_norm = decision.strip().lower()
             if decision_norm not in {"pass", "warn", "fail", "skip"}:
@@ -204,8 +205,23 @@ def _validate_required_payload_fields(event: str, payload: dict[str, Any], *, li
             invalid.append("ok")
         if "warn" in payload and not isinstance(payload.get("warn"), bool):
             invalid.append("warn")
+        audit_obj = payload.get("audit")
+        if isinstance(audit_obj, dict):
+            if "per_metric_tv" not in audit_obj:
+                invalid.append("audit.per_metric_tv")
+            try:
+                audit_model = AuditV1.model_validate(audit_obj)
+            except Exception:
+                invalid.append("audit")
+            else:
+                if decision_norm == "skip" and bool(audit_model.evaluated):
+                    invalid.append("audit.evaluated")
+                if decision_norm in {"pass", "warn", "fail"} and (not bool(audit_model.evaluated)):
+                    invalid.append("audit.evaluated")
 
     if missing or invalid:
+        missing = sorted(set(missing))
+        invalid = sorted(set(invalid))
         return _warn_governance_payload_required_fields(
             line_no,
             event=event,
@@ -475,6 +491,15 @@ def _append_governance_entry(outdir: Path, entry: dict[str, Any]) -> tuple[Path,
         raise ValueError("governance entry must not include both event and event_type")
     if not has_event and not has_event_type:
         raise ValueError("governance entry must include event or event_type")
+
+    event_name = entry.get("event") if has_event else entry.get("event_type")
+    payload_obj = entry.get("payload")
+    if not isinstance(payload_obj, dict):
+        raise ValueError("payload missing or invalid for governance entry append")
+    if isinstance(event_name, str):
+        payload_warning = _validate_required_payload_fields(event_name, payload_obj, line_no=0)
+        if payload_warning is not None:
+            raise ValueError(payload_warning.replace("WARNING:GOVERNANCE_LOG_INVALID line=0 ", ""))
 
     ts_utc = entry.get("ts_utc")
     if not isinstance(ts_utc, str):

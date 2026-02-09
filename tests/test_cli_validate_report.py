@@ -518,7 +518,11 @@ def test_partial_summary_allows_report_without_results(minimal_artifact_dir: Pat
     summ_path = minimal_artifact_dir / "results_summary.json"
     summ_obj = _read_json_dict(summ_path)
     summ_obj["partial"] = True
+    summ_obj["counts"] = {"evaluated": 0, "skip": 0, "pass": 0, "warn": 0, "fail": 0}
+    summ_obj["final_decision"] = "skip"
+    summ_obj["first_fail_iter"] = None
     _write_json(summ_path, summ_obj)
+    (minimal_artifact_dir / "first_fail_iter.txt").unlink(missing_ok=True)
 
     v = validate_outdir(minimal_artifact_dir, allow_partial=True)
     assert v.ok, v.message
@@ -531,3 +535,31 @@ def test_partial_summary_allows_report_without_results(minimal_artifact_dir: Pat
     txt = render_report_md(minimal_artifact_dir, fmt="text")
     assert "Gate Preset: test" in txt
     assert "Started:" in txt
+
+
+def test_partial_summary_rejects_non_neutral_counts_without_results(minimal_artifact_dir: Path) -> None:
+    (minimal_artifact_dir / "results.json").unlink()
+    summ_path = minimal_artifact_dir / "results_summary.json"
+    summ_obj = _read_json_dict(summ_path)
+    summ_obj["partial"] = True
+    _write_json(summ_path, summ_obj)
+
+    v = validate_outdir(minimal_artifact_dir, allow_partial=True)
+    assert not v.ok
+    assert "requires neutral summary counts" in v.message
+
+
+def test_validate_rejects_stale_first_fail_marker_when_fail_zero(minimal_artifact_dir: Path) -> None:
+    (minimal_artifact_dir / "results.json").unlink()
+    summ_path = minimal_artifact_dir / "results_summary.json"
+    summ_obj = _read_json_dict(summ_path)
+    summ_obj["partial"] = True
+    summ_obj["counts"] = {"evaluated": 0, "skip": 0, "pass": 0, "warn": 0, "fail": 0}
+    summ_obj["final_decision"] = "skip"
+    summ_obj["first_fail_iter"] = None
+    _write_json(summ_path, summ_obj)
+    (minimal_artifact_dir / "first_fail_iter.txt").write_text("950\n", encoding="utf-8")
+
+    v = validate_outdir(minimal_artifact_dir, allow_partial=True)
+    assert not v.ok
+    assert "counts.fail == 0 but first_fail_iter.txt must be absent" in v.message

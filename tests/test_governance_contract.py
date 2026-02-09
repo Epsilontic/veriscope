@@ -268,6 +268,55 @@ def test_governance_log_rejects_missing_run_started_required_payload_fields(tmp_
     assert not any("GOVERNANCE_LOG_PREV_HASH_MISMATCH" in warn for warn in validation.warnings)
 
 
+def test_append_run_started_rejects_missing_window_signature_hash(tmp_path: Path) -> None:
+    outdir = tmp_path / "run"
+    ts_0 = _iso_z(datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc))
+    with pytest.raises(ValueError, match="payload_required_fields event=run_started_v1"):
+        append_run_started(
+            outdir,
+            run_id="run",
+            outdir_path=outdir,
+            argv=["pytest", "governance_fixture"],
+            code_identity={"package_version": "test"},
+            window_signature_ref={"path": "window_signature.json"},
+            entrypoint={"kind": "runner", "name": "tests.governance_fixture"},
+            ts_utc=ts_0,
+        )
+    assert not (outdir / "governance_log.jsonl").exists()
+
+
+def test_governance_log_rejects_invalid_gate_decision_nested_audit(tmp_path: Path) -> None:
+    outdir = tmp_path / "out"
+    outdir.mkdir()
+    log_path = outdir / "governance_log.jsonl"
+    entry = {
+        "schema_version": 1,
+        "rev": 1,
+        "ts_utc": "2026-01-01T00:00:00Z",
+        "actor": "tester",
+        "event": "gate_decision_v1",
+        "payload": {
+            "run_id": "run",
+            "outdir": str(outdir),
+            "iter": 10,
+            "decision": "pass",
+            "ok": True,
+            "warn": False,
+            "audit": {
+                "evaluated": True,
+                "per_metric_tv": {},
+            },
+        },
+        "prev_hash": None,
+    }
+    entry["entry_hash"] = governance_entry_hash(entry)
+    log_path.write_text(json.dumps(entry, sort_keys=True) + "\n", encoding="utf-8")
+
+    validation = validate_governance_log(log_path, allow_legacy_governance=True)
+    assert not validation.ok
+    assert any("payload_required_fields event=gate_decision_v1" in err for err in validation.errors)
+
+
 def test_run_started_distributed_payload_is_optional(tmp_path: Path) -> None:
     outdir = tmp_path / "run"
     ts_0 = _iso_z(datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc))

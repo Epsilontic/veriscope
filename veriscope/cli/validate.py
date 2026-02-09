@@ -345,15 +345,60 @@ def validate_outdir(
         )
 
     summary_partial = bool(getattr(summ, "partial", False))
-    if res is None and allow_partial and not summary_partial:
-        return ValidationResult(
-            False,
-            "results.json missing but results_summary.json is not marked partial=true",
-            window_signature_hash=ws_hash,
-            partial=False,
-            warnings=identity_warnings,
-            errors=identity_errors,
-        )
+    if res is None and allow_partial:
+        if not summary_partial:
+            return ValidationResult(
+                False,
+                "results.json missing but results_summary.json is not marked partial=true",
+                window_signature_hash=ws_hash,
+                partial=False,
+                warnings=identity_warnings,
+                errors=identity_errors,
+            )
+
+        partial_counts = {
+            "evaluated": int(summ.counts.evaluated),
+            "skip": int(summ.counts.skip),
+            "pass": int(summ.counts.pass_),
+            "warn": int(summ.counts.warn),
+            "fail": int(summ.counts.fail),
+        }
+        if any(value != 0 for value in partial_counts.values()):
+            return ValidationResult(
+                False,
+                (
+                    "results.json missing with partial=true requires neutral summary counts: "
+                    f"counts={partial_counts}"
+                ),
+                window_signature_hash=ws_hash,
+                partial=True,
+                warnings=identity_warnings,
+                errors=identity_errors,
+            )
+        if str(summ.final_decision) != "skip":
+            return ValidationResult(
+                False,
+                (
+                    "results.json missing with partial=true requires final_decision='skip': "
+                    f"final_decision={summ.final_decision!r}"
+                ),
+                window_signature_hash=ws_hash,
+                partial=True,
+                warnings=identity_warnings,
+                errors=identity_errors,
+            )
+        if summ.first_fail_iter is not None:
+            return ValidationResult(
+                False,
+                (
+                    "results.json missing with partial=true requires first_fail_iter=null: "
+                    f"first_fail_iter={summ.first_fail_iter!r}"
+                ),
+                window_signature_hash=ws_hash,
+                partial=True,
+                warnings=identity_warnings,
+                errors=identity_errors,
+            )
 
     if res is not None:
         derived_counts, derived_first_fail_iter = _derive_counts_and_first_fail(res)
@@ -389,8 +434,8 @@ def validate_outdir(
                 errors=identity_errors,
             )
 
+    marker_path = outdir / "first_fail_iter.txt"
     if int(summ.counts.fail) > 0:
-        marker_path = outdir / "first_fail_iter.txt"
         if not marker_path.exists():
             return ValidationResult(
                 False,
@@ -433,6 +478,15 @@ def validate_outdir(
                 warnings=identity_warnings,
                 errors=identity_errors,
             )
+    elif marker_path.exists():
+        return ValidationResult(
+            False,
+            "counts.fail == 0 but first_fail_iter.txt must be absent",
+            window_signature_hash=ws_hash,
+            partial=False,
+            warnings=identity_warnings,
+            errors=identity_errors,
+        )
 
     warnings = list(identity_warnings)
     errors = list(identity_errors)
