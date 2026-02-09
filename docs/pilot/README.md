@@ -15,6 +15,7 @@ Measured on `gate_preset=tuned_v0` with control + injected runs:
 - At minimum (non-partial capsules): `results.json`, `results_summary.json`, `window_signature.json`
 - For partial capsules: `window_signature.json` + `results_summary.json` with `partial=true`
 - `run_config_resolved.json` is recommended for reproducibility context
+- If you plan to run `veriscope diff` or `veriscope report --compare`, include a valid `governance_log.jsonl`; compare mode rejects missing/invalid governance and rejects `partial=true` capsules.
 
 ## Redaction policy (write-time enforced)
 Provenance capture applies allowlist/denylist redaction **at write time** when emitting `run_config_resolved.json`, so redaction is enforced at the boundary, not as a post-run scan. See `veriscope/core/redaction_policy.py` for the shared policy and `veriscope/cli/main.py` for the write-time sanitizer.

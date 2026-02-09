@@ -275,6 +275,10 @@ Compare multiple capsules:
 veriscope report --compare OUTDIR_A OUTDIR_B --format md
 ```
 
+Comparison notes:
+- `veriscope diff` and `veriscope report --compare` require a valid `governance_log.jsonl` in every compared OUTDIR; missing or invalid governance fails the command.
+- Capsules marked `partial=true` are not comparable and are rejected by both `diff` and `report --compare`.
+
 ---
 
 ## Pilot kit overview
@@ -454,6 +458,9 @@ Terminology:
 - **Partial capsules (required):**
   - `window_signature.json`
   - `results_summary.json` with `partial=true`
+- **Fail-marker invariant (enforced):**
+  - `results_summary.first_fail_iter` is required when `counts.fail > 0`, and must be `null` when `counts.fail == 0`.
+  - `first_fail_iter.txt` must exist iff `results_summary.first_fail_iter` is non-null.
 - **Recommended:**
   - `run_config_resolved.json`
 - **Optional governance / overlays (append-only; do not mutate raw artifacts):**

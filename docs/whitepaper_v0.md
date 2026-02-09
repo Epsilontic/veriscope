@@ -105,6 +105,9 @@ The repo emits additional fields that are not part of the contract spine, but ar
 - `manual_judgement.jsonl` (append-only)
 - `governance_log.jsonl` (append-only, hash-chained)
 
+Operational compare note:
+- `veriscope diff` and `veriscope report --compare` require valid `governance_log.jsonl` in each compared capsule; missing/invalid governance causes failure.
+
 ### 4.2 Operational “golden path” note: `run_config_resolved.json`
 
 The frozen contract calls `run_config_resolved.json` **recommended**. The v0 operational guide and pilot harness treat it as operationally expected for provenance, determinism reporting, warmup/cadence visibility, and scoring convenience. This document follows the contract for interop (recommended) while acknowledging ops/pilot expectations in practice.
@@ -141,7 +144,7 @@ This is the contract’s **MUST** form for canonicalization used in hashing/veri
 
 `window_signature_ref.hash` is SHA256 over canonical JSON after removing the volatile fields used by the writer/verifier (the contract gives examples).
 
-**Veriscope v0 behavior (current):** hashing strips `created_ts_utc` (and only that key) as volatile.
+**Veriscope v0 behavior (current):** hashing strips `created_ts_utc` (and only that key) as volatile **only when it is a valid ISO8601 UTC string with trailing `Z`**; invalid values fail validation.
 **Contract posture:** the contract describes volatile stripping by example (e.g., `created_ts_utc`), and the volatile set may expand; downstream verifiers must apply the same volatile-set rule as the writer/verifier for interoperable recomputation.
 
 ### 5.3 Verification rule (avoid the self-reference trap)
@@ -157,20 +160,22 @@ When validating or comparing, consumers **must recompute** the canonical hash fr
 Two capsules are comparable if they meet the contract’s explicit predicate, at minimum:
 
 - `schema_version == 1`,
+- both capsules are non-partial,
 - matching recomputed `window_signature_ref.hash`,
-- matching **`profile.gate_preset`** (the gate preset identity recorded in `results_summary.json` / `results.json`, often referred to as `gate_preset`) unless a diff flag explicitly permits a preset mismatch (`--allow-gate-preset-mismatch`).
+- matching **`profile.gate_preset`** (the gate preset identity recorded in `results_summary.json` / `results.json`, often referred to as `gate_preset`) unless a diff flag explicitly permits a preset mismatch (`--allow-gate-preset-mismatch`),
+- valid governance logs for compared capsules.
 
 **Note on “preset in two places.”** `window_signature.json.gates.preset` is identity-defining because it is inside the hashed window signature spine. Separately, the contract’s explicit comparability predicate checks the *results/profile* field (`profile.gate_preset`) unless mismatch is explicitly allowed. Typically these align (`profile.gate_preset == window_signature.gates.preset`), but consumers should treat the profile value as the explicit comparability gate per contract.
 
-### 6.2 Partial capsules: comparison precedence rule
+### 6.2 Partial capsules: compare-mode rejection rule
 
 Partial mode exists to support workflows where full per-gate evidence is unavailable. In partial mode:
 
-- comparisons are restricted to signature/header-level identity and overlays,
-- **counts and gate-by-gate sequences must not be compared** (because the full evidence stream may be absent or incomplete),
-- governance overlays can be surfaced but must be treated as overlays, not replacement evidence.
+- `veriscope diff` rejects the comparison (`PARTIAL_CAPSULE`),
+- `veriscope report --compare` rejects the comparison input,
+- single-capsule `veriscope report OUTDIR` can still render the capsule as a standalone report.
 
-This is exactly the contract’s precedence rule for comparisons in partial mode.
+This preserves neutral handling for partial evidence without allowing cross-run comparability claims.
 
 ---
 
@@ -191,7 +196,7 @@ The CLI provides:
 **Contract v1 public meanings**
 - `validate`: `0` valid, `2` invalid
 - `report`: `0` ok, `2` failed
-- `diff`: `0` comparable, `2` incomparable
+- `diff`: `0` comparable, `2` incomparable/invalid (including missing/invalid governance or partial capsules)
 
 **Operational semantics (productization guide)**
 - exit code `3` is reserved for **internal error** class conditions (including internal-error codepaths in validate/report),
@@ -288,7 +293,7 @@ The pilot kit also states **pilot success criteria** for these metrics (not prod
 
 ## 12. Reporting
 
-`veriscope report` renders capsules into text/Markdown summaries suitable for sharing alongside machine-readable artifacts. Reporting may optionally incorporate comparison behavior, but comparisons are bounded by the contract’s comparability constraints and the partial-mode precedence rule.
+`veriscope report` renders capsules into text/Markdown summaries suitable for sharing alongside machine-readable artifacts. `report --compare` additionally enforces comparability preconditions, valid governance logs, and non-partial inputs.
 
 ---
 
@@ -341,7 +346,7 @@ Veriscope is **AGPL-3.0-only unless you have a commercial license**. See `LICENS
 
 - Treat `skip` as “no decision,” not “safe.”
 - Validate capsules before ingestion or diffing.
-- In partial mode, restrict comparisons to signature/header-level identity and overlays.
+- Treat partial capsules as non-comparable in `diff`/`report --compare`.
 - Handle exit code `3` as an internal-error class distinct from invalid capsules (`2`).
 
 ---

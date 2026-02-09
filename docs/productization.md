@@ -134,33 +134,46 @@ Notes (HF runner)
 
 2.3 veriscope validate OUTDIR (new)
 
-veriscope validate OUTDIR [--strict-version]
+veriscope validate OUTDIR \
+  [--strict-governance] \
+  [--require-governance] \
+  [--strict-identity] \
+  [--allow-legacy-governance]
 
 Validates:
 	•	schema correctness (required keys + types; extra keys allowed)
 	•	cross-artifact compatibility, at minimum:
 	•	run_id matches across artifacts
-	•	results.json.window_signature_ref.hash == window_signature.json.hash
-	•	results_summary.json.window_signature_ref.hash == window_signature.json.hash
-	•	schema versions compatible (see below)
+	•	results.json.window_signature_ref.hash and results_summary.json.window_signature_ref.hash must match the recomputed canonical hash of `window_signature.json`
+	•	`window_signature.created_ts_utc` is excluded from hashing only when it is a valid ISO8601 UTC timestamp string (trailing `Z`)
+	•	results_summary counts must match gate decisions when results.json is present
+	•	`first_fail_iter` is required when `counts.fail > 0`, and must be null when `counts.fail == 0`
+	•	`first_fail_iter.txt` must exist iff `first_fail_iter` is non-null
+	•	if run-governance events exist, governance payload `run_id` and `outdir` must match artifacts
+	•	schema_version=1 (v0/v1 contract)
 
-Validation fails if a *.tmp file is present alongside an expected final artifact (indicates interrupted atomic rename).
+Validation is read-only and does not mutate artifacts.
 
 Schema compatibility rule:
-	•	Validators accept schema_version ∈ {CURRENT, CURRENT-1}.
-	•	For v0, CURRENT=1, so only schema_version=1 is accepted.
-	•	In v0, --strict-version is a no-op (identical behavior), included for forward compatibility.
+	•	For v0, only `schema_version=1` is accepted.
 
 ⸻
 
-2.4 veriscope report OUTDIR (new; Markdown-first)
+2.4 veriscope report OUTDIR (single-capsule + compare modes)
 
 veriscope report OUTDIR \
-  [--control] \
-  [--spike-start I --spike-len L] \
   [--format md|text]
 
-Requirement: Markdown is the default output.
+veriscope report --compare OUTDIR_A OUTDIR_B [OUTDIR_N ...] \
+  [--format text|md|json] \
+  [--allow-incompatible] \
+  [--allow-gate-preset-mismatch]
+
+Compare-mode constraints (enforced):
+	•	each OUTDIR must contain a valid `governance_log.jsonl` (missing/invalid governance fails compare mode)
+	•	partial capsules (`partial=true`) are non-comparable and are rejected by `diff` and `report --compare`
+
+Default output is text; Markdown is available with `--format md`.
 
 Minimum report skeleton (stable for goldens):
 	1.	# Veriscope Report: <OUTDIR>
@@ -173,12 +186,10 @@ Minimum report skeleton (stable for goldens):
 	•	Started / Ended
 	•	Window Signature hash
 	3.	## Gate Summary table (Evaluated / SKIP / WARN / FAIL counts)
-	4.	Conditional sections:
-	•	## False Alarm Rate (control) (only with --control in v0)
-	•	## Detection (spike) (only with --spike-start/--spike-len)
-	•	## Overhead (only if timing fields exist)
+	4.	Conditional section:
+	•	## Manual Judgement (only when manual overlays exist)
 	5.	## Artifacts table (relative paths from OUTDIR)
-	6.	## Manual Judgement if manual_judgement.json exists
+	6.	## Governance summary (log present/validity/rev)
 
 Appendix A provides a golden reference.
 
@@ -241,18 +252,31 @@ Code	Meaning
 2	cannot report due to invalid/missing artifacts
 3	veriscope internal error
 
+veriscope diff / veriscope report --compare
+
+Code	Meaning
+0	comparison rendered (or incompatible runs included when `--allow-incompatible` is set for report compare)
+2	incompatible/invalid inputs, including missing or invalid governance logs, or partial capsules
+
 
 ⸻
 
 3) Artifacts emitted (v0, regular JSON)
 
-Required artifacts
-	•	OUTDIR/run_config_resolved.json (v1)
+Required artifacts (non-partial capsules)
 	•	OUTDIR/window_signature.json (v1)
 	•	OUTDIR/results.json (v1; detailed; includes gates[]; written atomically)
 	•	OUTDIR/results_summary.json (v1; compiled summary; written atomically)
 
+Required artifacts (partial capsules)
+	•	OUTDIR/window_signature.json (v1)
+	•	OUTDIR/results_summary.json (v1) with `partial=true`
+
+Conditionally required artifact
+	•	OUTDIR/first_fail_iter.txt (must exist iff `results_summary.first_fail_iter` is non-null)
+
 Recommended artifacts (best-effort; must not block runs)
+	•	OUTDIR/run_config_resolved.json (v1)
 	•	OUTDIR/runner_output.log (captured stdout/stderr)
 	•	OUTDIR/environment.txt (dependency + platform capture; best effort)
 
@@ -326,22 +350,20 @@ Minimum content of environment.txt (best effort):
 
 Purpose: compatibility key.
 
-Required keys:
-	•	schema_version: 1
-	•	hash: str (SHA256 canonical JSON)
-	•	code_identity: { git_sha: str | null, package_version: str }
-	•	window_decl_identity: { hash: str, metrics: list[str], weights: object, bins: int, cal_ranges?: object, epsilon?: float }
-	•	transport_identity: { name: str, params: object, hash: str }
-	•	gate_controls_hash: str
+Contract posture:
+	•	`window_signature.json` is hashed as an opaque JSON object (after volatile-key handling); comparisons use `results*.window_signature_ref.hash`.
+	•	Extra keys are allowed.
+	•	Current runners commonly emit fields like `schema_version`, `created_ts_utc`, `transport`, `evidence`, `gates`, and runner metadata.
 
 Canonical JSON hashing:
-	•	Canonical JSON means: json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False) encoded as UTF-8.
+	•	Canonical JSON means: json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False) encoded as UTF-8.
 	•	SHA256 is computed over that UTF-8 byte sequence.
+	•	When recomputing window-signature hash, `created_ts_utc` is excluded only if it is a valid ISO8601 UTC string with trailing `Z`; invalid values fail validation.
 	•	Sub-hashes use the same method on their respective sub-payloads.
 
 Note: v0 assumes hash production and verification are performed by the same implementation; float rendering is therefore implementation-defined within that constraint.
 
-gate_controls_hash canonicalization:
+If a runner emits `gate_controls_hash`, canonicalization is:
 	•	Hash payload is canonical JSON (sorted keys, UTF-8) of a fixed object including at least:
 	•	gate_window: int
 	•	gate_warmup_iters: int
@@ -407,9 +429,9 @@ AuditV1 required fields
 
 ⸻
 
-4D) results_summary.json (v1; compiled; authoritative for exit code)
+4D) results_summary.json (v1; compiled summary)
 
-Purpose: stable summary for pipelines; authoritative basis for veriscope run exit code.
+Purpose: stable summary for pipelines; run exit code is derived from `run_status`.
 
 Required keys:
 	•	schema_version: 1
@@ -421,8 +443,9 @@ Required keys:
 	•	runner_signal: str | null
 	•	started_ts_utc: str
 	•	ended_ts_utc: str | null
-	•	counts: { evaluated: int, skip: int, warn: int, fail: int }
+	•	counts: { evaluated: int, skip: int, pass: int, warn: int, fail: int }
 	•	final_decision: "pass" | "warn" | "fail" | "skip"
+	•	first_fail_iter: int | null
 
 final_decision policy:
 	•	any fail → fail
@@ -430,10 +453,15 @@ final_decision policy:
 	•	else any pass → pass
 	•	else → skip
 
+first_fail_iter / marker invariants:
+	•	if `counts.fail > 0`, `first_fail_iter` must be an integer
+	•	if `counts.fail == 0`, `first_fail_iter` must be null
+	•	`first_fail_iter.txt` must exist iff `first_fail_iter` is non-null
+
 Run status mapping:
 	•	veriscope_failure means the wrapper failed (validation error, schema emission failure, internal exception), not the training.
 	•	If runner_exit_code != 0 and wrapper did not fail: run_status="user_code_failure".
-	•	If runner exits 0 and wrapper succeeds: run_status="success" (gate FAIL is represented via final_decision and exit code 1).
+	•	If runner exits 0 and wrapper succeeds: run_status="success" (gate FAIL is represented via final_decision; wrapper exit remains 0).
 
 ⸻
 
@@ -511,16 +539,16 @@ v1+
 	3.	Emit window_signature.json (+ gate_controls_hash canonicalization)
 	4.	Emit results.json + results_summary.json (atomic rename)
 	5.	Env allowlist + deny exact/regex redaction; environment.txt best-effort with platform info
-	6.	Pydantic schemas + veriscope validate (+ strict-version no-op in v0)
+	6.	Pydantic schemas + veriscope validate (including governance/identity switches)
 	7.	Markdown veriscope report with fixed skeleton + goldens
 	8.	Optional veriscope override + report overlay
 
 ⸻
 
-10) Top v0 pilot blockers (ranked)
+10) Top v0 pilot regression risks (ranked)
 	1.	Secrets leakage risk (env capture not allowlisted/redacted)
 	2.	Unsafe wrapper behavior (no streaming / no process-group signal forwarding / wrong exit codes)
-	3.	Missing authoritative summary/exit-code linkage (exit codes not derived from results_summary)
+	3.	Summary/run-status linkage regressions between emitted artifacts and wrapper exit behavior
 	4.	Missing decision derivation alignment (emitter/validator disagree)
 	5.	Missing schema validation + goldens (contract drift)
 

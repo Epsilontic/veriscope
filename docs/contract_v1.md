@@ -18,23 +18,26 @@ without breaking this contract, but new semantics must be documented here first.
 
 **Recommended:**
 - `run_config_resolved.json`
-- `first_fail_iter.txt` (present when `results_summary.first_fail_iter` is non-null; integer with trailing newline)
 
-**Governance artifacts (optional, append-only unless noted):**
+**Conditionally required:**
+- `first_fail_iter.txt` (MUST exist iff `results_summary.first_fail_iter` is non-null; contents must be a non-negative integer with trailing newline)
+
+**Governance artifacts (optional for single-capsule validate/report; append-only unless noted):**
 - `manual_judgement.json` (snapshot overlay)
 - `manual_judgement.jsonl` (append-only)
-- `governance_log.jsonl` (append-only, canonical governance journal; strict validators may require this when `results.json` exists)
-  - For non-partial capsules, governance logs are recommended when `results.json` is present; partial capsules may omit them.
+- `governance_log.jsonl` (append-only, canonical governance journal)
+  - `veriscope diff` and `veriscope report --compare` require this file and reject missing or invalid governance logs.
 
 ## Hashing Rules
 
 *Canonical JSON* is:
 ```
-json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
 ```
 
 Hashing requirements:
-- `window_signature_ref.hash` equals `sha256(canonical_json(window_signature.json))` with volatile keys (e.g., `created_ts_utc`) removed first.
+- `window_signature_ref.hash` equals `sha256(canonical_json(window_signature.json))` with volatile keys removed first.
+- `window_signature.created_ts_utc` is excluded from hashing only when it is a valid ISO8601 UTC timestamp string (trailing `Z`); otherwise validation fails.
 - `window_signature_ref.path` equals `"window_signature.json"`.
 - Governance log hash chaining uses:
   - `entry_hash = sha256(canonical_json(entry_without_entry_hash))`
@@ -63,8 +66,9 @@ Each line is a JSON object with:
   - `run_started_v1`: `run_id`, `outdir`, `argv`, `code_identity`, `window_signature_ref`, `entrypoint`, optional `distributed`
   - `run_overrides_applied_v1`: `run_id`, `outdir`, `overrides`, `profile`, `entrypoint`, optional `argv` (wrappers should record default-divergent `gate_preset` values here)
   - `gate_decision_v1`: `run_id`, `outdir`, `iter`, `decision`, optional `ok`/`warn`, `audit`
+- Binding invariant (enforced when run-governance events are present): governance payload `run_id`/`outdir` must match artifact identity (`results*.run_id` and capsule OUTDIR).
 - `prev_hash`: optional hash of previous entry
-- `entry_hash`: optional hash of this entry (writers MUST include; readers MAY accept missing entry_hash for legacy journals and must warn)
+- `entry_hash`: hash of this entry (required for canonical v1 journals; legacy missing `entry_hash` is only accepted in explicit legacy-validation modes)
 
 ### Distributed execution (run_started_v1 payload)
 
@@ -99,21 +103,23 @@ Semantics:
 | **Automated outcome** | `results_summary.final_decision` (always present in non-partial; may be placeholder in partial). |
 | **Manual overlay** | Last valid `manual_judgement.jsonl` entry matching run_id; else `manual_judgement.json` if valid and matching run_id; else none. |
 | **Displayed Final Status** | Manual overlay if present; else automated outcome. |
-| **Comparisons** | If partial: compare only header-level fields + overlay; never compare counts/gates. If non-partial: compare counts + decisions + overlay, but only when `Comparable(A,B)` holds. |
+| **Comparisons** | Partial capsules are non-comparable and must be rejected by `veriscope diff` and `veriscope report --compare`. Non-partial comparisons require `Comparable(A,B)` plus valid governance logs. |
 
-## Optional Summary Diagnostics
+## Summary Fail Diagnostics
 
-`results_summary.json` may include optional diagnostics for downstream automation:
+`results_summary.json` includes fail diagnostics used by validation/automation:
 - `first_fail_iter`: integer iteration of the earliest fail gate, or `null` when no fail occurred.
 
 Finite-window invariant:
 - If `counts.fail > 0`, `first_fail_iter` must be an integer.
 - If `counts.fail == 0`, `first_fail_iter` must be `null`.
+- `first_fail_iter.txt` must exist iff `first_fail_iter` is non-null.
 
 ## Comparable(A,B)
 
 Runs A and B are comparable iff:
 - `schema_version` matches (`1`).
+- both capsules are non-partial (`partial != true` and full results present).
 - `window_signature_ref.hash` matches.
 - `gate_preset` matches (unless explicitly overridden).
   - Override is via CLI flag `--allow-gate-preset-mismatch` (or equivalent API argument).
@@ -128,7 +134,7 @@ Runs A and B are comparable iff:
 |  | `2` | Invalid/missing artifacts |
 | `veriscope report` | `0` | Report rendered |
 |  | `2` | Report failed (invalid artifacts or render error) |
-| `veriscope diff` | `0` | Comparable (or warnings) |
-|  | `2` | Incomparable or invalid artifacts |
-| `veriscope report --compare` | `0` | Report rendered |
-|  | `2` | Incompatible group (unless `--allow-incompatible`) |
+| `veriscope diff` | `0` | Comparable (or warnings), with valid governance logs |
+|  | `2` | Incomparable or invalid artifacts (including missing/invalid governance or partial capsules) |
+| `veriscope report --compare` | `0` | Report rendered (or incompatible rows included when `--allow-incompatible`) |
+|  | `2` | Invalid input capsules (including missing/invalid governance or partial capsules), or incompatible group without `--allow-incompatible` |

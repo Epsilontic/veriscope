@@ -26,3 +26,6 @@ At minimum:
 - `run_config_resolved.json`
 
 If allowed, share the full OUTDIR capsule for reproducibility.
+
+## Why did compare mode fail even though report works?
+`veriscope diff` and `veriscope report --compare` are stricter than single-capsule report mode: they require valid `governance_log.jsonl` files and reject capsules marked `partial=true`.
