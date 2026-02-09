@@ -1,134 +1,126 @@
 # Veriscope Contract Completeness / Pilot-Honesty Audit (2026-02-09)
 
-## Scope and Method
-- Scope audited: artifact emission + validation + comparability + report paths for `legacy/cifar`, `gpt/nanoGPT`, `hf/transformers`.
-- Contract source: `docs/contract_v1.md`.
-- Code paths traced: `veriscope/runners/gpt/*`, `veriscope/runners/hf/*`, `veriscope/cli/validate.py`, `veriscope/cli/diff.py`, `veriscope/cli/report.py`, `veriscope/cli/main.py`, `veriscope/core/artifacts.py`, `veriscope/core/governance.py`.
-- Validation status in this environment: could not run pytest end-to-end because the available Python environments are missing `pytest`/`numpy`; syntax checks passed via `py_compile`.
+## Window W
+- Scope: artifact emission + validation + comparability + report paths for runners (`legacy/cifar`, `gpt/nanoGPT`, `hf/transformers`).
+- Goal: detect silent contract violations (missing artifacts/fields, inconsistent derivations, nullable-or-missing fields that should be concrete).
+- Method: static code-path trace + contract/schema crosswalk + targeted regression tests.
+- Environment limits: runtime test execution was blocked by missing dependencies (`pytest`, `numpy`) in available Python environments; syntax checks passed via `py_compile`.
 
-## Contract Matrix (from `docs/contract_v1.md`)
+## 1) Contract Matrix (from `docs/contract_v1.md`)
 
-### Artifacts
-| Artifact | Contract requirement | Evidence |
+### 1.1 Artifact set
+| Artifact | Contract status | Source |
 |---|---|---|
-| `window_signature.json` | Required for non-partial and partial capsules | `docs/contract_v1.md:10`, `docs/contract_v1.md:16` |
-| `results.json` | Required for non-partial capsules | `docs/contract_v1.md:12` |
-| `results_summary.json` | Required for non-partial and partial capsules; partial must have `partial=true` | `docs/contract_v1.md:13`, `docs/contract_v1.md:17` |
+| `window_signature.json` | Required (non-partial + partial) | `docs/contract_v1.md:10`, `docs/contract_v1.md:16` |
+| `results.json` | Required (non-partial) | `docs/contract_v1.md:12` |
+| `results_summary.json` | Required (non-partial + partial, with `partial=true` in partial) | `docs/contract_v1.md:13`, `docs/contract_v1.md:17` |
 | `run_config_resolved.json` | Recommended | `docs/contract_v1.md:20` |
 | `first_fail_iter.txt` | Recommended when `results_summary.first_fail_iter` is non-null | `docs/contract_v1.md:21` |
 | `manual_judgement.json` | Optional governance overlay | `docs/contract_v1.md:24` |
 | `manual_judgement.jsonl` | Optional append-only governance overlay | `docs/contract_v1.md:25` |
 | `governance_log.jsonl` | Optional append-only governance journal | `docs/contract_v1.md:26` |
 
-### Required/MUST field-level rules explicitly stated in contract doc
-| File | Required rule(s) from contract text | Evidence |
+### 1.2 Required field rules called out by contract text
+| File | Required field rules | Source |
 |---|---|---|
-| `window_signature.json` | Hash comparability root; recomputed canonical hash (excluding volatile keys) must match `window_signature_ref.hash` and path must be `window_signature.json` | `docs/contract_v1.md:37`, `docs/contract_v1.md:38` |
-| `results.json` | Contract doc requires artifact presence for non-partial capsules; explicit field spine is not fully restated in this file (implemented in schema code) | `docs/contract_v1.md:12` |
-| `results_summary.json` | `final_decision` is authoritative automated outcome; optional `first_fail_iter` obeys fail/no-fail invariant; partial capsules must be marked `partial=true` | `docs/contract_v1.md:17`, `docs/contract_v1.md:99`, `docs/contract_v1.md:106`, `docs/contract_v1.md:110` |
-| `governance_log.jsonl` | Per-line object with `schema_version`, `rev`, `ts_utc`, `event/event_type`, `payload`; hash chain semantics (`prev_hash`, `entry_hash`) | `docs/contract_v1.md:48`, `docs/contract_v1.md:53`, `docs/contract_v1.md:62`, `docs/contract_v1.md:66`, `docs/contract_v1.md:67` |
+| `window_signature.json` | Recomputed canonical hash (volatile keys removed) must match refs; ref path must be `window_signature.json` | `docs/contract_v1.md:37`, `docs/contract_v1.md:38` |
+| `results_summary.json` | `final_decision` is authoritative automated outcome; `first_fail_iter` obeys fail/no-fail invariant; partial capsule must set `partial=true` | `docs/contract_v1.md:17`, `docs/contract_v1.md:99`, `docs/contract_v1.md:106`, `docs/contract_v1.md:110` |
+| `governance_log.jsonl` | Per-entry fields (`schema_version`, `rev`, `ts_utc`, `event|event_type`, `payload`, `prev_hash`, `entry_hash`) + hash chain semantics | `docs/contract_v1.md:48`, `docs/contract_v1.md:53`, `docs/contract_v1.md:62`, `docs/contract_v1.md:66`, `docs/contract_v1.md:67` |
+| `results.json` | Required artifact in non-partial capsules; detailed wire spine enforced in schema (`ResultsV1`) | `docs/contract_v1.md:12`, `veriscope/core/artifacts.py:289` |
 
-## Runner Emission Trace (Golden Paths)
-- GPT path: `veriscope/runners/gpt/train_nanogpt.py:2761` -> `veriscope/runners/gpt/emit_artifacts.py:406`
-- HF path: `veriscope/runners/hf/train_hf.py:1634` -> `veriscope/runners/hf/emit_artifacts.py:79`
-- CIFAR legacy wrapper path: `veriscope/cli/main.py:697` delegates to `veriscope-legacy`, wrapper fills partial summary fallback in `veriscope/cli/main.py:807`
+## 2) Golden-Path Emission Trace
+- `legacy/cifar` wrapper: `veriscope/cli/main.py:704` (`_cmd_run_cifar`) -> delegates to `veriscope-legacy`; wrapper repairs missing/invalid summary via `_write_partial_summary` at `veriscope/cli/main.py:814`.
+- `gpt/nanoGPT`: `veriscope/runners/gpt/train_nanogpt.py:2761` -> `veriscope/runners/gpt/emit_artifacts.py:414`; writes all three artifacts + fail marker (`first_fail_iter.txt`) at `veriscope/runners/gpt/emit_artifacts.py:663`.
+- `hf/transformers`: `veriscope/runners/hf/train_hf.py:1634` -> `veriscope/runners/hf/emit_artifacts.py:79`; writes all three artifacts + fail marker at `veriscope/runners/hf/emit_artifacts.py:165`.
 
-## Top 10 Pilot-Risk Findings (ranked)
+## 3) `results_summary.json` Invariant Enforcement Status
+- `counts.*` coherence with `results.gates`: enforced in validator (`veriscope/cli/validate.py:358` to `veriscope/cli/validate.py:378`).
+- `final_decision` derived canonically from counts: enforced in schema model validator (`veriscope/core/artifacts.py:331` to `veriscope/core/artifacts.py:338`).
+- `counts.fail > 0` requires `first_fail_iter` and marker file: schema + validator enforce both (`veriscope/core/artifacts.py:339` to `veriscope/core/artifacts.py:342`, `veriscope/cli/validate.py:392` to `veriscope/cli/validate.py:435`).
+- Partial summary must be explicit: validator enforces `partial=true` if `results.json` missing (`veriscope/cli/validate.py:347` to `veriscope/cli/validate.py:356`).
+- Partial comparability claim: still open (see Issue 6).
 
-### 1) [P0] Summary counts could diverge from gate events without validation failure (FIXED)
-- Evidence: invariant now enforced in `veriscope/cli/validate.py:358`; regression test in `tests/test_cli_validate_report.py:340`.
-- Failure mode: tampered or stale `results_summary.json` can claim different pass/warn/fail counts than `results.json`.
-- Reproduction/unit test: `tests/test_cli_validate_report.py:340`.
-- Minimal patch: compare summary counts against counts derived from `results.gates`; fail validation on mismatch.
-- Status: fixed in this diff.
+## 4) Schema / Validator / Emitter Mismatch Check
+- `ResultsSummaryV1.partial` exists and is emitted only for wrapper partial fallbacks (`veriscope/cli/main.py:301` to `veriscope/cli/main.py:313`). Complete runner summaries omit it (expected).
+- Extra summary keys emitted by wrappers (`note`, `wrapper_emitted`) are not in schema but are allowed by `extra="allow"` (`veriscope/core/artifacts.py:90`).
+- Governance payload contract now checked for required run-event keys (`veriscope/core/governance.py:116` to `veriscope/core/governance.py:215`), but nested audit schema under `gate_decision_v1` is still not fully validated (Issue 10).
 
-### 2) [P0] `final_decision` and `first_fail_iter` invariants were not schema-enforced (FIXED)
-- Evidence: invariants now in `veriscope/core/artifacts.py:331`; regression tests at `tests/test_artifacts_roundtrip.py:183` and `tests/test_artifacts_roundtrip.py:199`.
-- Failure mode: summary could carry a contradictory final decision or missing `first_fail_iter` under fail counts.
-- Reproduction/unit test: `tests/test_artifacts_roundtrip.py:183`, `tests/test_artifacts_roundtrip.py:199`.
-- Minimal patch: model-level validator on `ResultsSummaryV1`.
-- Status: fixed in this diff.
+## 5) Top 10 Findings (ranked by pilot risk)
 
-### 3) [P0] HF emitter did not emit `first_fail_iter`/marker under failures (FIXED)
-- Evidence: now computed and emitted in `veriscope/runners/hf/emit_artifacts.py:145`, `veriscope/runners/hf/emit_artifacts.py:165`; regression test at `tests/test_hf_emitter_parity.py:82`.
-- Failure mode: HF fail capsules could not satisfy finite-window fail diagnostics parity with GPT.
-- Reproduction/unit test: `tests/test_hf_emitter_parity.py:82`.
-- Minimal patch: derive earliest fail iteration from gate records; emit `first_fail_iter` and `first_fail_iter.txt`.
-- Status: fixed in this diff.
+### 1. [P0][FIXED] CIFAR wrapper could return success with invalid `results_summary.json`
+- Evidence: legacy path now validates summary quality before deciding exit (`veriscope/cli/main.py:779` to `veriscope/cli/main.py:792`).
+- Failure mode: before fix, malformed summary file could leave wrapper exit as success.
+- Repro/test: `tests/test_cli_run_cifar_wrapper.py:29` to `tests/test_cli_run_cifar_wrapper.py:65`.
+- Minimal fix: treat missing/invalid summary as wrapper failure and emit partial fallback.
 
-### 4) [P0] Partial capsules could pass allow-partial flows without explicit `partial=true` (FIXED)
-- Evidence: check added in `veriscope/cli/validate.py:347`; regression test at `tests/test_cli_validate_report.py:361`.
-- Failure mode: missing `results.json` could be silently treated as partial in report/diff/inspect even when summary was not marked partial.
-- Reproduction/unit test: `tests/test_cli_validate_report.py:361`.
-- Minimal patch: require `results_summary.partial==true` when `results.json` is absent in allow-partial mode.
-- Status: fixed in this diff.
+### 2. [P0][FIXED] `diff` accepted identity-mismatched capsules in allow-partial mode
+- Evidence: `diff` now validates with `strict_identity=True` (`veriscope/cli/diff.py:189`, `veriscope/cli/diff.py:192`).
+- Failure mode: summary/results identity drift could pass into comparability.
+- Repro/test: `tests/test_cli_diff.py:197` to `tests/test_cli_diff.py:209`.
+- Minimal fix: strict identity gate at entry to diff path.
 
-### 5) [P1] CIFAR wrapper fallback only checks summary existence, not summary validity (OPEN)
-- Evidence: `veriscope/cli/main.py:807` checks only `exists()`.
-- Failure mode: malformed `results_summary.json` can remain in capsule with no wrapper repair path.
-- Reproduction: run CIFAR path with an invalid pre-existing summary file; wrapper does not rewrite fallback unless file is absent.
-- Minimal patch: gate fallback on `exists() and _summary_is_valid(...)` (same policy used in GPT/HF wrapper path at `veriscope/cli/main.py:636`).
-- Test plan: add wrapper integration test with fake legacy runner and pre-seeded invalid summary.
+### 3. [P0][FIXED] `report --compare` accepted identity-mismatched capsules
+- Evidence: compare report now validates with `strict_identity=True` (`veriscope/cli/report.py:405` to `veriscope/cli/report.py:409`).
+- Failure mode: multi-run compare could proceed on internally inconsistent capsules.
+- Repro/test: `tests/test_cli_diff.py:212` to `tests/test_cli_diff.py:224`.
+- Minimal fix: strict identity gate for each compared outdir.
 
-### 6) [P1] Identity mismatches are downgraded to warnings in allow-partial mode (OPEN)
-- Evidence: `veriscope/cli/validate.py:187` (warning path).
-- Failure mode: structurally inconsistent capsules can still flow through report/inspect as “partial”.
-- Reproduction: existing behavior locked in `tests/test_cli_inspect.py:123` (exit 0 with `WARNING:ARTIFACT_IDENTITY_MISMATCH`).
-- Minimal patch: keep warning in `inspect`, but make `diff`/`report --compare` require strict identity.
-- Test plan: add diff/report tests expecting hard-fail on identity mismatch.
+### 4. [P0][FIXED] single-run `report` rendered despite identity mismatch
+- Evidence: report path now enforces strict identity at validation (`veriscope/cli/report.py:114` to `veriscope/cli/report.py:118`).
+- Failure mode: report appeared healthy while cross-artifact identity was broken.
+- Repro/test: `tests/test_cli_validate_report.py:351` to `tests/test_cli_validate_report.py:358`.
+- Minimal fix: strict identity in report validation entrypoint.
 
-### 7) [P1] Report commands intentionally allow invalid governance logs (OPEN)
-- Evidence: `veriscope/cli/report.py:114` and `veriscope/cli/report.py:405` set `allow_invalid_governance=True`.
-- Failure mode: reports can render from capsules with invalid governance hash chains.
-- Reproduction: malformed governance log still renders report with warning banner.
-- Minimal patch: add strict mode default for compare/report in CI contexts or a hard-fail flag defaulted on for `report --compare`.
-- Test plan: add report compare test that fails on invalid governance by default.
+### 5. [P0][FIXED] governance validator allowed run-event payloads missing required fields
+- Evidence: required payload validation added (`veriscope/core/governance.py:116` to `veriscope/core/governance.py:215`, wired at `veriscope/core/governance.py:297` to `veriscope/core/governance.py:299`).
+- Failure mode: structurally malformed `run_started_v1` / `run_overrides_applied_v1` / `gate_decision_v1` lines could pass validation.
+- Repro/test: `tests/test_governance_contract.py:233` to `tests/test_governance_contract.py:252`.
+- Minimal fix: event-specific required key/type checks.
 
-### 8) [P1] Governance validator does not enforce event-specific payload schema requirements (OPEN)
-- Evidence: parser only checks `payload` is a dict in `veriscope/core/governance.py:179`; no per-event required-key validation.
-- Failure mode: governance lines can validate while missing required keys like `run_id`, `iter`, or `window_signature_ref`.
-- Reproduction: craft `gate_decision_v1` entry with `payload={}` and valid hash chain; `validate_governance_log` accepts structural line.
-- Minimal patch: add per-event payload validators (required key/type checks).
-- Test plan: unit tests for each event type with missing required payload fields.
+### 6. [P1][OPEN] partial capsules are still reported/computed as comparable
+- Evidence: no partial guard in comparability predicate (`veriscope/cli/comparability.py:137` to `veriscope/cli/comparability.py:197`); diff returns success in partial mode (`veriscope/cli/diff.py:215`, `veriscope/cli/diff.py:220`, `veriscope/cli/diff.py:256` to `veriscope/cli/diff.py:259`).
+- Failure mode: partial summaries can be interpreted as comparable outcomes.
+- Repro/test: existing behavior covered by `tests/test_cli_diff.py:269` to `tests/test_cli_diff.py:285`.
+- Suggested fix: force `ComparableResult.ok=False` when either run is partial (or hard-disable partial comparisons in diff/report-compare).
 
-### 9) [P2] Governance event dual-key (`event` + `event_type`) only warns, never fails (OPEN)
-- Evidence: warning emitted in `veriscope/core/governance.py:253`; not promoted to error in `veriscope/core/governance.py:291`.
-- Failure mode: new entries can violate contract exclusivity and still pass non-strict validation.
-- Reproduction: append a line with both keys; governance validation returns ok if hashes/rev are otherwise valid.
-- Minimal patch: treat dual-key presence as invalid for schema v1 writes.
-- Test plan: add governance unit test expecting validation failure for dual-key entries.
+### 7. [P1][OPEN] report paths intentionally tolerate invalid governance logs
+- Evidence: report validators set `allow_invalid_governance=True` (`veriscope/cli/report.py:119`, `veriscope/cli/report.py:410`).
+- Failure mode: report succeeds even when governance hash chain is invalid.
+- Repro/test: `tests/test_cli_validate_report.py:422` to `tests/test_cli_validate_report.py:429` (tampered governance still renders).
+- Suggested fix: default strict governance for compare mode, or require explicit `--allow-invalid-governance` opt-in.
 
-### 10) [P2] HF run-start governance can be emitted with hash-less `window_signature_ref` (OPEN)
-- Evidence: default `{"path": "window_signature.json"}` at `veriscope/runners/hf/train_hf.py:1284`; hash filled only inside try at `veriscope/runners/hf/train_hf.py:1287`.
-- Failure mode: governance provenance may omit comparability hash under pre-write failures.
-- Reproduction: induce write failure before governance append (e.g., path permissions); inspect logged run_started payload.
-- Minimal patch: fail run_started append if hash missing, or defer append until hash is guaranteed.
-- Test plan: simulate write failure and assert run_started is not appended with incomplete signature ref.
+### 8. [P1][OPEN] HF can emit `run_started_v1` without `window_signature_ref.hash`
+- Evidence: hash is optional in pre-write branch (`veriscope/runners/hf/train_hf.py:1284` to `veriscope/runners/hf/train_hf.py:1302`).
+- Failure mode: pre-write failure can still append a run-start entry with incomplete comparability reference.
+- Reproduction: monkeypatch `atomic_write_json` in HF runner preamble to raise; observe attempted append with hash-less `window_signature_ref`.
+- Suggested fix: skip `append_run_started` unless signature hash is available, or compute hash from canonical in-memory signature when file write succeeds.
 
-## Implemented Top-3 Fix Set
-- `veriscope/cli/validate.py`
-  - Added summary-vs-results count coherence checks.
-  - Added explicit partial marker requirement when `results.json` is absent.
-  - Added `first_fail_iter.txt` enforcement for fail summaries.
-- `veriscope/core/artifacts.py`
-  - Added `ResultsSummaryV1.partial`.
-  - Added model invariants for canonical `final_decision` and `first_fail_iter` semantics.
-- `veriscope/runners/hf/emit_artifacts.py`
-  - Added fail-iteration derivation and marker emission/removal logic.
-- `veriscope/cli/main.py`
-  - Partial summary now derives final decision via canonical function and populates `partial` in-model.
+### 9. [P2][OPEN] dual `event` + `event_type` is warning-only, not invalid
+- Evidence: dual key emits warning (`veriscope/core/governance.py:371` to `veriscope/core/governance.py:372`), and `validate_governance_log` does not promote it to error (`veriscope/core/governance.py:409` to `veriscope/core/governance.py:417`).
+- Failure mode: new lines can violate exclusivity contract while still validating.
+- Reproduction: write a governance line with both keys and valid hash chain; validation returns `ok=True` with warning.
+- Suggested fix: escalate `GOVERNANCE_LOG_EVENT_DUAL_PRESENT` to validation error.
 
-## Added/Updated Tests
-- `tests/test_cli_validate_report.py:340`
-- `tests/test_cli_validate_report.py:353`
-- `tests/test_cli_validate_report.py:361`
-- `tests/test_hf_emitter_parity.py:82`
-- `tests/test_artifacts_roundtrip.py:183`
-- Fixture updates for counts/gates consistency:
-  - `tests/test_cli_validate_report.py:148`
-  - `tests/test_cli_diff.py:73`
-  - `tests/test_cli_inspect.py:64`
-  - `tests/test_phase5c_diff_json_parse.py:67`
+### 10. [P2][OPEN] `gate_decision_v1.audit` nested contract is not schema-validated in governance parser
+- Evidence: parser only requires `audit` be a dict (`veriscope/core/governance.py:137` to `veriscope/core/governance.py:144`, `veriscope/core/governance.py:197` to `veriscope/core/governance.py:206`).
+- Failure mode: governance gate events can omit required audit semantics (e.g., evaluated/policy/reason) yet still pass log validation.
+- Reproduction: append a `gate_decision_v1` line with `audit={}` and valid hashes; validator accepts line shape.
+- Suggested fix: nested audit field checks aligned to `AuditV1` contract.
 
-## Notes
-- A pre-existing unrelated worktree change was present in `veriscope/runners/gpt/emit_artifacts.py`; this audit did not modify or revert it.
+## 6) Implemented Fixes in This Diff (Top 3+)
+1. CIFAR wrapper now fails closed on missing/invalid summary and emits valid partial fallback.
+2. `diff` and `report --compare` now enforce strict cross-artifact identity.
+3. Governance parser now enforces required payload fields for run events.
+4. Single-run `report` now also enforces strict identity.
+
+## 7) Added Tests
+- `tests/test_cli_run_cifar_wrapper.py:29` (invalid CIFAR summary replacement).
+- `tests/test_cli_diff.py:197` (diff identity mismatch rejection).
+- `tests/test_cli_diff.py:212` (report-compare identity mismatch rejection).
+- `tests/test_cli_validate_report.py:351` (single report identity mismatch rejection).
+- `tests/test_governance_contract.py:233` (run_started required payload validation).
+
+## 8) Verification Notes
+- Could not execute pytest due missing `pytest`/`numpy` in available environments.
+- Syntax checks passed:
+  - `PYTHONPYCACHEPREFIX=/tmp/veriscope_pycache /usr/bin/python3 -m py_compile ...` on all modified Python files.

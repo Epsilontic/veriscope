@@ -285,7 +285,7 @@ def _write_partial_summary(
     *,
     outdir: Path,
     run_id: str,
-    ws_ref: WindowSignatureRefV1,
+    ws_ref: WindowSignatureRefV1 | Dict[str, str],
     gate_preset: str,
     started_ts_utc: datetime,
     ended_ts_utc: datetime,
@@ -295,12 +295,23 @@ def _write_partial_summary(
     note: str,
     wrapper_emitted: bool = True,
 ) -> None:
+    resolved_ws_ref: WindowSignatureRefV1
+    if isinstance(ws_ref, WindowSignatureRefV1):
+        resolved_ws_ref = ws_ref
+    else:
+        ws_path = str(ws_ref.get("path") or "window_signature.json")
+        ws_hash = str(ws_ref.get("hash") or ("0" * 64))
+        try:
+            resolved_ws_ref = WindowSignatureRefV1(hash=ws_hash, path=ws_path)
+        except Exception:
+            resolved_ws_ref = WindowSignatureRefV1(hash=("0" * 64), path="window_signature.json")
+
     profile = ProfileV1(gate_preset=gate_preset, overrides={})
     safe_exit_code = runner_exit_code if runner_exit_code is None or runner_exit_code >= 0 else None
     counts = CountsV1(evaluated=0, skip=0, pass_=0, warn=0, fail=0)
     summary = ResultsSummaryV1(
         run_id=run_id,
-        window_signature_ref=ws_ref,
+        window_signature_ref=resolved_ws_ref,
         profile=profile,
         run_status=run_status,
         runner_exit_code=safe_exit_code,
@@ -776,14 +787,20 @@ def _cmd_run_cifar(args: argparse.Namespace) -> int:
                 signal.signal(signal.SIGTERM, prev_term)
             lifecycle.mark_runner_exit(proc.returncode)
 
-            summary_exit = _summary_wrapper_exit_code(outdir)
+            summary_path = outdir / "results_summary.json"
+            summary_ok = summary_path.exists() and _summary_is_valid(summary_path)
             run_status, wrapper_exit = map_status_and_exit(
                 runner_exit_code=proc.returncode,
                 runner_signal=lifecycle.runner_signal,
                 internal_error=False,
             )
-            if summary_exit is not None and run_status == "success":
-                wrapper_exit = summary_exit
+            if not summary_ok:
+                run_status = VERISCOPE_FAILURE
+                wrapper_exit = 2
+            else:
+                summary_exit = _summary_wrapper_exit_code(outdir)
+                if summary_exit is not None and run_status == "success":
+                    wrapper_exit = summary_exit
         except Exception as exc:
             lifecycle.mark_internal_failure(str(exc))
             run_status, wrapper_exit = map_status_and_exit(
@@ -804,18 +821,30 @@ def _cmd_run_cifar(args: argparse.Namespace) -> int:
                 "ended_ts_utc": lifecycle.ended_ts_utc.isoformat() if lifecycle.ended_ts_utc else None,
             },
         )
-        if not (outdir / "results_summary.json").exists():
+        summary_path = outdir / "results_summary.json"
+        if not (summary_path.exists() and _summary_is_valid(summary_path)):
+            recovery_ws_ref: WindowSignatureRefV1 | Dict[str, str] = ws_ref
+            try:
+                recovery_ws_ref = _ensure_window_signature(
+                    outdir,
+                    reason="wrapper_emitted_partial_summary",
+                    run_kind="cifar",
+                )
+            except Exception as exc:
+                _eprint(f"[veriscope] WARNING: failed to refresh window_signature in recovery path: {exc}")
+                if not isinstance(recovery_ws_ref, WindowSignatureRefV1):
+                    recovery_ws_ref = {"path": "window_signature.json"}
             _write_partial_summary(
                 outdir=outdir,
                 run_id=run_id,
-                ws_ref=ws_ref,
+                ws_ref=recovery_ws_ref,
                 gate_preset="unknown",
                 started_ts_utc=lifecycle.started_ts_utc,
                 ended_ts_utc=lifecycle.ended_ts_utc or datetime.now(timezone.utc),
                 run_status=lifecycle.run_status,
                 runner_exit_code=lifecycle.runner_exit_code,
                 runner_signal=lifecycle.runner_signal,
-                note="results_summary.json missing; emitted wrapper-level partial summary",
+                note="results_summary.json missing_or_invalid; emitted wrapper-level partial summary",
             )
         return int(lifecycle.wrapper_exit_code or 0)
     finally:

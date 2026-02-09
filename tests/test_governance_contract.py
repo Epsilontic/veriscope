@@ -18,6 +18,7 @@ from veriscope.cli.governance import (
     validate_governance_log,
 )
 from veriscope.core.artifacts import ManualJudgementV1
+from veriscope.core.governance import governance_entry_hash
 
 pytestmark = pytest.mark.unit
 
@@ -227,6 +228,44 @@ def test_governance_log_allows_legacy_entry_hash(tmp_path: Path) -> None:
     legacy_validation = validate_governance_log(log_path, allow_legacy_governance=True)
     assert legacy_validation.ok
     assert any("GOVERNANCE_LOG_ENTRY_HASH_MISSING" in w for w in legacy_validation.warnings)
+
+
+def test_governance_log_rejects_missing_run_started_required_payload_fields(tmp_path: Path) -> None:
+    outdir = tmp_path / "out"
+    outdir.mkdir()
+    log_path = outdir / "governance_log.jsonl"
+
+    entry_1 = {
+        "schema_version": 1,
+        "rev": 1,
+        "ts_utc": "2026-01-01T00:00:00Z",
+        "actor": "tester",
+        "event": "run_started_v1",
+        "payload": {},
+        "prev_hash": None,
+    }
+    entry_1["entry_hash"] = governance_entry_hash(entry_1)
+
+    entry_2 = {
+        "schema_version": 1,
+        "rev": 2,
+        "ts_utc": "2026-01-01T00:00:01Z",
+        "actor": "tester",
+        "event": "artifact_note",
+        "payload": {"run_id": "run", "note": "second"},
+        "prev_hash": entry_1["entry_hash"],
+    }
+    entry_2["entry_hash"] = governance_entry_hash(entry_2)
+    log_path.write_text(
+        json.dumps(entry_1, sort_keys=True) + "\n" + json.dumps(entry_2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    validation = validate_governance_log(log_path, allow_legacy_governance=True)
+    assert not validation.ok
+    assert any("payload_required_fields event=run_started_v1" in err for err in validation.errors)
+    assert not any("GOVERNANCE_LOG_PREV_HASH_MISMATCH" in err for err in validation.errors)
+    assert not any("GOVERNANCE_LOG_PREV_HASH_MISMATCH" in warn for warn in validation.warnings)
 
 
 def test_run_started_distributed_payload_is_optional(tmp_path: Path) -> None:

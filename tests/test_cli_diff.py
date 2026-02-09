@@ -12,6 +12,7 @@ import pytest
 from veriscope.cli.comparability import comparable, comparable_explain, load_run_metadata
 from veriscope.cli.governance import append_run_started
 from veriscope.cli.diff import diff_outdirs
+from veriscope.cli.report import render_report_compare
 from veriscope.cli.validate import validate_outdir
 from veriscope.core.artifacts import ManualJudgementV1, ResultsSummaryV1, ResultsV1
 from veriscope.core.governance import append_gate_decision
@@ -191,6 +192,36 @@ def test_diff_rejects_gate_preset_mismatch_without_flag(tmp_path: Path) -> None:
 
     allowed = diff_outdirs(outdir_a, outdir_b, allow_gate_preset_mismatch=True)
     assert allowed.exit_code == 0
+
+
+def test_diff_rejects_intra_capsule_identity_mismatch(tmp_path: Path) -> None:
+    outdir_a = tmp_path / "run_a"
+    outdir_b = tmp_path / "run_b"
+    _make_minimal_artifacts(outdir_a, run_id="run_a")
+    _make_minimal_artifacts(outdir_b, run_id="run_b")
+
+    summary_obj = _read_json_dict(outdir_b / "results_summary.json")
+    summary_obj["run_id"] = "run_b_mismatched"
+    _write_json(outdir_b / "results_summary.json", summary_obj)
+
+    result = diff_outdirs(outdir_a, outdir_b)
+    assert result.exit_code == 2
+    assert "ARTIFACT_IDENTITY_MISMATCH" in result.stderr
+
+
+def test_report_compare_rejects_intra_capsule_identity_mismatch(tmp_path: Path) -> None:
+    outdir_a = tmp_path / "run_a"
+    outdir_b = tmp_path / "run_b"
+    _make_minimal_artifacts(outdir_a, run_id="run_a")
+    _make_minimal_artifacts(outdir_b, run_id="run_b")
+
+    summary_obj = _read_json_dict(outdir_b / "results_summary.json")
+    summary_obj["run_id"] = "run_b_mismatched"
+    _write_json(outdir_b / "results_summary.json", summary_obj)
+
+    result = render_report_compare([outdir_a, outdir_b], fmt="text")
+    assert result.exit_code == 2
+    assert "ARTIFACT_IDENTITY_MISMATCH" in result.stderr
 
 
 def test_comparable_rejects_schema_mismatch(tmp_path: Path) -> None:

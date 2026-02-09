@@ -114,6 +114,7 @@ def render_report_md(outdir: Path, *, fmt: str = "md") -> str:
     v = validate_outdir(
         outdir,
         allow_partial=True,
+        strict_identity=True,
         allow_missing_governance=True,
         allow_invalid_governance=True,
     )
@@ -405,6 +406,7 @@ def render_report_compare(
         v = validate_outdir(
             Path(outdir),
             allow_partial=True,
+            strict_identity=True,
             allow_missing_governance=True,
             allow_invalid_governance=True,
         )

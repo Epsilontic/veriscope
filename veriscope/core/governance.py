@@ -100,6 +100,121 @@ def _warn_governance_event_dual_present(line_no: int) -> str:
     return f"WARNING:GOVERNANCE_LOG_EVENT_DUAL_PRESENT line={line_no}"
 
 
+def _warn_governance_payload_required_fields(line_no: int, *, event: str, missing: list[str], invalid: list[str]) -> str:
+    missing_part = ",".join(sorted(missing)) if missing else "-"
+    invalid_part = ",".join(sorted(invalid)) if invalid else "-"
+    return _warn_governance_invalid(
+        line_no,
+        f"payload_required_fields event={event} missing={missing_part} invalid={invalid_part}",
+    )
+
+
+def _is_non_empty_str(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _validate_required_payload_fields(event: str, payload: dict[str, Any], *, line_no: int) -> Optional[str]:
+    """
+    Validate event-specific governance payload keys required by docs/contract_v1.md.
+    """
+    if event == "run_started_v1":
+        required: dict[str, type] = {
+            "run_id": str,
+            "outdir": str,
+            "argv": list,
+            "code_identity": dict,
+            "window_signature_ref": dict,
+            "entrypoint": dict,
+        }
+    elif event == "run_overrides_applied_v1":
+        required = {
+            "run_id": str,
+            "outdir": str,
+            "overrides": dict,
+            "profile": dict,
+            "entrypoint": dict,
+        }
+    elif event == "gate_decision_v1":
+        required = {
+            "run_id": str,
+            "outdir": str,
+            "iter": int,
+            "decision": str,
+            "audit": dict,
+        }
+    else:
+        return None
+
+    missing: list[str] = []
+    invalid: list[str] = []
+
+    for key, expected_type in required.items():
+        if key not in payload:
+            missing.append(key)
+            continue
+        value = payload.get(key)
+        if expected_type is str:
+            if not _is_non_empty_str(value):
+                invalid.append(key)
+            continue
+        if expected_type is int:
+            if isinstance(value, bool) or not isinstance(value, int):
+                invalid.append(key)
+            continue
+        if not isinstance(value, expected_type):
+            invalid.append(key)
+
+    if event == "run_started_v1":
+        ws_ref = payload.get("window_signature_ref")
+        if isinstance(ws_ref, dict):
+            if not _is_non_empty_str(ws_ref.get("hash")):
+                invalid.append("window_signature_ref.hash")
+            if not _is_non_empty_str(ws_ref.get("path")):
+                invalid.append("window_signature_ref.path")
+        entrypoint = payload.get("entrypoint")
+        if isinstance(entrypoint, dict):
+            if not _is_non_empty_str(entrypoint.get("kind")):
+                invalid.append("entrypoint.kind")
+            if not _is_non_empty_str(entrypoint.get("name")):
+                invalid.append("entrypoint.name")
+        distributed = payload.get("distributed")
+        if distributed is not None and not isinstance(distributed, dict):
+            invalid.append("distributed")
+
+    if event == "run_overrides_applied_v1":
+        if "argv" in payload and not isinstance(payload.get("argv"), list):
+            invalid.append("argv")
+        entrypoint = payload.get("entrypoint")
+        if isinstance(entrypoint, dict):
+            if not _is_non_empty_str(entrypoint.get("kind")):
+                invalid.append("entrypoint.kind")
+            if not _is_non_empty_str(entrypoint.get("name")):
+                invalid.append("entrypoint.name")
+        profile = payload.get("profile")
+        if isinstance(profile, dict) and not _is_non_empty_str(profile.get("gate_preset")):
+            invalid.append("profile.gate_preset")
+
+    if event == "gate_decision_v1":
+        decision = payload.get("decision")
+        if isinstance(decision, str):
+            decision_norm = decision.strip().lower()
+            if decision_norm not in {"pass", "warn", "fail", "skip"}:
+                invalid.append("decision")
+        if "ok" in payload and not isinstance(payload.get("ok"), bool):
+            invalid.append("ok")
+        if "warn" in payload and not isinstance(payload.get("warn"), bool):
+            invalid.append("warn")
+
+    if missing or invalid:
+        return _warn_governance_payload_required_fields(
+            line_no,
+            event=event,
+            missing=missing,
+            invalid=invalid,
+        )
+    return None
+
+
 def _now_utc_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
@@ -179,6 +294,7 @@ def _parse_governance_log_line(line: str, *, line_no: int) -> tuple[Optional[Gov
     payload = obj.get("payload")
     if not isinstance(payload, dict):
         return None, _warn_governance_invalid(line_no, "payload_missing_or_invalid")
+    payload_validation = _validate_required_payload_fields(str(event), payload, line_no=line_no)
 
     ts_utc = obj.get("ts_utc")
     if not isinstance(ts_utc, str):
@@ -213,7 +329,7 @@ def _parse_governance_log_line(line: str, *, line_no: int) -> tuple[Optional[Gov
             line_no=line_no,
             raw=obj,
         ),
-        None,
+        payload_validation,
     )
 
 
@@ -232,7 +348,6 @@ def read_governance_log(path: Path) -> GovernanceLogResult:
         entry, warning = _parse_governance_log_line(line, line_no=idx)
         if warning:
             warnings.append(warning)
-            continue
         if entry is None:
             continue
 
@@ -291,7 +406,7 @@ def validate_governance_log(path: Path, *, allow_legacy_governance: bool = False
     for warning in result.warnings:
         if "GOVERNANCE_LOG_HASH_MISMATCH" in warning or "GOVERNANCE_LOG_PREV_HASH_MISMATCH" in warning:
             errors.append(warning)
-        if "GOVERNANCE_LOG_INVALID" in warning:
+        if "GOVERNANCE_LOG_INVALID" in warning or "payload_required_fields" in warning:
             errors.append(warning)
         if "GOVERNANCE_LOG_ENTRY_HASH_MISSING" in warning and not allow_legacy_governance:
             errors.append(warning)

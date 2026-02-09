@@ -348,6 +348,16 @@ def test_validate_identity_mismatch_fails_default(minimal_artifact_dir: Path) ->
     assert "ARTIFACT_IDENTITY_MISMATCH" in v.message
 
 
+def test_report_rejects_identity_mismatch(minimal_artifact_dir: Path) -> None:
+    p = minimal_artifact_dir / "results_summary.json"
+    obj = _read_json_dict(p)
+    obj["run_id"] = "different_run_id"
+    _write_json(p, obj)
+
+    with pytest.raises(ValueError, match=r"Cannot report: .*ARTIFACT_IDENTITY_MISMATCH"):
+        render_report_md(minimal_artifact_dir, fmt="text")
+
+
 def test_validate_detects_summary_counts_mismatch_results(minimal_artifact_dir: Path) -> None:
     summ_path = minimal_artifact_dir / "results_summary.json"
     summ_obj = _read_json_dict(summ_path)
