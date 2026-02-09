@@ -431,30 +431,32 @@ def test_emit_first_fail_iter_summary_and_marker_file(
         assert marker_path.read_text(encoding="utf-8") == f"{expected_first_fail_iter}\n"
 
 
-def test_emit_raises_when_fail_count_present_but_first_fail_iter_missing(tmp_path: Path) -> None:
-    outdir = tmp_path / "out_bad_first_fail_iter"
-    with pytest.raises(ValueError, match=r"counts\.fail > 0"):
-        emit_gpt_artifacts_v1(
-            outdir=outdir,
-            run_id="run_test_missing_first_fail_iter",
-            started_ts_utc=datetime(2026, 1, 1, 0, 0, 0),
-            ended_ts_utc=None,
-            gate_preset="tuned_v0",
-            overrides=None,
-            resolved_gate_cfg={"gate_window": 16, "min_evidence": 16, "gate_epsilon": 0.08},
-            gate_history=[
-                {
-                    # Coercible by _get_event_iter -> counts.fail > 0, but extractor ignores non-int raw iter.
-                    "iter": "950",
-                    "decision": "fail",
-                    "audit": {
-                        "evaluated": True,
-                        "reason": "evaluated_fail",
-                        "policy": "either",
-                        "per_metric_tv": {"m1": 0.2},
-                        "evidence_total": 16,
-                        "min_evidence": 16,
-                    },
-                }
-            ],
-        )
+def test_emit_coerces_string_iter_for_first_fail_iter(tmp_path: Path) -> None:
+    outdir = tmp_path / "out_coerced_first_fail_iter"
+    emitted = emit_gpt_artifacts_v1(
+        outdir=outdir,
+        run_id="run_test_coerced_first_fail_iter",
+        started_ts_utc=datetime(2026, 1, 1, 0, 0, 0),
+        ended_ts_utc=None,
+        gate_preset="tuned_v0",
+        overrides=None,
+        resolved_gate_cfg={"gate_window": 16, "min_evidence": 16, "gate_epsilon": 0.08},
+        gate_history=[
+            {
+                "iter": "950",
+                "decision": "fail",
+                "audit": {
+                    "evaluated": True,
+                    "reason": "evaluated_fail",
+                    "policy": "either",
+                    "per_metric_tv": {"m1": 0.2},
+                    "evidence_total": 16,
+                    "min_evidence": 16,
+                },
+            }
+        ],
+    )
+    assert emitted.results_summary_path.exists()
+    summary_obj = json.loads((outdir / "results_summary.json").read_text(encoding="utf-8"))
+    assert summary_obj["first_fail_iter"] == 950
+    assert (outdir / "first_fail_iter.txt").read_text(encoding="utf-8") == "950\n"

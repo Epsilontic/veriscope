@@ -14,6 +14,7 @@ from veriscope.cli.report import render_report_md
 from veriscope.core.jsonutil import canonical_dumps
 from veriscope.cli.validate import validate_outdir
 from veriscope.core.artifacts import ManualJudgementV1, ResultsSummaryV1, ResultsV1
+from veriscope.core.governance import append_gate_decision
 from veriscope.core.jsonutil import canonical_json_sha256
 
 pytestmark = pytest.mark.unit
@@ -169,6 +170,16 @@ def _make_minimal_artifacts(outdir: Path, *, run_id: str = "test_run_min") -> No
         entrypoint={"kind": "runner", "name": "tests.fixture"},
         ts_utc=_iso_z(T0),
     )
+    for gate in gates_obj:
+        append_gate_decision(
+            outdir,
+            run_id=run_id,
+            iter_num=gate["iter"],
+            decision=gate["decision"],
+            ok=gate["ok"],
+            warn=gate["warn"],
+            audit=gate["audit"],
+        )
 
     # Sanity: fixtures must conform to schemas
     ResultsV1.model_validate_json((outdir / "results.json").read_text(encoding="utf-8"))

@@ -11,6 +11,7 @@ import pytest
 from veriscope.cli.diff import diff_outdirs
 from veriscope.cli.governance import append_run_started
 from veriscope.core.artifacts import ResultsSummaryV1, ResultsV1
+from veriscope.core.governance import append_gate_decision
 from veriscope.core.jsonutil import canonical_json_sha256
 
 pytestmark = pytest.mark.unit
@@ -100,6 +101,16 @@ def _make_minimal_artifacts(outdir: Path, *, run_id: str, extra: str | None = No
         entrypoint={"kind": "runner", "name": "tests.diff_json_fixture"},
         ts_utc=_iso_z(T0),
     )
+    for gate in gates_obj:
+        append_gate_decision(
+            outdir,
+            run_id=run_id,
+            iter_num=gate["iter"],
+            decision=gate["decision"],
+            ok=gate["ok"],
+            warn=gate["warn"],
+            audit=gate["audit"],
+        )
 
     ResultsV1.model_validate_json((outdir / "results.json").read_text(encoding="utf-8"))
     ResultsSummaryV1.model_validate_json((outdir / "results_summary.json").read_text(encoding="utf-8"))
