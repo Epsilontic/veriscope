@@ -625,7 +625,6 @@ def validate_outdir(
 
                 if expected_run_id is not None:
                     if governance_run_ids and governance_run_ids != {expected_run_id}:
-                        msg = "Governance run_id does not match artifact run_id"
                         token = (
                             "ERROR:GOVERNANCE_RUN_ID_MISMATCH "
                             f"expected={expected_run_id!r} observed={sorted(governance_run_ids)!r}"
@@ -636,7 +635,7 @@ def validate_outdir(
                             errors.append(token)
                             return ValidationResult(
                                 False,
-                                msg,
+                                token,
                                 window_signature_hash=ws_hash,
                                 partial=False,
                                 warnings=tuple(warnings),
@@ -651,7 +650,6 @@ def validate_outdir(
                         if raw != expected_outdir_raw and _normalize_path_for_compare(raw) != expected_outdir_norm
                     )
                     if mismatched_outdirs:
-                        msg = "Governance outdir does not match artifact directory"
                         token = (
                             "ERROR:GOVERNANCE_OUTDIR_MISMATCH "
                             f"expected={expected_outdir_raw!r} observed={mismatched_outdirs!r}"
@@ -662,7 +660,7 @@ def validate_outdir(
                             errors.append(token)
                             return ValidationResult(
                                 False,
-                                msg,
+                                token,
                                 window_signature_hash=ws_hash,
                                 partial=False,
                                 warnings=tuple(warnings),
