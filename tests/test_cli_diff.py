@@ -249,6 +249,58 @@ def test_report_compare_rejects_invalid_governance(tmp_path: Path) -> None:
     assert "governance_log.jsonl invalid" in result.stderr
 
 
+def test_diff_rejects_missing_governance_log(tmp_path: Path) -> None:
+    outdir_a = tmp_path / "run_a"
+    outdir_b = tmp_path / "run_b"
+    _make_minimal_artifacts(outdir_a, run_id="run_a")
+    _make_minimal_artifacts(outdir_b, run_id="run_b")
+    (outdir_b / "governance_log.jsonl").unlink()
+
+    result = diff_outdirs(outdir_a, outdir_b)
+    assert result.exit_code == 2
+    assert "Missing governance_log.jsonl for results.json" in result.stderr
+
+
+def test_report_compare_rejects_missing_governance_log(tmp_path: Path) -> None:
+    outdir_a = tmp_path / "run_a"
+    outdir_b = tmp_path / "run_b"
+    _make_minimal_artifacts(outdir_a, run_id="run_a")
+    _make_minimal_artifacts(outdir_b, run_id="run_b")
+    (outdir_b / "governance_log.jsonl").unlink()
+
+    result = render_report_compare([outdir_a, outdir_b], fmt="text")
+    assert result.exit_code == 2
+    assert "Missing governance_log.jsonl for results.json" in result.stderr
+
+
+def test_diff_rejects_swapped_artifacts_with_stale_governance_run_id(tmp_path: Path) -> None:
+    outdir_a = tmp_path / "run_a"
+    outdir_b = tmp_path / "run_b"
+    _make_minimal_artifacts(outdir_a, run_id="run_a")
+    _make_minimal_artifacts(outdir_b, run_id="run_b")
+
+    for name in ("results.json", "results_summary.json"):
+        (outdir_b / name).write_text((outdir_a / name).read_text(encoding="utf-8"), encoding="utf-8")
+
+    result = diff_outdirs(outdir_a, outdir_b)
+    assert result.exit_code == 2
+    assert "GOVERNANCE_RUN_ID_MISMATCH" in result.stderr
+
+
+def test_report_compare_rejects_swapped_artifacts_with_stale_governance_run_id(tmp_path: Path) -> None:
+    outdir_a = tmp_path / "run_a"
+    outdir_b = tmp_path / "run_b"
+    _make_minimal_artifacts(outdir_a, run_id="run_a")
+    _make_minimal_artifacts(outdir_b, run_id="run_b")
+
+    for name in ("results.json", "results_summary.json"):
+        (outdir_b / name).write_text((outdir_a / name).read_text(encoding="utf-8"), encoding="utf-8")
+
+    result = render_report_compare([outdir_a, outdir_b], fmt="text")
+    assert result.exit_code == 2
+    assert "GOVERNANCE_RUN_ID_MISMATCH" in result.stderr
+
+
 def test_comparable_rejects_schema_mismatch(tmp_path: Path) -> None:
     outdir_a = tmp_path / "run_a"
     outdir_b = tmp_path / "run_b"

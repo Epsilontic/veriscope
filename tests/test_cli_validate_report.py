@@ -325,6 +325,17 @@ def test_validate_detects_tampering_minimal(minimal_artifact_dir: Path) -> None:
     assert re.search(r"mismatch", v.message, flags=re.IGNORECASE)
 
 
+def test_validate_rejects_non_string_created_ts_utc(minimal_artifact_dir: Path) -> None:
+    ws_path = minimal_artifact_dir / "window_signature.json"
+    ws_obj = _read_json_dict(ws_path)
+    ws_obj["created_ts_utc"] = {"tampered": {"gate_controls": {"gate_epsilon": 999}}}
+    _write_json(ws_path, ws_obj)
+
+    v = validate_outdir(minimal_artifact_dir, allow_partial=True)
+    assert not v.ok
+    assert "created_ts_utc" in v.message
+
+
 def test_validate_detects_run_id_mismatch_minimal(minimal_artifact_dir: Path) -> None:
     p = minimal_artifact_dir / "results_summary.json"
     obj = _read_json_dict(p)

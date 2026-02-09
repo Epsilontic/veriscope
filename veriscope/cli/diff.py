@@ -186,10 +186,10 @@ def diff_outdirs(
     outdir_a = Path(outdir_a)
     outdir_b = Path(outdir_b)
 
-    v_a = validate_outdir(outdir_a, allow_partial=True, strict_identity=True)
+    v_a = validate_outdir(outdir_a, allow_partial=True, strict_identity=True, allow_missing_governance=False)
     if not v_a.ok:
         return DiffOutput(exit_code=2, stdout="", stderr=f"INVALID: {v_a.message}")
-    v_b = validate_outdir(outdir_b, allow_partial=True, strict_identity=True)
+    v_b = validate_outdir(outdir_b, allow_partial=True, strict_identity=True, allow_missing_governance=False)
     if not v_b.ok:
         return DiffOutput(exit_code=2, stdout="", stderr=f"INVALID: {v_b.message}")
 

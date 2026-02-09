@@ -6,6 +6,7 @@ import json
 import math
 import os
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Union
 
@@ -64,13 +65,35 @@ def canonical_json_sha256(obj: Any) -> str:
 WINDOW_SIGNATURE_VOLATILE_KEYS = frozenset({"created_ts_utc"})
 
 
+def _is_iso8601_utc_z(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    raw = value.strip()
+    if not raw.endswith("Z"):
+        return False
+    try:
+        parsed = datetime.fromisoformat(raw[:-1] + "+00:00")
+    except Exception:
+        return False
+    return parsed.tzinfo is not None and parsed.utcoffset() == timezone.utc.utcoffset(parsed)
+
+
 def canonicalize_window_signature(window_signature: Mapping[str, Any]) -> dict[str, Any]:
     """
     Return a canonicalized window signature for hashing/comparability.
 
     Volatile metadata (e.g., created_ts_utc) is excluded so identical evidence spaces remain comparable.
     """
-    return {key: value for key, value in window_signature.items() if key not in WINDOW_SIGNATURE_VOLATILE_KEYS}
+    canonical: dict[str, Any] = {}
+    for key, value in window_signature.items():
+        if key in WINDOW_SIGNATURE_VOLATILE_KEYS:
+            # created_ts_utc is intentionally excluded from comparability hashing, but only
+            # when it is a valid UTC timestamp string (prevents semantic smuggling via objects).
+            if key == "created_ts_utc" and not _is_iso8601_utc_z(value):
+                raise ValueError("window_signature.created_ts_utc must be ISO8601 UTC with trailing 'Z'")
+            continue
+        canonical[key] = value
+    return canonical
 
 
 def window_signature_sha256(window_signature: Mapping[str, Any]) -> str:

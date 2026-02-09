@@ -407,7 +407,7 @@ def render_report_compare(
             Path(outdir),
             allow_partial=True,
             strict_identity=True,
-            allow_missing_governance=True,
+            allow_missing_governance=False,
             allow_invalid_governance=False,
         )
         if not v.ok:

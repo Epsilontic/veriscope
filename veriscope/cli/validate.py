@@ -35,6 +35,16 @@ class ValidationResult:
     errors: tuple[str, ...] = field(default_factory=tuple)
 
 
+_RUN_GOVERNANCE_EVENTS = frozenset(
+    {
+        "run_started_v1",
+        "capsule_opened_v1",
+        "run_overrides_applied_v1",
+        "gate_decision_v1",
+    }
+)
+
+
 def _read_text_utf8(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
@@ -158,6 +168,41 @@ def _derive_counts_and_first_fail(results: ResultsV1) -> tuple[dict[str, int], O
     )
 
 
+def _collect_governance_bindings(path: Path) -> tuple[set[str], set[str]]:
+    run_ids: set[str] = set()
+    outdirs: set[str] = set()
+    for line in path.read_text(encoding="utf-8").splitlines():
+        raw = line.strip()
+        if not raw:
+            continue
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        event = obj.get("event") or obj.get("event_type")
+        if event not in _RUN_GOVERNANCE_EVENTS:
+            continue
+        payload = obj.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        run_id = payload.get("run_id")
+        if isinstance(run_id, str) and run_id.strip():
+            run_ids.add(run_id.strip())
+        outdir = payload.get("outdir")
+        if isinstance(outdir, str) and outdir.strip():
+            outdirs.add(outdir.strip())
+    return run_ids, outdirs
+
+
+def _normalize_path_for_compare(path_value: str) -> str:
+    try:
+        return str(Path(path_value).expanduser().resolve(strict=False))
+    except Exception:
+        return str(path_value)
+
+
 def _check_identity_consistency(
     outdir: Path,
     results: Optional[ResultsV1],
@@ -260,6 +305,13 @@ def validate_outdir(
     # 4) Hash verification (hash what's on disk)
     try:
         ws_hash = window_signature_sha256(ws_obj)
+    except ValueError as exc:
+        hash_error = str(exc)
+        return ValidationResult(
+            False,
+            hash_error,
+            errors=(hash_error,),
+        )
     except Exception as e:
         return ValidationResult(False, f"Failed to compute canonical hash: {e}")
 
@@ -562,6 +614,60 @@ def validate_outdir(
                             warnings=tuple(warnings),
                             errors=tuple(errors),
                         )
+
+            if run_governance_present:
+                governance_run_ids, governance_outdirs = _collect_governance_bindings(gov_path)
+                expected_run_id: Optional[str] = None
+                if res is not None:
+                    expected_run_id = res.run_id
+                elif summ is not None:
+                    expected_run_id = summ.run_id
+
+                if expected_run_id is not None:
+                    if governance_run_ids and governance_run_ids != {expected_run_id}:
+                        msg = "Governance run_id does not match artifact run_id"
+                        token = (
+                            "ERROR:GOVERNANCE_RUN_ID_MISMATCH "
+                            f"expected={expected_run_id!r} observed={sorted(governance_run_ids)!r}"
+                        )
+                        if allow_invalid_governance:
+                            warnings.append(token.replace("ERROR", "WARNING", 1))
+                        else:
+                            errors.append(token)
+                            return ValidationResult(
+                                False,
+                                msg,
+                                window_signature_hash=ws_hash,
+                                partial=False,
+                                warnings=tuple(warnings),
+                                errors=tuple(errors),
+                            )
+
+                    expected_outdir_raw = str(outdir)
+                    expected_outdir_norm = _normalize_path_for_compare(expected_outdir_raw)
+                    mismatched_outdirs = sorted(
+                        raw
+                        for raw in governance_outdirs
+                        if raw != expected_outdir_raw and _normalize_path_for_compare(raw) != expected_outdir_norm
+                    )
+                    if mismatched_outdirs:
+                        msg = "Governance outdir does not match artifact directory"
+                        token = (
+                            "ERROR:GOVERNANCE_OUTDIR_MISMATCH "
+                            f"expected={expected_outdir_raw!r} observed={mismatched_outdirs!r}"
+                        )
+                        if allow_invalid_governance:
+                            warnings.append(token.replace("ERROR", "WARNING", 1))
+                        else:
+                            errors.append(token)
+                            return ValidationResult(
+                                False,
+                                msg,
+                                window_signature_hash=ws_hash,
+                                partial=False,
+                                warnings=tuple(warnings),
+                                errors=tuple(errors),
+                            )
 
             if run_governance_present and res.gates:
                 required_gate_events = len(res.gates)
