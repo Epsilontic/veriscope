@@ -394,6 +394,14 @@ def _first_fail_iter_from_events(events: Sequence[Any]) -> Optional[int]:
     return first_fail_iter
 
 
+def _first_fail_iter_from_records(records: Sequence[GateRecordV1]) -> Optional[int]:
+    first_fail_iter: Optional[int] = None
+    for record in records:
+        if record.decision == "fail" and (first_fail_iter is None or int(record.iter) < first_fail_iter):
+            first_fail_iter = int(record.iter)
+    return first_fail_iter
+
+
 def _read_json_obj(path: Path) -> Dict[str, Any]:
     """Read JSON file and parse to an object, with a tighter error message."""
     try:
@@ -607,7 +615,7 @@ def emit_gpt_artifacts_v1(
 
     counts = _counts_from_gate_records(gate_records)
     final_decision = derive_final_decision(counts)
-    first_fail_iter = _first_fail_iter_from_events(gate_events)
+    first_fail_iter = _first_fail_iter_from_records(gate_records)
 
     if counts.fail == 0:
         if first_fail_iter is not None:

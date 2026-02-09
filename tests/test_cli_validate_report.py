@@ -86,17 +86,78 @@ def _make_minimal_artifacts(outdir: Path, *, run_id: str = "test_run_min") -> No
         "ended_ts_utc": _iso_z(T1),
     }
 
-    res_obj = {**common, "gates": [], "metrics": []}
+    gates_obj = [
+        {
+            "iter": 0,
+            "decision": "pass",
+            "ok": True,
+            "warn": False,
+            "audit": {
+                "evaluated": True,
+                "reason": "evaluated_pass",
+                "policy": "test_policy",
+                "per_metric_tv": {"m": 0.01},
+                "evidence_total": 16,
+                "min_evidence": 16,
+            },
+        },
+        {
+            "iter": 1,
+            "decision": "warn",
+            "ok": True,
+            "warn": True,
+            "audit": {
+                "evaluated": True,
+                "reason": "evaluated_warn",
+                "policy": "test_policy",
+                "per_metric_tv": {"m": 0.02},
+                "evidence_total": 16,
+                "min_evidence": 16,
+            },
+        },
+        {
+            "iter": 2,
+            "decision": "fail",
+            "ok": False,
+            "warn": False,
+            "audit": {
+                "evaluated": True,
+                "reason": "evaluated_fail",
+                "policy": "test_policy",
+                "per_metric_tv": {"m": 0.12},
+                "evidence_total": 16,
+                "min_evidence": 16,
+            },
+        },
+        {
+            "iter": 3,
+            "decision": "skip",
+            "ok": True,
+            "warn": False,
+            "audit": {
+                "evaluated": False,
+                "reason": "not_evaluated",
+                "policy": "test_policy",
+                "per_metric_tv": {},
+                "evidence_total": 0,
+                "min_evidence": 16,
+            },
+        },
+    ]
+
+    res_obj = {**common, "gates": gates_obj, "metrics": []}
 
     # Counts correspond to: total=4 derived from evaluated+skip
     summ_obj = {
         **common,
         "counts": {"evaluated": 3, "skip": 1, "pass": 1, "warn": 1, "fail": 1},
         "final_decision": "fail",
+        "first_fail_iter": 2,
     }
 
     _write_json(outdir / "results.json", res_obj)
     _write_json(outdir / "results_summary.json", summ_obj)
+    (outdir / "first_fail_iter.txt").write_text("2\n", encoding="utf-8")
 
     append_run_started(
         outdir,
@@ -274,6 +335,35 @@ def test_validate_identity_mismatch_fails_default(minimal_artifact_dir: Path) ->
     v = validate_outdir(minimal_artifact_dir)
     assert not v.ok
     assert "ARTIFACT_IDENTITY_MISMATCH" in v.message
+
+
+def test_validate_detects_summary_counts_mismatch_results(minimal_artifact_dir: Path) -> None:
+    summ_path = minimal_artifact_dir / "results_summary.json"
+    summ_obj = _read_json_dict(summ_path)
+    summ_obj["counts"] = {"evaluated": 2, "skip": 2, "pass": 1, "warn": 1, "fail": 0}
+    summ_obj["final_decision"] = "warn"
+    summ_obj["first_fail_iter"] = None
+    _write_json(summ_path, summ_obj)
+
+    v = validate_outdir(minimal_artifact_dir)
+    assert not v.ok
+    assert "summary counts mismatch results gates" in v.message
+
+
+def test_validate_requires_first_fail_marker_when_fails_present(minimal_artifact_dir: Path) -> None:
+    (minimal_artifact_dir / "first_fail_iter.txt").unlink()
+
+    v = validate_outdir(minimal_artifact_dir)
+    assert not v.ok
+    assert "counts.fail > 0 but first_fail_iter.txt is missing" in v.message
+
+
+def test_validate_partial_requires_explicit_partial_marker(minimal_artifact_dir: Path) -> None:
+    (minimal_artifact_dir / "results.json").unlink()
+
+    v = validate_outdir(minimal_artifact_dir, allow_partial=True)
+    assert not v.ok
+    assert "not marked partial=true" in v.message
 
 
 def test_report_smoke_and_integrity_minimal(minimal_artifact_dir: Path) -> None:

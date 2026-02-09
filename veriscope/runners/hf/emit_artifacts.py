@@ -21,6 +21,7 @@ from veriscope.core.ddp import ddp_is_chief
 from veriscope.core.jsonutil import (
     atomic_write_json,
     atomic_write_pydantic_json,
+    atomic_write_text,
     canonicalize_window_signature,
     canonical_dumps,
     read_json_obj,
@@ -62,6 +63,17 @@ def _counts_from_gates(gates: Iterable[GateRecordV1]) -> CountsV1:
             raise ValueError(f"Unexpected gate decision={record.decision!r} at iter={record.iter!r}")
     evaluated = pass_n + warn + fail
     return CountsV1(evaluated=evaluated, skip=skip, pass_=pass_n, warn=warn, fail=fail)
+
+
+def _first_fail_iter(gates: Iterable[GateRecordV1]) -> Optional[int]:
+    first: Optional[int] = None
+    for record in gates:
+        if record.decision != "fail":
+            continue
+        record_iter = int(record.iter)
+        if first is None or record_iter < first:
+            first = record_iter
+    return first
 
 
 def emit_hf_artifacts_v1(
@@ -131,6 +143,7 @@ def emit_hf_artifacts_v1(
     atomic_write_pydantic_json(results_path, results, by_alias=True, exclude_none=True, fsync=True)
 
     counts = _counts_from_gates(gate_records_list)
+    first_fail_iter = _first_fail_iter(gate_records_list)
     summary = ResultsSummaryV1(
         schema_version=1,
         run_id=run_id,
@@ -143,10 +156,18 @@ def emit_hf_artifacts_v1(
         ended_ts_utc=_iso_z(ended_ts_utc) if ended_ts_utc else None,
         counts=counts,
         final_decision=derive_final_decision(counts),
+        first_fail_iter=first_fail_iter,
     )
 
     results_summary_path = outdir / "results_summary.json"
     atomic_write_pydantic_json(results_summary_path, summary, by_alias=True, exclude_none=True, fsync=True)
+
+    first_fail_iter_path = outdir / "first_fail_iter.txt"
+    if first_fail_iter is None:
+        if first_fail_iter_path.exists():
+            first_fail_iter_path.unlink()
+    else:
+        atomic_write_text(first_fail_iter_path, f"{int(first_fail_iter)}\n", fsync=True)
 
     logger.info("Wrote HF artifacts to %s (run_id=%s)", outdir, run_id)
     return EmittedArtifactsV1(

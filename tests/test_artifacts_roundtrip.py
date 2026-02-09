@@ -180,6 +180,38 @@ def test_counts_invariant_violations_raise() -> None:
         CountsV1(evaluated=1, skip=0, pass_=0, warn=0, fail=0)
 
 
+def test_results_summary_rejects_final_decision_mismatch() -> None:
+    win_ref = WindowSignatureRefV1(hash="f" * 64, path="out/window_signature.json")
+    profile = ProfileV1(gate_preset="default")
+    counts = CountsV1(evaluated=1, skip=0, pass_=1, warn=0, fail=0)
+    with pytest.raises(ValueError, match="derive_final_decision"):
+        ResultsSummaryV1(
+            run_id="run_bad_summary",
+            window_signature_ref=win_ref,
+            profile=profile,
+            run_status="success",
+            started_ts_utc=_dt_utc(),
+            counts=counts,
+            final_decision="fail",
+        )
+
+
+def test_results_summary_rejects_missing_first_fail_iter_when_fails_present() -> None:
+    win_ref = WindowSignatureRefV1(hash="e" * 64, path="out/window_signature.json")
+    profile = ProfileV1(gate_preset="default")
+    counts = CountsV1(evaluated=1, skip=0, pass_=0, warn=0, fail=1)
+    with pytest.raises(ValueError, match="first_fail_iter is required"):
+        ResultsSummaryV1(
+            run_id="run_missing_first_fail",
+            window_signature_ref=win_ref,
+            profile=profile,
+            run_status="success",
+            started_ts_utc=_dt_utc(),
+            counts=counts,
+            final_decision="fail",
+        )
+
+
 def test_temporal_order_violation_raises() -> None:
     win_ref = WindowSignatureRefV1(hash="c" * 64, path="out/window_signature.json")
     profile = ProfileV1(gate_preset="default")

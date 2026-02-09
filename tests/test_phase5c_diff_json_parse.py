@@ -64,7 +64,23 @@ def _make_minimal_artifacts(outdir: Path, *, run_id: str, extra: str | None = No
         "ended_ts_utc": _iso_z(T1),
     }
 
-    res_obj = {**common, "gates": [], "metrics": []}
+    gates_obj = [
+        {
+            "iter": 0,
+            "decision": "pass",
+            "ok": True,
+            "warn": False,
+            "audit": {
+                "evaluated": True,
+                "reason": "evaluated_pass",
+                "policy": "test_policy",
+                "per_metric_tv": {},
+                "evidence_total": 1,
+                "min_evidence": 1,
+            },
+        }
+    ]
+    res_obj = {**common, "gates": gates_obj, "metrics": []}
     summ_obj = {
         **common,
         "counts": {"evaluated": 1, "skip": 0, "pass": 1, "warn": 0, "fail": 0},

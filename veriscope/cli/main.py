@@ -16,7 +16,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from veriscope.core.artifacts import CountsV1, ProfileV1, ResultsSummaryV1, RunStatus, WindowSignatureRefV1
+from veriscope.core.artifacts import (
+    CountsV1,
+    ProfileV1,
+    ResultsSummaryV1,
+    RunStatus,
+    WindowSignatureRefV1,
+    derive_final_decision,
+)
 from veriscope.core.jsonutil import atomic_write_json, window_signature_sha256
 from veriscope.core.lifecycle import RunLifecycle, map_status_and_exit
 from veriscope.core.redaction_policy import POLICY_REV, default_env_capture, prepare_env_capture, redact_argv
@@ -301,10 +308,10 @@ def _write_partial_summary(
         started_ts_utc=started_ts_utc,
         ended_ts_utc=ended_ts_utc,
         counts=counts,
-        final_decision="skip",
+        final_decision=derive_final_decision(counts),
+        partial=True,
     )
     payload = summary.model_dump(mode="json", by_alias=True, exclude_none=True)
-    payload["partial"] = True
     payload["note"] = note
     payload["wrapper_emitted"] = wrapper_emitted
     atomic_write_json(outdir / "results_summary.json", payload, fsync=True)

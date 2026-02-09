@@ -326,6 +326,21 @@ class ResultsSummaryV1(_ResultsHeaderV1):
     counts: CountsV1
     final_decision: Decision
     first_fail_iter: Optional[NonNegInt] = None
+    partial: Optional[bool] = None
+
+    @model_validator(mode="after")
+    def _summary_decision_and_fail_iter_invariants(self) -> "ResultsSummaryV1":
+        expected_final = derive_final_decision(self.counts)
+        if self.final_decision != expected_final:
+            raise ValueError(
+                "final_decision must match derive_final_decision(counts): "
+                f"{self.final_decision!r} != {expected_final!r}"
+            )
+        if int(self.counts.fail) > 0 and self.first_fail_iter is None:
+            raise ValueError("first_fail_iter is required when counts.fail > 0")
+        if int(self.counts.fail) == 0 and self.first_fail_iter is not None:
+            raise ValueError("first_fail_iter must be null when counts.fail == 0")
+        return self
 
 
 class ManualJudgementV1(VSModel):

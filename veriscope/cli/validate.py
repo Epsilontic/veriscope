@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -121,6 +122,42 @@ def _format_distributed_warning(meta: Optional[dict[str, Any]]) -> Optional[str]
     )
 
 
+def _derive_counts_and_first_fail(results: ResultsV1) -> tuple[dict[str, int], Optional[int]]:
+    pass_n = 0
+    warn_n = 0
+    fail_n = 0
+    skip_n = 0
+    first_fail_iter: Optional[int] = None
+
+    for gate in results.gates:
+        decision = str(gate.decision)
+        if decision == "pass":
+            pass_n += 1
+        elif decision == "warn":
+            warn_n += 1
+        elif decision == "fail":
+            fail_n += 1
+            gate_iter = int(gate.iter)
+            if first_fail_iter is None or gate_iter < first_fail_iter:
+                first_fail_iter = gate_iter
+        elif decision == "skip":
+            skip_n += 1
+        else:  # pragma: no cover - defensive; schema already constrains this
+            raise ValueError(f"Unknown gate decision={decision!r}")
+
+    evaluated = pass_n + warn_n + fail_n
+    return (
+        {
+            "evaluated": int(evaluated),
+            "skip": int(skip_n),
+            "pass": int(pass_n),
+            "warn": int(warn_n),
+            "fail": int(fail_n),
+        },
+        first_fail_iter,
+    )
+
+
 def _check_identity_consistency(
     outdir: Path,
     results: Optional[ResultsV1],
@@ -180,6 +217,8 @@ def validate_outdir(
       - window_signature_ref.path equals "window_signature.json" in results (if present) + summary
       - when results.json exists, identity fields match results_summary.json (run_id, schema_version,
         window_signature_ref.hash/path, profile.gate_preset)
+      - when results.json exists, summary counts must match gate decisions in results.json
+      - first_fail_iter/first_fail_iter.txt invariants are enforced when summary counts include fail>0
       - run_id matches across results (if present) + summary
       - schema_version == 1 (v0 contract)
     """
@@ -305,6 +344,96 @@ def validate_outdir(
             errors=identity_errors,
         )
 
+    summary_partial = bool(getattr(summ, "partial", False))
+    if res is None and allow_partial and not summary_partial:
+        return ValidationResult(
+            False,
+            "results.json missing but results_summary.json is not marked partial=true",
+            window_signature_hash=ws_hash,
+            partial=False,
+            warnings=identity_warnings,
+            errors=identity_errors,
+        )
+
+    if res is not None:
+        derived_counts, derived_first_fail_iter = _derive_counts_and_first_fail(res)
+        summary_counts = {
+            "evaluated": int(summ.counts.evaluated),
+            "skip": int(summ.counts.skip),
+            "pass": int(summ.counts.pass_),
+            "warn": int(summ.counts.warn),
+            "fail": int(summ.counts.fail),
+        }
+        if summary_counts != derived_counts:
+            return ValidationResult(
+                False,
+                (
+                    "summary counts mismatch results gates: "
+                    f"summary={summary_counts} results_derived={derived_counts}"
+                ),
+                window_signature_hash=ws_hash,
+                partial=False,
+                warnings=identity_warnings,
+                errors=identity_errors,
+            )
+        if summary_counts["fail"] > 0 and int(summ.first_fail_iter or 0) != int(derived_first_fail_iter or -1):
+            return ValidationResult(
+                False,
+                (
+                    "first_fail_iter mismatch between summary and results gates: "
+                    f"summary={summ.first_fail_iter!r} results_derived={derived_first_fail_iter!r}"
+                ),
+                window_signature_hash=ws_hash,
+                partial=False,
+                warnings=identity_warnings,
+                errors=identity_errors,
+            )
+
+    if int(summ.counts.fail) > 0:
+        marker_path = outdir / "first_fail_iter.txt"
+        if not marker_path.exists():
+            return ValidationResult(
+                False,
+                "counts.fail > 0 but first_fail_iter.txt is missing",
+                window_signature_hash=ws_hash,
+                partial=False,
+                warnings=identity_warnings,
+                errors=identity_errors,
+            )
+        try:
+            marker_text = marker_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            return ValidationResult(
+                False,
+                f"Failed reading first_fail_iter.txt: {exc}",
+                window_signature_hash=ws_hash,
+                partial=False,
+                warnings=identity_warnings,
+                errors=identity_errors,
+            )
+        if not re.fullmatch(r"[0-9]+\n", marker_text):
+            return ValidationResult(
+                False,
+                "first_fail_iter.txt must contain a non-negative integer with trailing newline",
+                window_signature_hash=ws_hash,
+                partial=False,
+                warnings=identity_warnings,
+                errors=identity_errors,
+            )
+        marker_iter = int(marker_text.strip())
+        if marker_iter != int(summ.first_fail_iter or -1):
+            return ValidationResult(
+                False,
+                (
+                    "first_fail_iter.txt mismatch: "
+                    f"marker={marker_iter} summary.first_fail_iter={summ.first_fail_iter!r}"
+                ),
+                window_signature_hash=ws_hash,
+                partial=False,
+                warnings=identity_warnings,
+                errors=identity_errors,
+            )
+
     warnings = list(identity_warnings)
     errors = list(identity_errors)
     if res is not None:
@@ -407,7 +536,6 @@ def validate_outdir(
         warnings.append(distributed_warning)
 
     # Return the derived truth (the computed hash), not just the referenced one.
-    summary_partial = bool(getattr(summ, "partial", False))
     return ValidationResult(
         True,
         "OK",
