@@ -105,6 +105,7 @@ def _make_minimal_artifacts(outdir: Path, *, run_id: str) -> None:
 def test_inspect_strict_governance_requires_log(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     outdir = tmp_path / "run_a"
     _make_minimal_artifacts(outdir, run_id="run_a")
+    (outdir / "governance_log.jsonl").unlink()
 
     args = argparse.Namespace(
         outdir=str(outdir),
@@ -124,6 +125,7 @@ def test_inspect_strict_governance_requires_log(tmp_path: Path, capsys: pytest.C
 def test_inspect_strict_governance_warns_when_optional(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     outdir = tmp_path / "run_b"
     _make_minimal_artifacts(outdir, run_id="run_b")
+    (outdir / "governance_log.jsonl").unlink()
 
     args = argparse.Namespace(
         outdir=str(outdir),

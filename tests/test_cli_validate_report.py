@@ -413,10 +413,12 @@ def test_report_governance_absent(minimal_artifact_dir: Path) -> None:
 
 def test_report_governance_valid(minimal_artifact_dir: Path) -> None:
     _write_valid_governance_log(minimal_artifact_dir)
+    gov_lines = (minimal_artifact_dir / "governance_log.jsonl").read_text(encoding="utf-8").splitlines()
+    expected_last_rev = json.loads(gov_lines[-1])["rev"]
     txt = render_report_md(minimal_artifact_dir, fmt="text")
     assert "Log: YES" in txt
     assert "Valid: YES" in txt
-    assert "Last Rev: 2" in txt
+    assert f"Last Rev: {expected_last_rev}" in txt
 
 
 def test_report_governance_invalid_tampered(minimal_artifact_dir: Path) -> None:
