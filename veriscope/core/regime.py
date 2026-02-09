@@ -2064,13 +2064,22 @@ class RegimeAnchoredGateEngine:
         pre_reference_ignore_change_warn = False
         decision_source_gate_norm = str(decision_source_gate).strip().lower()
         change_gain_failed_now = bool(audit.get("change_gain_failed", False))
+        reason_norm = str(audit.get("reason") or "").strip().lower()
         change_only_failure = bool(
             evaluated
             and (not bool(combined_ok))
             and (decision_source_gate_norm == "change")
             and (not change_gain_failed_now)
         )
-        change_only_persistence_failure = bool(change_only_failure and pfail)
+        pre_reference_change_persistence_failure = bool(
+            evaluated
+            and (not bool(combined_ok))
+            and pfail
+            and (
+                reason_norm.endswith("_persistence_fail")
+                or (reason_norm == "persistence_fail")
+            )
+        )
 
         # Pre-reference suppression is controlled by reference readiness itself,
         # not by whether regime checks are enabled.
@@ -2082,6 +2091,7 @@ class RegimeAnchoredGateEngine:
                 if change_only_failure:
                     original_reason = str(audit.get("reason") or "change_fail").strip() or "change_fail"
                     audit["pre_reference_change_suppressed"] = True
+                    audit["pre_reference_suppression_cause"] = "reference_not_ready"
                     audit["pre_reference_original_ok"] = bool(combined_ok)
                     audit["pre_reference_original_reason"] = original_reason
                     audit["reason"] = f"pre_reference_suppressed:{original_reason}"
@@ -2111,11 +2121,12 @@ class RegimeAnchoredGateEngine:
                 pre_reference_ignore_change_warn = bool(warn_pending and (not change_gain_failed_now))
             elif pre_reference_policy == "warn_only":
                 # Allow telemetry/persistence tracking, but suppress hard FAILs from change persistence.
-                if change_only_persistence_failure:
+                if pre_reference_change_persistence_failure:
                     original_reason = str(audit.get("reason") or "change_persistence_fail").strip()
                     if not original_reason:
                         original_reason = "change_persistence_fail"
                     audit["pre_reference_change_suppressed"] = True
+                    audit["pre_reference_suppression_cause"] = "reference_not_ready"
                     audit["pre_reference_original_ok"] = bool(combined_ok)
                     audit["pre_reference_original_reason"] = original_reason
                     audit["reason"] = f"pre_reference_suppressed:{original_reason}"
