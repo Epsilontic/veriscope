@@ -43,6 +43,7 @@ _RUN_GOVERNANCE_EVENTS = frozenset(
         "gate_decision_v1",
     }
 )
+_ALLOWED_DISTRIBUTED_MODES = frozenset({"single_process", "replicated_single_chief_emit", "ddp_wrapped"})
 
 
 def _read_text_utf8(path: Path) -> str:
@@ -116,16 +117,64 @@ def _coerce_int(value: Any) -> Optional[int]:
         return None
 
 
+def _distributed_mode(meta: Optional[dict[str, Any]]) -> Optional[str]:
+    if meta is None:
+        return None
+    raw = meta.get("distributed_mode")
+    if raw is None:
+        return None
+    mode = str(raw).strip()
+    return mode or None
+
+
+def _distributed_world_size(meta: Optional[dict[str, Any]]) -> Optional[int]:
+    if meta is None:
+        return None
+    return _coerce_int(meta.get("world_size_observed"))
+
+
+def _distributed_backend(meta: Optional[dict[str, Any]]) -> Optional[str]:
+    if meta is None:
+        return None
+    raw = meta.get("backend")
+    if raw is None:
+        raw = meta.get("ddp_backend")
+    if raw is None:
+        return None
+    value = str(raw).strip()
+    return value or None
+
+
+def _distributed_hint_keys(meta: Optional[dict[str, Any]]) -> tuple[str, ...]:
+    if meta is None:
+        return tuple()
+    hint_keys = (
+        "rank",
+        "rank_observed",
+        "local_rank",
+        "local_rank_observed",
+        "backend",
+        "ddp_backend",
+        "ddp_wrapped",
+        "ddp_active",
+    )
+    return tuple(key for key in hint_keys if meta.get(key) is not None)
+
+
+def _distributed_hints_present(meta: Optional[dict[str, Any]]) -> bool:
+    return bool(_distributed_hint_keys(meta))
+
+
 def _format_distributed_warning(meta: Optional[dict[str, Any]]) -> Optional[str]:
     if meta is None:
         return None
-    mode = meta.get("distributed_mode")
-    world_size = _coerce_int(meta.get("world_size_observed"))
+    mode = _distributed_mode(meta)
+    world_size = _distributed_world_size(meta)
     if mode == "single_process" and (world_size is None or world_size <= 1):
         return None
     mode_value = str(mode) if mode is not None else "unknown"
     world_value = str(world_size) if world_size is not None else "unknown"
-    backend_value = meta.get("ddp_backend")
+    backend_value = _distributed_backend(meta)
     backend_display = str(backend_value) if backend_value is not None else "unknown"
     return (
         f"WARNING:DISTRIBUTED_EXECUTION_DETECTED mode={mode_value} world_size={world_value} backend={backend_display}"
@@ -689,7 +738,56 @@ def validate_outdir(
                             errors=tuple(errors),
                         )
 
-    distributed_warning = _format_distributed_warning(load_distributed_meta(outdir))
+    distributed_meta = load_distributed_meta(outdir)
+    distributed_world_size = _distributed_world_size(distributed_meta)
+    if distributed_world_size is None and _distributed_hints_present(distributed_meta):
+        hint_keys = _distributed_hint_keys(distributed_meta)
+        token = (
+            "ERROR:DISTRIBUTED_WORLD_SIZE_MISSING "
+            f"hints_present={list(hint_keys)!r} distributed execution hints require world_size_observed"
+        )
+        errors.append(token)
+        return ValidationResult(
+            False,
+            token,
+            window_signature_hash=ws_hash,
+            partial=False,
+            warnings=tuple(warnings),
+            errors=tuple(errors),
+        )
+
+    if distributed_world_size is not None and distributed_world_size > 1:
+        distributed_mode = _distributed_mode(distributed_meta)
+        if distributed_mode is None:
+            token = (
+                "ERROR:DISTRIBUTED_MODE_MISSING "
+                f"world_size_observed={distributed_world_size} requires distributed_mode"
+            )
+            errors.append(token)
+            return ValidationResult(
+                False,
+                token,
+                window_signature_hash=ws_hash,
+                partial=False,
+                warnings=tuple(warnings),
+                errors=tuple(errors),
+            )
+        if distributed_mode not in _ALLOWED_DISTRIBUTED_MODES:
+            token = (
+                "ERROR:DISTRIBUTED_MODE_INVALID "
+                f"distributed_mode={distributed_mode!r} allowed={sorted(_ALLOWED_DISTRIBUTED_MODES)!r}"
+            )
+            errors.append(token)
+            return ValidationResult(
+                False,
+                token,
+                window_signature_hash=ws_hash,
+                partial=False,
+                warnings=tuple(warnings),
+                errors=tuple(errors),
+            )
+
+    distributed_warning = _format_distributed_warning(distributed_meta)
     if distributed_warning:
         warnings.append(distributed_warning)
 

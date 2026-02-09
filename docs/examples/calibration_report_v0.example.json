@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "artifact_type": "calibration_report_v0",
+  "status": "accepted",
+  "protocol_version": "v0",
+  "window_signature_ref": {
+    "hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "path": "window_signature.json"
+  },
+  "profile": {
+    "preset_family": "tuned_v0",
+    "preset_candidate": {
+      "gate_window": 16,
+      "gate_epsilon": 0.08,
+      "min_evidence": 16,
+      "aggregate_policy": "max_exceedance"
+    }
+  },
+  "inputs": {
+    "control_capsules": 12,
+    "injected_capsules": 6,
+    "post_warmup_events_control": 840,
+    "post_warmup_events_injected": 360
+  },
+  "estimates": {
+    "far": 0.032,
+    "detection_delay_iters_p50": 24,
+    "detection_delay_iters_p95": 48,
+    "overhead_fraction": 0.021,
+    "sensitivity": 0.91,
+    "calibration_stability": 0.04
+  },
+  "error_budgets": {
+    "delta_far": 0.05,
+    "epsilon_det": 64,
+    "kappa_sens": 0.85,
+    "kappa_cal": 0.1
+  },
+  "constraint_checks": {
+    "delta_far": true,
+    "epsilon_det": true,
+    "kappa_sens": true,
+    "kappa_cal": true
+  },
+  "failure_modes": [],
+  "notes": [
+    "Valid only for the listed window_signature hash.",
+    "Not portable across different metric sets or transports without recalibration."
+  ]
+}

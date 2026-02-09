@@ -5,6 +5,11 @@ hashing rules, comparability predicate, governance artifacts, and precedence rul
 are allowed; schema_version is pinned to 1 for the v0/v1 contract. New optional fields may be added
 without breaking this contract, but new semantics must be documented here first.
 
+Related operational docs:
+- `docs/incubation_readiness.md`
+- `docs/calibration_protocol_v0.md`
+- `docs/distributed_mode.md`
+
 ## Artifact Set
 
 **Required (non-partial run capsules):**
@@ -72,23 +77,32 @@ Each line is a JSON object with:
 
 ### Distributed execution (run_started_v1 payload)
 
-Distributed execution context is an **optional** object under `payload.distributed`. Writers SHOULD include it when known; readers MUST accept its absence.
+Distributed execution context is an **optional** object under `payload.distributed`. Writers SHOULD include it when known; readers MUST accept its absence for legacy compatibility.
 
 ```
 payload.distributed: {
   distributed_mode: "single_process" | "replicated_single_chief_emit" | "ddp_wrapped",
   world_size_observed: int,          # >=1
-  rank_observed: int,                # >=0
-  local_rank_observed: int | null,   # null if unknown/unset
-  ddp_backend: "nccl" | "gloo" | string | null,   # null if not ddp_wrapped
-  ddp_active: bool                   # true iff ddp_wrapped
+  backend: "nccl" | "gloo" | string | null,
+  rank: int,                         # >=0
+  local_rank: int | null,
+  ddp_wrapped: bool
 }
 ```
 
 Semantics:
 - `ddp_wrapped`: torch.distributed is initialized AND world_size > 1 (use `ddp_is_active()` semantics).
-- `replicated_single_chief_emit`: world_size > 1 but no initialized process group; artifacts SHOULD be emitted by rank 0 only (chief = `rank_observed == 0`).
+- `replicated_single_chief_emit`: world_size > 1 but no initialized process group; artifacts SHOULD be emitted by rank 0 only (chief = `rank == 0`).
 - `single_process`: world_size == 1 (or distributed env absent).
+- Legacy aliases are accepted for backward compatibility:
+  - `ddp_backend` alias of `backend`
+  - `rank_observed` alias of `rank`
+  - `local_rank_observed` alias of `local_rank`
+  - `ddp_active` alias of `ddp_wrapped`
+- Validation fail-loud rule:
+  - if distributed-execution hints are present (`rank|local_rank|backend|ddp_wrapped` or legacy aliases) and `world_size_observed` is missing -> `ERROR:DISTRIBUTED_WORLD_SIZE_MISSING`
+  - if `world_size_observed > 1` and `distributed_mode` is missing -> `ERROR:DISTRIBUTED_MODE_MISSING`
+  - if `distributed_mode` is present but outside allowed enum -> `ERROR:DISTRIBUTED_MODE_INVALID`
 
 ## Manual Judgement Artifacts
 

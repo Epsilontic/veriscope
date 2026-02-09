@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, List, Optional
 
-from veriscope.core.artifacts import AuditV1, derive_gate_decision
+from veriscope.core.artifacts import AuditV1, DistributedRunConfigV1, derive_gate_decision
 from veriscope.core.ddp import ddp_is_active, ddp_rank, ddp_world_size
 from veriscope.core.jsonutil import atomic_append_jsonl, canonical_json_sha256, sanitize_json_value
 
@@ -178,8 +178,14 @@ def _validate_required_payload_fields(event: str, payload: dict[str, Any], *, li
             if not _is_non_empty_str(entrypoint.get("name")):
                 invalid.append("entrypoint.name")
         distributed = payload.get("distributed")
-        if distributed is not None and not isinstance(distributed, dict):
-            invalid.append("distributed")
+        if distributed is not None:
+            if not isinstance(distributed, dict):
+                invalid.append("distributed")
+            else:
+                try:
+                    DistributedRunConfigV1.model_validate(distributed)
+                except Exception:
+                    invalid.append("distributed")
 
     if event == "run_overrides_applied_v1":
         if "argv" in payload and not isinstance(payload.get("argv"), list):
@@ -559,9 +565,15 @@ def build_distributed_context() -> dict[str, Any]:
     if distributed_mode != "single_process":
         local_rank = _parse_optional_int(os.environ.get("LOCAL_RANK"))
 
+    ddp_wrapped = distributed_mode == "ddp_wrapped"
     return {
         "distributed_mode": distributed_mode,
         "world_size_observed": int(world_size),
+        "backend": ddp_backend,
+        "rank": int(rank),
+        "local_rank": local_rank,
+        "ddp_wrapped": ddp_wrapped,
+        # Legacy aliases kept for backward compatibility in older consumers.
         "rank_observed": int(rank),
         "local_rank_observed": local_rank,
         "ddp_backend": ddp_backend,

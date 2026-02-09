@@ -29,6 +29,11 @@ In ~30 seconds, what you get:
 - A finite-window gate that turns monitored signals into an explicit status enum (`pass | warn | fail | skip`) plus structured audit fields.
 - Validators (`veriscope validate`, `veriscope diff`) and reporting (`veriscope report`) for post-hoc review and sharing.
 
+What we enforce (scoped to the declared window in `window_signature.json`):
+- Capsule integrity checks are contract-enforced and auditable (`veriscope validate`).
+- Validation is deterministic and read-only (no artifact mutation during validate/report).
+- Run comparability is explicit and hash-gated by `window_signature_ref.hash` (+ gate preset policy).
+
 Pipeline overview:
 
 ```
@@ -73,6 +78,9 @@ What it does **not** guarantee:
 | --- | --- |
 | v0 product/ops contract (CLI semantics, exit codes, invariants) | `docs/productization.md` |
 | Frozen artifact contract (hashing, canonicalization, governance chaining) | `docs/contract_v1.md` |
+| Incubation readiness scope + claims/non-claims | `docs/incubation_readiness.md` |
+| Calibration protocol (window-scoped) + report shape | `docs/calibration_protocol_v0.md` |
+| Distributed mode contract and fail-loud rules | `docs/distributed_mode.md` |
 | Pilot kit overview (what to run + what to share) | `docs/pilot/README.md` |
 | Pilot harness scripts (exact commands + scoring) | `scripts/pilot/README.md` |
 
@@ -198,6 +206,24 @@ Note: `SCAR_*` environment variables are legacy names used across the repository
 
 After installation, run Veriscope via explicit subcommands (recommended).
 Use `veriscope --help` to see the available subcommands.
+
+### Golden Path (one command)
+
+```bash
+bash scripts/run_gpt_smoke.sh
+```
+
+This command emits a smoke capsule under `./out/`. Then verify it:
+
+```bash
+veriscope validate ./out/gpt_smoke_YYYYMMDD_HHMMSS
+veriscope report ./out/gpt_smoke_YYYYMMDD_HHMMSS --format text
+```
+
+For pilot-scoped guarantees and boundaries, see:
+- `docs/incubation_readiness.md`
+- `docs/calibration_protocol_v0.md`
+- `docs/distributed_mode.md`
 
 ### CIFAR smoke run (fast end-to-end)
 

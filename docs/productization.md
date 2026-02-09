@@ -2,6 +2,11 @@
 
 This document defines Veriscope v0 as usable infrastructure: contracts, operational semantics, exit codes, and testable artifacts. It is intended to be committed as `docs/productization.md` and shared with design partners.
 
+Companion docs for incubation and boundary clarity:
+- `docs/incubation_readiness.md`
+- `docs/calibration_protocol_v0.md`
+- `docs/distributed_mode.md`
+
 ---
 
 ## 0) One-page overview (founder + design partner)

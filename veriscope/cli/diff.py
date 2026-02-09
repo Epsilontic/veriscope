@@ -46,7 +46,9 @@ def _distributed_meta_fields(
         return None
     mode = meta.get("distributed_mode")
     world_size = _coerce_int(meta.get("world_size_observed"))
-    backend = meta.get("ddp_backend")
+    backend = meta.get("backend")
+    if backend is None:
+        backend = meta.get("ddp_backend")
     mode_value = str(mode) if mode is not None else None
     backend_value = str(backend) if backend is not None else None
     return mode_value, world_size, backend_value

@@ -38,9 +38,11 @@ __all__ = [
     "Decision",
     "RunStatus",
     "JudgementStatus",
+    "DistributedMode",
     "JsonValue",
     "VSModel",
     "WindowSignatureRefV1",
+    "DistributedRunConfigV1",
     "ProfileV1",
     "AuditV1",
     "GateRecordV1",
@@ -66,12 +68,14 @@ RunStatus = Literal["success", "user_code_failure", "veriscope_failure"]
 
 # Manual judgements are binary to avoid conflating with Decision states.
 JudgementStatus = Literal["pass", "fail"]
+DistributedMode = Literal["single_process", "replicated_single_chief_emit", "ddp_wrapped"]
 
 # JSON-compatible values (artifact hygiene for external-facing contracts).
 # Use Pydantic's named-recursive JsonValue to avoid schema-generation recursion.
 JsonValue: TypeAlias = PydanticJsonValue
 
 NonNegInt = Annotated[StrictInt, Field(ge=0)]
+PosInt = Annotated[StrictInt, Field(ge=1)]
 # Prefer non-strict float for JSON-producer friendliness; still enforce >= 0.
 NonNegFloat = Annotated[float, Field(ge=0)]
 
@@ -147,6 +151,41 @@ class ProfileV1(VSModel):
     def _ser_overrides(self, v: Mapping[str, JsonValue]) -> dict[str, JsonValue]:
         # Ensure downstream JSON tooling sees a plain dict, not MappingProxyType.
         return dict(v)
+
+
+class DistributedRunConfigV1(VSModel):
+    """
+    Optional distributed execution metadata recorded in run governance payloads.
+
+    Canonical keys are the short names (`backend`, `rank`, `local_rank`, `ddp_wrapped`).
+    Legacy aliases remain accepted for backward compatibility.
+    """
+
+    # Intentionally permissive at governance-ingest time; strict allowed-value
+    # checks are enforced in validate_outdir so user-facing token behavior is stable.
+    distributed_mode: Optional[str] = Field(default=None, min_length=1)
+    world_size_observed: Optional[PosInt] = None
+    backend: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        validation_alias=AliasChoices("backend", "ddp_backend"),
+        serialization_alias="backend",
+    )
+    rank: Optional[NonNegInt] = Field(
+        default=None,
+        validation_alias=AliasChoices("rank", "rank_observed"),
+        serialization_alias="rank",
+    )
+    local_rank: Optional[NonNegInt] = Field(
+        default=None,
+        validation_alias=AliasChoices("local_rank", "local_rank_observed"),
+        serialization_alias="local_rank",
+    )
+    ddp_wrapped: Optional[bool] = Field(
+        default=None,
+        validation_alias=AliasChoices("ddp_wrapped", "ddp_active"),
+        serialization_alias="ddp_wrapped",
+    )
 
 
 class AuditV1(VSModel):
