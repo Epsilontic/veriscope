@@ -20,6 +20,7 @@ def _run_wrapper(
     fake_deps_dir: Path,
     *,
     gate_preset: str = "tuned_v0",
+    force: bool = True,
 ) -> subprocess.CompletedProcess:
     cmd = [
         sys.executable,
@@ -31,9 +32,10 @@ def _run_wrapper(
         gate_preset,
         "--outdir",
         str(outdir),
-        "--force",
-        "--",
-    ] + runner_args
+    ]
+    if force:
+        cmd.append("--force")
+    cmd += ["--"] + runner_args
     env = os.environ.copy()
     env["VERISCOPE_HF_RUNNER_CMD"] = f"{sys.executable} {RUNNER_SCRIPT}"
     pythonpath = env.get("PYTHONPATH", "")
@@ -95,3 +97,23 @@ def test_run_hf_wrapper_logs_overrides(tmp_path: Path) -> None:
     log_path.write_text("\n".join(filtered) + "\n", encoding="utf-8")
     v_missing = validate_outdir(outdir)
     assert not v_missing.ok
+
+
+def test_run_hf_refuses_existing_capsule_without_force(tmp_path: Path) -> None:
+    outdir = tmp_path / "hf_existing_capsule"
+    outdir.mkdir(parents=True, exist_ok=True)
+    sentinel = outdir / "window_signature.json"
+    sentinel_payload = "{\"schema_version\": 1}\n"
+    sentinel.write_text(sentinel_payload, encoding="utf-8")
+
+    fake_deps_dir = tmp_path / "fake_deps"
+    fake_deps_dir.mkdir()
+    (fake_deps_dir / "datasets.py").write_text("__all__ = []\n", encoding="utf-8")
+    (fake_deps_dir / "transformers.py").write_text("__all__ = []\n", encoding="utf-8")
+
+    result = _run_wrapper(outdir, ["--max_steps", "1"], fake_deps_dir, force=False)
+
+    assert result.returncode != 0
+    assert "already contains capsule artifacts" in result.stderr
+    assert sentinel.read_text(encoding="utf-8") == sentinel_payload
+    assert not (outdir / "run_config_resolved.json").exists()

@@ -28,6 +28,13 @@ from veriscope.core.jsonutil import atomic_write_json, window_signature_sha256
 from veriscope.core.lifecycle import RunLifecycle, map_status_and_exit
 from veriscope.core.redaction_policy import POLICY_REV, default_env_capture, prepare_env_capture, redact_argv
 
+RUN_OUTDIR_SENTINELS = (
+    "run_config_resolved.json",
+    "results.json",
+    "results_summary.json",
+    "window_signature.json",
+)
+
 
 def _now_utc_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -63,6 +70,36 @@ def _default_outdir(kind: str) -> Path:
     base = Path(os.environ.get("VERISCOPE_OUT_BASE", "./out")).expanduser()
     ts = time.strftime("%Y%m%d_%H%M%S")
     return base / f"veriscope_{kind}_{ts}_{os.getpid()}"
+
+
+def _existing_run_sentinels(outdir: Path) -> tuple[str, ...]:
+    return tuple(name for name in RUN_OUTDIR_SENTINELS if (outdir / name).exists())
+
+
+def _prepare_run_outdir(*, requested_outdir: Path, run_kind: str, force: bool) -> Path:
+    requested = Path(requested_outdir).expanduser()
+    requested.mkdir(parents=True, exist_ok=True)
+    sentinels = _existing_run_sentinels(requested)
+    if not sentinels:
+        return requested
+    joined = ", ".join(sentinels)
+    if not force:
+        raise SystemExit(
+            "Refusing to run: OUTDIR already contains capsule artifacts "
+            f"({joined}). Use --force to run in a fresh subdirectory."
+        )
+
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    forced = requested / f"force_{run_kind}_{ts}_{uuid.uuid4().hex[:8]}"
+    forced.mkdir(parents=True, exist_ok=False)
+    print(
+        (
+            "[veriscope] --force preserved existing capsule artifacts in "
+            f"{requested}; using fresh outdir {forced}"
+        ),
+        file=sys.stderr,
+    )
+    return forced
 
 
 def _filter_env_for_run(env: Dict[str, str]) -> Dict[str, str]:
@@ -713,8 +750,8 @@ def _select_cifar_outdir(args_outdir: str) -> Path:
 
 
 def _cmd_run_cifar(args: argparse.Namespace) -> int:
-    outdir = _select_cifar_outdir(args.outdir)
-    outdir.mkdir(parents=True, exist_ok=True)
+    requested_outdir = _select_cifar_outdir(args.outdir)
+    outdir = _prepare_run_outdir(requested_outdir=requested_outdir, run_kind="cifar", force=bool(args.force))
 
     env = os.environ.copy()
     # Set SCAR_OUTDIR to preserve legacy default and ensure artifact goes to the run dir.
@@ -857,8 +894,8 @@ def _cmd_run_cifar(args: argparse.Namespace) -> int:
 
 def _cmd_run_gpt(args: argparse.Namespace) -> int:
     outdir_str = (args.outdir or "").strip()
-    outdir = Path(outdir_str).expanduser() if outdir_str else _default_outdir("gpt")
-    outdir.mkdir(parents=True, exist_ok=True)
+    requested_outdir = Path(outdir_str).expanduser() if outdir_str else _default_outdir("gpt")
+    outdir = _prepare_run_outdir(requested_outdir=requested_outdir, run_kind="gpt", force=bool(args.force))
 
     env = os.environ.copy()
     run_id = uuid.uuid4().hex[:12]
@@ -909,8 +946,8 @@ def _cmd_run_gpt(args: argparse.Namespace) -> int:
 
 def _cmd_run_hf(args: argparse.Namespace) -> int:
     outdir_str = (args.outdir or "").strip()
-    outdir = Path(outdir_str).expanduser() if outdir_str else _default_outdir("hf")
-    outdir.mkdir(parents=True, exist_ok=True)
+    requested_outdir = Path(outdir_str).expanduser() if outdir_str else _default_outdir("hf")
+    outdir = _prepare_run_outdir(requested_outdir=requested_outdir, run_kind="hf", force=bool(args.force))
 
     env = os.environ.copy()
     run_id = uuid.uuid4().hex[:12]
@@ -934,8 +971,7 @@ def _cmd_run_hf(args: argparse.Namespace) -> int:
         if not has_gate_preset:
             hf_args = ["--gate_preset", args.gate_preset] + hf_args
 
-    # Forward wrapper-level --force into the HF runner so artifact emission can overwrite
-    # wrapper-created placeholders (e.g., window_signature.json) inside an existing capsule.
+    # Forward wrapper-level --force into the HF runner as a best-effort compatibility signal.
     if bool(args.force):
         has_force = ("--force" in hf_args) or any(a.startswith("--force=") for a in hf_args)
         if not has_force:
@@ -1243,14 +1279,22 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     p_gpt = run_sub.add_parser("gpt", help="Run the nanoGPT-based runner")
     p_gpt.add_argument("--outdir", type=str, default="", help="Output directory (default: ./out/...)")
-    p_gpt.add_argument("--force", action="store_true", help="Bypass GPU lock")
+    p_gpt.add_argument(
+        "--force",
+        action="store_true",
+        help="Bypass GPU lock; if OUTDIR has artifacts, run in a fresh subdirectory",
+    )
     p_gpt.add_argument("gpt_args", nargs=argparse.REMAINDER, help="Args forwarded to train_nanogpt.py")
     p_gpt.set_defaults(_handler=_cmd_run_gpt)
 
     p_hf = run_sub.add_parser("hf", help="Run the Hugging Face transformer runner")
     p_hf.add_argument("--outdir", type=str, default="", help="Output directory (default: ./out/...)")
     p_hf.add_argument("--gate-preset", type=str, default="tuned_v0", help="Gate preset name")
-    p_hf.add_argument("--force", action="store_true", help="Bypass GPU lock")
+    p_hf.add_argument(
+        "--force",
+        action="store_true",
+        help="Bypass GPU lock; if OUTDIR has artifacts, run in a fresh subdirectory",
+    )
     p_hf.add_argument("hf_args", nargs=argparse.REMAINDER, help="Args forwarded to train_hf.py")
     p_hf.set_defaults(_handler=_cmd_run_hf)
 
@@ -1262,7 +1306,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="Output directory (default: SCAR_OUTDIR or ./scar_bundle_phase4)",
     )
     p_cifar.add_argument("--smoke", action="store_true", help="Set SCAR_SMOKE=1 for this run")
-    p_cifar.add_argument("--force", action="store_true", help="Bypass GPU lock")
+    p_cifar.add_argument(
+        "--force",
+        action="store_true",
+        help="Bypass GPU lock; if OUTDIR has artifacts, run in a fresh subdirectory",
+    )
     p_cifar.add_argument("legacy_args", nargs=argparse.REMAINDER, help="Args forwarded to legacy runner")
     p_cifar.set_defaults(_handler=_cmd_run_cifar)
 

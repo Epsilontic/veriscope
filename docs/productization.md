@@ -101,7 +101,7 @@ veriscope run treats OUTDIR as “containing Veriscope artifacts” if any of th
 
 Policy:
 	•	If sentinel(s) exist: veriscope run fails unless --force is passed.
-	•	--force deletes prior Veriscope artifacts in OUTDIR before starting.
+	•	--force preserves existing artifacts and starts the run in a fresh subdirectory under OUTDIR.
 
 Process safety requirements (v0 must-have)
 	•	Real-time stdout/stderr streaming: child logs must stream live to the console (no end-of-run buffering).
@@ -133,7 +133,7 @@ Notes (HF runner)
 	•	HF dependency preflight runs before launch and fails fast if datasets/transformers are missing.
 	•	Override runner command via VERISCOPE_HF_RUNNER_CMD for CI-safe integration testing.
 	•	HF runner inherits the same wrapper process-safety invariants as run gpt (streaming logs, process group, signal forwarding, best-effort finalization).
-	•	--force has the same meaning as run gpt (bypass GPU lock).
+	•	--force has the same meaning as run gpt (bypass GPU lock; fresh subdirectory when OUTDIR already contains artifacts).
 
 ⸻
 

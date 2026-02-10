@@ -34,7 +34,7 @@ def _wait_for_proc_running(proc: subprocess.Popen, timeout_s: float = 5.0) -> No
     raise AssertionError("Process exited before signal could be sent")
 
 
-def _run_wrapper(outdir: Path, runner_args: list[str]) -> subprocess.Popen:
+def _wrapper_cmd(outdir: Path, runner_args: list[str], *, force: bool) -> list[str]:
     cmd = [
         sys.executable,
         "-c",
@@ -43,11 +43,22 @@ def _run_wrapper(outdir: Path, runner_args: list[str]) -> subprocess.Popen:
         "gpt",
         "--outdir",
         str(outdir),
-        "--force",
-        "--",
-    ] + runner_args
+    ]
+    if force:
+        cmd.append("--force")
+    cmd += ["--"] + runner_args
+    return cmd
+
+
+def _wrapper_env() -> dict[str, str]:
     env = os.environ.copy()
     env["VERISCOPE_GPT_RUNNER_CMD"] = f"{sys.executable} {RUNNER_SCRIPT}"
+    return env
+
+
+def _run_wrapper(outdir: Path, runner_args: list[str], *, force: bool = True) -> subprocess.Popen:
+    cmd = _wrapper_cmd(outdir, runner_args, force=force)
+    env = _wrapper_env()
     return subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
 
@@ -99,3 +110,53 @@ def test_run_gpt_interrupt_timeout_escalation(tmp_path: Path) -> None:
     v = validate_outdir(outdir, allow_partial=True)
     assert v.ok, v.message
     assert render_report_md(outdir, fmt="text")
+
+
+def test_run_gpt_refuses_existing_capsule_without_force(tmp_path: Path) -> None:
+    outdir = tmp_path / "existing_capsule"
+    outdir.mkdir(parents=True, exist_ok=True)
+    sentinel = outdir / "results_summary.json"
+    sentinel_payload = "{\"sentinel\": true}\n"
+    sentinel.write_text(sentinel_payload, encoding="utf-8")
+
+    result = subprocess.run(
+        _wrapper_cmd(outdir, ["--sleep-seconds", "0"], force=False),
+        env=_wrapper_env(),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "already contains capsule artifacts" in result.stderr
+    assert sentinel.read_text(encoding="utf-8") == sentinel_payload
+    assert not (outdir / "run_config_resolved.json").exists()
+
+
+def test_run_gpt_force_uses_fresh_subdir_when_outdir_has_capsule(tmp_path: Path) -> None:
+    outdir = tmp_path / "existing_capsule_force"
+    outdir.mkdir(parents=True, exist_ok=True)
+    sentinel = outdir / "results_summary.json"
+    sentinel_payload = "{\"sentinel\": true}\n"
+    sentinel.write_text(sentinel_payload, encoding="utf-8")
+
+    result = subprocess.run(
+        _wrapper_cmd(outdir, ["--sleep-seconds", "0", "--emit-artifacts"], force=True),
+        env=_wrapper_env(),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "using fresh outdir" in result.stderr
+    assert sentinel.read_text(encoding="utf-8") == sentinel_payload
+    assert not (outdir / "run_config_resolved.json").exists()
+
+    forced_dirs = [p for p in outdir.iterdir() if p.is_dir() and p.name.startswith("force_gpt_")]
+    assert forced_dirs, f"expected force subdir under {outdir}, stderr={result.stderr!r}"
+    forced_outdir = max(forced_dirs, key=lambda p: p.stat().st_mtime_ns)
+    assert (forced_outdir / "run_config_resolved.json").exists()
+    assert (forced_outdir / "window_signature.json").exists()
+    assert (forced_outdir / "results_summary.json").exists()
+    assert (forced_outdir / "results.json").exists()
