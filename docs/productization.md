@@ -82,8 +82,9 @@ veriscope run gpt \
   --gate-preset tuned_v0 \
   --outdir OUTDIR \
   [--force] \
-  [--strict-determinism] \
   -- <training args>
+
+Note: `--strict-determinism` is roadmap and is not currently implemented in `veriscope run gpt`.
 
 Run ID (join key)
 	•	run_id is generated once by the CLI and propagated into all emitted artifacts.
@@ -282,8 +283,8 @@ Conditionally required artifact
 
 Recommended artifacts (best-effort; must not block runs)
 	•	OUTDIR/run_config_resolved.json (v1)
-	•	OUTDIR/runner_output.log (captured stdout/stderr)
-	•	OUTDIR/environment.txt (dependency + platform capture; best effort)
+	•	Roadmap (not yet implemented): OUTDIR/runner_output.log (captured stdout/stderr)
+	•	Roadmap (not yet implemented): OUTDIR/environment.txt (dependency + platform capture; best effort)
 
 Optional artifacts
 	•	OUTDIR/calibration.csv (existing contract)
@@ -338,9 +339,10 @@ Environment capture safety (blocker)
 	•	redactions_applied=false only if no deny rules matched any captured key.
 
 Dependency + platform capture (best effort; non-blocking)
-	•	Attempt to write OUTDIR/environment.txt. If it fails, set dependencies.method="unavailable" and continue.
+	•	Roadmap (not yet implemented): attempt to write OUTDIR/environment.txt. Until implemented, wrappers continue without this file.
 
 Minimum content of environment.txt (best effort):
+	•	Roadmap (not yet implemented; target content below when shipped)
 	•	Python version (sys.version)
 	•	OS/arch (platform.platform(), platform.machine())
 	•	pip freeze output (if available)
@@ -493,7 +495,7 @@ Presets (required) and discoverability
 
 Determinism policy
 	•	default: warn + record in determinism_status
-	•	--strict-determinism: hard-fail on missing critical settings
+	•	`--strict-determinism` hard-fail mode is roadmap (not currently implemented in the run wrapper CLI).
 
 Secrets hygiene (explicit blocker)
 	•	env capture must be allowlisted + redacted; never dump full env; redacted keys remain present with "***REDACTED***".
@@ -503,8 +505,8 @@ Secrets hygiene (explicit blocker)
 6) Observability
 
 Captured logs (recommended)
-	•	OUTDIR/runner_output.log captures runner stdout/stderr.
-	•	If run_status != "success", report must point to runner_output.log as the first debugging artifact.
+	•	Roadmap (not yet implemented): OUTDIR/runner_output.log capture for runner stdout/stderr.
+	•	Roadmap (not yet implemented): report linkage to runner_output.log for first-line debugging.
 
 ⸻
 
@@ -543,7 +545,7 @@ v1+
 	2.	CLI-generated run_id propagation to all artifacts
 	3.	Emit window_signature.json (+ gate_controls_hash canonicalization)
 	4.	Emit results.json + results_summary.json (atomic rename)
-	5.	Env allowlist + deny exact/regex redaction; environment.txt best-effort with platform info
+	5.	Env allowlist + deny exact/regex redaction (environment.txt remains roadmap)
 	6.	Pydantic schemas + veriscope validate (including governance/identity switches)
 	7.	Markdown veriscope report with fixed skeleton + goldens
 	8.	Optional veriscope override + report overlay
@@ -594,8 +596,8 @@ Appendix A: Sample Markdown report output (golden reference)
 | Window signature | `window_signature.json` |
 | Detailed results | `results.json` |
 | Summary | `results_summary.json` |
-| Dependencies | `environment.txt` |
-| Runner logs | `runner_output.log` |
+| Dependencies | `environment.txt` (roadmap; not yet emitted) |
+| Runner logs | `runner_output.log` (roadmap; not yet emitted) |
 
 ## Manual Judgement
 - None
