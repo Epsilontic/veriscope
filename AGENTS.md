@@ -84,7 +84,7 @@ If a referenced file exists, it MUST be consistent:
 - If `results.json` exists:    
   `counts.evaluated + counts.skip == len(results.gates)`  
 - `final_decision` MUST match the derivation rule in §6.5  
-- All timestamps MUST be ISO8601 UTC `...Z` (seconds precision recommended)  
+- Timestamp compatibility: writers SHOULD emit ISO8601 UTC `...Z` (seconds precision recommended); readers MAY accept `+00:00` or naive ISO8601 and treat them as UTC for backward compatibility.  
   
 ---  
   
@@ -191,7 +191,7 @@ interface WindowSignatureV1 {
   schema_version: 1;  
   
   // Informational fields (recommended)  
-  created_ts_utc?: string;      // ISO8601 UTC Z  
+  created_ts_utc?: string;      // ISO8601 UTC (writers emit Z; readers may normalize +00:00/naive to UTC)
   description?: string;  
   
   // Identity-defining content (examples; repo may add more keys)  
@@ -254,7 +254,7 @@ interface ResultsSummaryV1 {
   runner_exit_code?: number | null;  
   runner_signal?: string | null;  
   
-  started_ts_utc: string; // ISO8601 UTC Z  
+  started_ts_utc: string; // ISO8601 UTC (writers emit Z; readers may normalize +00:00/naive to UTC)
   ended_ts_utc?: string | null;  
   
   counts: CountsV1;  
@@ -347,7 +347,7 @@ interface ManualJudgementV1 {
   reason: string;  
   
   reviewer?: string | null;  
-  ts_utc: string; // ISO8601 UTC Z  
+  ts_utc: string; // ISO8601 UTC (writers emit Z; readers may normalize +00:00/naive to UTC)
 }  
 ```  
   

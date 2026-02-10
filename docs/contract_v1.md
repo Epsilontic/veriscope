@@ -50,13 +50,16 @@ Hashing requirements:
 - The governance hash includes whichever of `event` or `event_type` is present (writers should prefer `event`).
 - For new entries, `event` and `event_type` are mutually exclusive.
 - Non-finite floats MUST NOT appear in governance logs; writers MAY sanitize them to `null` but SHOULD warn.
+- Timestamp wire policy for `*_utc` fields:
+  - Writers SHOULD emit ISO-8601 UTC strings with trailing `Z` (seconds precision recommended).
+  - Readers MAY accept `Z`, `+00:00`, or naive ISO-8601 and treat naive values as UTC.
 
 ## Governance Journal: `governance_log.jsonl`
 
 Each line is a JSON object with:
 - `schema_version`: `1`
 - `rev`: integer (strictly consecutive in append order; `prev_rev + 1`)
-- `ts_utc`: ISO-8601 timestamp in UTC (`Z` preferred; `+00:00` accepted) (informational, not authoritative)
+- `ts_utc`: ISO-8601 timestamp in UTC (`Z` preferred; `+00:00` and naive accepted; naive is treated as UTC) (informational, not authoritative)
 - `actor`: optional string (reviewer/operator)
 - `event` (preferred) or `event_type` (legacy), mutually exclusive for new entries: one of:
   - `manual_judgement_set`

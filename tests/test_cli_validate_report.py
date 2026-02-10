@@ -10,6 +10,7 @@ from typing import Any, Callable
 import pytest
 
 from veriscope.cli.governance import GOVERNANCE_LOG_SCHEMA_VERSION, append_governance_log, append_run_started
+from veriscope.cli.override import write_manual_judgement
 from veriscope.cli.report import render_report_md
 from veriscope.core.jsonutil import canonical_dumps
 from veriscope.cli.validate import validate_outdir
@@ -516,6 +517,27 @@ def test_validate_rejects_manual_judgement_run_id_mismatch(minimal_artifact_dir:
     v = validate_outdir(minimal_artifact_dir)
     assert not v.ok
     assert "run_id mismatch" in v.message
+
+
+def test_override_accepts_naive_ts_and_serializes_utc_z(minimal_artifact_dir: Path) -> None:
+    path, warnings = write_manual_judgement(
+        minimal_artifact_dir,
+        status="pass",
+        reason="naive timestamp accepted",
+        ts_utc="2026-01-01T00:00:00",
+        force=True,
+    )
+    assert path.exists()
+    assert warnings == ()
+    obj = _read_json_dict(path)
+    assert obj["ts_utc"] == "2026-01-01T00:00:00Z"
+
+    gov_path = minimal_artifact_dir / "governance_log.jsonl"
+    assert gov_path.exists()
+    last_entry = json.loads(gov_path.read_text(encoding="utf-8").splitlines()[-1])
+    event = last_entry.get("event") or last_entry.get("event_type")
+    assert event == "manual_judgement_set"
+    assert last_entry["ts_utc"] == "2026-01-01T00:00:00Z"
 
 
 def test_report_raises_on_invalid_dir_minimal(minimal_artifact_dir: Path) -> None:
