@@ -85,6 +85,14 @@ def test_run_gpt_smoke_defaults_cpu_and_tuned_v0(tmp_path: Path) -> None:
     assert _arg_value(normalized, "--device") == "cpu"
     assert _arg_value(normalized, "--gate_preset") == "tuned_v0"
 
+    window_signature = json.loads((outdir / "window_signature.json").read_text(encoding="utf-8"))
+    assert window_signature["schema_version"] == 1
+    assert window_signature.get("placeholder") is not True
+    assert window_signature["gates"]["preset"] == "fake_runner"
+
+    results_summary = json.loads((outdir / "results_summary.json").read_text(encoding="utf-8"))
+    assert results_summary["profile"]["gate_preset"] == "fake_runner"
+
 
 def test_pilot_run_strict_default_and_lenient_opt_out(tmp_path: Path) -> None:
     env = _base_env(tmp_path)

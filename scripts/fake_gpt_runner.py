@@ -39,9 +39,25 @@ def _read_json_obj(path: Path) -> dict[str, Any]:
     return obj
 
 
+def _iso_utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _minimal_window_signature() -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "created_ts_utc": _iso_utc_now(),
+        "description": "Fake GPT runner (test harness)",
+        "transport": {"name": "fake_gpt_metrics_v1", "cadence": "every_1_iters"},
+        "evidence": {"metrics": ["loss"]},
+        "gates": {"preset": "fake_runner"},
+    }
+
+
 def _emit_minimal_artifacts(out_dir: Path, *, run_status: RunStatus, runner_exit_code: int) -> None:
     ws_path = out_dir / "window_signature.json"
-    ws_obj = _read_json_obj(ws_path) if ws_path.exists() else {"schema_version": 1, "placeholder": True}
+    ws_obj = _minimal_window_signature()
+    atomic_write_json(ws_path, ws_obj)
     ws_hash = window_signature_sha256(ws_obj)
     ws_ref = WindowSignatureRefV1(hash=ws_hash, path="window_signature.json")
 

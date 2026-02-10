@@ -222,7 +222,7 @@ veriscope validate ./out/gpt_smoke_YYYYMMDD_HHMMSS
 veriscope report ./out/gpt_smoke_YYYYMMDD_HHMMSS --format text
 ```
 
-Smoke defaults are reviewer-safe:
+For `scripts/run_gpt_smoke.sh`, smoke defaults are reviewer-safe:
 - default device is `cpu` (override with `VERISCOPE_GPT_SMOKE_DEVICE` or forwarded `--device ...`)
 - default gate preset is `tuned_v0` unless you explicitly pass `--gate_preset/--gate-preset`
 
