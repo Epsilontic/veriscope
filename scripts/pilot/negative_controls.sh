@@ -116,20 +116,35 @@ partial_dir="${base_parent}/${base_name}_neg_partial_${ts}"
 cp -a "$base_outdir" "$partial_dir"
 rm -f "$partial_dir/results.json"
 
+# Partial capsules are rejected per contract (docs/contract_v1.md Comparable(A,B)) - this validates that rejection.
 set +e
 partial_out="$(veriscope diff "$base_outdir" "$partial_dir" 2> "$partial_dir/partial_diff_stderr.txt")"
 partial_status=$?
 set -e
 echo "$partial_out" > "$partial_dir/partial_diff.txt"
-if [[ $partial_status -ne 0 ]]; then
-  echo "EXPECTED_PARTIAL_DIFF_SUCCESS: diff returned $partial_status" >&2
+if [[ $partial_status -eq 0 ]]; then
+  echo "EXPECTED_PARTIAL_DIFF_FAILURE: diff unexpectedly succeeded" >&2
   exit 2
 fi
-echo "$partial_out" | $GREP -q "NOTE:PARTIAL_MODE" || {
-  echo "EXPECTED_PARTIAL_NOTE_MISSING" >&2
+if [[ ! -s "$partial_dir/partial_diff_stderr.txt" ]]; then
+  echo "EXPECTED_PARTIAL_ERROR_TEXT_MISSING: stderr is empty" >&2
   exit 2
-}
-if echo "$partial_out" | $GREP -q "counts_"; then
-  echo "EXPECTED_NO_COUNTS_LINES" >&2
+fi
+if ! $GREP -qi "partial|non-partial|PARTIAL_CAPSULE" "$partial_dir/partial_diff_stderr.txt"; then
+  echo "EXPECTED_PARTIAL_ERROR_INDICATOR_MISSING" >&2
+  cat "$partial_dir/partial_diff_stderr.txt" >&2 || true
+  exit 2
+fi
+
+comparable_dir="${base_parent}/${base_name}_neg_comparable_${ts}"
+cp -a "$base_outdir" "$comparable_dir"
+set +e
+comparable_out="$(veriscope diff "$base_outdir" "$comparable_dir" 2> "$comparable_dir/comparable_diff_stderr.txt")"
+comparable_status=$?
+set -e
+echo "$comparable_out" > "$comparable_dir/comparable_diff.txt"
+if [[ $comparable_status -ne 0 ]]; then
+  echo "EXPECTED_COMPARABLE_DIFF_SUCCESS: diff returned $comparable_status" >&2
+  cat "$comparable_dir/comparable_diff_stderr.txt" >&2 || true
   exit 2
 fi

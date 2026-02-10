@@ -52,7 +52,8 @@ bash scripts/pilot/negative_controls.sh OUTDIR
 This script creates copies of the capsule to validate:
 - Governance tamper detection (`veriscope validate --strict-governance` must fail).
 - Window signature mismatch detection (`veriscope diff` must report `WINDOW_HASH_MISMATCH`).
-- Partial-mode diff behavior (no `counts_` lines, with `NOTE:PARTIAL_MODE`).
+- Partial-capsule rejection (`veriscope diff` must fail with a partial/non-partial indicator).
+- Full-capsule comparability sanity check (`veriscope diff` on two full capsules must succeed).
 
 ## Troubleshooting
 - If `veriscope diff` fails early, validate the base capsule first with `veriscope validate OUTDIR`.
