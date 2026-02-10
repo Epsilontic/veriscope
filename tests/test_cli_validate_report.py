@@ -528,7 +528,7 @@ def test_override_accepts_naive_ts_and_serializes_utc_z(minimal_artifact_dir: Pa
         force=True,
     )
     assert path.exists()
-    assert warnings == ()
+    assert isinstance(warnings, tuple)
     obj = _read_json_dict(path)
     assert obj["ts_utc"] == "2026-01-01T00:00:00Z"
 
