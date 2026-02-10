@@ -5,6 +5,8 @@ hashing rules, comparability predicate, governance artifacts, and precedence rul
 are allowed; schema_version is pinned to 1 for the v0/v1 contract. New optional fields may be added
 without breaking this contract, but new semantics must be documented here first.
 
+Normative precedence: this is the single authoritative contract. All other docs are derived guidance and must defer to this file on conflict.
+
 Related operational docs:
 - `docs/incubation_readiness.md`
 - `docs/calibration_protocol_v0.md`

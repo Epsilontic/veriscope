@@ -1,8 +1,7 @@
 # Distributed Mode Contract (v0/v1 Bridge)
 
 This document defines how distributed execution is represented in governance and validated.
-
-Normative enum/token names live in `docs/contract_v1.md`; this page is an operator-focused companion.
+Normative precedence: `docs/contract_v1.md` is the authoritative contract; this page is derived operator guidance.
 
 ## Scope and Intent
 

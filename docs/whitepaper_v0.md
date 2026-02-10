@@ -4,12 +4,9 @@
 
 ## Norm hierarchy (how to resolve “what is normative”)
 
-1. **Frozen capsule contract (primary):** `docs/contract_v1.md`
-   Normative for artifact schemas, canonicalization, hashing, comparability, and partial-capsule rules.
-2. **Operational guide (secondary):** `docs/productization.md`
-   Normative for pipeline/ops expectations (atomic writes, canonical decision posture, operational exit codes).
-3. **Pilot kit (tertiary):** `docs/pilot/*`, `scripts/pilot/*`
-   Normative for pilot harness workflows and scoring definitions (including pilot success criteria stated in pilot docs).
+`docs/contract_v1.md` is the single normative source for artifact schemas, canonicalization, hashing, comparability, governance, and contract-level exit semantics.
+
+All other documents (`docs/productization.md`, `docs/pilot/*`, `scripts/pilot/*`, and this whitepaper) are derived guidance and must defer to `docs/contract_v1.md` on conflict.
 
 (See **Appendix D — Traceability**.)
 
@@ -198,11 +195,11 @@ The CLI provides:
 - `report`: `0` ok, `2` failed
 - `diff`: `0` comparable, `2` incomparable/invalid (including missing/invalid governance or partial capsules)
 
-**Operational semantics (productization guide)**
-- exit code `3` is reserved for **internal error** class conditions (including internal-error codepaths in validate/report),
-- `veriscope run` uses operational exit behavior tied to run status, including a fallback rule when `results_summary.json` is missing.
+**Operational semantics (implementation detail)**
+- `veriscope run` uses operational exit behavior tied to run status (`0/2/3`).
+- `veriscope validate` and `veriscope report` currently surface failures as `2` in CLI paths.
 
-Pipeline recommendation: treat `3` as “tooling/internal failure,” distinct from a contract-level invalid capsule (`2`).
+Pipeline recommendation: treat `3` (when emitted) as a tooling/internal failure class distinct from a contract-level invalid capsule (`2`).
 
 ---
 
@@ -347,7 +344,7 @@ Veriscope is **AGPL-3.0-only unless you have a commercial license**. See `LICENS
 - Treat `skip` as “no decision,” not “safe.”
 - Validate capsules before ingestion or diffing.
 - Treat partial capsules as non-comparable in `diff`/`report --compare`.
-- Handle exit code `3` as an internal-error class distinct from invalid capsules (`2`).
+- Handle exit code `3` (when emitted, primarily by run/calibration paths) as an internal-error class distinct from invalid capsules (`2`).
 
 ---
 

@@ -1,5 +1,7 @@
 # Pilot kit overview
 
+Normative precedence: `docs/contract_v1.md` is the authoritative contract. This page is derived pilot guidance.
+
 ## What this is
 The pilot kit provides a partner-facing workflow for running a control and an injected-pathology run, validating artifacts, and generating shareable outputs. It follows the v0 contract in `docs/productization.md` and uses the pilot harness scripts in `scripts/pilot/`.
 
@@ -12,8 +14,8 @@ Measured on `gate_preset=tuned_v0` with control + injected runs:
 ## What to share
 - `report.md` (from `veriscope report OUTDIR --format md`)
 - `calibration.json` + `calibration.md` (from `scripts/pilot/score.py`)
-- At minimum (non-partial capsules): `results.json`, `results_summary.json`, `window_signature.json`
-- For partial capsules: `window_signature.json` + `results_summary.json` with `partial=true`
+- At minimum (non-partial capsules): `window_signature.json`, `results.json`, `results_summary.json`
+- At minimum (partial capsules): `window_signature.json` and `results_summary.json` with `partial=true`
 - `run_config_resolved.json` is recommended for reproducibility context
 - If you plan to run `veriscope diff` or `veriscope report --compare`, include a valid `governance_log.jsonl`; compare mode rejects missing/invalid governance and rejects `partial=true` capsules.
 

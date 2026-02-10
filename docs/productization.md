@@ -2,6 +2,8 @@
 
 This document defines Veriscope v0 as usable infrastructure: contracts, operational semantics, exit codes, and testable artifacts. It is intended to be committed as `docs/productization.md` and shared with design partners.
 
+Normative precedence: `docs/contract_v1.md` is the single authoritative contract. This document is derived operational guidance; if any statement conflicts with `docs/contract_v1.md`, the contract wins.
+
 Companion docs for incubation and boundary clarity:
 - `docs/incubation_readiness.md`
 - `docs/calibration_protocol_v0.md`
@@ -249,14 +251,12 @@ veriscope validate
 Code	Meaning
 0	valid
 2	validation failed (schema or cross-artifact mismatch)
-3	veriscope internal error
 
 veriscope report
 
 Code	Meaning
 0	report generated
 2	cannot report due to invalid/missing artifacts
-3	veriscope internal error
 
 veriscope diff / veriscope report --compare
 

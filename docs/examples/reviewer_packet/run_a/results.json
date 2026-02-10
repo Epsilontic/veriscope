@@ -1,0 +1,1 @@
+{"ended_ts_utc":"2026-02-10T18:41:27Z","gates":[],"metrics":[],"profile":{"gate_preset":"fake_runner","overrides":{}},"run_id":"3179293c5c9c","run_status":"success","runner_exit_code":0,"schema_version":1,"started_ts_utc":"2026-02-10T18:41:27Z","window_signature_ref":{"hash":"0b77e84a5d512ff9895524a60324906e8a3231e99d75a55afe8d48d63700b35b","path":"window_signature.json"}}

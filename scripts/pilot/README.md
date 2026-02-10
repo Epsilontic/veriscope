@@ -1,6 +1,7 @@
 # Pilot harness scripts
 
 For pilot goals and success criteria, see `docs/pilot/README.md`.
+Normative precedence for artifacts/comparability is `docs/contract_v1.md`; this page is workflow guidance.
 
 ## run.sh
 
@@ -15,17 +16,22 @@ Behavior:
 - Injects `--gate_preset tuned_v0` **unless** you already provided `--gate_preset`.
 - Comparability canonicalizes the legacy alias `tuned` to `tuned_v0`.
 - Captures `validate`, `inspect`, and `report` outputs in the OUTDIR.
+- Resolves the effective capsule directory into `OUTDIR/capdir.txt` (important when `veriscope run ... --force` emits into a fresh subdirectory).
+- Strict by default: fails if `run`, `validate`, `inspect`, or `report` fail.
+- Lenient mode is explicit: set `VERISCOPE_PILOT_STRICT=0` to keep old "run-only exit status" behavior.
 
 Outputs in OUTDIR:
 - `validate.txt`
 - `inspect.txt`
 - `report.md`
 - `report_stderr.txt`
+- `capdir.txt` (resolved capsule directory validated/reported by the harness)
 - `git_sha.txt`
 - `version.txt`
 
 Exit code:
-- Propagates the `veriscope run gpt` exit code if nonzero; otherwise exits 0.
+- Default (`VERISCOPE_PILOT_STRICT=1`): nonzero if any of `run`, `validate`, `inspect`, or `report` fail.
+- Lenient (`VERISCOPE_PILOT_STRICT=0`): propagates `veriscope run gpt` exit code if nonzero; otherwise exits 0.
 
 ## score.py
 

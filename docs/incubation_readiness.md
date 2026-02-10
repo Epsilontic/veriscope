@@ -1,6 +1,7 @@
 # Incubation Readiness (v0, Next 1–2 Days)
 
 This page is the short decision memo for AI2-style incubation review.
+Normative precedence: `docs/contract_v1.md` is the authoritative contract; this document is derived scope/positioning guidance.
 
 ## Scope First: `W_inc = (M_W, I_W, Φ_W, B, ε)`
 

@@ -22,17 +22,19 @@ dataset_dir="${nanogpt_dir}/data/${smoke_dataset}"
 train_bin="${dataset_dir}/train.bin"
 prep_py="${dataset_dir}/prepare.py"
 
-force_flag=()
+use_force=0
 if [[ -n "${VERISCOPE_FORCE:-}" ]]; then
-  force_flag=(--force)
+  use_force=1
 fi
 
-# Default smoke device stays "cuda" (historical behavior), but callers may override.
-smoke_device="${VERISCOPE_GPT_SMOKE_DEVICE:-cuda}"
+# Default smoke device is CPU for reviewer-safe behavior on macOS/CPU-only hosts.
+smoke_device="${VERISCOPE_GPT_SMOKE_DEVICE:-cpu}"
 default_max_iters="${VERISCOPE_GPT_SMOKE_MAX_ITERS:-50}"
 
 # Detect caller --device / --device=... and avoid passing --device twice.
 has_max_iters=0
+has_gate_preset=0
+caller_provided_device=0
 for ((i=0; i<${#extra_args[@]}; i++)); do
   tok="${extra_args[$i]}"
   if [[ "${tok}" == "--device" ]]; then
@@ -40,11 +42,25 @@ for ((i=0; i<${#extra_args[@]}; i++)); do
       echo "[smoke] ERROR: --device provided without a value" >&2
       exit 2
     fi
+    caller_provided_device=1
     smoke_device="${extra_args[$((i+1))]}"
     continue
   fi
   if [[ "${tok}" == --device=* ]]; then
+    caller_provided_device=1
     smoke_device="${tok#--device=}"
+    continue
+  fi
+  if [[ "${tok}" == "--gate_preset" || "${tok}" == "--gate-preset" ]]; then
+    if (( i+1 >= ${#extra_args[@]} )); then
+      echo "[smoke] ERROR: ${tok} provided without a value" >&2
+      exit 2
+    fi
+    has_gate_preset=1
+    continue
+  fi
+  if [[ "${tok}" == --gate_preset=* || "${tok}" == --gate-preset=* ]]; then
+    has_gate_preset=1
     continue
   fi
   if [[ "${tok}" == "--max_iters" ]]; then
@@ -85,6 +101,9 @@ if [[ ${#extra_args_filtered[@]} -gt 0 ]]; then
 fi
 
 base_args=(--dataset "${smoke_dataset}" --nanogpt_dir "${nanogpt_dir}" --device "${smoke_device}")
+if (( ! has_gate_preset )); then
+  base_args+=(--gate_preset tuned_v0)
+fi
 if (( ! has_max_iters )); then
   base_args+=(--max_iters "${default_max_iters}")
 fi
@@ -95,7 +114,14 @@ base_args_str="${base_args[*]}"
 echo "[smoke] outdir=${outdir}"
 echo "[smoke] nanogpt_dir=${nanogpt_dir}"
 echo "[smoke] extra_args=${extra_args_str}"
-echo "[smoke] cmd: veriscope run gpt --outdir ${outdir} ${force_flag[*]:-} -- ${base_args_str} ${extra_args_str}"
+if [[ -z "${VERISCOPE_GPT_SMOKE_DEVICE:-}" && ${caller_provided_device} -eq 0 ]]; then
+  echo "[smoke] defaulting to --device cpu (override with VERISCOPE_GPT_SMOKE_DEVICE or --device ...)"
+fi
+force_flag_str=""
+if (( use_force )); then
+  force_flag_str="--force"
+fi
+echo "[smoke] cmd: veriscope run gpt --outdir ${outdir} ${force_flag_str} -- ${base_args_str} ${extra_args_str}"
 
 # Ensure nanoGPT dataset bins exist inside fresh environments (e.g., containers).
 if [[ ! -f "${train_bin}" ]]; then
@@ -111,7 +137,9 @@ if [[ ! -f "${train_bin}" ]]; then
 fi
 
 cmd=(veriscope run gpt --outdir "${outdir}")
-cmd+=("${force_flag[@]}")
+if (( use_force )); then
+  cmd+=(--force)
+fi
 cmd+=(-- "${base_args[@]}")
 if [[ ${#extra_args_filtered[@]} -gt 0 ]]; then
   cmd+=("${extra_args_filtered[@]}")

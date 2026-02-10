@@ -1,0 +1,37 @@
+Veriscope Report: docs/examples/reviewer_packet/run_a
+
+Run ID: 3179293c5c9c
+Status: SUCCESS
+Final Status: SKIP
+Wrapper Exit: 0
+Runner Exit: 0
+Gate Preset: fake_runner
+Started: 2026-02-10T18:41:27Z
+Ended: 2026-02-10T18:41:27Z
+Window Signature: 0b77e84a5d512ff9895524a60324906e8a3231e99d75a55afe8d48d63700b35b
+
+GOVERNANCE:
+  Log: YES
+  Valid: YES
+  Last Rev: 1
+  Last Hash: ad194638f4a5
+  Legacy (missing entry_hash): NO
+  Events: run_started_v1=1
+
+Gate Summary:
+  Total: 0
+  Evaluated: 0
+  PASS: 0
+  SKIP: 0
+  WARN: 0
+  FAIL: 0
+
+Artifacts:
+  run_config_resolved.json: YES
+  window_signature.json: YES
+  results.json: YES
+  results_summary.json: YES
+  manual_judgement.json: NO
+  manual_judgement.jsonl: NO
+  governance_log.jsonl: YES
+

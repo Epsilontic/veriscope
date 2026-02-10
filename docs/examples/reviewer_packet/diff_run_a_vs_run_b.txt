@@ -1,0 +1,62 @@
+Run A:
+  outdir: docs/examples/reviewer_packet/run_a
+  run_id: 3179293c5c9c
+  run_status: success
+  schema_version: 1
+  wrapper_exit_code: 0
+  runner_exit_code: 0
+  final_decision: skip
+  effective_decision: skip
+  decision_source: automated
+  manual_status: -
+  gate_preset: fake_runner
+  window_signature_hash: 0b77e84a5d51
+  partial: false
+  governance_present: yes
+  governance_ok: yes
+  governance_rev: 1
+  governance_legacy_missing_hash: no
+
+Run B:
+  outdir: docs/examples/reviewer_packet/run_b
+  run_id: c50e4e8ba6f7
+  run_status: success
+  schema_version: 1
+  wrapper_exit_code: 0
+  runner_exit_code: 0
+  final_decision: skip
+  effective_decision: skip
+  decision_source: automated
+  manual_status: -
+  gate_preset: fake_runner
+  window_signature_hash: 0b77e84a5d51
+  partial: false
+  governance_present: yes
+  governance_ok: yes
+  governance_rev: 1
+  governance_legacy_missing_hash: no
+
+Comparison:
+  run_id_differs: yes
+  run_status_differs: no
+  schema_version_differs: no
+  wrapper_exit_code_differs: no
+  runner_exit_code_differs: no
+  final_decision_differs: no
+  effective_decision_differs: no
+  decision_source_differs: no
+  manual_status_differs: no
+  gate_preset_differs: no
+  window_signature_hash_differs: no
+  governance_present_differs: no
+  governance_ok_differs: no
+  governance_rev_differs: no
+  counts_differs: no
+  counts_a: evaluated=0 skip=0 pass=0 warn=0 fail=0
+  counts_b: evaluated=0 skip=0 pass=0 warn=0 fail=0
+
+Comparability:
+  ok: yes
+  reason: -
+  details: -
+  policy: {'allow_gate_preset_mismatch': False}

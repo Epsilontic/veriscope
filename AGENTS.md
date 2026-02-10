@@ -1,8 +1,10 @@
 # Agents.md — veriscope (agent-facing contract)  
   
-This file is the **agent-facing contract** for `veriscope`: invariants, boundary rules, canonical schemas, and golden-path commands. It is optimized for automated agents (Codex-style) so changes can be made safely without repo archaeology.  
+This file is the **agent-facing companion** for `veriscope`: invariants, boundary rules, canonical schemas, and golden-path commands. It is optimized for automated agents (Codex-style) so changes can be made safely without repo archaeology.  
+
+**Normative precedence:** `docs/contract_v1.md` is the single normative contract for artifacts, comparability, governance, and exit-code semantics. This file is derived guidance; if there is any conflict, `docs/contract_v1.md` wins.  
   
-If this document disagrees with repository behavior/tests, **update this file and the tests together**. Do not let “tribal knowledge” live only in code.  
+If this document disagrees with repository behavior/tests, update this file and tests as needed, but keep `docs/contract_v1.md` authoritative. Do not let “tribal knowledge” live only in code.  
   
 ---  
   
@@ -50,21 +52,29 @@ veriscope report   ./out/gpt_smoke_YYYYMMDD_HHMMSS > report.md
 A “capsule” is a directory containing artifacts for a single run.  
   
 ### 2.1 Required files (MUST)  
-- `results_summary.json` (authoritative pipeline contract)  
-- `window_signature.json` (comparability root; hash defines identity)  
+- Non-partial capsules:
+  - `window_signature.json`
+  - `results.json`
+  - `results_summary.json`
+- Partial capsules:
+  - `window_signature.json`
+  - `results_summary.json` with `partial=true`
   
-### 2.2 Optional files (MAY)  
-- `results.json` (detailed per-cadence audit)  
-- `manual_judgement.json` (overlay; does not mutate raw artifacts)  
-- `governance_log.jsonl` (append-only journal)  
-- provenance files (runner logs, configs, stdout/stderr captures, etc.)  
+### 2.2 Recommended / Optional files  
+- Recommended:
+  - `run_config_resolved.json`
+- Optional:
+  - `manual_judgement.json` (overlay; does not mutate raw artifacts)
+  - `manual_judgement.jsonl` (append-only overlay log)
+  - `governance_log.jsonl` (append-only journal)
+  - provenance files (runner logs, configs, stdout/stderr captures, etc.)
   
 ### 2.3 Example layout  
 ```text  
 OUTDIR/  
   window_signature.json  
   results_summary.json  
-  results.json                      (optional but typical)  
+  results.json                      (required for non-partial capsules)  
   manual_judgement.json             (optional)  
   governance_log.jsonl              (optional)  
   provenance/                       (optional)  

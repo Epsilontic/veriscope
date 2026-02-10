@@ -84,6 +84,8 @@ What it does **not** guarantee:
 | Pilot kit overview (what to run + what to share) | `docs/pilot/README.md` |
 | Pilot harness scripts (exact commands + scoring) | `scripts/pilot/README.md` |
 
+Normative precedence: `docs/contract_v1.md` is the authoritative contract. All other docs are derived companion guidance.
+
 ---
 
 ## Key capabilities
@@ -220,6 +222,10 @@ veriscope validate ./out/gpt_smoke_YYYYMMDD_HHMMSS
 veriscope report ./out/gpt_smoke_YYYYMMDD_HHMMSS --format text
 ```
 
+Smoke defaults are reviewer-safe:
+- default device is `cpu` (override with `VERISCOPE_GPT_SMOKE_DEVICE` or forwarded `--device ...`)
+- default gate preset is `tuned_v0` unless you explicitly pass `--gate_preset/--gate-preset`
+
 For pilot-scoped guarantees and boundaries, see:
 - `docs/incubation_readiness.md`
 - `docs/calibration_protocol_v0.md`
@@ -304,6 +310,7 @@ veriscope report --compare OUTDIR_A OUTDIR_B --format md
 Comparison notes:
 - `veriscope diff` and `veriscope report --compare` require a valid `governance_log.jsonl` in every compared OUTDIR; missing or invalid governance fails the command.
 - Capsules marked `partial=true` are not comparable and are rejected by both `diff` and `report --compare`.
+- Single-capsule `veriscope report OUTDIR` is less strict than compare mode and can still render while surfacing governance warnings.
 
 ---
 
@@ -313,6 +320,11 @@ If you are piloting Veriscope with a design partner, the pilot kit provides:
 - A control + injected-pathology workflow with a shareable report and calibration summary.
 - Success criteria grounded in the v0 contract.
 - A stable artifact bundle to share with Veriscope.
+
+Minimum share set (contract-aligned):
+- non-partial capsules: `window_signature.json`, `results.json`, `results_summary.json`
+- partial capsules: `window_signature.json` and `results_summary.json` with `partial=true`
+- `run_config_resolved.json` is recommended for reproducibility context
 
 For operational semantics (exit codes, schemas, artifact contracts, and validation), see `docs/productization.md`.
 For narrative guidance, success criteria, and sharing guidance, see `docs/pilot/README.md`.

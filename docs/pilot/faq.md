@@ -1,5 +1,7 @@
 # Pilot FAQ (operators)
 
+Normative precedence: `docs/contract_v1.md` is the authoritative contract. This page is derived pilot guidance.
+
 ## How do I run the pilot?
 Use the harness in `scripts/pilot/run.sh`:
 
@@ -7,7 +9,7 @@ Use the harness in `scripts/pilot/run.sh`:
 bash scripts/pilot/run.sh [OUTDIR] -- <runner args>
 ```
 
-This runs `veriscope run gpt`, then `validate`, `inspect`, and `report` while capturing outputs to the OUTDIR.
+This runs `veriscope run gpt`, then `validate`, `inspect`, and `report` while capturing outputs to the OUTDIR. `scripts/pilot/run.sh` is strict by default (`VERISCOPE_PILOT_STRICT=1`) and exits non-zero if any of those checks fail; set `VERISCOPE_PILOT_STRICT=0` only when you explicitly want lenient capture.
 
 ## What do the exit codes mean?
 `veriscope run` returns non-zero on runner failure or a Veriscope internal failure. Decision outcomes (pass/warn/fail/skip) are recorded in artifacts rather than as exit codes, per the productization contract.
@@ -20,10 +22,13 @@ WARN means investigate; FAIL means stop or rollback under the configured preset.
 
 ## What should I share?
 At minimum:
-- `report.md`
-- `results_summary.json`
 - `window_signature.json`
+- for non-partial capsules: `results.json` and `results_summary.json`
+- for partial capsules: `results_summary.json` with `partial=true`
+
+Recommended:
 - `run_config_resolved.json`
+- `report.md`
 
 If allowed, share the full OUTDIR capsule for reproducibility.
 
