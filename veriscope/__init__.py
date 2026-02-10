@@ -7,18 +7,7 @@ try:
 except _PNF:
     __version__ = "0.1.0+dev"
 
-from .core import (
-    DeclTransport,
-    GateEngine,
-    GateResult,
-    WindowDecl,
-    aggregate_epsilon_stat,
-    assert_naturality,
-    epsilon_statistic_bhc,
-    tv_hist_fixed,
-)
-
-__all__ = [
+_CORE_EXPORTS = (
     "WindowDecl",
     "DeclTransport",
     "assert_naturality",
@@ -27,5 +16,18 @@ __all__ = [
     "aggregate_epsilon_stat",
     "GateEngine",
     "GateResult",
-    "__version__",
-]
+)
+
+__all__ = [*_CORE_EXPORTS, "__version__"]
+
+
+def __getattr__(name: str):
+    if name in _CORE_EXPORTS:
+        from . import core as _core
+
+        return getattr(_core, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(__all__))
