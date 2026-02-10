@@ -357,6 +357,25 @@ def test_comparable_explain_gate_preset_policy(tmp_path: Path) -> None:
     assert result.policy == {"allow_gate_preset_mismatch": False}
 
 
+def test_comparable_accepts_tuned_alias_as_tuned_v0(tmp_path: Path) -> None:
+    outdir_a = tmp_path / "run_a"
+    outdir_b = tmp_path / "run_b"
+    _make_minimal_artifacts(outdir_a, run_id="run_a", gate_preset="tuned")
+    _make_minimal_artifacts(outdir_b, run_id="run_b", gate_preset="tuned_v0")
+
+    v_a = validate_outdir(outdir_a, allow_partial=True)
+    v_b = validate_outdir(outdir_b, allow_partial=True)
+    run_a = load_run_metadata(outdir_a, v_a, prefer_jsonl=True)
+    run_b = load_run_metadata(outdir_b, v_b, prefer_jsonl=True)
+
+    comparable_result = comparable_explain(run_a, run_b)
+    assert comparable_result.ok
+    assert comparable_result.reason is None
+
+    diff_result = diff_outdirs(outdir_a, outdir_b)
+    assert diff_result.exit_code == 0
+
+
 def test_comparable_rejects_missing_window_hash(tmp_path: Path) -> None:
     outdir_a = tmp_path / "run_a"
     outdir_b = tmp_path / "run_b"

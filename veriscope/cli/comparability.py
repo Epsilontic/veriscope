@@ -16,6 +16,18 @@ from veriscope.cli.governance import (
 from veriscope.cli.validate import ValidationResult
 from veriscope.core.artifacts import ResultsSummaryV1, ResultsV1
 
+PRESET_ALIASES: dict[str, str] = {
+    "tuned": "tuned_v0",
+}
+
+
+def canonical_preset(name: str) -> str:
+    raw = str(name).strip()
+    if not raw:
+        return raw
+    alias = PRESET_ALIASES.get(raw.lower())
+    return alias if alias is not None else raw
+
 
 @dataclass(frozen=True)
 class ComparableResult:
@@ -141,6 +153,8 @@ def comparable_explain(
     allow_gate_preset_mismatch: bool = False,
 ) -> ComparableResult:
     policy = {"allow_gate_preset_mismatch": allow_gate_preset_mismatch}
+    gate_preset_a = canonical_preset(a.gate_preset)
+    gate_preset_b = canonical_preset(b.gate_preset)
 
     if a.partial or b.partial:
         return ComparableResult(
@@ -197,14 +211,14 @@ def comparable_explain(
             warnings=tuple(),
             policy=policy,
         )
-    if not allow_gate_preset_mismatch and a.gate_preset != b.gate_preset:
+    if not allow_gate_preset_mismatch and gate_preset_a != gate_preset_b:
         return ComparableResult(
             ok=False,
             reason="GATE_PRESET_MISMATCH",
             details={
                 "gate_preset": {
-                    "expected": a.gate_preset,
-                    "got": b.gate_preset,
+                    "expected": gate_preset_a,
+                    "got": gate_preset_b,
                 }
             },
             warnings=tuple(),

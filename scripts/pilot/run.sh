@@ -22,7 +22,7 @@ gate_args=()
 if [[ "$inject_gate_preset" == "true" ]]; then
   run_kind="gpt"
   if [[ "${run_kind}" == "gpt" ]]; then
-    gate_args=(--gate_preset tuned)
+    gate_args=(--gate_preset tuned_v0)
   else
     gate_args=(--gate_preset tuned_v0)
   fi

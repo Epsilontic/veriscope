@@ -13,6 +13,7 @@ bash scripts/pilot/run.sh [OUTDIR] -- <runner args>
 Behavior:
 - Writes artifacts into `OUTDIR` (default: `./out/pilot_<ts>`).
 - Injects `--gate_preset tuned_v0` **unless** you already provided `--gate_preset`.
+- Comparability canonicalizes the legacy alias `tuned` to `tuned_v0`.
 - Captures `validate`, `inspect`, and `report` outputs in the OUTDIR.
 
 Outputs in OUTDIR:
