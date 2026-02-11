@@ -32,6 +32,7 @@ Partner runs Veriscope on 1–2 internal fine-tunes (run gpt shown; run hf uses 
 veriscope run gpt --gate-preset tuned_v0 --outdir OUTDIR -- <their training args>
 veriscope validate OUTDIR
 veriscope report OUTDIR > report.md
+```
 
 We provide: (1) stable artifact contracts, (2) validators + golden tests, (3) a Markdown report suitable for copy/paste into Slack/Notion/GitHub.
 

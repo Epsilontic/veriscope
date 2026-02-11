@@ -3,7 +3,7 @@
 Normative precedence: `docs/contract_v1.md` is the authoritative contract. This page is derived pilot guidance.
 
 ## What this is
-The pilot kit is a lightweight, CLI-first workflow for running Veriscope on a control and an injected-pathology run, validating artifacts, and producing a shareable report. It follows the productization contract for artifacts, exit codes, and decision semantics in `docs/productization.md`.
+The pilot kit is a lightweight, CLI-first workflow for running Veriscope on a control and an injected-pathology run, validating artifacts, and producing a shareable report. It follows operational guidance in `docs/productization.md`, which is derived from the normative contract in `docs/contract_v1.md`.
 
 ## Success criteria (v0 pilot)
 Measured on `gate_preset=tuned_v0` with control + injected runs:

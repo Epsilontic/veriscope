@@ -12,7 +12,7 @@ bash scripts/pilot/run.sh [OUTDIR] -- <runner args>
 This runs `veriscope run gpt`, then `validate`, `inspect`, and `report` while capturing outputs to the OUTDIR. `scripts/pilot/run.sh` is strict by default (`VERISCOPE_PILOT_STRICT=1`) and exits non-zero if any of those checks fail; set `VERISCOPE_PILOT_STRICT=0` only when you explicitly want lenient capture.
 
 ## What do the exit codes mean?
-`veriscope run` returns non-zero on runner failure or a Veriscope internal failure. Decision outcomes (pass/warn/fail/skip) are recorded in artifacts rather than as exit codes, per the productization contract.
+`veriscope run` returns non-zero on runner failure or a Veriscope internal failure. Decision outcomes (pass/warn/fail/skip) are recorded in artifacts rather than as exit codes, per operational guidance in `docs/productization.md` (derived from `docs/contract_v1.md`).
 
 ## What does decision=skip mean?
 `skip` is neutral: the gate was not evaluated due to missing evidence or policy, and it should not be treated as pass/fail.

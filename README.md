@@ -19,6 +19,33 @@ Runners: **CIFAR (PyTorch)** • **GPT (nanoGPT)** • **HF (transformers)**
 
 ---
 
+## 5-minute AI2 reviewer path
+
+Start with the synthetic reviewer packet (fast, no long training run required):
+
+```bash
+source ~/venv/bin/activate
+veriscope --help
+python -m veriscope.cli.main --help
+veriscope validate docs/examples/reviewer_packet/run_a
+veriscope report docs/examples/reviewer_packet/run_a --format text
+veriscope diff docs/examples/reviewer_packet/run_a docs/examples/reviewer_packet/run_b
+```
+
+Optional smoke run:
+
+```bash
+bash scripts/run_gpt_smoke.sh /tmp/veriscope_smoke_test -- --max_iters 1
+veriscope validate /tmp/veriscope_smoke_test
+veriscope report /tmp/veriscope_smoke_test --format text
+```
+
+Notes:
+- CPU smoke can be slow on some hosts.
+- Tiny smoke runs may end with `final_decision=skip` and zero evaluated gates; this is expected.
+
+---
+
 ## Overview
 
 Veriscope is a CLI-first tool for detecting early signs of training-time failure (representation collapse / drift) *before* loss curves or eval metrics make the issue obvious. It produces **auditable, reproducible capsule artifacts** you can validate, diff, and share.
@@ -76,7 +103,7 @@ What it does **not** guarantee:
 
 | Topic | Where |
 | --- | --- |
-| v0 product/ops contract (CLI semantics, exit codes, invariants) | `docs/productization.md` |
+| v0 product/ops operational guidance (CLI semantics, exit codes, invariants) | `docs/productization.md` |
 | Frozen artifact contract (hashing, canonicalization, governance chaining) | `docs/contract_v1.md` |
 | Incubation readiness scope + claims/non-claims | `docs/incubation_readiness.md` |
 | Calibration protocol (window-scoped) + report shape | `docs/calibration_protocol_v0.md` |
@@ -114,9 +141,9 @@ Normative precedence: `docs/contract_v1.md` is the authoritative contract. All o
 
 `GateEngine` evaluates stability by computing `worst_DW` (a windowed divergence across tracked metrics) and comparing it to an effective threshold `eps_eff`. The emitted status is an explicit enum (`pass | warn | fail | skip`); `skip` means “not evaluated” and is neutral.
 
-For the authoritative decision and exit-code contract, defer to:
-- `docs/productization.md` (operational semantics)
-- `docs/contract_v1.md` (frozen artifact + hashing rules)
+For decision and exit-code behavior, defer to:
+- `docs/contract_v1.md` (single normative contract)
+- `docs/productization.md` (derived operational guidance)
 
 ---
 
@@ -237,7 +264,7 @@ For pilot-scoped guarantees and boundaries, see:
 export SCAR_DATA=./data
 veriscope run cifar --smoke --outdir ./out/cifar_smoke_$(date +%Y%m%d_%H%M%S)
 # If the console script is not available:
-# python -m veriscope run cifar --smoke --outdir ./out/cifar_smoke_$(date +%Y%m%d_%H%M%S)
+# python -m veriscope.cli.main run cifar --smoke --outdir ./out/cifar_smoke_$(date +%Y%m%d_%H%M%S)
 ```
 
 Runs a small CIFAR sweep (few seeds, short epochs) into the specified outdir.
@@ -357,7 +384,7 @@ bash scripts/pilot/negative_controls.sh ./out/pilot_control
 
 ## GPT runner (nanoGPT)
 
-The GPT runner wraps nanoGPT training with FR gating and emits a capsule directory (results summary + provenance + optional calibration CSV). For the authoritative contract, defer to `docs/productization.md`.
+The GPT runner wraps nanoGPT training with FR gating and emits a capsule directory (results summary + provenance + optional calibration CSV). For the normative artifact contract, defer to `docs/contract_v1.md`; for operational runner guidance, see `docs/productization.md`.
 
 ```bash
 # Clone nanoGPT alongside veriscope
