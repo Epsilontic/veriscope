@@ -36,8 +36,9 @@ Optional smoke run:
 
 ```bash
 bash scripts/run_gpt_smoke.sh /tmp/veriscope_smoke_test -- --max_iters 1
-veriscope validate /tmp/veriscope_smoke_test
-veriscope report /tmp/veriscope_smoke_test --format text
+capdir="$(cat /tmp/veriscope_smoke_test/capdir.txt)"
+veriscope validate "$capdir"
+veriscope report "$capdir" --format text
 ```
 
 Notes:

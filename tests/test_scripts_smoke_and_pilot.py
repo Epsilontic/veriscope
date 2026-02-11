@@ -80,6 +80,10 @@ def test_run_gpt_smoke_defaults_cpu_and_tuned_v0(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     assert "defaulting to --device cpu" in result.stdout
 
+    capdir = Path((outdir / "capdir.txt").read_text(encoding="utf-8").strip())
+    assert capdir == outdir
+    assert (capdir / "window_signature.json").exists()
+
     run_cfg = json.loads((outdir / "run_config_resolved.json").read_text(encoding="utf-8"))
     normalized = list(run_cfg["argv"]["normalized_forwarded_args"])
     assert _arg_value(normalized, "--device") == "cpu"

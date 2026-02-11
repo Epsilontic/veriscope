@@ -146,3 +146,14 @@ if [[ ${#extra_args_filtered[@]} -gt 0 ]]; then
 fi
 
 "${cmd[@]}"
+
+# Resolve the effective capsule directory and persist it for follow-up commands.
+capdir="${outdir}"
+if [[ ! -f "${capdir}/window_signature.json" ]]; then
+  found_sig="$(find "${outdir}" -maxdepth 4 -type f -name window_signature.json -print -quit 2>/dev/null || true)"
+  if [[ -n "${found_sig}" ]]; then
+    capdir="$(dirname "${found_sig}")"
+  fi
+fi
+printf "%s\n" "${capdir}" > "${outdir}/capdir.txt"
+echo "[smoke] capdir=${capdir} (saved to ${outdir}/capdir.txt)"
