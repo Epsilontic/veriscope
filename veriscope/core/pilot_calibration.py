@@ -5,6 +5,8 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List, Literal, NoReturn, Optional, Tuple, Union
 
+from .jsonutil import window_signature_sha256
+
 
 class CalibrationError(Exception):
     def __init__(self, token: str, message: str) -> None:
@@ -27,6 +29,22 @@ def _load_json(path: Path, token: str) -> Dict[str, Any]:
     if not isinstance(data, dict):
         _die(token, f"{path.name} must be a JSON object")
     return data
+
+
+def _extract_summary_window_hash(summary: Dict[str, Any], *, label: str) -> str:
+    window_signature_ref = summary.get("window_signature_ref")
+    if not isinstance(window_signature_ref, dict):
+        _die(
+            "MISSING_WINDOW_SIGNATURE_REF",
+            f"{label} results_summary.json missing window_signature_ref",
+        )
+    hash_value = window_signature_ref.get("hash")
+    if not isinstance(hash_value, str) or not hash_value.strip():
+        _die(
+            "MISSING_WINDOW_SIGNATURE_REF_HASH",
+            f"{label} results_summary.json missing window_signature_ref.hash",
+        )
+    return hash_value.strip()
 
 
 def _parse_optional_int(value: Any) -> Optional[int]:
@@ -387,6 +405,35 @@ def calibrate_pilot(
     if injected_summary.get("run_status") != "success":
         _die("RUN_STATUS_NOT_SUCCESS", "injected run_status != success")
 
+    control_window_signature = _load_json(control_dir / "window_signature.json", "MISSING_WINDOW_SIGNATURE")
+    injected_window_signature = _load_json(injected_dir / "window_signature.json", "MISSING_WINDOW_SIGNATURE")
+    try:
+        control_window_hash = window_signature_sha256(control_window_signature)
+    except Exception as exc:
+        _die("INVALID_WINDOW_SIGNATURE", f"control window_signature.json is invalid for hashing: {exc}")
+    try:
+        injected_window_hash = window_signature_sha256(injected_window_signature)
+    except Exception as exc:
+        _die("INVALID_WINDOW_SIGNATURE", f"injected window_signature.json is invalid for hashing: {exc}")
+
+    control_summary_window_hash = _extract_summary_window_hash(control_summary, label="control")
+    injected_summary_window_hash = _extract_summary_window_hash(injected_summary, label="injected")
+    if control_summary_window_hash != control_window_hash:
+        _die(
+            "WINDOW_SIGNATURE_HASH_MISMATCH",
+            "control results_summary.window_signature_ref.hash does not match control window_signature.json",
+        )
+    if injected_summary_window_hash != injected_window_hash:
+        _die(
+            "WINDOW_SIGNATURE_HASH_MISMATCH",
+            "injected results_summary.window_signature_ref.hash does not match injected window_signature.json",
+        )
+    if control_window_hash != injected_window_hash:
+        _die(
+            "WINDOW_SIGNATURE_HASH_MISMATCH",
+            f"control/injected window signature hash mismatch: {control_window_hash} != {injected_window_hash}",
+        )
+
     control_run_cfg = None
     injected_run_cfg = None
     control_run_cfg_path = control_dir / "run_config_resolved.json"
@@ -396,7 +443,7 @@ def calibrate_pilot(
     if injected_run_cfg_path.exists():
         injected_run_cfg = _load_json(injected_run_cfg_path, "INVALID_RUN_CONFIG")
 
-    window_signature = _load_json(control_dir / "window_signature.json", "MISSING_WINDOW_SIGNATURE")
+    window_signature = control_window_signature
     gate_window, gate_window_source = _resolve_gate_window(window_signature, control_run_cfg, injected_run_cfg)
 
     control_events, control_events_source, control_warnings = _read_gate_events(control_dir)
