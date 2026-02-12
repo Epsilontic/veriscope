@@ -29,6 +29,7 @@ elif [[ "$SCOPE" == "full" ]]; then
 elif [[ "$SCOPE" == "gc" ]]; then
   run python -m pytest -q \
     tests/test_cli_import_boundary.py \
+    tests/test_docs_links.py \
     tests/test_markdown_fences.py \
     tests/test_file_modes.py
 else
@@ -36,6 +37,7 @@ else
     tests/test_cli_import_boundary.py \
     tests/test_cli_diff.py \
     tests/test_cli_validate_report.py \
+    tests/test_docs_links.py \
     tests/test_markdown_fences.py \
     tests/test_file_modes.py
 fi

@@ -47,4 +47,4 @@ def test_markdown_fences_are_balanced() -> None:
         if open_fence_line is not None:
             failures.append(f"{md_file}:{open_fence_line}")
 
-    assert not failures, "Unmatched ``` fence(s) in docs markdown:\n" + "\n".join(failures)
+    assert not failures, "Unmatched ``` fence(s) in repo markdown:\n" + "\n".join(failures)

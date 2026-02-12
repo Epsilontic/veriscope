@@ -26,7 +26,6 @@ def test_docs_relative_links_exist() -> None:
     assert md_files, "Expected markdown files under docs/."
 
     violations: list[str] = []
-    repo_root = Path.cwd().resolve()
 
     for md_file in md_files:
         content = md_file.read_text(encoding="utf-8")
@@ -47,10 +46,8 @@ def test_docs_relative_links_exist() -> None:
             if resolved.exists():
                 continue
 
-            md_display = md_file.resolve().relative_to(repo_root)
-            rel_display = (md_file.parent / path_part)
             violations.append(
-                f"{md_display}: link target '{target}' not found (resolved: {rel_display})"
+                f"{md_file}: link target '{target}' not found (resolved: {resolved})"
             )
 
     assert not violations, "Broken relative docs links:\n" + "\n".join(violations)

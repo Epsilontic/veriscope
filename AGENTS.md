@@ -71,7 +71,8 @@ New docs page → add to docs/INDEX.md + verify links
 ## 5) Mechanical Enforcement In Repo
 
 - Import boundary checks: `tests/test_cli_import_boundary.py`
-- Markdown fence guard (`docs/**/*.md`): `tests/test_markdown_fences.py`
+- Markdown fence guard (all tracked `*.md`): `tests/test_markdown_fences.py`
+- Docs relative link guard (`docs/**/*.md`): `tests/test_docs_links.py`
 - Agent fix loop: `scripts/agent/fixit.md`
 - File mode guard for docs/artifacts: `tests/test_file_modes.py`
 - Local pre-merge loop: `scripts/agent/check.sh`
