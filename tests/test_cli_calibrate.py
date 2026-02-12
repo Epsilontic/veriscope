@@ -9,7 +9,8 @@ from typing import Any, Dict, List, Optional
 import pytest
 
 from veriscope.cli.calibrate import run_calibrate
-from veriscope.core.pilot_calibration import calibrate_pilot
+from veriscope.core.jsonutil import window_signature_sha256
+from veriscope.core.pilot_calibration import CalibrationError, calibrate_pilot
 
 pytestmark = pytest.mark.unit
 
@@ -36,12 +37,13 @@ def _write_capsule(
         "schema_version": 1,
         "gate_controls": {"gate_window": gate_window},
     }
+    ws_hash = window_signature_sha256(window_signature)
     _write_json(outdir / "window_signature.json", window_signature)
 
     results_summary = {
         "schema_version": 1,
         "run_id": run_id,
-        "window_signature_ref": {"hash": "test", "path": "window_signature.json"},
+        "window_signature_ref": {"hash": ws_hash, "path": "window_signature.json"},
         "profile": {"gate_preset": "test"},
         "run_status": "success",
         "runner_exit_code": 0,
@@ -63,7 +65,7 @@ def _write_capsule(
         results = {
             "schema_version": 1,
             "run_id": run_id,
-            "window_signature_ref": {"hash": "test", "path": "window_signature.json"},
+            "window_signature_ref": {"hash": ws_hash, "path": "window_signature.json"},
             "profile": {"gate_preset": "test"},
             "run_status": "success",
             "runner_exit_code": 0,
@@ -128,7 +130,13 @@ def test_calibrate_pilot_happy_path(tmp_path: Path) -> None:
         {"iter": 3, "decision": "warn"},
     ]
 
-    _write_capsule(control_dir, run_id="control", gate_window=gate_window, gate_warmup=warmup, gates=control_gates)
+    _write_capsule(
+        control_dir,
+        run_id="control",
+        gate_window=gate_window,
+        gate_warmup=warmup,
+        gates=control_gates,
+    )
     _write_capsule(
         injected_dir,
         run_id="injected",
@@ -150,7 +158,12 @@ def test_calibrate_missing_injected_results(tmp_path: Path) -> None:
     control_dir = tmp_path / "control"
     injected_dir = tmp_path / "injected"
 
-    _write_capsule(control_dir, run_id="control", gate_warmup=0, gates=[{"iter": 0, "decision": "pass"}])
+    _write_capsule(
+        control_dir,
+        run_id="control",
+        gate_warmup=0,
+        gates=[{"iter": 0, "decision": "pass"}],
+    )
     _write_capsule(
         injected_dir,
         run_id="injected",
@@ -170,7 +183,12 @@ def test_calibrate_invalid_injected_results(tmp_path: Path) -> None:
     control_dir = tmp_path / "control"
     injected_dir = tmp_path / "injected"
 
-    _write_capsule(control_dir, run_id="control", gate_warmup=0, gates=[{"iter": 0, "decision": "pass"}])
+    _write_capsule(
+        control_dir,
+        run_id="control",
+        gate_warmup=0,
+        gates=[{"iter": 0, "decision": "pass"}],
+    )
     _write_capsule(
         injected_dir,
         run_id="injected",
@@ -230,6 +248,149 @@ def test_calibrate_governance_log_empty_marks_missing(tmp_path: Path) -> None:
     assert output["injected_gate_events_source"] == "governance_log_empty"
     assert "control.gate_events_missing" in output["missing_fields"]
     assert "injected.gate_events_missing" in output["missing_fields"]
+
+
+def test_calibrate_rejects_window_signature_hash_mismatch(tmp_path: Path) -> None:
+    control_dir = tmp_path / "control"
+    injected_dir = tmp_path / "injected"
+    _write_capsule(
+        control_dir,
+        run_id="control",
+        gate_window=2,
+        gate_warmup=0,
+        gates=[{"iter": 0, "decision": "pass"}],
+    )
+    _write_capsule(
+        injected_dir,
+        run_id="injected",
+        gate_window=3,
+        gate_warmup=0,
+        gates=[{"iter": 0, "decision": "warn"}],
+        data_corrupt_at=0,
+    )
+
+    with pytest.raises(CalibrationError) as exc_info:
+        calibrate_pilot(control_dir, injected_dir)
+
+    assert exc_info.value.token == "WINDOW_SIGNATURE_HASH_MISMATCH"
+
+
+def test_calibrate_rejects_summary_hash_tampered(tmp_path: Path) -> None:
+    control_dir = tmp_path / "control"
+    injected_dir = tmp_path / "injected"
+    _write_capsule(
+        control_dir,
+        run_id="control",
+        gate_window=2,
+        gate_warmup=0,
+        gates=[{"iter": 0, "decision": "pass"}],
+    )
+    _write_capsule(
+        injected_dir,
+        run_id="injected",
+        gate_window=2,
+        gate_warmup=0,
+        gates=[{"iter": 0, "decision": "warn"}],
+        data_corrupt_at=0,
+    )
+
+    control_summary_path = control_dir / "results_summary.json"
+    control_summary = json.loads(control_summary_path.read_text(encoding="utf-8"))
+    control_summary["window_signature_ref"]["hash"] = "bad"
+    _write_json(control_summary_path, control_summary)
+
+    with pytest.raises(CalibrationError) as exc_info:
+        calibrate_pilot(control_dir, injected_dir)
+
+    assert exc_info.value.token == "WINDOW_SIGNATURE_HASH_MISMATCH"
+
+
+def test_calibrate_rejects_missing_window_signature_ref(tmp_path: Path) -> None:
+    control_dir = tmp_path / "control"
+    injected_dir = tmp_path / "injected"
+    _write_capsule(
+        control_dir,
+        run_id="control",
+        gate_window=2,
+        gate_warmup=0,
+        gates=[{"iter": 0, "decision": "pass"}],
+    )
+    _write_capsule(
+        injected_dir,
+        run_id="injected",
+        gate_window=2,
+        gate_warmup=0,
+        gates=[{"iter": 0, "decision": "warn"}],
+        data_corrupt_at=0,
+    )
+
+    control_summary_path = control_dir / "results_summary.json"
+    control_summary = json.loads(control_summary_path.read_text(encoding="utf-8"))
+    control_summary.pop("window_signature_ref", None)
+    _write_json(control_summary_path, control_summary)
+
+    with pytest.raises(CalibrationError) as exc_info:
+        calibrate_pilot(control_dir, injected_dir)
+
+    assert exc_info.value.token == "MISSING_WINDOW_SIGNATURE_REF"
+
+
+def test_calibrate_rejects_empty_window_signature_ref_hash(tmp_path: Path) -> None:
+    control_dir = tmp_path / "control"
+    injected_dir = tmp_path / "injected"
+    _write_capsule(
+        control_dir,
+        run_id="control",
+        gate_window=2,
+        gate_warmup=0,
+        gates=[{"iter": 0, "decision": "pass"}],
+    )
+    _write_capsule(
+        injected_dir,
+        run_id="injected",
+        gate_window=2,
+        gate_warmup=0,
+        gates=[{"iter": 0, "decision": "warn"}],
+        data_corrupt_at=0,
+    )
+
+    control_summary_path = control_dir / "results_summary.json"
+    control_summary = json.loads(control_summary_path.read_text(encoding="utf-8"))
+    control_summary["window_signature_ref"] = {"hash": "", "path": "window_signature.json"}
+    _write_json(control_summary_path, control_summary)
+
+    with pytest.raises(CalibrationError) as exc_info:
+        calibrate_pilot(control_dir, injected_dir)
+
+    assert exc_info.value.token == "MISSING_WINDOW_SIGNATURE_REF_HASH"
+
+
+@pytest.mark.xfail(
+    reason=(
+        "calibrate_pilot gate-event parsing currently rejects 'skip' decisions; "
+        "see docs/audit_core_20260212.md"
+    )
+)
+def test_calibrate_skip_gate_events(tmp_path: Path) -> None:
+    control_dir = tmp_path / "control"
+    injected_dir = tmp_path / "injected"
+    _write_capsule(
+        control_dir,
+        run_id="control",
+        gate_window=2,
+        gate_warmup=0,
+        gates=[{"iter": 0, "decision": "skip"}],
+    )
+    _write_capsule(
+        injected_dir,
+        run_id="injected",
+        gate_window=2,
+        gate_warmup=0,
+        gates=[{"iter": 0, "decision": "warn"}],
+        data_corrupt_at=0,
+    )
+
+    calibrate_pilot(control_dir, injected_dir)
 
 
 def test_cli_calibrate_exit_codes(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
