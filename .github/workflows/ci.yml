@@ -45,11 +45,18 @@ jobs:
             fi
           done
 
-      - name: Ruff
-        run: ruff check . --output-format=github
+      - name: Agent check loop (fast)
+        run: bash scripts/agent/check.sh
 
-      - name: Pytest (unit)
-        run: python -m pytest -m unit
+      - name: Pytest (unit full)
+        # Avoid overlap with tests already exercised by the fast agent loop.
+        run: |
+          python -m pytest -m unit \
+            --ignore=tests/test_cli_import_boundary.py \
+            --ignore=tests/test_cli_diff.py \
+            --ignore=tests/test_cli_validate_report.py \
+            --ignore=tests/test_markdown_fences.py \
+            --ignore=tests/test_file_modes.py
 
   integration:
     runs-on: ubuntu-latest
