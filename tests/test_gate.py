@@ -72,6 +72,9 @@ class TestGateEngineSemantics:
         assert r.warn is False
         assert r.audit["evaluated"] is True
         assert r.audit["reason"] == "zero_tv_nonidentical_windows"
+        assert r.audit["degenerate_window"] is True
+        assert r.audit["failure_mode"] == "diagnostic"
+        assert r.audit["dw_exceeds_threshold"] is False
         assert "test_metric" in r.audit.get("window_debug_nonidentical_metrics", [])
         assert "test_metric" not in r.audit.get("window_debug_empty_metrics", [])
         assert "window_ref_range" in r.audit
@@ -153,6 +156,33 @@ class TestGateEngineSemantics:
             and (not np.array_equal(past[m], recent[m]))
         ]
         assert rescued_metrics
+
+    def test_zero_tv_rescue_marks_observed_range_fallback_when_calibration_range_disjoint(
+        self, make_window_decl, make_fr_window, make_gate_engine
+    ):
+        wd = make_window_decl(
+            ["test_metric"],
+            epsilon=0.5,
+            weights={"test_metric": 1.0},
+            bins=16,
+            cal_ranges={"test_metric": (10.0, 20.0)},
+        )
+        fr = make_fr_window(wd)
+        ge = make_gate_engine(fr, min_evidence=0, policy="either", gain_thresh=0.0, eps_sens=0.0)
+
+        n = 41
+        past = {"test_metric": np.full(n, 10.10, dtype=float)}
+        recent = {"test_metric": np.full(n, 10.20, dtype=float)}
+        counts = {"test_metric": n}
+
+        r = ge.check(past, recent, counts, gain_bits=0.1, kappa_sens=np.nan, eps_stat_value=0.0, iter_num=123)
+        a = r.audit
+        assert a["evaluated"] is True
+        assert a.get("reason") != "zero_tv_nonidentical_windows"
+        assert float(a["per_metric_tv"]["test_metric"]) > 0.0
+        rescue = a.get("per_metric_tv_rescue", {})
+        assert "test_metric" in rescue
+        assert rescue["test_metric"].get("tv_rescue_used_observed_range") is True
 
     def test_empty_window_fail_loudly(self, fr_window, make_gate_engine, force_zero_tv):
         ge = make_gate_engine(fr_window, min_evidence=0, policy="either", gain_thresh=0.0, eps_sens=0.0)

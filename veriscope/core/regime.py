@@ -1741,16 +1741,34 @@ class RegimeAnchoredGateEngine:
                 alpha=float(self.config.eps_stat_alpha),
             )
 
-            regime_result = self.regime_engine.check(
-                past=current_ref.metrics,
-                recent=recent,
-                counts_by_metric=regime_counts,
-                gain_bits=0.0,
-                kappa_sens=0.0,
-                eps_stat_value=regime_eps_stat,
-                iter_num=iter_num,
-                regime_state="active",
-            )
+            regime_persistence_state: Any = None
+            _restore_regime_state = None
+            if shadow_mode:
+                _save_regime_state = getattr(self.regime_engine, "save_persistence_state", None)
+                _restore_regime_state = getattr(self.regime_engine, "restore_persistence_state", None)
+                if callable(_save_regime_state) and callable(_restore_regime_state):
+                    try:
+                        regime_persistence_state = _save_regime_state()
+                    except Exception:
+                        regime_persistence_state = None
+
+            try:
+                regime_result = self.regime_engine.check(
+                    past=current_ref.metrics,
+                    recent=recent,
+                    counts_by_metric=regime_counts,
+                    gain_bits=0.0,
+                    kappa_sens=0.0,
+                    eps_stat_value=regime_eps_stat,
+                    iter_num=iter_num,
+                    regime_state="active",
+                )
+            finally:
+                if shadow_mode and callable(_restore_regime_state) and (regime_persistence_state is not None):
+                    try:
+                        _restore_regime_state(regime_persistence_state)
+                    except Exception:
+                        pass
 
             regime_ok = regime_result.ok
             regime_warn = bool(bool(regime_result.ok) and bool(getattr(regime_result, "warn", False)))

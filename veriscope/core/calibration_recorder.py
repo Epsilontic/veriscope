@@ -18,7 +18,7 @@ import csv
 import json
 import multiprocessing as _mp
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, TextIO
 
@@ -376,7 +376,7 @@ class CalibrationRecorder:
 
         return CalibrationRecord(
             iter_num=iter_num,
-            timestamp_utc=datetime.utcnow().isoformat(),
+            timestamp_utc=datetime.now(timezone.utc).isoformat(),
             change_worst_DW=_safe_float(audit.get("change_worst_DW")),
             change_eps_eff=_safe_float(audit.get("change_eps_eff")),
             change_eps=_safe_float(audit.get("change_eps")),

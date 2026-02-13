@@ -37,9 +37,9 @@ def force_zero_tv(monkeypatch):
         bins: int,
         *,
         cal_range: Optional[Tuple[float, float]] = None,
-    ) -> float:
+    ) -> Tuple[float, Dict[str, bool]]:
         _ = (a, b, bins, cal_range)
-        return float(tv)
+        return float(tv), {}
 
     monkeypatch.setattr("veriscope.core.gate.tv_hist_fixed", _force_zero_tv)
     monkeypatch.setattr("veriscope.core.gate._rescue_zero_tv_from_bin_collapse", _keep_zero_tv)

@@ -110,19 +110,20 @@ def _rescue_zero_tv_from_bin_collapse(
     bins: int,
     *,
     cal_range: Optional[Tuple[float, float]] = None,
-) -> float:
+) -> Tuple[float, Dict[str, bool]]:
     """
     Preserve fixed-bin TV as primary, but rescue all-zero collapse on nonidentical windows.
 
     This is only active when fixed-bin TV returns exactly 0 while finite transformed arrays are
     nonempty and not elementwise identical.
     """
+    rescue_meta: Dict[str, bool] = {}
     try:
         tv0 = float(tv)
     except Exception:
-        return float("nan")
+        return float("nan"), rescue_meta
     if not (np.isfinite(tv0) and np.isclose(tv0, 0.0, atol=1e-12)):
-        return tv0
+        return tv0, rescue_meta
 
     a_f = np.asarray(a, float)
     b_f = np.asarray(b, float)
@@ -130,11 +131,11 @@ def _rescue_zero_tv_from_bin_collapse(
     b_f = b_f[np.isfinite(b_f)]
 
     if a_f.size == 0 and b_f.size == 0:
-        return 0.0
+        return 0.0, rescue_meta
     if a_f.size == 0 or b_f.size == 0:
-        return float("nan")
+        return float("nan"), rescue_meta
     if a_f.size == b_f.size and _array_equal_nan_safe(a_f, b_f):
-        return 0.0
+        return 0.0, rescue_meta
 
     lo = float(min(np.min(a_f), np.min(b_f)))
     hi = float(max(np.max(a_f), np.max(b_f)))
@@ -153,6 +154,8 @@ def _rescue_zero_tv_from_bin_collapse(
             hi = min(obs_hi, cal_hi)
             if not (np.isfinite(lo) and np.isfinite(hi) and (hi > lo)):
                 lo, hi = obs_lo, obs_hi
+                # Audit marker: cal-range intersection was empty, so rescue used observed span.
+                rescue_meta["tv_rescue_used_observed_range"] = True
     if np.isfinite(lo) and np.isfinite(hi) and (hi > lo):
         fine_bins = int(max(256, 8 * max(1, int(bins))))
         fine_bins = min(fine_bins, 4096)
@@ -165,11 +168,11 @@ def _rescue_zero_tv_from_bin_collapse(
             pb = hb / float(sb)
             tv_fine = 0.5 * float(np.abs(pa - pb).sum())
             if np.isfinite(tv_fine) and tv_fine > 0.0:
-                return float(min(max(tv_fine, 0.0), 1.0))
+                return float(min(max(tv_fine, 0.0), 1.0)), rescue_meta
 
     # KS distance is a different metric than TV; mixing them into a TV-calibrated
     # threshold is unsound.
-    return 0.0
+    return 0.0, rescue_meta
 
 
 def _sha16_of_values(arr: np.ndarray) -> str:
@@ -590,6 +593,7 @@ class GateEngine:
 
         # Gate rescue so the normal path remains unchanged and cheap.
         per_metric_vals_pre = list(worst_per_metric_tv.values())
+        per_metric_tv_rescue: Dict[str, Dict[str, bool]] = {}
         finite_tv_vals_pre: list[float] = []
         for v in per_metric_vals_pre:
             try:
@@ -612,14 +616,17 @@ class GateEngine:
                 past_arr = np.asarray(payload.get("past", np.array([], float)), float)
                 recent_arr = np.asarray(payload.get("recent", np.array([], float)), float)
                 cal_range = cal_ranges.get(m) if isinstance(cal_ranges, dict) else None
-                rescued = _rescue_zero_tv_from_bin_collapse(
+                rescued_out = _rescue_zero_tv_from_bin_collapse(
                     prior_tv,
                     past_arr,
                     recent_arr,
                     wd.bins,
                     cal_range=cal_range,
                 )
+                rescued, rescue_meta = rescued_out
                 worst_per_metric_tv[m] = float(rescued) if np.isfinite(rescued) else float("nan")
+                if isinstance(rescue_meta, dict) and rescue_meta:
+                    per_metric_tv_rescue[str(m)] = dict(rescue_meta)
 
             rescued_sum = 0.0
             rescued_finite = 0
@@ -885,11 +892,18 @@ class GateEngine:
             **({"reason": "gain_below_threshold"} if reason_gain_only else {}),
         )
 
+        if per_metric_tv_rescue:
+            # Audit key: per-metric rescue diagnostics (e.g., observed-range fallback marker).
+            audit["per_metric_tv_rescue"] = per_metric_tv_rescue
+
         if degenerate_reason is not None:
             # `evaluated` is already correct from the normal audit path; evidence-insufficient
             # cases return before reaching this point.
             audit["reason"] = str(degenerate_reason)
             audit["degenerate_window"] = True
+            # Audit key: disambiguates diagnostic hard-failure from true threshold divergence.
+            audit["failure_mode"] = "diagnostic"
+            audit["dw_exceeds_threshold"] = False
             audit["ok_stab"] = False
             audit["ok_stab_raw"] = False
             # Minimal debug payload for proving raw-window degeneracy.

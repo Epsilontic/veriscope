@@ -261,3 +261,68 @@ class TestRegimeGatingSemantics:
         assert result.audit.get("change_ok") is False
         assert result.audit.get("regime_ok") is False
         assert result.audit.get("regime_fail_suppressed") is not True
+
+    def test_shadow_mode_freezes_regime_persistence_counter(self, make_gate_engine, fr_window):
+        base_engine = make_gate_engine(
+            fr_window,
+            min_evidence=1,
+            policy="persistence",
+            persistence_k=2,
+            gain_thresh=0.0,
+            eps_sens=0.0,
+        )
+        rag = RegimeAnchoredGateEngine(
+            base_engine=base_engine,
+            fr_win=fr_window,
+            config=RegimeConfig(
+                enabled=True,
+                shadow_mode=True,
+                reference_build_min_iter=0,
+                reference_build_max_iter=0,
+                min_evidence_per_metric=1,
+                min_windows_for_reference=1,
+            ),
+            gate_warmup=0,
+            gate_window=10,
+        )
+
+        rag._ref = RegimeReference(  # type: ignore[attr-defined]
+            metrics={"test_metric": np.full(64, 0.0)},
+            counts={"test_metric": 64},
+            established_at=0,
+            n_samples_per_metric={"test_metric": 64},
+        )
+
+        baseline = rag.regime_engine.save_persistence_state()["consecutive_exceedances"]
+
+        for i in range(3):
+            r_shadow = rag.check(
+                past={"test_metric": np.full(64, 1.0)},
+                recent={"test_metric": np.full(64, 1.0)},
+                counts_by_metric={"test_metric": 64},
+                gain_bits=0.1,
+                kappa_sens=0.0,
+                eps_stat_value=0.0,
+                iter_num=200 + i,
+            )
+            assert r_shadow.audit.get("regime_check_ran") is True
+            assert r_shadow.audit.get("regime_shadow_mode") is True
+
+        after_shadow = rag.regime_engine.save_persistence_state()["consecutive_exceedances"]
+        assert after_shadow == baseline
+
+        rag.config.shadow_mode = False
+        r_live = rag.check(
+            past={"test_metric": np.full(64, 1.0)},
+            recent={"test_metric": np.full(64, 1.0)},
+            counts_by_metric={"test_metric": 64},
+            gain_bits=0.1,
+            kappa_sens=0.0,
+            eps_stat_value=0.0,
+            iter_num=300,
+        )
+        after_live = rag.regime_engine.save_persistence_state()["consecutive_exceedances"]
+        assert r_live.ok is True
+        assert r_live.audit.get("regime_ok") is True
+        assert r_live.audit.get("regime_shadow_mode") is False
+        assert after_live == baseline + 1
