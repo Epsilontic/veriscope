@@ -1263,6 +1263,56 @@ def _cmd_calibrate(args: argparse.Namespace) -> int:
     return run_calibrate(args)
 
 
+def _cmd_assemble(args: argparse.Namespace) -> int:
+    from veriscope.cli.validate import validate_outdir
+    from veriscope.core.assemble import assemble_capsule_from_jsonl
+
+    outdir = Path(str(args.outdir)).expanduser()
+    logs_path = Path(str(args.from_jsonl)).expanduser()
+    manifest = str(args.manifest or "").strip()
+    manifest_path = Path(manifest).expanduser() if manifest else None
+
+    run_id_arg = str(args.run_id or "").strip()
+    run_id = run_id_arg if run_id_arg else None
+
+    try:
+        assembled = assemble_capsule_from_jsonl(
+            outdir=outdir,
+            logs_path=logs_path,
+            manifest_path=manifest_path,
+            run_id=run_id,
+            gate_preset=str(args.gate_preset),
+            min_evidence=int(args.min_evidence),
+            write_governance=not bool(args.no_governance),
+        )
+    except Exception as exc:
+        _eprint(f"ASSEMBLE_FAILED: {exc}")
+        return 2
+
+    validation = validate_outdir(
+        outdir,
+        strict_identity=True,
+        allow_missing_governance=bool(args.no_governance),
+    )
+    if not validation.ok:
+        _eprint(f"ASSEMBLED_INVALID: {validation.message}")
+        for err in validation.errors:
+            if err != validation.message:
+                _eprint(err)
+        return 2
+
+    for warning in validation.warnings:
+        _eprint(warning)
+    print(
+        "OK assembled"
+        f" outdir={assembled.outdir}"
+        f" run_id={assembled.run_id}"
+        f" records={assembled.records}"
+        f" window_signature_hash={assembled.window_signature_hash}"
+    )
+    return 0
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
@@ -1418,6 +1468,42 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_calibrate.add_argument("--out", default="calibration.json", help="Output JSON path")
     p_calibrate.add_argument("--out-md", default="calibration.md", help="Output Markdown path")
     p_calibrate.set_defaults(_handler=_cmd_calibrate)
+
+    p_assemble = sub.add_parser("assemble", help="Assemble capsule artifacts from universal step JSONL logs")
+    p_assemble.add_argument("outdir", type=str, help="Artifact directory to create (OUTDIR)")
+    p_assemble.add_argument(
+        "--from",
+        dest="from_jsonl",
+        required=True,
+        help="Path to universal step JSONL log file",
+    )
+    p_assemble.add_argument(
+        "--manifest",
+        default="",
+        help="Optional manifest JSON path (defaults to sibling universal_manifest.json when present)",
+    )
+    p_assemble.add_argument(
+        "--run-id",
+        default="",
+        help="Optional run_id override (defaults to manifest run_id or generated id)",
+    )
+    p_assemble.add_argument(
+        "--gate-preset",
+        default="universal_v0",
+        help="Gate preset identity recorded in results/profile",
+    )
+    p_assemble.add_argument(
+        "--min-evidence",
+        type=int,
+        default=1,
+        help="Minimum number of available universal fields required to evaluate a gate",
+    )
+    p_assemble.add_argument(
+        "--no-governance",
+        action="store_true",
+        help="Skip governance_log.jsonl emission during assembly",
+    )
+    p_assemble.set_defaults(_handler=_cmd_assemble)
 
     p_override = sub.add_parser("override", help="Write a manual judgement artifact to an OUTDIR")
     p_override.add_argument("outdir", type=str, help="Artifact directory (OUTDIR)")

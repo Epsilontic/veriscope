@@ -296,6 +296,8 @@ class MetricsRefV1(VSModel):
     path: str = Field(min_length=1)
     format: str = Field(default="legacy_v0", min_length=1)
     count: Optional[NonNegInt] = None
+    # Optional integrity binding for external metrics payloads (non-breaking extension).
+    sha256: Optional[str] = Field(default=None, pattern=r"^[a-fA-F0-9]{64}$")
 
 
 class _ResultsHeaderV1(VSModel):

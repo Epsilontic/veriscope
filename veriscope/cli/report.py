@@ -106,6 +106,15 @@ def _artifact_rows(outdir: Path) -> List[Tuple[str, bool]]:
     return [(name, (outdir / name).exists()) for name in names]
 
 
+def _universal_v0_disclaimer(gate_preset: str) -> Optional[str]:
+    if not str(gate_preset).strip().startswith("universal_v0"):
+        return None
+    return (
+        "universal_v0 is a plumbing/safety gate only "
+        "(NaN/overflow/missing telemetry); PASS is not a full training-health claim."
+    )
+
+
 def render_report_md(outdir: Path, *, fmt: str = "md") -> str:
     """
     Renders a report. Despite the name, supports fmt="md" and fmt="text".
@@ -166,6 +175,7 @@ def render_report_md(outdir: Path, *, fmt: str = "md") -> str:
         else str(summ.final_decision).upper()
     )
     gate_preset = res.profile.gate_preset if res is not None else summ.profile.gate_preset
+    universal_disclaimer = _universal_v0_disclaimer(gate_preset)
     started_ts = res.started_ts_utc if res is not None else summ.started_ts_utc
     ended_ts = res.ended_ts_utc if res is not None else summ.ended_ts_utc
     distributed_banner = _distributed_banner(load_distributed_meta(outdir))
@@ -180,6 +190,8 @@ def render_report_md(outdir: Path, *, fmt: str = "md") -> str:
         lines.append(f"Run ID: {run_id}")
         lines.append(f"Status: {str(summ.run_status).upper()}")
         lines.append(f"Final Status: {final_status}")
+        if universal_disclaimer:
+            lines.append(f"NOTE: {universal_disclaimer}")
         lines.append(f"Wrapper Exit: {wrapper_exit if wrapper_exit is not None else '-'}")
         lines.append(f"Runner Exit: {runner_exit if runner_exit is not None else '-'}")
         lines.append(f"Gate Preset: {gate_preset}")
@@ -252,6 +264,9 @@ def render_report_md(outdir: Path, *, fmt: str = "md") -> str:
     lines.append(f"| Ended | {_fmt_dt(ended_ts)} |")
     lines.append(f"| Window Signature | `{ws_hash}` |")
     lines.append("")
+    if universal_disclaimer:
+        lines.append(f"> **NOTE:** {universal_disclaimer}")
+        lines.append("")
 
     if manual_status.manual is not None:
         lines.append("## ⚠ Manual Judgement")
