@@ -362,6 +362,40 @@ def test_hf_metric_snapshot_requires_full_past_and_recent_windows(monkeypatch: p
     assert [row["iter"] for row in recent_full] == [2, 3]
 
 
+def test_hf_parse_args_rejects_skip_only_configuration(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _install_fake_torch_ddp_init(monkeypatch)
+    sys.modules.pop("veriscope.runners.hf.train_hf", None)
+    train_hf = importlib.import_module("veriscope.runners.hf.train_hf")
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train_hf.py",
+            "--outdir",
+            str(tmp_path / "hf_skip_only"),
+            "--max_steps",
+            "100",
+            "--cadence",
+            "10",
+            "--gate_window",
+            "6",
+        ],
+    )
+
+    with pytest.raises(ValueError) as excinfo:
+        train_hf._parse_args()
+
+    msg = str(excinfo.value)
+    assert "Run will produce only skip decisions." in msg
+    assert "Need at least 12 snapshots but settings yield only 10." in msg
+    assert "increase max_steps to at least 120" in msg
+    assert "reduce gate_window to at most 5" in msg
+    assert "or reduce cadence." in msg
+
+
 def test_hf_gate_fail_dominates_warn(monkeypatch: pytest.MonkeyPatch) -> None:
     _install_fake_torch_ddp_init(monkeypatch)
     sys.modules.pop("veriscope.runners.hf.train_hf", None)

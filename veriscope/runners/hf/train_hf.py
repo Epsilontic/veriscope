@@ -1761,6 +1761,18 @@ def _parse_args() -> HFRunConfig:
     args = parser.parse_args()
     if int(args.cadence) <= 0:
         raise ValueError("--cadence must be >= 1")
+    max_steps = int(args.max_steps)
+    cadence = int(args.cadence)
+    gate_window = int(args.gate_window)
+    snapshots = max_steps // cadence
+    min_snapshots = 2 * gate_window
+    if snapshots < min_snapshots:
+        raise ValueError(
+            "Run will produce only skip decisions. "
+            f"Need at least {min_snapshots} snapshots but settings yield only {snapshots}. "
+            f"Fix: increase max_steps to at least {min_snapshots * cadence}, "
+            f"or reduce gate_window to at most {snapshots // 2}, or reduce cadence."
+        )
     outdir = Path(args.outdir).expanduser() if args.outdir else _default_outdir()
     run_id = args.run_id.strip() or uuid.uuid4().hex[:12]
     dataset_name = args.dataset_name.strip()
@@ -1826,16 +1838,16 @@ def _parse_args() -> HFRunConfig:
         outdir=outdir,
         run_id=run_id,
         force=force,
-        max_steps=int(args.max_steps),
+        max_steps=max_steps,
         batch_size=int(args.batch_size),
         lr=float(args.lr),
         seed=int(resolved_seed),
-        cadence=int(args.cadence),
+        cadence=cadence,
         block_size=int(args.block_size),
         device=str(args.device),
         grad_clip=float(args.grad_clip),
         gate_preset=str(args.gate_preset),
-        gate_window=int(args.gate_window),
+        gate_window=gate_window,
         gate_epsilon=float(args.gate_epsilon),
         gate_min_evidence=int(args.gate_min_evidence),
         gate_gain_thresh=float(args.gate_gain_thresh),

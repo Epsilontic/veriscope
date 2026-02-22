@@ -49,6 +49,7 @@ class DeclTransport(TransportProtocol):
         self._decl = decl
         self._atol = float(atol)
         self._ranges = dict(getattr(decl, "cal_ranges", {}) or {})
+        self._fallback_warned_metrics: set[str] = set()
 
         if probe_contexts is None:
             mets = list(getattr(decl, "metrics", ()) or ())
@@ -75,9 +76,29 @@ class DeclTransport(TransportProtocol):
     def apply(self, ctx: str, x: np.ndarray) -> np.ndarray:
         arr = np.asarray(x, float)
         # Prefer calibrated range; fall back to [0,1] if missing/invalid
-        lo, hi = self._ranges.get(ctx, (0.0, 1.0))
-        if not (np.isfinite(lo) and np.isfinite(hi) and (hi > lo)):
+        raw = self._ranges.get(ctx, None)
+        use_fallback = False
+        try:
+            if raw is None or len(raw) != 2:  # type: ignore[arg-type]
+                raise ValueError("invalid cal_range")
+            lo = float(raw[0])  # type: ignore[index]
+            hi = float(raw[1])  # type: ignore[index]
+            if not (np.isfinite(lo) and np.isfinite(hi) and (hi > lo)):
+                raise ValueError("invalid cal_range")
+        except Exception:
+            use_fallback = True
+        if use_fallback:
             lo, hi = 0.0, 1.0
+            if ctx not in self._fallback_warned_metrics:
+                warnings.warn(
+                    (
+                        f"DeclTransport: no valid cal_range for metric '{ctx}', falling back to [0, 1]. "
+                        f"Set cal_ranges['{ctx}'] to suppress this warning."
+                    ),
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                self._fallback_warned_metrics.add(ctx)
         span = max(1e-12, float(hi - lo))
         z = (arr - float(lo)) / span
         return np.clip(z, 0.0, 1.0)

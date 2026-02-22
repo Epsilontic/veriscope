@@ -420,10 +420,14 @@ def test_report_smoke_and_integrity_minimal(minimal_artifact_dir: Path) -> None:
     assert "test_run_fixture" in md
     assert "## Gate Summary" in md
     assert "## Artifacts" in md
+    assert "- evaluated_fraction: 0.750" in md
+    assert "- first_evaluated_step: 0" in md
 
     # Prefer stable text output for numeric assertions
     txt = render_report_md(minimal_artifact_dir, fmt="text")
     assert f"Total: {derived_total}" in txt
+    assert "evaluated_fraction: 0.750" in txt
+    assert "first_evaluated_step: 0" in txt
 
 
 def test_report_governance_absent(minimal_artifact_dir: Path) -> None:
@@ -568,6 +572,8 @@ def test_partial_summary_allows_report_without_results(minimal_artifact_dir: Pat
     txt = render_report_md(minimal_artifact_dir, fmt="text")
     assert "Gate Preset: test" in txt
     assert "Started:" in txt
+    assert "evaluated_fraction: not available" in txt
+    assert "first_evaluated_step: not available" in txt
 
 
 def test_partial_summary_rejects_non_neutral_counts_without_results(minimal_artifact_dir: Path) -> None:

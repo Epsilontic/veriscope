@@ -47,6 +47,51 @@ def _coerce_int(value: Any) -> Optional[int]:
         return None
 
 
+def _gate_history_coverage(gates: Any) -> tuple[Optional[float], Optional[int]]:
+    def _get(obj: Any, key: str) -> Any:
+        if obj is None:
+            return None
+        if isinstance(obj, dict):
+            return obj.get(key)
+        return getattr(obj, key, None)
+
+    if gates is None:
+        return None, None
+    try:
+        gate_list = list(gates)
+    except Exception:
+        return None, None
+    total = len(gate_list)
+    if total <= 0:
+        return None, None
+
+    evaluated_count = 0
+    missing_evaluated = False
+    first_evaluated_step: Optional[int] = None
+    for gate in gate_list:
+        audit = _get(gate, "audit")
+        evaluated = _get(audit, "evaluated")
+        if not isinstance(evaluated, bool):
+            missing_evaluated = True
+            continue
+        if not evaluated:
+            continue
+        evaluated_count += 1
+        step_val: Optional[int] = None
+        for key in ("iter", "step", "global_step"):
+            step_val = _coerce_int(_get(gate, key))
+            if step_val is not None:
+                break
+        if step_val is None:
+            continue
+        if first_evaluated_step is None or step_val < first_evaluated_step:
+            first_evaluated_step = step_val
+
+    if missing_evaluated:
+        return None, first_evaluated_step
+    return float(evaluated_count) / float(total), first_evaluated_step
+
+
 def _distributed_banner(meta: Optional[Dict[str, Any]]) -> Optional[str]:
     if meta is None:
         return None
@@ -179,6 +224,9 @@ def render_report_md(outdir: Path, *, fmt: str = "md") -> str:
     started_ts = res.started_ts_utc if res is not None else summ.started_ts_utc
     ended_ts = res.ended_ts_utc if res is not None else summ.ended_ts_utc
     distributed_banner = _distributed_banner(load_distributed_meta(outdir))
+    evaluated_fraction, first_evaluated_step = _gate_history_coverage(getattr(res, "gates", None) if res is not None else None)
+    evaluated_fraction_text = f"{evaluated_fraction:.3f}" if evaluated_fraction is not None else "not available"
+    first_evaluated_step_text = str(first_evaluated_step) if first_evaluated_step is not None else "not available"
 
     if fmt == "text":
         lines: List[str] = []
@@ -230,6 +278,8 @@ def render_report_md(outdir: Path, *, fmt: str = "md") -> str:
         lines.append(f"  SKIP: {skip}")
         lines.append(f"  WARN: {warn}")
         lines.append(f"  FAIL: {fail}")
+        lines.append(f"  evaluated_fraction: {evaluated_fraction_text}")
+        lines.append(f"  first_evaluated_step: {first_evaluated_step_text}")
         lines.append("")
         lines.append("Artifacts:")
         for name, exists in _artifact_rows(outdir):
@@ -312,6 +362,8 @@ def render_report_md(outdir: Path, *, fmt: str = "md") -> str:
     lines.append("| Total | Evaluated | PASS | SKIP | WARN | FAIL |")
     lines.append("|---:|---:|---:|---:|---:|---:|")
     lines.append(f"| **{total}** | {evaluated} | **{passed}** | {skip} | {warn} | {fail} |")
+    lines.append(f"- evaluated_fraction: {evaluated_fraction_text}")
+    lines.append(f"- first_evaluated_step: {first_evaluated_step_text}")
     lines.append("")
 
     lines.append("## Artifacts")
