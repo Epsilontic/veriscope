@@ -362,9 +362,7 @@ def test_hf_metric_snapshot_requires_full_past_and_recent_windows(monkeypatch: p
     assert [row["iter"] for row in recent_full] == [2, 3]
 
 
-def test_hf_parse_args_rejects_skip_only_configuration(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_hf_parse_args_rejects_skip_only_configuration(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     _install_fake_torch_ddp_init(monkeypatch)
     sys.modules.pop("veriscope.runners.hf.train_hf", None)
     train_hf = importlib.import_module("veriscope.runners.hf.train_hf")

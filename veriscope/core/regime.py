@@ -2093,10 +2093,7 @@ class RegimeAnchoredGateEngine:
             evaluated
             and (not bool(combined_ok))
             and pfail
-            and (
-                reason_norm.endswith("_persistence_fail")
-                or (reason_norm == "persistence_fail")
-            )
+            and (reason_norm.endswith("_persistence_fail") or (reason_norm == "persistence_fail"))
         )
 
         # Pre-reference suppression is controlled by reference readiness itself,

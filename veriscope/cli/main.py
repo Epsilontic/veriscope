@@ -93,10 +93,7 @@ def _prepare_run_outdir(*, requested_outdir: Path, run_kind: str, force: bool) -
     forced = requested / f"force_{run_kind}_{ts}_{uuid.uuid4().hex[:8]}"
     forced.mkdir(parents=True, exist_ok=False)
     print(
-        (
-            "[veriscope] --force preserved existing capsule artifacts in "
-            f"{requested}; using fresh outdir {forced}"
-        ),
+        (f"[veriscope] --force preserved existing capsule artifacts in {requested}; using fresh outdir {forced}"),
         file=sys.stderr,
     )
     return forced
@@ -1263,6 +1260,23 @@ def _cmd_calibrate(args: argparse.Namespace) -> int:
     return run_calibrate(args)
 
 
+def _cmd_calibrate_from_run(args: argparse.Namespace) -> int:
+    from veriscope.cli.calibrate_from_run import calibrate_from_run
+
+    outdir = Path(str(args.capsule_dir)).expanduser()
+    try:
+        result = calibrate_from_run(outdir, quantile=float(args.quantile))
+    except Exception as exc:
+        _eprint(f"CALIBRATE_FAILED: {exc}")
+        return 2
+    Path(str(args.out)).expanduser().write_text(
+        json.dumps(result, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    print(f"OK epsilon={result['epsilon']:.6f} n={result['n_samples']} -> {args.out}")
+    return 0
+
+
 def _cmd_assemble(args: argparse.Namespace) -> int:
     from veriscope.cli.validate import validate_outdir
     from veriscope.core.assemble import assemble_capsule_from_jsonl
@@ -1468,6 +1482,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_calibrate.add_argument("--out", default="calibration.json", help="Output JSON path")
     p_calibrate.add_argument("--out-md", default="calibration.md", help="Output Markdown path")
     p_calibrate.set_defaults(_handler=_cmd_calibrate)
+
+    p_calibrate_from = sub.add_parser(
+        "calibrate-from-run",
+        help="Compute gate epsilon from a single completed run's metric stream.",
+    )
+    p_calibrate_from.add_argument("capsule_dir", type=str)
+    p_calibrate_from.add_argument("--quantile", type=float, default=0.95)
+    p_calibrate_from.add_argument("--out", default="calibration.json")
+    p_calibrate_from.set_defaults(_handler=_cmd_calibrate_from_run)
 
     p_assemble = sub.add_parser("assemble", help="Assemble capsule artifacts from universal step JSONL logs")
     p_assemble.add_argument("outdir", type=str, help="Artifact directory to create (OUTDIR)")

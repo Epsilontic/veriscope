@@ -159,8 +159,15 @@ def _rescue_zero_tv_from_bin_collapse(
     if np.isfinite(lo) and np.isfinite(hi) and (hi > lo):
         fine_bins = int(max(256, 8 * max(1, int(bins))))
         fine_bins = min(fine_bins, 4096)
-        ha, _ = np.histogram(a_f, bins=fine_bins, range=(lo, hi), density=False)
-        hb, _ = np.histogram(b_f, bins=fine_bins, range=(lo, hi), density=False)
+        try:
+            ha, _ = np.histogram(a_f, bins=fine_bins, range=(lo, hi), density=False)
+            hb, _ = np.histogram(b_f, bins=fine_bins, range=(lo, hi), density=False)
+        except ValueError:
+            # Extremely tiny nonzero spans can be smaller than float bin resolution,
+            # causing NumPy to reject a large uniform bin count. This path is a best-effort
+            # rescue for tv==0 only; if rescue cannot be computed safely, preserve tv==0.
+            rescue_meta["tv_rescue_tiny_range"] = True
+            return 0.0, rescue_meta
         sa = int(np.sum(ha))
         sb = int(np.sum(hb))
         if sa > 0 and sb > 0:

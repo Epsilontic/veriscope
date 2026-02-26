@@ -224,7 +224,9 @@ def render_report_md(outdir: Path, *, fmt: str = "md") -> str:
     started_ts = res.started_ts_utc if res is not None else summ.started_ts_utc
     ended_ts = res.ended_ts_utc if res is not None else summ.ended_ts_utc
     distributed_banner = _distributed_banner(load_distributed_meta(outdir))
-    evaluated_fraction, first_evaluated_step = _gate_history_coverage(getattr(res, "gates", None) if res is not None else None)
+    evaluated_fraction, first_evaluated_step = _gate_history_coverage(
+        getattr(res, "gates", None) if res is not None else None
+    )
     evaluated_fraction_text = f"{evaluated_fraction:.3f}" if evaluated_fraction is not None else "not available"
     first_evaluated_step_text = str(first_evaluated_step) if first_evaluated_step is not None else "not available"
 

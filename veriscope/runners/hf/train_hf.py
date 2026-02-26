@@ -35,6 +35,12 @@ from veriscope.core.ddp import (
     ddp_reduce_mean_scalars_masked,
     env_truthy,
 )
+from veriscope.core.evidence import (
+    compute_evidence_counts,
+    compute_loss_delta_z,
+    extract_metric_array,
+    metric_snapshot as _metric_snapshot,
+)
 from veriscope.core.gate import GateEngine
 from veriscope.core.transport import DeclTransport
 from veriscope.core.window import FRWindow, WindowDecl
@@ -840,19 +846,6 @@ def _tokenize_dataset(
     return DataLoader(grouped, batch_size=batch_size, shuffle=True, collate_fn=collate, generator=generator)
 
 
-def _metric_snapshot(
-    metric_history: List[Dict[str, Any]], gate_window: int
-) -> tuple[list[Dict[str, Any]], list[Dict[str, Any]]]:
-    if gate_window <= 0:
-        return [], []
-    # Require full past+recent windows before evaluating.
-    if len(metric_history) < (2 * gate_window):
-        return [], list(metric_history)
-    past = metric_history[-2 * gate_window : -gate_window]
-    recent = metric_history[-gate_window:]
-    return past, recent
-
-
 def _ddp_aggregate_slice(
     slice_data: List[Dict[str, Any]], agg_metrics: Dict[str, Optional[str]], metrics: List[str]
 ) -> Optional[List[Dict[str, Any]]]:
@@ -904,16 +897,6 @@ def _gate_from_history(
 
     metrics = list(window_decl.weights.keys())
 
-    def _count_finite(slice_data: List[Dict[str, Any]], key: str) -> int:
-        vals = [float(d.get(key, np.nan)) for d in slice_data]
-        arr = np.array(vals, dtype=float)
-        return int(np.isfinite(arr).sum())
-
-    def _extract(slice_data: List[Dict[str, Any]], key: str) -> np.ndarray:
-        vals = [float(d.get(key, np.nan)) for d in slice_data]
-        arr = np.array(vals, dtype=float)
-        return arr[np.isfinite(arr)]
-
     ddp_agg_used = False
     ddp_barrier_status: Optional[str] = None
     agg_metrics: Dict[str, Optional[str]] = {m: DDP_AGG_METRICS.get(m) for m in metrics}
@@ -938,7 +921,9 @@ def _gate_from_history(
             past_slice = [{}] * (gate_window - len(past_slice)) + past_slice
         evidence_total = 0
         if past_slice and recent_slice:
-            counts = {m: min(_count_finite(past_slice, m), _count_finite(recent_slice, m)) for m in metrics}
+            past_dict = {m: extract_metric_array(past_slice, m) for m in metrics}
+            recent_dict = {m: extract_metric_array(recent_slice, m) for m in metrics}
+            counts, _ = compute_evidence_counts(past_dict, recent_dict, metrics)
             evidence_total = int(sum(counts.values()))
         audit = AuditV1(
             evaluated=False,
@@ -984,7 +969,9 @@ def _gate_from_history(
             )
             evidence_total = 0
             if past_slice and recent_slice:
-                counts = {m: min(_count_finite(past_slice, m), _count_finite(recent_slice, m)) for m in metrics}
+                past_dict = {m: extract_metric_array(past_slice, m) for m in metrics}
+                recent_dict = {m: extract_metric_array(recent_slice, m) for m in metrics}
+                counts, _ = compute_evidence_counts(past_dict, recent_dict, metrics)
                 evidence_total = int(sum(counts.values()))
             audit = AuditV1(
                 evaluated=False,
@@ -1012,10 +999,9 @@ def _gate_from_history(
         )
         return GateRecordV1(iter=iter_num, decision="skip", audit=audit, ok=True, warn=False)
 
-    past_dict = {m: _extract(past_slice, m) for m in metrics}
-    recent_dict = {m: _extract(recent_slice, m) for m in metrics}
-    counts = {m: min(len(past_dict[m]), len(recent_dict[m])) for m in metrics}
-    evidence_total = int(sum(counts.values()))
+    past_dict = {m: extract_metric_array(past_slice, m) for m in metrics}
+    recent_dict = {m: extract_metric_array(recent_slice, m) for m in metrics}
+    counts, evidence_total = compute_evidence_counts(past_dict, recent_dict, metrics)
 
     eps_stat_value = float("nan")
     if evidence_total > 0:
@@ -1481,13 +1467,11 @@ def _run_body(
                 if gw > 0 and metric_history:
                     ref_window = metric_history[-min(len(metric_history), gw) :]
                     ref_losses = [float(d.get("loss_mean", d.get("loss", float("nan")))) for d in ref_window]
+                    loss_delta_z = compute_loss_delta_z(loss_mean, ref_losses, gw)
                     ref_arr = np.array([v for v in ref_losses if math.isfinite(v)], dtype=float)
                     if ref_arr.size >= 2:
                         ref_mean = float(ref_arr.mean())
-                        ref_std = float(ref_arr.std(ddof=1))
                         loss_delta = loss_mean - ref_mean
-                        loss_delta_z = loss_delta / max(ref_std, 1e-4)
-                        loss_delta_z = float(np.clip(loss_delta_z, -6.0, 6.0))
 
                 var_out_k_raw = float(m.get("var_out_k", float("nan")))
                 eff_dim_raw = float(m.get("eff_dim", float("nan")))

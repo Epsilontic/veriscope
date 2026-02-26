@@ -625,10 +625,7 @@ def emit_gpt_artifacts_v1(
             )
         first_fail_iter = None
     elif first_fail_iter is None:
-        msg = (
-            "Invariant violation: counts.fail > 0 but first_fail_iter could not be derived "
-            "from gate_history events."
-        )
+        msg = "Invariant violation: counts.fail > 0 but first_fail_iter could not be derived from gate_history events."
         logger.error(msg)
         raise ValueError(msg)
 

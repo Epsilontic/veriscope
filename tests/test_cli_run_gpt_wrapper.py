@@ -116,7 +116,7 @@ def test_run_gpt_refuses_existing_capsule_without_force(tmp_path: Path) -> None:
     outdir = tmp_path / "existing_capsule"
     outdir.mkdir(parents=True, exist_ok=True)
     sentinel = outdir / "results_summary.json"
-    sentinel_payload = "{\"sentinel\": true}\n"
+    sentinel_payload = '{"sentinel": true}\n'
     sentinel.write_text(sentinel_payload, encoding="utf-8")
 
     result = subprocess.run(
@@ -137,7 +137,7 @@ def test_run_gpt_force_uses_fresh_subdir_when_outdir_has_capsule(tmp_path: Path)
     outdir = tmp_path / "existing_capsule_force"
     outdir.mkdir(parents=True, exist_ok=True)
     sentinel = outdir / "results_summary.json"
-    sentinel_payload = "{\"sentinel\": true}\n"
+    sentinel_payload = '{"sentinel": true}\n'
     sentinel.write_text(sentinel_payload, encoding="utf-8")
 
     result = subprocess.run(

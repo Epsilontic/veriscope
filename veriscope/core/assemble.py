@@ -164,9 +164,7 @@ def _read_step_records(path: Path) -> list[UniversalStepRecord]:
                 raise ValueError(f"line {line_no}: expected a JSON object")
             row = _normalize_step_record(obj, line_no=line_no)
             if prev_step is not None and row.step <= prev_step:
-                raise ValueError(
-                    f"line {line_no}: step must be strictly increasing (got {row.step} after {prev_step})"
-                )
+                raise ValueError(f"line {line_no}: step must be strictly increasing (got {row.step} after {prev_step})")
             rows.append(row)
             prev_step = row.step
     if not rows:
@@ -392,7 +390,9 @@ def assemble_capsule_from_jsonl(
     outdir_path = Path(outdir).expanduser()
     outdir_path.mkdir(parents=True, exist_ok=True)
     logs_path_resolved = Path(logs_path).expanduser().resolve()
-    payload_logs_path, metrics_ref_path = _prepare_metrics_payload_path(outdir=outdir_path, logs_path=logs_path_resolved)
+    payload_logs_path, metrics_ref_path = _prepare_metrics_payload_path(
+        outdir=outdir_path, logs_path=logs_path_resolved
+    )
 
     manifest_candidate: Optional[Path] = None
     if manifest_path is not None:

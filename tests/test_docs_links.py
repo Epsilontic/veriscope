@@ -46,8 +46,6 @@ def test_docs_relative_links_exist() -> None:
             if resolved.exists():
                 continue
 
-            violations.append(
-                f"{md_file}: link target '{target}' not found (resolved: {resolved})"
-            )
+            violations.append(f"{md_file}: link target '{target}' not found (resolved: {resolved})")
 
     assert not violations, "Broken relative docs links:\n" + "\n".join(violations)

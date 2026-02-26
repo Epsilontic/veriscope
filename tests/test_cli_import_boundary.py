@@ -59,9 +59,7 @@ def test_cli_main_import_stays_thin() -> None:
 
 
 def test_core_imports_do_not_pull_runner_heavy_dependencies() -> None:
-    discovered_submodules = sorted(
-        module_info.name for module_info in pkgutil.iter_modules(veriscope.core.__path__)
-    )
+    discovered_submodules = sorted(module_info.name for module_info in pkgutil.iter_modules(veriscope.core.__path__))
     imports = ["veriscope.core"] + [f"veriscope.core.{name}" for name in discovered_submodules]
     payload = _probe_import_side_effects(imports)
     assert payload["loaded_blocked"] == []

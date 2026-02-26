@@ -366,10 +366,7 @@ def test_calibrate_rejects_empty_window_signature_ref_hash(tmp_path: Path) -> No
 
 
 @pytest.mark.xfail(
-    reason=(
-        "calibrate_pilot gate-event parsing currently rejects 'skip' decisions; "
-        "see docs/audit_core_20260212.md"
-    )
+    reason=("calibrate_pilot gate-event parsing currently rejects 'skip' decisions; see docs/audit_core_20260212.md")
 )
 def test_calibrate_skip_gate_events(tmp_path: Path) -> None:
     control_dir = tmp_path / "control"

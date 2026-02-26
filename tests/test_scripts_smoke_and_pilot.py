@@ -81,9 +81,7 @@ def test_run_gpt_smoke_defaults_cpu_and_tuned_v0(tmp_path: Path) -> None:
     assert "defaulting to --device cpu" in result.stdout
 
     capdir = Path((outdir / "capdir.txt").read_text(encoding="utf-8").strip())
-    assert capdir == outdir or outdir in capdir.parents, (
-        f"capdir {capdir} is not outdir or a subdirectory of it"
-    )
+    assert capdir == outdir or outdir in capdir.parents, f"capdir {capdir} is not outdir or a subdirectory of it"
     assert capdir.exists()
     assert (capdir / "window_signature.json").exists()
 

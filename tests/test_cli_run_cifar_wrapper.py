@@ -27,7 +27,9 @@ def _write_fake_legacy_executable(path: Path, body: str) -> None:
     path.chmod(0o755)
 
 
-def test_run_cifar_wrapper_replaces_invalid_summary_with_partial(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_run_cifar_wrapper_replaces_invalid_summary_with_partial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     outdir = tmp_path / "cifar_run"
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir(parents=True, exist_ok=True)

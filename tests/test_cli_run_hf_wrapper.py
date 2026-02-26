@@ -103,7 +103,7 @@ def test_run_hf_refuses_existing_capsule_without_force(tmp_path: Path) -> None:
     outdir = tmp_path / "hf_existing_capsule"
     outdir.mkdir(parents=True, exist_ok=True)
     sentinel = outdir / "window_signature.json"
-    sentinel_payload = "{\"schema_version\": 1}\n"
+    sentinel_payload = '{"schema_version": 1}\n'
     sentinel.write_text(sentinel_payload, encoding="utf-8")
 
     fake_deps_dir = tmp_path / "fake_deps"

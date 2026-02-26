@@ -100,7 +100,9 @@ def _warn_governance_event_dual_present(line_no: int) -> str:
     return f"WARNING:GOVERNANCE_LOG_EVENT_DUAL_PRESENT line={line_no}"
 
 
-def _warn_governance_payload_required_fields(line_no: int, *, event: str, missing: list[str], invalid: list[str]) -> str:
+def _warn_governance_payload_required_fields(
+    line_no: int, *, event: str, missing: list[str], invalid: list[str]
+) -> str:
     missing_part = ",".join(sorted(missing)) if missing else "-"
     invalid_part = ",".join(sorted(invalid)) if invalid else "-"
     return _warn_governance_invalid(

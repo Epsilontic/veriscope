@@ -467,10 +467,7 @@ def validate_outdir(
         if any(value != 0 for value in partial_counts.values()):
             return ValidationResult(
                 False,
-                (
-                    "results.json missing with partial=true requires neutral summary counts: "
-                    f"counts={partial_counts}"
-                ),
+                (f"results.json missing with partial=true requires neutral summary counts: counts={partial_counts}"),
                 window_signature_hash=ws_hash,
                 partial=True,
                 warnings=identity_warnings,
@@ -513,10 +510,7 @@ def validate_outdir(
         if summary_counts != derived_counts:
             return ValidationResult(
                 False,
-                (
-                    "summary counts mismatch results gates: "
-                    f"summary={summary_counts} results_derived={derived_counts}"
-                ),
+                (f"summary counts mismatch results gates: summary={summary_counts} results_derived={derived_counts}"),
                 window_signature_hash=ws_hash,
                 partial=False,
                 warnings=identity_warnings,
@@ -760,8 +754,7 @@ def validate_outdir(
         distributed_mode = _distributed_mode(distributed_meta)
         if distributed_mode is None:
             token = (
-                "ERROR:DISTRIBUTED_MODE_MISSING "
-                f"world_size_observed={distributed_world_size} requires distributed_mode"
+                f"ERROR:DISTRIBUTED_MODE_MISSING world_size_observed={distributed_world_size} requires distributed_mode"
             )
             errors.append(token)
             return ValidationResult(
