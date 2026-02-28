@@ -85,6 +85,49 @@ def test_results_v1_roundtrip_dump_validate_json_mode() -> None:
     assert "extra_audit_note" in r2.gates[0].audit.model_dump()
 
 
+def test_results_v1_roundtrip_preserves_regime_audit_extension_fields() -> None:
+    win_ref = WindowSignatureRefV1(hash="1" * 64, path="out/window_signature.json")
+    profile = ProfileV1(gate_preset="default")
+
+    audit = AuditV1(
+        evaluated=True,
+        reason="evaluated_fail",
+        policy="test_policy",
+        worst_DW=0.77,
+        eps_eff=0.41,
+        per_metric_tv={"m": 0.12},
+        evidence_total=16,
+        min_evidence=16,
+        regime_ok=False,
+        regime_check_ran=True,
+        regime_ref_ready=True,
+        regime_ref_windows=3,
+        regime_worst_DW=0.77,
+        regime_eps_eff=0.41,
+        eps_regime_eff=0.41,
+        eps_regime=0.375,
+    )
+    gate = GateRecordV1(iter=2, decision="fail", audit=audit, ok=False, warn=False)
+    res = ResultsV1(
+        run_id="run_regime_roundtrip",
+        window_signature_ref=win_ref,
+        profile=profile,
+        run_status="success",
+        runner_exit_code=0,
+        started_ts_utc=_dt_utc(),
+        ended_ts_utc=_dt_utc(2026, 1, 18, 0, 1, 0),
+        gates=(gate,),
+        metrics=(),
+    )
+
+    res2 = ResultsV1.model_validate_json(res.model_dump_json(by_alias=True))
+    audit_dump = res2.gates[0].audit.model_dump(mode="json", by_alias=True, exclude_none=False)
+    assert audit_dump.get("regime_ref_windows") == 3
+    assert audit_dump.get("regime_eps_eff") == pytest.approx(0.41)
+    assert audit_dump.get("eps_regime_eff") == pytest.approx(0.41)
+    assert audit_dump.get("eps_regime") == pytest.approx(0.375)
+
+
 def test_results_v1_roundtrip_json_and_datetime_z() -> None:
     """
     model_dump_json() -> model_validate_json() round-trips.

@@ -1948,8 +1948,16 @@ class VeriscopeGatedTrainer:
                 if gate_result.get("ref_just_established"):
                     regime_status = " [REF ESTABLISHED]"
                 elif gate_result.get("regime_active"):
-                    regime_dw = audit.get("regime_worst_DW")
-                    regime_status = f", regime_D_W={regime_dw:.4f}" if regime_dw is not None else ""
+                    regime_dw = _coerce_float(audit.get("regime_worst_DW", audit.get("regime_D_W", float("nan"))))
+                    regime_eps_eff = _coerce_float(
+                        audit.get("regime_eps_eff", audit.get("eps_regime_eff", float("nan")))
+                    )
+                    if np.isfinite(regime_dw) and np.isfinite(regime_eps_eff):
+                        regime_status = f", regime_D_W={regime_dw:.4f}/eps_regime_eff={regime_eps_eff:.4f}"
+                    elif np.isfinite(regime_dw):
+                        regime_status = f", regime_D_W={regime_dw:.4f}"
+                    else:
+                        regime_status = ""
                 elif gate_result.get("regime_enabled"):
                     accum = audit.get("ref_windows_accumulated", 0)
                     regime_status = f" [REF building: {accum} windows]"

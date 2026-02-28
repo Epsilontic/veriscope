@@ -1281,6 +1281,27 @@ def _cmd_calibrate_from_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_calibrate_regime_from_run(args: argparse.Namespace) -> int:
+    from veriscope.cli.calibrate_regime_from_run import calibrate_regime_from_run
+
+    outdir = Path(str(args.capsule_dir)).expanduser()
+    try:
+        result = calibrate_regime_from_run(outdir, quantile=float(args.quantile))
+    except Exception as exc:
+        _eprint(f"CALIBRATE_FAILED: {exc}")
+        return 2
+    try:
+        Path(str(args.out)).expanduser().write_text(
+            json.dumps(result, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        _eprint(f"CALIBRATE_FAILED: {exc}")
+        return 2
+    print(f"OK regime_epsilon={result['epsilon']:.6f} n={result['n_samples']} -> {args.out}")
+    return 0
+
+
 def _cmd_assemble(args: argparse.Namespace) -> int:
     from veriscope.cli.validate import validate_outdir
     from veriscope.core.assemble import assemble_capsule_from_jsonl
@@ -1495,6 +1516,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_calibrate_from.add_argument("--quantile", type=float, default=0.95)
     p_calibrate_from.add_argument("--out", default="calibration.json")
     p_calibrate_from.set_defaults(_handler=_cmd_calibrate_from_run)
+
+    p_calibrate_regime_from = sub.add_parser(
+        "calibrate-regime-from-run",
+        help="Compute regime epsilon from regime-active gates in a single completed run.",
+    )
+    p_calibrate_regime_from.add_argument("capsule_dir", type=str)
+    p_calibrate_regime_from.add_argument("--quantile", type=float, default=0.95)
+    p_calibrate_regime_from.add_argument("--out", default="calibration_regime.json")
+    p_calibrate_regime_from.set_defaults(_handler=_cmd_calibrate_regime_from_run)
 
     p_assemble = sub.add_parser("assemble", help="Assemble capsule artifacts from universal step JSONL logs")
     p_assemble.add_argument("outdir", type=str, help="Artifact directory to create (OUTDIR)")

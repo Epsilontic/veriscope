@@ -365,14 +365,19 @@ class CalibrationRecorder:
             "base_eps_sens": audit.get("base_eps_sens"),
             "base_min_metrics_exceeding_effective": audit.get("base_min_metrics_exceeding_effective"),
             "regime_epsilon": audit.get("regime_epsilon"),
+            "eps_regime": audit.get("eps_regime"),
+            "eps_regime_eff": audit.get("eps_regime_eff"),
             "regime_policy": audit.get("regime_policy"),
             "regime_persistence_k": audit.get("regime_persistence_k"),
             "regime_eps_sens_used": audit.get("regime_eps_sens_used"),
+            "regime_ref_windows": audit.get("regime_ref_windows"),
         }
         try:
             meta_json = json.dumps(meta)
         except Exception:
             meta_json = ""
+
+        regime_eps_eff_val = _safe_float(_first_not_none(audit.get("regime_eps_eff"), audit.get("eps_regime_eff")))
 
         return CalibrationRecord(
             iter_num=iter_num,
@@ -387,7 +392,7 @@ class CalibrationRecorder:
             change_evaluated=bool(audit.get("change_evaluated", evaluated)),
             change_ok=_as_opt_bool(audit.get("change_dw_ok")),
             regime_worst_DW=_safe_float(audit.get("regime_worst_DW")),
-            regime_eps_eff=_safe_float(audit.get("regime_eps_eff")),
+            regime_eps_eff=regime_eps_eff_val,
             regime_eps_stat=_safe_float(audit.get("regime_eps_stat")),
             regime_margin_raw=_safe_float(audit.get("regime_margin_raw")),
             regime_margin_eff=_safe_float(audit.get("regime_margin_eff")),

@@ -50,12 +50,14 @@ class TestRegimeGatingSemantics:
             "ref_windows_built",
             "regime_ref_ready",
             "regime_ref_windows_built",
+            "regime_ref_windows",
         ):
             assert key in r.audit
         assert r.audit.get("ref_ready") is False
         assert isinstance(r.audit.get("ref_windows_built"), int)
         assert r.audit.get("regime_ref_ready") is None
         assert r.audit.get("regime_ref_windows_built") is None
+        assert r.audit.get("regime_ref_windows") is None
         if "regime_state" in r.audit:
             assert isinstance(r.audit["regime_state"], str)
 
@@ -118,6 +120,7 @@ class TestRegimeGatingSemantics:
         assert r1.audit.get("reason") == "change_warn_pending"
         assert r1.audit.get("regime_ref_candidate_windows_seen") == 1
         assert r1.audit.get("regime_ref_windows_built", 0) >= 1
+        assert r1.audit.get("regime_ref_windows", 0) >= 1
         assert r1.audit.get("regime_has_reference") is False
         assert "regime_build_window" in r1.audit
         assert r1.audit.get("regime_ref_last_reject_reason", "").startswith("insufficient_complete_windows")
@@ -135,6 +138,7 @@ class TestRegimeGatingSemantics:
         assert r2.ok is True
         assert r2.audit.get("regime_ref_candidate_windows_seen") == 2
         assert r2.audit.get("regime_ref_windows_built", 0) >= 2
+        assert r2.audit.get("regime_ref_windows", 0) >= 2
         assert r2.audit.get("regime_has_reference") is True
         assert r2.audit.get("regime_ref_last_reject_reason") in (None, "")
 
@@ -223,6 +227,92 @@ class TestRegimeGatingSemantics:
         assert result.audit.get("regime_fail_suppressed") is True
         assert result.audit.get("ref_ready") is True
         assert result.audit.get("regime_ref_ready") is True
+        assert isinstance(result.audit.get("regime_ref_windows"), int)
+        assert result.audit.get("eps_eff_source") == "regime"
+        assert result.audit.get("eps_eff") == pytest.approx(float(result.audit.get("regime_eps_eff")))
+
+    def test_change_only_failure_uses_change_eps_eff_source(self, make_gate_engine, fr_window):
+        base_engine = make_gate_engine(
+            fr_window,
+            min_evidence=1,
+            policy="either",
+            gain_thresh=0.0,
+            eps_sens=0.0,
+        )
+        rag = RegimeAnchoredGateEngine(
+            base_engine=base_engine,
+            fr_win=fr_window,
+            config=RegimeConfig(enabled=True, reference_build_min_iter=0, reference_build_max_iter=0),
+            gate_warmup=0,
+            gate_window=10,
+        )
+
+        rag._ref = RegimeReference(  # type: ignore[attr-defined]
+            metrics={"test_metric": np.full(64, 1.0)},
+            counts={"test_metric": 64},
+            established_at=0,
+            n_samples_per_metric={"test_metric": 64},
+        )
+
+        result = rag.check(
+            past={"test_metric": np.full(64, 0.0)},
+            recent={"test_metric": np.full(64, 1.0)},
+            counts_by_metric={"test_metric": 64},
+            gain_bits=0.1,
+            kappa_sens=0.0,
+            eps_stat_value=0.0,
+            iter_num=200,
+        )
+
+        assert result.audit.get("decision_source_stability") == "change"
+        assert result.audit.get("eps_eff_source") == "change"
+        assert result.audit.get("eps_eff") == pytest.approx(float(result.audit.get("change_eps_eff")))
+
+    def test_regime_check_ran_emits_finite_regime_eps_eff_when_unevaluated(self, make_gate_engine, fr_window):
+        base_engine = make_gate_engine(
+            fr_window,
+            min_evidence=256,
+            policy="either",
+            gain_thresh=0.0,
+            eps_sens=0.04,
+        )
+        rag = RegimeAnchoredGateEngine(
+            base_engine=base_engine,
+            fr_win=fr_window,
+            config=RegimeConfig(enabled=True, reference_build_min_iter=0, reference_build_max_iter=0),
+            gate_warmup=0,
+            gate_window=10,
+        )
+
+        rag._ref = RegimeReference(  # type: ignore[attr-defined]
+            metrics={"test_metric": np.full(64, 0.0)},
+            counts={"test_metric": 64},
+            established_at=0,
+            n_samples_per_metric={"test_metric": 64},
+        )
+
+        result = rag.check(
+            past={"test_metric": np.full(8, 0.0)},
+            recent={"test_metric": np.full(8, 1.0)},
+            counts_by_metric={"test_metric": 8},
+            gain_bits=0.1,
+            kappa_sens=0.0,
+            eps_stat_value=0.0,
+            iter_num=201,
+        )
+
+        assert result.audit.get("regime_check_ran") is True
+        regime_eps_eff = result.audit.get("regime_eps_eff")
+        assert regime_eps_eff is not None
+        assert np.isfinite(float(regime_eps_eff))
+        assert result.audit.get("eps_regime_eff") == pytest.approx(float(regime_eps_eff))
+        assert result.audit.get("regime_eps_eff_source") in {
+            "audit",
+            "reconstructed_from_audit_terms",
+            "reconstructed_from_wrapper_terms",
+            "fallback_no_eps_stat",
+            "fallback_declared_regime_epsilon",
+        }
 
     def test_persistence_stability_keeps_fail_when_change_channel_fails(self, make_gate_engine, fr_window):
         base_engine = make_gate_engine(

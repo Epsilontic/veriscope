@@ -5,7 +5,7 @@ import json
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 import pytest
 
@@ -54,7 +54,12 @@ def _minimal_window_signature() -> dict[str, Any]:
     }
 
 
-def _make_minimal_artifacts(outdir: Path, *, run_id: str = "test_run_min") -> None:
+def _make_minimal_artifacts(
+    outdir: Path,
+    *,
+    run_id: str = "test_run_min",
+    mutate_gates: Optional[Callable[[list[dict[str, Any]]], None]] = None,
+) -> None:
     """
     Write the minimal canonical artifact set needed to satisfy validate_outdir()
     and render_report_md(), without depending on the emitter.
@@ -146,6 +151,9 @@ def _make_minimal_artifacts(outdir: Path, *, run_id: str = "test_run_min") -> No
             },
         },
     ]
+
+    if mutate_gates is not None:
+        mutate_gates(gates_obj)
 
     res_obj = {**common, "gates": gates_obj, "metrics": []}
 
@@ -255,6 +263,42 @@ def minimal_artifact_dir(tmp_path: Path) -> Path:
     outdir = tmp_path / "out_minimal"
     _make_minimal_artifacts(outdir, run_id="test_run_fixture")
     return outdir
+
+
+def test_validate_and_report_preserve_finite_regime_eps_eff(tmp_path: Path) -> None:
+    outdir = tmp_path / "out_regime_eps"
+
+    def _inject_regime_fields(gates: list[dict[str, Any]]) -> None:
+        assert len(gates) >= 3
+        target_gate = gates[2]
+        audit = target_gate.setdefault("audit", {})
+        audit["regime_ok"] = False
+        audit["regime_check_ran"] = True
+        audit["regime_ref_ready"] = True
+        audit["regime_ref_windows"] = 3
+        audit["regime_worst_DW"] = 0.77
+        audit["regime_eps_eff"] = 0.41
+        audit["eps_regime_eff"] = 0.41
+
+    _make_minimal_artifacts(outdir, run_id="test_run_fixture", mutate_gates=_inject_regime_fields)
+
+    res_path = outdir / "results.json"
+    validation = validate_outdir(
+        outdir,
+        strict_identity=True,
+        allow_partial=False,
+        allow_missing_governance=False,
+        allow_invalid_governance=False,
+    )
+    assert validation.ok is True
+
+    rendered = render_report_md(outdir, fmt="text")
+    assert "Veriscope Report" in rendered
+
+    parsed = ResultsV1.model_validate_json(res_path.read_text(encoding="utf-8"))
+    audit_dump = parsed.gates[2].audit.model_dump(mode="json", by_alias=True, exclude_none=False)
+    assert audit_dump.get("regime_ok") is False
+    assert audit_dump.get("regime_eps_eff") == pytest.approx(0.41)
 
 
 def _mutate_delete_results_json(d: Path) -> None:

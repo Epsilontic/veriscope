@@ -419,6 +419,15 @@ def _coerce_float_maybe(v: Any) -> Optional[float]:
     return fv if np.isfinite(fv) else None
 
 
+def _first_finite_float(*vals: Any) -> Optional[float]:
+    """Return the first finite float found in vals, else None."""
+    for v in vals:
+        fv = _coerce_float_maybe(v)
+        if fv is not None:
+            return fv
+    return None
+
+
 def _pick_worst_metric(per_metric: Any) -> Tuple[Optional[str], Optional[float]]:
     """Pick the metric with the largest finite TV/drift.
 
@@ -1696,6 +1705,9 @@ class RegimeAnchoredGateEngine:
         regime_audit: Dict[str, Any] = {
             "regime_worst_DW": None,
             "regime_eps_eff": None,
+            "eps_regime": _coerce_float_maybe(self._regime_epsilon),
+            "eps_regime_eff": None,
+            "regime_eps_eff_source": None,
             "regime_eps_stat": None,
             "regime_per_metric": {},
             "regime_per_metric_n": {},
@@ -1830,10 +1842,48 @@ class RegimeAnchoredGateEngine:
 
             ra = regime_result.audit or {}
             _per_metric = ra.get("per_metric_tv") or ra.get("drifts") or {}
+            regime_eps_decl = _first_finite_float(ra.get("eps"), self._regime_epsilon)
+            regime_eps_eff = _coerce_float_maybe(ra.get("eps_eff"))
+            regime_eps_eff_source = "audit" if regime_eps_eff is not None else "missing"
+
+            # Regime health must be judged against the regime engine scale, not base-change eps_eff.
+            # If eps_eff is absent in audit, reconstruct only from regime terms and wrapper-local
+            # regime stats (never from base-change eps_eff), so regime_check_ran emits a concrete scale.
+            if regime_eps_eff is None:
+                eps_term = _first_finite_float(ra.get("eps"), regime_eps_decl, self._regime_epsilon)
+                eps_sens_term = _first_finite_float(ra.get("eps_sens"), self._eps_sens_used, 0.0)
+                eps_stat_term = _coerce_float_maybe(ra.get("eps_stat"))
+
+                if eps_stat_term is not None:
+                    regime_eps_eff_source = "reconstructed_from_audit_terms"
+                else:
+                    eps_stat_term = _coerce_float_maybe(regime_eps_stat)
+                    if eps_stat_term is not None and eps_term is not None:
+                        # Match GateEngine's capped eps_stat semantics for apples-to-apples epsilon scale.
+                        eps_cap = float(eps_term) * float(min(max(self.config.eps_stat_max_frac, 0.0), 1.0))
+                        eps_stat_term = float(min(max(0.0, float(eps_stat_term)), float(eps_cap)))
+                        regime_eps_eff_source = "reconstructed_from_wrapper_terms"
+                    else:
+                        eps_stat_term = 0.0
+                        regime_eps_eff_source = "fallback_no_eps_stat"
+
+                if eps_term is not None and eps_sens_term is not None:
+                    regime_eps_eff = max(0.0, float(eps_term) + float(eps_sens_term) - float(eps_stat_term))
+
+            if regime_eps_eff is None:
+                eps_term = _coerce_float_maybe(self._regime_epsilon)
+                if eps_term is not None:
+                    regime_eps_eff = max(0.0, float(eps_term) + float(self._eps_sens_used))
+                    regime_eps_eff_source = "fallback_declared_regime_epsilon"
+
             regime_audit = {
                 "regime_worst_DW": ra.get("worst_DW"),
-                "regime_eps_eff": ra.get("eps_eff"),
+                "regime_eps_eff": regime_eps_eff,
+                "eps_regime": regime_eps_decl,
+                "eps_regime_eff": regime_eps_eff,
+                "regime_eps_eff_source": regime_eps_eff_source,
                 "regime_eps_stat": float(regime_eps_stat),
+                "regime_eps_stat_eff": _coerce_float_maybe(ra.get("eps_stat")),
                 "regime_per_metric": _per_metric,
                 "regime_per_metric_n": ra.get("per_metric_n", {}),
                 "regime_counts": regime_counts,
@@ -1927,12 +1977,17 @@ class RegimeAnchoredGateEngine:
 
         regime_ref_ready: Optional[bool]
         regime_ref_windows_built: Optional[int]
+        regime_ref_windows: Optional[int]
         if self._enabled_effective:
             regime_ref_ready = bool(ref_ready)
             regime_ref_windows_built = int(ref_windows_built)
+            regime_ref_windows = int(ref_windows_built)
         else:
             regime_ref_ready = None
             regime_ref_windows_built = None
+            regime_ref_windows = None
+        if regime_ref_ready is True and regime_ref_windows is None:
+            regime_ref_windows = int(ref_windows_built)
 
         audit.update(
             {
@@ -1956,6 +2011,7 @@ class RegimeAnchoredGateEngine:
                 "regime_shadow_mode": shadow_mode,
                 "regime_build_window": [int(self._build_min_iter), int(self._build_max_iter)],
                 "regime_ref_windows_built": regime_ref_windows_built,
+                "regime_ref_windows": regime_ref_windows,
                 "regime_ref_ready": regime_ref_ready,
                 "regime_ref_candidate_windows_seen": int(self._ref_candidate_windows_seen),
                 "regime_ref_last_reject_reason": self._ref_last_reject_reason,
@@ -2223,24 +2279,41 @@ class RegimeAnchoredGateEngine:
 
         if ds_stability in ("change", "regime", "both"):
             if ds_stability == "change":
-                dw, eps = _as_finite_pair(audit.get("change_worst_DW"), audit.get("change_eps_eff"))
+                change_dw = _coerce_float_maybe(audit.get("change_worst_DW"))
+                change_eps = _coerce_float_maybe(audit.get("change_eps_eff"))
+                dw, eps = _as_finite_pair(change_dw, change_eps)
                 if dw is not None and eps is not None:
                     audit["worst_DW"] = dw
                     audit["eps_eff"] = eps
+                    audit["eps_eff_source"] = "change"
+                else:
+                    audit["worst_DW"] = change_dw
+                    audit["eps_eff"] = change_eps
+                    audit["eps_eff_source"] = "change_missing"
                 audit["margin_raw"] = audit.get("change_margin_raw")
                 audit["margin_eff"] = audit.get("change_margin_eff")
                 audit["margin_slope_eff"] = audit.get("change_margin_slope_eff")
 
             elif ds_stability == "regime":
-                dw, eps = _as_finite_pair(audit.get("regime_worst_DW"), audit.get("regime_eps_eff"))
+                regime_dw = _coerce_float_maybe(audit.get("regime_worst_DW"))
+                regime_eps = _coerce_float_maybe(audit.get("regime_eps_eff"))
+                dw, eps = _as_finite_pair(regime_dw, regime_eps)
                 if dw is not None and eps is not None:
                     audit["worst_DW"] = dw
                     audit["eps_eff"] = eps
+                    audit["eps_eff_source"] = "regime"
+                else:
+                    # Avoid stale base eps_eff on regime-driven rows.
+                    audit["worst_DW"] = regime_dw
+                    audit["eps_eff"] = regime_eps
+                    audit["eps_eff_source"] = "regime_missing"
                 audit["margin_raw"] = audit.get("regime_margin_raw")
                 audit["margin_eff"] = audit.get("regime_margin_eff")
                 audit["margin_slope_eff"] = audit.get("regime_margin_slope_eff")
 
             else:  # both
+                # Selection rule: report the channel with larger relative exceedance
+                # (margin_rel_eff when available, else D_W/eps ratio).
                 r_change = _exceedance_ratio(audit.get("change_worst_DW"), audit.get("change_eps_eff"))
                 r_regime = _exceedance_ratio(audit.get("regime_worst_DW"), audit.get("regime_eps_eff"))
                 mc = _coerce_float_maybe(audit.get("change_margin_rel_eff"))
@@ -2254,18 +2327,43 @@ class RegimeAnchoredGateEngine:
                     src = "change"
 
                 if src == "regime":
-                    dw, eps = _as_finite_pair(audit.get("regime_worst_DW"), audit.get("regime_eps_eff"))
+                    src_dw = _coerce_float_maybe(audit.get("regime_worst_DW"))
+                    src_eps = _coerce_float_maybe(audit.get("regime_eps_eff"))
                 else:
-                    dw, eps = _as_finite_pair(audit.get("change_worst_DW"), audit.get("change_eps_eff"))
+                    src_dw = _coerce_float_maybe(audit.get("change_worst_DW"))
+                    src_eps = _coerce_float_maybe(audit.get("change_eps_eff"))
 
+                dw, eps = _as_finite_pair(src_dw, src_eps)
                 if dw is not None and eps is not None:
                     audit["worst_DW"] = dw
                     audit["eps_eff"] = eps
+                    audit["eps_eff_source"] = "regime" if src == "regime" else "change"
+                else:
+                    audit["worst_DW"] = src_dw
+                    audit["eps_eff"] = src_eps
+                    audit["eps_eff_source"] = "regime_missing" if src == "regime" else "change_missing"
 
                 audit["margin_raw"] = audit.get(f"{src}_margin_raw")
                 audit["margin_eff"] = audit.get(f"{src}_margin_eff")
                 audit["margin_slope_eff"] = audit.get(f"{src}_margin_slope_eff")
         else:
+            change_dw = _coerce_float_maybe(audit.get("change_worst_DW"))
+            change_eps = _coerce_float_maybe(audit.get("change_eps_eff"))
+            dw, eps = _as_finite_pair(change_dw, change_eps)
+            if dw is not None:
+                audit["worst_DW"] = dw
+            elif audit.get("worst_DW") is None:
+                audit["worst_DW"] = change_dw
+            if eps is not None:
+                audit["eps_eff"] = eps
+                audit["eps_eff_source"] = "change"
+            else:
+                if audit.get("eps_eff") is None:
+                    audit["eps_eff"] = change_eps
+                if _coerce_float_maybe(audit.get("eps_eff")) is None:
+                    audit["eps_eff_source"] = "change_missing"
+                else:
+                    audit.setdefault("eps_eff_source", "change")
             audit.setdefault("margin_raw", audit.get("change_margin_raw"))
             audit.setdefault("margin_eff", audit.get("change_margin_eff"))
             audit.setdefault("margin_slope_eff", audit.get("change_margin_slope_eff"))
