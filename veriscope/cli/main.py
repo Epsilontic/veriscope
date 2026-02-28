@@ -1269,10 +1269,14 @@ def _cmd_calibrate_from_run(args: argparse.Namespace) -> int:
     except Exception as exc:
         _eprint(f"CALIBRATE_FAILED: {exc}")
         return 2
-    Path(str(args.out)).expanduser().write_text(
-        json.dumps(result, indent=2, sort_keys=True),
-        encoding="utf-8",
-    )
+    try:
+        Path(str(args.out)).expanduser().write_text(
+            json.dumps(result, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        _eprint(f"CALIBRATE_FAILED: {exc}")
+        return 2
     print(f"OK epsilon={result['epsilon']:.6f} n={result['n_samples']} -> {args.out}")
     return 0
 

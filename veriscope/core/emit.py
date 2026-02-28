@@ -115,8 +115,10 @@ def emit_capsule_v1(
         try:
             exit_i = int(runner_exit_code)
         except Exception:
-            exit_i = -1
-        safe_exit = exit_i if 0 <= exit_i <= 255 else None
+            raise ValueError(f"runner_exit_code must be int-castable in [0, 255]; got {runner_exit_code!r}") from None
+        if not (0 <= exit_i <= 255):
+            raise ValueError(f"runner_exit_code must be within [0, 255]; got {exit_i}")
+        safe_exit = exit_i
 
     metric_records_list = list(metrics or [])
 

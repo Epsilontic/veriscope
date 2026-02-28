@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any, Dict
 
 import pytest
 
@@ -91,6 +92,42 @@ def test_convenience_observer_comparable_with_gated(tmp_path: Path) -> None:
 
     result = diff_outdirs(tmp_path / "observer", tmp_path / "gated")
     assert result.exit_code == 0, result.stderr
+
+
+@pytest.mark.parametrize(
+    ("kwargs_a", "kwargs_b"),
+    [
+        ({"gate_policy": "persistence"}, {"gate_policy": "either"}),
+        ({"gate_persistence_k": 2}, {"gate_persistence_k": 3}),
+    ],
+)
+def test_convenience_semantics_changes_are_not_comparable(
+    tmp_path: Path, kwargs_a: Dict[str, Any], kwargs_b: Dict[str, Any]
+) -> None:
+    from veriscope.core.convenience_logger import ConvenienceLogger
+
+    outdir_a = tmp_path / "a"
+    outdir_b = tmp_path / "b"
+
+    logger_a = ConvenienceLogger(outdir_a, cadence=2, gate_window=5, **kwargs_a)
+    logger_b = ConvenienceLogger(outdir_b, cadence=2, gate_window=5, **kwargs_b)
+    for i in range(60):
+        loss = 2.0 - 0.005 * i
+        logger_a.step(i, loss=loss)
+        logger_b.step(i, loss=loss)
+    logger_a.close()
+    logger_b.close()
+
+    result = diff_outdirs(outdir_a, outdir_b)
+    assert result.exit_code != 0
+    stderr = str(result.stderr or "")
+    stderr_lower = stderr.lower()
+    assert (
+        "WINDOW_HASH_MISMATCH" in stderr
+        or "hash" in stderr_lower
+        or "comparable" in stderr_lower
+        or "WINDOW_SIGNATURE_MISMATCH" in stderr
+    ), stderr
 
 
 def test_convenience_spike_triggers_gate(tmp_path: Path) -> None:

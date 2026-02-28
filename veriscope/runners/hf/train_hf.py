@@ -921,8 +921,8 @@ def _gate_from_history(
             past_slice = [{}] * (gate_window - len(past_slice)) + past_slice
         evidence_total = 0
         if past_slice and recent_slice:
-            past_dict = {m: extract_metric_array(past_slice, m) for m in metrics}
-            recent_dict = {m: extract_metric_array(recent_slice, m) for m in metrics}
+            past_dict = {m: extract_metric_array(past_slice, m, strict=True) for m in metrics}
+            recent_dict = {m: extract_metric_array(recent_slice, m, strict=True) for m in metrics}
             counts, _ = compute_evidence_counts(past_dict, recent_dict, metrics)
             evidence_total = int(sum(counts.values()))
         audit = AuditV1(
@@ -969,8 +969,8 @@ def _gate_from_history(
             )
             evidence_total = 0
             if past_slice and recent_slice:
-                past_dict = {m: extract_metric_array(past_slice, m) for m in metrics}
-                recent_dict = {m: extract_metric_array(recent_slice, m) for m in metrics}
+                past_dict = {m: extract_metric_array(past_slice, m, strict=True) for m in metrics}
+                recent_dict = {m: extract_metric_array(recent_slice, m, strict=True) for m in metrics}
                 counts, _ = compute_evidence_counts(past_dict, recent_dict, metrics)
                 evidence_total = int(sum(counts.values()))
             audit = AuditV1(
@@ -999,8 +999,8 @@ def _gate_from_history(
         )
         return GateRecordV1(iter=iter_num, decision="skip", audit=audit, ok=True, warn=False)
 
-    past_dict = {m: extract_metric_array(past_slice, m) for m in metrics}
-    recent_dict = {m: extract_metric_array(recent_slice, m) for m in metrics}
+    past_dict = {m: extract_metric_array(past_slice, m, strict=True) for m in metrics}
+    recent_dict = {m: extract_metric_array(recent_slice, m, strict=True) for m in metrics}
     counts, evidence_total = compute_evidence_counts(past_dict, recent_dict, metrics)
 
     eps_stat_value = float("nan")

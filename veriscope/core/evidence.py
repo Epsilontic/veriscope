@@ -24,13 +24,25 @@ def metric_snapshot(
 def extract_metric_array(
     slice_data: Sequence[Mapping[str, Any]],
     key: str,
+    *,
+    strict: bool = False,
 ) -> np.ndarray:
-    """Extract finite float values for one metric from a history slice."""
+    """Extract finite float values for one metric from a history slice.
+
+    When strict=True, non-coercible present values raise ValueError instead of
+    being silently dropped.
+    """
     vals: list[float] = []
     for row in slice_data:
+        raw = row.get(key, np.nan)
         try:
-            v = float(row.get(key, np.nan))
+            v = float(raw)
         except Exception:
+            if strict and key in row:
+                iter_value = row.get("iter")
+                raise ValueError(
+                    f"Non-coercible metric value for key={key!r} at iter={iter_value!r}: {raw!r}"
+                ) from None
             v = float("nan")
         vals.append(v)
     arr = np.asarray(vals, dtype=float)

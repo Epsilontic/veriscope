@@ -14,6 +14,14 @@ from veriscope.core.governance import append_gate_decision, append_run_started, 
 from veriscope.core.jsonutil import atomic_write_json, window_signature_sha256
 from veriscope.core.window import WindowDecl
 
+_CAPSULE_SENTINELS = (
+    "window_signature.json",
+    "results.json",
+    "results_summary.json",
+    "governance_log.jsonl",
+    "first_fail_iter.txt",
+)
+
 
 class GateSession:
     """Manage gate lifecycle, governance, and canonical capsule emission."""
@@ -41,6 +49,13 @@ class GateSession:
     ) -> None:
         self._outdir = Path(outdir)
         self._outdir.mkdir(parents=True, exist_ok=True)
+        existing_sentinels = [name for name in _CAPSULE_SENTINELS if (self._outdir / name).exists()]
+        if existing_sentinels:
+            joined = ", ".join(existing_sentinels)
+            raise FileExistsError(
+                "Refusing to initialize GateSession: outdir already contains existing capsule artifacts "
+                f"({joined}). Use a fresh outdir."
+            )
         self._run_id = str(run_id)
         self._window_decl = window_decl
         self._gate_engine = gate_engine

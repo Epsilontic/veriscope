@@ -362,6 +362,62 @@ def test_hf_metric_snapshot_requires_full_past_and_recent_windows(monkeypatch: p
     assert [row["iter"] for row in recent_full] == [2, 3]
 
 
+def test_hf_gate_raises_on_non_coercible_metric_value(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_fake_torch_ddp_init(monkeypatch)
+    sys.modules.pop("veriscope.runners.hf.train_hf", None)
+    train_hf = importlib.import_module("veriscope.runners.hf.train_hf")
+    _gate_from_history = train_hf._gate_from_history
+
+    for key in (
+        "WORLD_SIZE",
+        "RANK",
+        "MASTER_ADDR",
+        "MASTER_PORT",
+        "LOCAL_RANK",
+        "LOCAL_WORLD_SIZE",
+        "TORCHELASTIC_RUN_ID",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    window_decl = WindowDecl(
+        epsilon=0.12,
+        metrics=["var_out_k", "eff_dim"],
+        weights={"var_out_k": 0.5, "eff_dim": 0.5},
+        bins=16,
+    )
+    transport = DeclTransport(window_decl)
+    window_decl.attach_transport(transport)
+    fr_win = FRWindow(decl=window_decl, transport=transport, tests=())
+    gate_engine = GateEngine(
+        frwin=fr_win,
+        gain_thresh=0.0,
+        eps_stat_alpha=0.05,
+        eps_stat_max_frac=0.25,
+        eps_sens=0.04,
+        min_evidence=1,
+        policy="persistence",
+        persistence_k=2,
+        min_metrics_exceeding=1,
+    )
+
+    metric_history = [
+        {"iter": 0, "var_out_k": 0.1, "eff_dim": 0.2},
+        {"iter": 1, "var_out_k": "not-a-number", "eff_dim": 0.22},
+        {"iter": 2, "var_out_k": 0.11, "eff_dim": 0.21},
+        {"iter": 3, "var_out_k": 0.13, "eff_dim": 0.23},
+    ]
+    with pytest.raises(ValueError, match="Non-coercible metric value"):
+        _gate_from_history(
+            gate_engine,
+            window_decl,
+            metric_history,
+            gate_window=2,
+            iter_num=3,
+            gate_policy="persistence",
+            gate_min_evidence=1,
+        )
+
+
 def test_hf_parse_args_rejects_skip_only_configuration(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     _install_fake_torch_ddp_init(monkeypatch)
     sys.modules.pop("veriscope.runners.hf.train_hf", None)

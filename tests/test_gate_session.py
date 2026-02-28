@@ -113,6 +113,25 @@ def _events_by_name(outdir: Path, name: str) -> List[Dict[str, Any]]:
     return out
 
 
+@pytest.mark.parametrize(
+    "sentinel_name",
+    [
+        "window_signature.json",
+        "results.json",
+        "results_summary.json",
+        "governance_log.jsonl",
+        "first_fail_iter.txt",
+    ],
+)
+def test_session_init_refuses_existing_capsule_artifacts(tmp_path: Path, sentinel_name: str) -> None:
+    outdir = tmp_path / f"existing_{sentinel_name.replace('.', '_')}"
+    outdir.mkdir(parents=True, exist_ok=True)
+    (outdir / sentinel_name).write_text("{}\n", encoding="utf-8")
+
+    with pytest.raises(FileExistsError, match="existing capsule artifacts"):
+        _make_session(outdir)
+
+
 def test_session_observer_mode_skip_all(tmp_path: Path) -> None:
     outdir = tmp_path / "obs"
     session = _make_session(outdir, observer_mode=True, gate_window=5)

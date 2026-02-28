@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Any, Iterable, List, Optional
 
 from veriscope.core.artifacts import AuditV1, DistributedRunConfigV1, derive_gate_decision
-from veriscope.core.ddp import ddp_is_active, ddp_rank, ddp_world_size
 from veriscope.core.jsonutil import atomic_append_jsonl, canonical_json_sha256, sanitize_json_value
 
 
@@ -542,10 +541,33 @@ def _parse_optional_int(value: Optional[str]) -> Optional[int]:
         return None
 
 
+def _ddp_runtime_context() -> tuple[int, int, bool]:
+    # Keep governance import-light: only import DDP helpers when context is requested.
+    try:
+        from veriscope.core.ddp import ddp_is_active, ddp_rank, ddp_world_size
+    except Exception:
+        return 1, 0, False
+
+    try:
+        world_size = int(ddp_world_size())
+    except Exception:
+        world_size = 1
+    try:
+        rank = int(ddp_rank())
+    except Exception:
+        rank = 0
+    try:
+        ddp_active = bool(ddp_is_active())
+    except Exception:
+        ddp_active = False
+
+    world_size = max(1, world_size)
+    rank = max(0, rank)
+    return world_size, rank, ddp_active
+
+
 def build_distributed_context() -> dict[str, Any]:
-    world_size = ddp_world_size()
-    rank = ddp_rank()
-    ddp_active = ddp_is_active()
+    world_size, rank, ddp_active = _ddp_runtime_context()
     ddp_backend = None
     if ddp_active:
         try:
