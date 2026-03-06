@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -160,7 +161,244 @@ def _universal_v0_disclaimer(gate_preset: str) -> Optional[str]:
     )
 
 
-def render_report_md(outdir: Path, *, fmt: str = "md") -> str:
+@dataclass(frozen=True)
+class EconomicEstimate:
+    first_fail_iter: Optional[int]
+    planned_total_iters: Optional[int]
+    step_time_s: Optional[float]
+    saved_iters: Optional[int]
+    saved_wall_clock_s: Optional[float]
+    saved_cost: Optional[float]
+    price_per_gpu_hour: Optional[float]
+    gpus: int
+    action: str
+
+
+def _coerce_float(value: Any) -> Optional[float]:
+    try:
+        if value is None or isinstance(value, bool):
+            return None
+        result = float(value)
+    except Exception:
+        return None
+    return result if math.isfinite(result) else None
+
+
+def _parse_int_flag(argv: List[str], flag: str) -> Optional[int]:
+    parsed: Optional[int] = None
+    idx = 0
+    while idx < len(argv):
+        arg = argv[idx]
+        if arg == flag:
+            idx += 1
+            if idx >= len(argv):
+                return None
+            value = _coerce_int(argv[idx])
+            if value is None:
+                return None
+            parsed = value
+        elif arg.startswith(flag + "="):
+            value = _coerce_int(arg.split("=", 1)[1])
+            if value is None:
+                return None
+            parsed = value
+        idx += 1
+    return parsed
+
+
+def _resolve_planned_total_iters(
+    run_cfg: Optional[Dict[str, Any]],
+    *,
+    planned_total_iters_override: Optional[int],
+) -> Optional[int]:
+    if planned_total_iters_override is not None:
+        return planned_total_iters_override
+    if not isinstance(run_cfg, dict):
+        return None
+
+    argv_obj = run_cfg.get("argv")
+    if not isinstance(argv_obj, dict):
+        return None
+    normalized = argv_obj.get("normalized_forwarded_args")
+    if not isinstance(normalized, list) or not all(isinstance(item, str) for item in normalized):
+        return None
+
+    run_obj = run_cfg.get("run")
+    run_kind = run_obj.get("kind") if isinstance(run_obj, dict) else None
+    if run_kind == "gpt":
+        value = _parse_int_flag(normalized, "--max_iters")
+        return value if value is None or value >= 1 else None
+    if run_kind == "hf":
+        value = _parse_int_flag(normalized, "--max_steps")
+        return value if value is None or value >= 1 else None
+
+    gpt_iters = _parse_int_flag(normalized, "--max_iters")
+    if gpt_iters is not None:
+        return gpt_iters if gpt_iters >= 1 else None
+    hf_steps = _parse_int_flag(normalized, "--max_steps")
+    return hf_steps if hf_steps is None or hf_steps >= 1 else None
+
+
+def _mean_finite_step_time(results: Optional[ResultsV1]) -> Optional[float]:
+    if results is None:
+        return None
+    values: List[float] = []
+    for metric in results.metrics:
+        if getattr(metric, "name", None) != "step_time":
+            continue
+        value = _coerce_float(getattr(metric, "value", None))
+        if value is not None and value >= 0:
+            values.append(value)
+    if not values:
+        return None
+    return sum(values) / float(len(values))
+
+
+def _resolve_step_time(
+    results: Optional[ResultsV1],
+    run_cfg: Optional[Dict[str, Any]],
+    *,
+    planned_total_iters: Optional[int],
+) -> Optional[float]:
+    metric_mean = _mean_finite_step_time(results)
+    if metric_mean is not None:
+        return metric_mean
+    if planned_total_iters in (None, 0):
+        return None
+    if not isinstance(run_cfg, dict):
+        return None
+    timing = run_cfg.get("timing")
+    if not isinstance(timing, dict):
+        return None
+    runner_wall_s = _coerce_float(timing.get("runner_wall_s"))
+    if runner_wall_s is None or runner_wall_s < 0:
+        return None
+    return runner_wall_s / float(planned_total_iters)
+
+
+def _economic_action(decision: str) -> str:
+    mapping = {
+        "fail": "stop recommended",
+        "warn": "investigate",
+        "pass": "continue",
+        "skip": "no evaluated gate yet",
+    }
+    return mapping.get(str(decision).strip().lower(), "no evaluated gate yet")
+
+
+def _compute_economic_estimate(
+    *,
+    results: Optional[ResultsV1],
+    summary: ResultsSummaryV1,
+    run_cfg: Optional[Dict[str, Any]],
+    planned_total_iters_override: Optional[int],
+    price_per_gpu_hour: Optional[float],
+    gpus: int,
+) -> EconomicEstimate:
+    first_fail_iter = _coerce_int(summary.first_fail_iter)
+    price_value = _coerce_float(price_per_gpu_hour)
+    planned_total_iters = _resolve_planned_total_iters(
+        run_cfg,
+        planned_total_iters_override=planned_total_iters_override,
+    )
+    step_time_s = _resolve_step_time(
+        results,
+        run_cfg,
+        planned_total_iters=planned_total_iters,
+    )
+
+    saved_iters: Optional[int] = None
+    if planned_total_iters is not None and first_fail_iter is not None:
+        saved_iters = max(0, planned_total_iters - first_fail_iter)
+
+    saved_wall_clock_s: Optional[float] = None
+    if saved_iters is not None and step_time_s is not None:
+        saved_wall_clock_s = float(saved_iters) * step_time_s
+
+    saved_cost: Optional[float] = None
+    if saved_wall_clock_s is not None and price_value is not None:
+        saved_cost = (saved_wall_clock_s / 3600.0) * price_value * int(gpus)
+
+    return EconomicEstimate(
+        first_fail_iter=first_fail_iter,
+        planned_total_iters=planned_total_iters,
+        step_time_s=step_time_s,
+        saved_iters=saved_iters,
+        saved_wall_clock_s=saved_wall_clock_s,
+        saved_cost=saved_cost,
+        price_per_gpu_hour=price_value,
+        gpus=int(gpus),
+        action=_economic_action(str(summary.final_decision)),
+    )
+
+
+def _fmt_na(value: Optional[Any]) -> str:
+    return "not available" if value is None else str(value)
+
+
+def _fmt_hours(seconds: Optional[float]) -> str:
+    if seconds is None:
+        return "not available"
+    return f"{seconds / 3600.0:.2f} hours"
+
+
+def _fmt_price(value: float) -> str:
+    text = f"{value:.2f}".rstrip("0").rstrip(".")
+    if not text:
+        text = "0"
+    return f"${text}"
+
+
+def _fmt_saved_cost(estimate: EconomicEstimate) -> str:
+    if estimate.saved_cost is None or estimate.price_per_gpu_hour is None:
+        return "not available"
+    gpu_label = "GPU" if int(estimate.gpus) == 1 else "GPUs"
+    return (
+        f"${estimate.saved_cost:.2f} "
+        f"(assuming {estimate.gpus} {gpu_label} at {_fmt_price(estimate.price_per_gpu_hour)}/hr)"
+    )
+
+
+def _format_economic_section_text(estimate: EconomicEstimate) -> str:
+    lines = [
+        "Economic Estimate",
+        "-----------------",
+        "",
+        f"first_fail_iter: {_fmt_na(estimate.first_fail_iter)}",
+        f"planned_total_iters: {_fmt_na(estimate.planned_total_iters)}",
+        "",
+        f"saved_iters: {_fmt_na(estimate.saved_iters)}",
+        f"saved_wall_clock: {_fmt_hours(estimate.saved_wall_clock_s)}",
+        f"saved_cost: {_fmt_saved_cost(estimate)}",
+        "",
+        f"action: {estimate.action}",
+    ]
+    return "\n".join(lines)
+
+
+def _format_economic_section_md(estimate: EconomicEstimate) -> str:
+    lines = [
+        "## Economic Estimate",
+        "",
+        f"- first_fail_iter: {_fmt_na(estimate.first_fail_iter)}",
+        f"- planned_total_iters: {_fmt_na(estimate.planned_total_iters)}",
+        f"- saved_iters: {_fmt_na(estimate.saved_iters)}",
+        f"- saved_wall_clock: {_fmt_hours(estimate.saved_wall_clock_s)}",
+        f"- saved_cost: {_fmt_saved_cost(estimate)}",
+        f"- action: {estimate.action}",
+    ]
+    return "\n".join(lines)
+
+
+def render_report_md(
+    outdir: Path,
+    *,
+    fmt: str = "md",
+    economic: bool = False,
+    planned_total_iters: Optional[int] = None,
+    price_per_gpu_hour: Optional[float] = None,
+    gpus: int = 1,
+) -> str:
     """
     Renders a report. Despite the name, supports fmt="md" and fmt="text".
     """
@@ -229,6 +467,18 @@ def render_report_md(outdir: Path, *, fmt: str = "md") -> str:
     )
     evaluated_fraction_text = f"{evaluated_fraction:.3f}" if evaluated_fraction is not None else "not available"
     first_evaluated_step_text = str(first_evaluated_step) if first_evaluated_step is not None else "not available"
+    economic_estimate = (
+        _compute_economic_estimate(
+            results=res,
+            summary=summ,
+            run_cfg=run_cfg,
+            planned_total_iters_override=planned_total_iters,
+            price_per_gpu_hour=price_per_gpu_hour,
+            gpus=gpus,
+        )
+        if economic
+        else None
+    )
 
     if fmt == "text":
         lines: List[str] = []
@@ -294,6 +544,9 @@ def render_report_md(outdir: Path, *, fmt: str = "md") -> str:
             lines.append(f"  Type: {err.get('type', 'UnknownError')}")
             lines.append(f"  Message: {err.get('message', 'No message provided')}")
             lines.append("")
+
+        if economic_estimate is not None:
+            lines.append(_format_economic_section_text(economic_estimate))
 
         return "\n".join(lines)
 
@@ -383,6 +636,9 @@ def render_report_md(outdir: Path, *, fmt: str = "md") -> str:
         lines.append(f"- **Type**: `{err.get('type', 'UnknownError')}`")
         lines.append(f"- **Message**: {err.get('message', 'No message provided')}")
         lines.append("")
+
+    if economic_estimate is not None:
+        lines.append(_format_economic_section_md(economic_estimate))
 
     return "\n".join(lines)
 

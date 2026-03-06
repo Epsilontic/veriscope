@@ -1077,6 +1077,64 @@ def _eprint(msg: str) -> None:
     print(msg, file=sys.stderr)
 
 
+def _add_economic_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--economic",
+        action="store_true",
+        help="Append an economic estimate based on existing capsule metrics",
+    )
+    parser.add_argument(
+        "--planned-total-iters",
+        type=int,
+        default=None,
+        help="Override planned total iterations for the economic estimate",
+    )
+    parser.add_argument(
+        "--price-per-gpu-hour",
+        type=float,
+        default=None,
+        help="GPU-hour price assumption for the economic estimate",
+    )
+    parser.add_argument(
+        "--gpus",
+        type=int,
+        default=1,
+        help="GPU count assumption for the economic estimate",
+    )
+
+
+def _validated_economic_args(args: argparse.Namespace) -> tuple[Optional[int], Optional[float], int]:
+    planned_total_iters_raw = getattr(args, "planned_total_iters", None)
+    planned_total_iters: Optional[int] = None
+    if planned_total_iters_raw is not None:
+        try:
+            planned_total_iters = int(planned_total_iters_raw)
+        except Exception as exc:
+            raise ValueError("--planned-total-iters must be an integer >= 1") from exc
+        if planned_total_iters < 1:
+            raise ValueError("--planned-total-iters must be >= 1")
+
+    price_per_gpu_hour_raw = getattr(args, "price_per_gpu_hour", None)
+    price_per_gpu_hour: Optional[float] = None
+    if price_per_gpu_hour_raw is not None:
+        try:
+            price_per_gpu_hour = float(price_per_gpu_hour_raw)
+        except Exception as exc:
+            raise ValueError("--price-per-gpu-hour must be a float >= 0") from exc
+        if price_per_gpu_hour < 0:
+            raise ValueError("--price-per-gpu-hour must be >= 0")
+
+    gpus_raw = getattr(args, "gpus", 1)
+    try:
+        gpus = int(gpus_raw)
+    except Exception as exc:
+        raise ValueError("--gpus must be an integer >= 1") from exc
+    if gpus < 1:
+        raise ValueError("--gpus must be >= 1")
+
+    return planned_total_iters, price_per_gpu_hour, gpus
+
+
 def _cmd_validate(args: argparse.Namespace) -> int:
     outdir = Path(str(args.outdir)).expanduser()
     from veriscope.cli.validate import validate_outdir
@@ -1116,9 +1174,21 @@ def _cmd_report(args: argparse.Namespace) -> int:
     if bool(getattr(args, "json", False)):
         fmt = "json"
     compare = bool(getattr(args, "compare", False))
+    economic = bool(getattr(args, "economic", False))
     outdirs = [Path(str(p)).expanduser() for p in getattr(args, "outdirs", [])]
+    try:
+        planned_total_iters, price_per_gpu_hour, gpus = _validated_economic_args(args)
+    except ValueError as e:
+        _eprint(str(e))
+        return 2
+    if economic and fmt == "json":
+        _eprint("--economic is not supported with JSON output")
+        return 2
 
     if compare:
+        if economic:
+            _eprint("--economic is only supported for single-OUTDIR report output")
+            return 2
         result = render_report_compare(
             outdirs,
             fmt=fmt,
@@ -1139,7 +1209,14 @@ def _cmd_report(args: argparse.Namespace) -> int:
         return 2
 
     try:
-        text = render_report_md(outdirs[0], fmt=fmt)
+        text = render_report_md(
+            outdirs[0],
+            fmt=fmt,
+            economic=economic,
+            planned_total_iters=planned_total_iters,
+            price_per_gpu_hour=price_per_gpu_hour,
+            gpus=gpus,
+        )
     except Exception as e:
         _eprint(str(e))
         return 2
@@ -1217,7 +1294,16 @@ def _cmd_inspect(args: argparse.Namespace) -> int:
         _eprint(warning)
 
     no_report = bool(getattr(args, "no_report", False))
+    economic = bool(getattr(args, "economic", False))
+    try:
+        planned_total_iters, price_per_gpu_hour, gpus = _validated_economic_args(args)
+    except ValueError as e:
+        _eprint(str(e))
+        return 2
     if no_report:
+        if economic:
+            _eprint("--economic cannot be used with --no-report")
+            return 2
         if v.window_signature_hash:
             print(f"OK window_signature_hash={v.window_signature_hash}")
         else:
@@ -1225,8 +1311,18 @@ def _cmd_inspect(args: argparse.Namespace) -> int:
         return 0
 
     fmt = str(getattr(args, "format", "text")).strip().lower()
+    if economic and fmt == "json":
+        _eprint("--economic is not supported with JSON output")
+        return 2
     try:
-        text = render_report_md(outdir, fmt=fmt)
+        text = render_report_md(
+            outdir,
+            fmt=fmt,
+            economic=economic,
+            planned_total_iters=planned_total_iters,
+            price_per_gpu_hour=price_per_gpu_hour,
+            gpus=gpus,
+        )
     except Exception as e:
         _eprint(f"OK (validation passed), but report failed: {e}")
         return 2
@@ -1451,6 +1547,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         action="store_true",
         help="Allow comparisons across different gate_preset values",
     )
+    _add_economic_args(p_report)
     p_report.set_defaults(_handler=_cmd_report)
 
     p_inspect = sub.add_parser("inspect", help="Validate and summarize an OUTDIR (validate + report)")
@@ -1481,6 +1578,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         action="store_true",
         help="Fail validation if governance_log.jsonl is missing",
     )
+    _add_economic_args(p_inspect)
     p_inspect.set_defaults(_handler=_cmd_inspect)
 
     p_diff = sub.add_parser("diff", help="Compare two OUTDIRs with contract-aware checks")
