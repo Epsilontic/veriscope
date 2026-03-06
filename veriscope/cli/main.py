@@ -1320,7 +1320,7 @@ def _cmd_assemble(args: argparse.Namespace) -> int:
             logs_path=logs_path,
             manifest_path=manifest_path,
             run_id=run_id,
-            gate_preset=str(args.gate_preset),
+            gate_preset=None if args.gate_preset is None else str(args.gate_preset),
             min_evidence=int(args.min_evidence),
             write_governance=not bool(args.no_governance),
         )
@@ -1546,8 +1546,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     p_assemble.add_argument(
         "--gate-preset",
-        default="universal_v0",
-        help="Gate preset identity recorded in results/profile",
+        default=None,
+        help="Optional gate preset override (defaults to manifest gate_preset or universal_v0)",
     )
     p_assemble.add_argument(
         "--min-evidence",

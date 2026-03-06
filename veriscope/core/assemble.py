@@ -44,6 +44,7 @@ from veriscope.core.jsonutil import (
 _ALLOWED_RUN_STATUSES = {"success", "user_code_failure", "veriscope_failure"}
 _UNIVERSAL_SCALAR_KEYS = ("loss", "lr", "step_time", "grad_norm", "update_norm")
 _UNIVERSAL_DEFAULT_MIN_EVIDENCE = 1
+_UNIVERSAL_DEFAULT_GATE_PRESET = "universal_v0"
 _HASH_CHUNK_SIZE = 8 * 1024 * 1024
 
 
@@ -289,6 +290,15 @@ def _resolved_run_id(cli_run_id: Optional[str], manifest: Mapping[str, Any]) -> 
     return f"assemble_{uuid.uuid4().hex[:12]}"
 
 
+def _resolved_gate_preset(cli_gate_preset: Optional[str], manifest: Mapping[str, Any]) -> str:
+    if cli_gate_preset is not None:
+        return str(cli_gate_preset).strip() or _UNIVERSAL_DEFAULT_GATE_PRESET
+    manifest_gate_preset = manifest.get("gate_preset")
+    if isinstance(manifest_gate_preset, str) and manifest_gate_preset.strip():
+        return manifest_gate_preset.strip()
+    return _UNIVERSAL_DEFAULT_GATE_PRESET
+
+
 def _window_signature(
     *,
     gate_preset: str,
@@ -383,7 +393,7 @@ def assemble_capsule_from_jsonl(
     logs_path: Path | str,
     manifest_path: Optional[Path | str] = None,
     run_id: Optional[str] = None,
-    gate_preset: str = "universal_v0",
+    gate_preset: Optional[str] = None,
     min_evidence: int = _UNIVERSAL_DEFAULT_MIN_EVIDENCE,
     write_governance: bool = True,
 ) -> AssembledCapsule:
@@ -409,7 +419,7 @@ def assemble_capsule_from_jsonl(
 
     rows = _read_step_records(payload_logs_path)
     resolved_run_id = _resolved_run_id(run_id, manifest)
-    resolved_gate_preset = str(gate_preset or manifest.get("gate_preset") or "universal_v0").strip() or "universal_v0"
+    resolved_gate_preset = _resolved_gate_preset(gate_preset, manifest)
 
     created_ts = _parse_iso_utc(manifest.get("created_ts_utc")) or rows[0].ts_utc or datetime.now(timezone.utc)
     ended_ts = _parse_iso_utc(manifest.get("ended_ts_utc")) or rows[-1].ts_utc or datetime.now(timezone.utc)

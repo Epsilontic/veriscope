@@ -460,3 +460,38 @@ def test_emit_coerces_string_iter_for_first_fail_iter(tmp_path: Path) -> None:
     summary_obj = json.loads((outdir / "results_summary.json").read_text(encoding="utf-8"))
     assert summary_obj["first_fail_iter"] == 950
     assert (outdir / "first_fail_iter.txt").read_text(encoding="utf-8") == "950\n"
+
+
+def test_emit_raises_on_invalid_existing_governance_log(tmp_path: Path) -> None:
+    outdir = tmp_path / "out_invalid_governance"
+    outdir.mkdir(parents=True, exist_ok=True)
+    (outdir / "governance_log.jsonl").write_text("{bad json\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="Cannot append to invalid governance_log.jsonl"):
+        emit_gpt_artifacts_v1(
+            outdir=outdir,
+            run_id="run_test_invalid_governance",
+            started_ts_utc=datetime(2026, 1, 1, 0, 0, 0),
+            ended_ts_utc=datetime(2026, 1, 1, 0, 1, 0),
+            gate_preset="tuned_v0",
+            overrides=None,
+            resolved_gate_cfg={"gate_window": 16, "min_evidence": 16, "gate_epsilon": 0.08},
+            gate_history=[
+                {
+                    "iter": 1,
+                    "ok": True,
+                    "warn": False,
+                    "audit": {
+                        "evaluated": True,
+                        "reason": "evaluated_ok",
+                        "policy": "either",
+                        "per_metric_tv": {},
+                        "evidence_total": 16,
+                        "min_evidence": 16,
+                    },
+                }
+            ],
+        )
+
+    assert not (outdir / "results.json").exists()
+    assert not (outdir / "results_summary.json").exists()

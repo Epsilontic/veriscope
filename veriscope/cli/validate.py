@@ -35,6 +35,14 @@ class ValidationResult:
     errors: tuple[str, ...] = field(default_factory=tuple)
 
 
+@dataclass(frozen=True)
+class _RunStartedBinding:
+    line_no: int
+    run_id: Optional[str]
+    outdir: Optional[str]
+    window_signature_hash: Optional[str]
+
+
 _RUN_GOVERNANCE_EVENTS = frozenset(
     {
         "run_started_v1",
@@ -245,6 +253,48 @@ def _collect_governance_bindings(path: Path) -> tuple[set[str], set[str]]:
     return run_ids, outdirs
 
 
+def _collect_run_started_bindings(path: Path) -> tuple[_RunStartedBinding, ...]:
+    bindings: list[_RunStartedBinding] = []
+    for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        raw = line.strip()
+        if not raw:
+            continue
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        event = obj.get("event") or obj.get("event_type")
+        if event != "run_started_v1":
+            continue
+        payload = obj.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        window_signature_ref = payload.get("window_signature_ref")
+        window_signature_hash: Optional[str] = None
+        if isinstance(window_signature_ref, dict):
+            raw_hash = window_signature_ref.get("hash")
+            if isinstance(raw_hash, str) and raw_hash.strip():
+                window_signature_hash = raw_hash.strip()
+
+        run_id = payload.get("run_id")
+        binding_run_id = run_id.strip() if isinstance(run_id, str) and run_id.strip() else None
+
+        outdir = payload.get("outdir")
+        binding_outdir = outdir.strip() if isinstance(outdir, str) and outdir.strip() else None
+
+        bindings.append(
+            _RunStartedBinding(
+                line_no=line_no,
+                run_id=binding_run_id,
+                outdir=binding_outdir,
+                window_signature_hash=window_signature_hash,
+            )
+        )
+    return tuple(bindings)
+
+
 def _normalize_path_for_compare(path_value: str) -> str:
     try:
         return str(Path(path_value).expanduser().resolve(strict=False))
@@ -446,6 +496,16 @@ def validate_outdir(
         )
 
     summary_partial = bool(getattr(summ, "partial", False))
+    if res is not None and summary_partial:
+        token = "ERROR:FULL_CAPSULE_MARKED_PARTIAL results_summary.partial=true requires results.json to be absent"
+        return ValidationResult(
+            False,
+            token,
+            window_signature_hash=ws_hash,
+            partial=False,
+            warnings=identity_warnings,
+            errors=(*identity_errors, token),
+        )
     if res is None and allow_partial:
         if not summary_partial:
             return ValidationResult(
@@ -660,6 +720,7 @@ def validate_outdir(
 
             if run_governance_present:
                 governance_run_ids, governance_outdirs = _collect_governance_bindings(gov_path)
+                run_started_bindings = _collect_run_started_bindings(gov_path)
                 expected_run_id: Optional[str] = None
                 if res is not None:
                     expected_run_id = res.run_id
@@ -696,6 +757,64 @@ def validate_outdir(
                         token = (
                             "ERROR:GOVERNANCE_OUTDIR_MISMATCH "
                             f"expected={expected_outdir_raw!r} observed={mismatched_outdirs!r}"
+                        )
+                        if allow_invalid_governance:
+                            warnings.append(token.replace("ERROR", "WARNING", 1))
+                        else:
+                            errors.append(token)
+                            return ValidationResult(
+                                False,
+                                token,
+                                window_signature_hash=ws_hash,
+                                partial=False,
+                                warnings=tuple(warnings),
+                                errors=tuple(errors),
+                            )
+
+                    expected_bindings = []
+                    mismatched_window_hashes: set[str] = set()
+                    for binding in run_started_bindings:
+                        if binding.run_id != expected_run_id:
+                            continue
+                        if binding.outdir is None:
+                            continue
+                        if (
+                            binding.outdir != expected_outdir_raw
+                            and _normalize_path_for_compare(binding.outdir) != expected_outdir_norm
+                        ):
+                            continue
+                        expected_bindings.append(binding)
+                        if binding.window_signature_hash != ws_hash and binding.window_signature_hash is not None:
+                            mismatched_window_hashes.add(binding.window_signature_hash)
+
+                    if mismatched_window_hashes:
+                        token = (
+                            "ERROR:GOVERNANCE_WINDOW_HASH_MISMATCH "
+                            f"expected={ws_hash!r} observed={sorted(mismatched_window_hashes)!r}"
+                        )
+                        if allow_invalid_governance:
+                            warnings.append(token.replace("ERROR", "WARNING", 1))
+                        else:
+                            errors.append(token)
+                            return ValidationResult(
+                                False,
+                                token,
+                                window_signature_hash=ws_hash,
+                                partial=False,
+                                warnings=tuple(warnings),
+                                errors=tuple(errors),
+                            )
+
+                    if not any(binding.window_signature_hash == ws_hash for binding in expected_bindings):
+                        observed_hashes = sorted(
+                            {
+                                binding.window_signature_hash
+                                for binding in expected_bindings
+                                if binding.window_signature_hash is not None
+                            }
+                        )
+                        token = (
+                            f"ERROR:GOVERNANCE_NOT_BOUND_TO_WINDOW expected={ws_hash!r} observed={observed_hashes!r}"
                         )
                         if allow_invalid_governance:
                             warnings.append(token.replace("ERROR", "WARNING", 1))

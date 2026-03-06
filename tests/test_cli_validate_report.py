@@ -258,6 +258,23 @@ def _tamper_governance_log(outdir: Path) -> None:
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def _rewrite_window_signature_and_refs(outdir: Path) -> str:
+    ws_path = outdir / "window_signature.json"
+    ws_obj = _read_json_dict(ws_path)
+    gate_controls = ws_obj.setdefault("gate_controls", {})
+    if isinstance(gate_controls, dict):
+        gate_controls["gate_window"] = int(gate_controls.get("gate_window", 16)) + 16
+    _write_json(ws_path, ws_obj)
+    ws_hash = canonical_json_sha256(_read_json_dict(ws_path))
+
+    for name in ("results.json", "results_summary.json"):
+        path = outdir / name
+        obj = _read_json_dict(path)
+        obj["window_signature_ref"]["hash"] = ws_hash
+        _write_json(path, obj)
+    return ws_hash
+
+
 @pytest.fixture
 def minimal_artifact_dir(tmp_path: Path) -> Path:
     outdir = tmp_path / "out_minimal"
@@ -336,6 +353,29 @@ def test_validate_happy_path_minimal(minimal_artifact_dir: Path) -> None:
     v = validate_outdir(minimal_artifact_dir)
     assert v.ok, v.message
     assert v.window_signature_hash is not None
+
+
+def test_validate_requires_governance_binding_to_current_window_hash(minimal_artifact_dir: Path) -> None:
+    _rewrite_window_signature_and_refs(minimal_artifact_dir)
+
+    v = validate_outdir(
+        minimal_artifact_dir,
+        strict_identity=True,
+        allow_missing_governance=False,
+        allow_invalid_governance=False,
+    )
+    assert not v.ok
+    assert "GOVERNANCE_WINDOW_HASH_MISMATCH" in v.message
+
+
+def test_validate_accepts_governance_binding_when_window_hash_matches(minimal_artifact_dir: Path) -> None:
+    v = validate_outdir(
+        minimal_artifact_dir,
+        strict_identity=True,
+        allow_missing_governance=False,
+        allow_invalid_governance=False,
+    )
+    assert v.ok, v.message
 
 
 def test_validate_allows_user_code_failure_status(minimal_artifact_dir: Path) -> None:
@@ -441,6 +481,17 @@ def test_validate_partial_requires_explicit_partial_marker(minimal_artifact_dir:
     v = validate_outdir(minimal_artifact_dir, allow_partial=True)
     assert not v.ok
     assert "not marked partial=true" in v.message
+
+
+def test_validate_rejects_full_capsule_marked_partial(minimal_artifact_dir: Path) -> None:
+    summ_path = minimal_artifact_dir / "results_summary.json"
+    summ_obj = _read_json_dict(summ_path)
+    summ_obj["partial"] = True
+    _write_json(summ_path, summ_obj)
+
+    v = validate_outdir(minimal_artifact_dir, allow_partial=True)
+    assert not v.ok
+    assert "FULL_CAPSULE_MARKED_PARTIAL" in v.message
 
 
 def test_report_smoke_and_integrity_minimal(minimal_artifact_dir: Path) -> None:

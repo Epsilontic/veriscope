@@ -230,3 +230,55 @@ def test_cli_assemble_supports_no_governance_mode(tmp_path: Path) -> None:
     assert validate_result.ok, validate_result.message
     summary_obj = _read_json(outdir / "results_summary.json")
     assert summary_obj.get("final_decision") == "pass"
+
+
+def test_cli_assemble_uses_manifest_gate_preset_when_not_overridden(tmp_path: Path) -> None:
+    logs_dir = tmp_path / "logs_manifest_preset"
+    logger = UniversalStepLogger(logs_dir, run_id="manifest_gate", gate_preset="manifest_preset")
+    logger.log(step=0, loss=0.5, lr=1e-3, step_time=0.1, overflow=0, nan_count=0)
+    logger.finalize()
+
+    outdir = tmp_path / "assembled_manifest_gate"
+    exit_code = main(
+        [
+            "assemble",
+            str(outdir),
+            "--from",
+            str(logger.jsonl_path),
+            "--manifest",
+            str(logger.manifest_path),
+        ]
+    )
+    assert exit_code == 0
+
+    summary_obj = _read_json(outdir / "results_summary.json")
+    window_signature = _read_json(outdir / "window_signature.json")
+    assert summary_obj["profile"]["gate_preset"] == "manifest_preset"
+    assert window_signature["gate_controls"]["gate_preset"] == "manifest_preset"
+
+
+def test_cli_assemble_explicit_gate_preset_overrides_manifest(tmp_path: Path) -> None:
+    logs_dir = tmp_path / "logs_explicit_gate"
+    logger = UniversalStepLogger(logs_dir, run_id="explicit_gate", gate_preset="manifest_preset")
+    logger.log(step=0, loss=0.5, lr=1e-3, step_time=0.1, overflow=0, nan_count=0)
+    logger.finalize()
+
+    outdir = tmp_path / "assembled_explicit_gate"
+    exit_code = main(
+        [
+            "assemble",
+            str(outdir),
+            "--from",
+            str(logger.jsonl_path),
+            "--manifest",
+            str(logger.manifest_path),
+            "--gate-preset",
+            "cli_override",
+        ]
+    )
+    assert exit_code == 0
+
+    summary_obj = _read_json(outdir / "results_summary.json")
+    window_signature = _read_json(outdir / "window_signature.json")
+    assert summary_obj["profile"]["gate_preset"] == "cli_override"
+    assert window_signature["gate_controls"]["gate_preset"] == "cli_override"

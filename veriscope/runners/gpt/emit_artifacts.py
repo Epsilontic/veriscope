@@ -40,6 +40,10 @@ from veriscope.core.jsonutil import (
 logger = logging.getLogger(__name__)
 
 
+class GovernanceAppendError(RuntimeError):
+    """Raised when governance append fails in strict emission mode."""
+
+
 @dataclass(frozen=True)
 class EmittedArtifactsV1:
     window_signature_path: Path
@@ -430,6 +434,7 @@ def emit_gpt_artifacts_v1(
     runner_signal: Optional[str] = None,
     argv: Optional[Iterable[str]] = None,
     metrics_ref: Optional[Mapping[str, Any]] = None,
+    strict_governance: bool = True,
 ) -> EmittedArtifactsV1:
     """
     Emit standardized Veriscope artifacts (V1):
@@ -437,12 +442,21 @@ def emit_gpt_artifacts_v1(
       - results.json
       - results_summary.json
 
+    Governance append failures are fatal by default (`strict_governance=True`) so
+    callers do not receive a capsule that will immediately fail strict validation.
+    Set `strict_governance=False` to opt into best-effort governance writes.
+
     This function is intentionally CPU-light and does not import nanoGPT/torch.
     """
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
 
     logger.info("Emitting GPT artifacts to %s (run_id=%s)", outdir, run_id)
+
+    def _handle_governance_failure(action: str, exc: Exception) -> None:
+        if strict_governance:
+            raise GovernanceAppendError(f"Failed to append governance {action} entry: {exc}") from exc
+        logger.warning("Failed to append governance %s entry: %s", action, exc)
 
     # --- 1) window_signature.json ---
     code_identity: Dict[str, Any] = {"package_version": veriscope.__version__}
@@ -485,7 +499,7 @@ def emit_gpt_artifacts_v1(
             distributed=build_distributed_context(),
         )
     except Exception as exc:
-        logger.warning("Failed to append governance run_started entry: %s", exc)
+        _handle_governance_failure("run_started", exc)
     if overrides:
         try:
             append_overrides(
@@ -497,7 +511,7 @@ def emit_gpt_artifacts_v1(
                 argv=argv_list,
             )
         except Exception as exc:
-            logger.warning("Failed to append governance overrides entry: %s", exc)
+            _handle_governance_failure("overrides", exc)
 
     # --- 2) gate_history -> GateRecordV1 ---
     n_events = len(gate_history)
@@ -556,8 +570,10 @@ def emit_gpt_artifacts_v1(
                     audit=audit_payload,
                 )
             except Exception as exc:
-                logger.warning("Failed to append governance gate decision: %s", exc)
+                _handle_governance_failure("gate_decision", exc)
 
+        except GovernanceAppendError:
+            raise
         except Exception as e:
             iter_hint = ev.get("iter", ev.get("iter_num", "MISSING"))
             snippet = repr(dict(ev))[:400]
