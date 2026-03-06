@@ -296,7 +296,13 @@ def test_hf_run_started_failure_blocks_full_emission(tmp_path: Path, monkeypatch
     monkeypatch.setattr(train_hf, "HFMetricComputer", lambda *args, **kwargs: object())
     monkeypatch.setattr(train_hf, "_build_window_decl", lambda _cfg: object())
     monkeypatch.setattr(train_hf, "_build_gate_engine", lambda _cfg, _decl: object())
-    monkeypatch.setattr(train_hf, "_build_window_signature", lambda _cfg, *, created_ts_utc: {"schema_version": 1})
+
+    def _fake_build_window_signature(
+        _cfg: object, *, created_ts_utc: object, window_decl: object, gate_engine: object
+    ) -> dict[str, object]:
+        return {"schema_version": 1}
+
+    monkeypatch.setattr(train_hf, "_build_window_signature", _fake_build_window_signature)
     monkeypatch.setattr(train_hf, "build_code_identity", lambda **_kwargs: {"package_version": "test"})
     monkeypatch.setattr(
         train_hf,

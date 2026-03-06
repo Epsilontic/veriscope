@@ -9,6 +9,7 @@ from veriscope.core.calibration import (
     epsilon_statistic_bhc,
     resolve_epsilon_from_controls,
 )
+from veriscope.core.pilot_calibration import _compute_far
 
 pytestmark = pytest.mark.unit
 
@@ -22,6 +23,36 @@ def _np_quantile_linear(a: np.ndarray, q: float) -> float:
 
 
 class TestCalibrationMath:
+    def test_compute_far_excludes_skip_from_denominator(self):
+        events = [
+            {"iter": 0, "decision": "skip"},
+            {"iter": 1, "decision": "pass"},
+            {"iter": 2, "decision": "warn"},
+            {"iter": 3, "decision": "fail"},
+        ]
+
+        far_fail, far_warnfail, fail_count, warnfail_count, total = _compute_far(events, warmup_iters=0)
+
+        assert total == 3
+        assert fail_count == 1
+        assert warnfail_count == 2
+        assert far_fail == pytest.approx(1.0 / 3.0)
+        assert far_warnfail == pytest.approx(2.0 / 3.0)
+
+    def test_compute_far_returns_none_when_all_post_warmup_events_skip(self):
+        events = [
+            {"iter": 0, "decision": "skip"},
+            {"iter": 1, "decision": "skip"},
+        ]
+
+        far_fail, far_warnfail, fail_count, warnfail_count, total = _compute_far(events, warmup_iters=0)
+
+        assert far_fail is None
+        assert far_warnfail is None
+        assert fail_count == 0
+        assert warnfail_count == 0
+        assert total == 0
+
     def test_resolve_epsilon_from_controls_empty_invalid(self):
         eps, n = resolve_epsilon_from_controls([], 0.95, 0.1)
         assert eps == 0.1

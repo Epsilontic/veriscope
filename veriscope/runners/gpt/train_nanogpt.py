@@ -395,6 +395,34 @@ def _gpt_dw_aggregator_signature() -> Dict[str, str]:
     }
 
 
+def _gate_policy_value(engine: Any) -> Optional[str]:
+    policy_obj = getattr(engine, "policy", None)
+    if policy_obj is None:
+        return None
+    raw = getattr(policy_obj, "value", policy_obj)
+    if raw is None:
+        return None
+    value = str(raw).strip()
+    return value or None
+
+
+def _float_if_finite(value: Any) -> Optional[float]:
+    try:
+        out = float(value)
+    except Exception:
+        return None
+    if not math.isfinite(out):
+        return None
+    return out
+
+
+def _int_or_none(value: Any) -> Optional[int]:
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
 def _read_window_signature(path: Any) -> Optional[Dict[str, Any]]:
     try:
         p = Path(path)
@@ -694,6 +722,7 @@ from veriscope.runners.gpt.adapter import (
 )
 from veriscope.core.calibration import aggregate_epsilon_stat
 from veriscope.runners.gpt.emit_artifacts import emit_gpt_artifacts_v1
+from veriscope.runners.gpt.gate_semantics import canonicalize_runner_gate_flags
 from veriscope.core.artifacts import derive_gate_decision as _derive_gate_decision_v1
 from veriscope.core.jsonutil import atomic_write_json, canonical_json_sha256
 from veriscope.core.redaction_policy import POLICY_REV, prepare_env_capture, redact_argv
@@ -1547,28 +1576,7 @@ class VeriscopeGatedTrainer:
         if audit.get("regime_D_W") is None and audit.get("regime_worst_DW") is not None:
             audit["regime_D_W"] = audit.get("regime_worst_DW")
         evaluated = bool(audit.get("evaluated", True))
-        policy = str(audit.get("policy", "either"))
-        dw_exceeds = bool(audit.get("dw_exceeds_threshold", False))
-        gain_ok = bool(audit.get("gain_ok", True))
-
-        if evaluated and policy == "either" and (not dw_exceeds) and legacy_regime_ok and (not gain_ok):
-            ok = True
-            warn = True
-            # Downgrade gain-only FAIL -> WARN.
-            # In EITHER mode the core gate may not emit a reason; runner must canonicalize.
-            _r = audit.get("reason", None)
-            if (_r is None) or (_r == "") or (str(_r) == "evaluated_unknown"):
-                row_reason = "gain_below_threshold"
-            else:
-                row_reason = str(_r)
-            row_base_reason = row_reason
-            row_change_reason = row_reason
-            audit.setdefault("reason", row_reason)
-            audit["base_reason"] = row_reason
-            audit["change_reason"] = row_reason
-
-        if evaluated and not ok:
-            warn = False
+        ok, warn = canonicalize_runner_gate_flags(ok=ok, warn=warn, audit=audit)
 
         # Canonicalize runner sentinel: evaluated rows should never emit "evaluated_unknown".
         if evaluated and (row_reason is None or str(row_reason) == "" or str(row_reason) == "evaluated_unknown"):
@@ -2732,22 +2740,90 @@ if __name__ == "__main__":
             metric_pipeline=metric_pipeline_payload,
         )
         dw_aggregator_payload = _gpt_dw_aggregator_signature()
+        window_meta_for_signature = _window_meta_from_decl(window_decl_for_signature)
+        gate_engine_for_signature = getattr(trainer, "gate_engine", None) if trainer is not None else None
+        base_gate_for_signature = getattr(gate_engine_for_signature, "base", gate_engine_for_signature)
+        regime_cfg_for_signature = getattr(gate_engine_for_signature, "config", None)
 
         # Build a resolved gate config dict for the artifact signature.
         resolved_gate_cfg: Dict[str, Any] = {
             "metric_interval": int(config.metric_interval),
             "gate_window": int(config.gate_window),
             "gate_warmup": int(config.gate_warmup),
-            "gate_epsilon": float(config.gate_epsilon),
-            "gate_policy": str(config.gate_policy),
-            "gate_persistence_k": int(config.gate_persistence_k),
-            "gate_min_evidence": int(config.gate_min_evidence),
-            "gate_min_metrics_exceeding": int(config.gate_min_metrics_exceeding),
-            "gate_eps_stat_max_frac": float(config.gate_eps_stat_max_frac),
-            "gate_gain_thresh": float(config.gate_gain_thresh),
-            "regime_enabled": bool(config.regime_enabled),
-            "pre_reference_change_policy": str(config.pre_reference_change_policy),
+            "gate_epsilon": float(window_meta_for_signature.get("epsilon", config.gate_epsilon)),
+            "gate_policy": (_gate_policy_value(base_gate_for_signature) or str(config.gate_policy)),
+            "gate_persistence_k": int(getattr(base_gate_for_signature, "persistence_k", config.gate_persistence_k)),
+            "gate_min_evidence": int(getattr(base_gate_for_signature, "min_evidence", config.gate_min_evidence)),
+            "gate_min_metrics_exceeding": int(
+                getattr(base_gate_for_signature, "min_metrics_exceeding", config.gate_min_metrics_exceeding)
+            ),
+            "gate_eps_stat_max_frac": float(
+                getattr(base_gate_for_signature, "cap_frac", config.gate_eps_stat_max_frac)
+            ),
+            "gate_gain_thresh": float(getattr(base_gate_for_signature, "gain_thr", config.gate_gain_thresh)),
+            "regime_enabled": bool(getattr(gate_engine_for_signature, "enabled", config.regime_enabled)),
         }
+        gate_eps_sens = _float_if_finite(getattr(base_gate_for_signature, "eps_sens", None))
+        if gate_eps_sens is not None:
+            resolved_gate_cfg["gate_eps_sens"] = gate_eps_sens
+        gate_eps_stat_alpha = _float_if_finite(getattr(base_gate_for_signature, "alpha", None))
+        if gate_eps_stat_alpha is not None:
+            resolved_gate_cfg["gate_eps_stat_alpha"] = gate_eps_stat_alpha
+        gate_bins = _int_or_none(window_meta_for_signature.get("bins"))
+        if gate_bins is not None:
+            resolved_gate_cfg["gate_bins"] = gate_bins
+        gate_cal_ranges = window_meta_for_signature.get("cal_ranges")
+        if gate_cal_ranges is not None:
+            resolved_gate_cfg["gate_cal_ranges"] = gate_cal_ranges
+
+        if regime_cfg_for_signature is not None:
+            regime_epsilon = _float_if_finite(getattr(gate_engine_for_signature, "regime_epsilon", None))
+            if regime_epsilon is not None:
+                resolved_gate_cfg["regime_epsilon"] = regime_epsilon
+            regime_eps_stat_alpha = _float_if_finite(getattr(regime_cfg_for_signature, "eps_stat_alpha", None))
+            if regime_eps_stat_alpha is not None:
+                resolved_gate_cfg["regime_eps_stat_alpha"] = regime_eps_stat_alpha
+            regime_eps_stat_max_frac = _float_if_finite(getattr(regime_cfg_for_signature, "eps_stat_max_frac", None))
+            if regime_eps_stat_max_frac is not None:
+                resolved_gate_cfg["regime_eps_stat_max_frac"] = regime_eps_stat_max_frac
+            regime_policy = getattr(gate_engine_for_signature, "_regime_policy", None)
+            if regime_policy is not None and str(regime_policy).strip():
+                resolved_gate_cfg["regime_policy"] = str(regime_policy)
+            regime_persistence_k = _int_or_none(getattr(gate_engine_for_signature, "_regime_persistence_k", None))
+            if regime_persistence_k is not None:
+                resolved_gate_cfg["regime_persistence_k"] = regime_persistence_k
+            regime_epsilon_mult = _float_if_finite(getattr(regime_cfg_for_signature, "epsilon_mult", None))
+            if regime_epsilon_mult is not None:
+                resolved_gate_cfg["regime_epsilon_mult"] = regime_epsilon_mult
+            regime_build_min_iter = _int_or_none(getattr(regime_cfg_for_signature, "reference_build_min_iter", None))
+            if regime_build_min_iter is not None:
+                resolved_gate_cfg["regime_build_min_iter"] = regime_build_min_iter
+            regime_build_max_iter = _int_or_none(getattr(regime_cfg_for_signature, "reference_build_max_iter", None))
+            if regime_build_max_iter is not None:
+                resolved_gate_cfg["regime_build_max_iter"] = regime_build_max_iter
+            regime_build_span = _int_or_none(getattr(regime_cfg_for_signature, "reference_build_span", None))
+            if regime_build_span is not None:
+                resolved_gate_cfg["regime_build_span"] = regime_build_span
+            regime_build_gap_iters = _int_or_none(getattr(regime_cfg_for_signature, "reference_build_gap_iters", None))
+            if regime_build_gap_iters is not None:
+                resolved_gate_cfg["regime_build_gap_iters"] = regime_build_gap_iters
+            regime_build_max_dw = _float_if_finite(getattr(regime_cfg_for_signature, "reference_build_max_dw", None))
+            if regime_build_max_dw is not None:
+                resolved_gate_cfg["regime_build_max_dw"] = regime_build_max_dw
+            regime_build_min_gain = _float_if_finite(
+                getattr(regime_cfg_for_signature, "reference_build_min_gain", None)
+            )
+            if regime_build_min_gain is not None:
+                resolved_gate_cfg["regime_build_min_gain"] = regime_build_min_gain
+            regime_min_evidence = _int_or_none(getattr(regime_cfg_for_signature, "min_evidence_per_metric", None))
+            if regime_min_evidence is not None:
+                resolved_gate_cfg["regime_min_evidence"] = regime_min_evidence
+            regime_min_windows = _int_or_none(getattr(regime_cfg_for_signature, "min_windows_for_reference", None))
+            if regime_min_windows is not None:
+                resolved_gate_cfg["regime_min_windows"] = regime_min_windows
+            pre_reference_policy = getattr(regime_cfg_for_signature, "pre_reference_change_policy", None)
+            if pre_reference_policy is not None and str(pre_reference_policy).strip():
+                resolved_gate_cfg["pre_reference_change_policy"] = str(pre_reference_policy)
 
         gate_history_for_emit: List[Dict[str, Any]] = []
         if trainer is not None:

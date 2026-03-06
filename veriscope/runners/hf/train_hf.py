@@ -626,7 +626,21 @@ def _build_gate_engine(cfg: HFRunConfig, window_decl: WindowDecl) -> GateEngine:
     )
 
 
-def _build_window_signature(cfg: HFRunConfig, *, created_ts_utc: datetime) -> Dict[str, Any]:
+def _build_window_signature(
+    cfg: HFRunConfig,
+    *,
+    created_ts_utc: datetime,
+    window_decl: WindowDecl,
+    gate_engine: GateEngine,
+) -> Dict[str, Any]:
+    cal_ranges_payload: Dict[str, list[float]] = {}
+    for name, bounds in (getattr(window_decl, "cal_ranges", {}) or {}).items():
+        try:
+            lo, hi = bounds
+            cal_ranges_payload[str(name)] = [float(lo), float(hi)]
+        except Exception:
+            continue
+
     return {
         "schema_version": 1,
         "created_ts_utc": _iso_utc(created_ts_utc),
@@ -634,17 +648,24 @@ def _build_window_signature(cfg: HFRunConfig, *, created_ts_utc: datetime) -> Di
         "code_identity": {"package_version": veriscope.__version__},
         "transport": {"name": "hf_hidden_state_v1", "cadence": f"every_{cfg.cadence}_steps"},
         "evidence": {
-            "metrics": ["loss_delta_z"],
+            "metrics": list(getattr(window_decl, "metrics", ["loss_delta_z"])),
             "window": {"kind": "fixed", "size": cfg.gate_window, "stride": cfg.cadence},
         },
         "gates": {
             "preset": cfg.gate_preset,
             "params": {
-                "epsilon": cfg.gate_epsilon,
-                "min_evidence": cfg.gate_min_evidence,
-                "gain_thresh": cfg.gate_gain_thresh,
-                "policy": cfg.gate_policy,
-                "persistence_k": cfg.gate_persistence_k,
+                "epsilon": float(getattr(window_decl, "epsilon", cfg.gate_epsilon)),
+                "eps_sens": float(getattr(gate_engine, "eps_sens")),
+                "eps_stat_alpha": float(getattr(gate_engine, "alpha")),
+                "eps_stat_max_frac": float(getattr(gate_engine, "cap_frac")),
+                "min_evidence": int(getattr(gate_engine, "min_evidence")),
+                "min_metrics_exceeding": int(getattr(gate_engine, "min_metrics_exceeding")),
+                "gain_thresh": float(getattr(gate_engine, "gain_thr")),
+                "policy": str(getattr(getattr(gate_engine, "policy"), "value", cfg.gate_policy)),
+                "persistence_k": int(getattr(gate_engine, "persistence_k")),
+                "gate_window": cfg.gate_window,
+                "bins": int(getattr(window_decl, "bins")),
+                "cal_ranges": cal_ranges_payload,
             },
         },
         "model": {"name": cfg.model},
@@ -1281,7 +1302,12 @@ def _run_body(
 
     run_id = cfg.run_id
     started_ts = datetime.now(timezone.utc)
-    window_signature = _build_window_signature(cfg, created_ts_utc=started_ts)
+    window_signature = _build_window_signature(
+        cfg,
+        created_ts_utc=started_ts,
+        window_decl=window_decl,
+        gate_engine=gate_engine,
+    )
     window_signature_ref: Dict[str, Any] = {"path": "window_signature.json"}
     governance_failure: Optional[str] = None
     if _is_chief():

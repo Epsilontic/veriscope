@@ -166,7 +166,7 @@ def _load_results_gates(results_path: Path) -> ResultsGateStatus:
 
 def _normalize_decision(value: Any) -> Optional[str]:
     raw = str(value).strip().lower()
-    if raw in {"pass", "warn", "fail"}:
+    if raw in {"skip", "pass", "warn", "fail"}:
         return raw
     return None
 
@@ -291,9 +291,10 @@ def _compute_far(
     events: List[Dict[str, Any]], warmup_iters: int
 ) -> Tuple[Optional[float], Optional[float], int, int, int]:
     post = _post_warmup(events, warmup_iters)
-    total = len(post)
-    fail = sum(1 for event in post if event.get("decision") == "fail")
-    warn_fail = sum(1 for event in post if event.get("decision") in {"warn", "fail"})
+    evaluated = [event for event in post if event.get("decision") in {"pass", "warn", "fail"}]
+    total = len(evaluated)
+    fail = sum(1 for event in evaluated if event.get("decision") == "fail")
+    warn_fail = sum(1 for event in evaluated if event.get("decision") in {"warn", "fail"})
     if total == 0:
         return None, None, fail, warn_fail, total
     return fail / float(total), warn_fail / float(total), fail, warn_fail, total

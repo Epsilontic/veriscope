@@ -4,6 +4,9 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+from veriscope.core.artifacts import derive_gate_decision
+from veriscope.runners.gpt.gate_semantics import canonicalize_runner_gate_flags
+
 pytestmark = pytest.mark.unit
 
 
@@ -547,6 +550,25 @@ class TestGateEngineSemantics:
         assert r_conj.audit["dw_exceeds_threshold"] is False
         assert r_conj.ok is True
         assert r_conj.warn is False
+
+    def test_gpt_runner_gain_only_case_matches_core_either_semantics(self, fr_window, make_gate_engine):
+        past = {"test_metric": np.full(200, 0.5, dtype=float)}
+        recent = {"test_metric": np.full(200, 0.5, dtype=float)}
+        counts = {"test_metric": 200}
+
+        ge = make_gate_engine(fr_window, min_evidence=0, policy="either", gain_thresh=0.0, eps_sens=0.0)
+        result = ge.check(past, recent, counts, gain_bits=-0.1, kappa_sens=0.0, eps_stat_value=0.0)
+
+        runner_ok, runner_warn = canonicalize_runner_gate_flags(ok=result.ok, warn=result.warn, audit=result.audit)
+        evaluated = bool(result.audit.get("evaluated", True))
+
+        core_decision = derive_gate_decision(evaluated=evaluated, ok=result.ok, warn=result.warn)
+        runner_decision = derive_gate_decision(evaluated=evaluated, ok=runner_ok, warn=runner_warn)
+
+        assert core_decision == "fail"
+        assert runner_decision == core_decision
+        assert runner_ok is False
+        assert runner_warn is False
 
     def test_multi_metric_consensus_filter_blocks_single_metric_drift(
         self, make_window_decl, make_fr_window, make_gate_engine

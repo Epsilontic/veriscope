@@ -46,6 +46,7 @@ Hashing requirements:
 - `window_signature_ref.hash` equals `sha256(canonical_json(window_signature.json))` with volatile keys removed first.
 - `window_signature.created_ts_utc` is excluded from hashing only when it is a valid ISO8601 UTC timestamp string (trailing `Z`); otherwise validation fails.
 - `window_signature_ref.path` equals `"window_signature.json"`.
+- `window_signature.json` MUST bind the full gate decision policy, including all decision-affecting gate controls in the runner-specific gate configuration payload. At minimum this includes epsilon, gain/policy/persistence settings, finite-sample epsilon controls (`eps_sens`, `eps_stat_alpha`, `eps_stat_max_frac`), metric histogram settings (`bins`, `cal_ranges` or a deterministic digest), consensus thresholds, gate window/warmup, and any enabled regime-channel epsilon/build/pre-reference settings.
 - Governance log hash chaining uses:
   - `entry_hash = sha256(canonical_json(entry_without_entry_hash))`
   - `prev_hash = previous entry_hash` (or null if first entry).

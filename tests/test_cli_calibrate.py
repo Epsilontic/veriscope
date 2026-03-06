@@ -200,6 +200,45 @@ def test_calibrate_pilot_happy_path(tmp_path: Path) -> None:
     assert output["calibration_status"] == "complete"
 
 
+def test_calibrate_far_excludes_skip_events(tmp_path: Path) -> None:
+    control_dir = tmp_path / "control"
+    injected_dir = tmp_path / "injected"
+
+    _write_capsule(
+        control_dir,
+        run_id="control",
+        gate_window=2,
+        gate_warmup=0,
+        gates=[
+            {"iter": 0, "decision": "skip"},
+            {"iter": 1, "decision": "pass"},
+            {"iter": 2, "decision": "warn"},
+            {"iter": 3, "decision": "fail"},
+        ],
+    )
+    _write_capsule(
+        injected_dir,
+        run_id="injected",
+        gate_window=2,
+        gate_warmup=0,
+        gates=[
+            {"iter": 0, "decision": "pass"},
+            {"iter": 1, "decision": "warn"},
+        ],
+        data_corrupt_at=0,
+    )
+
+    output = calibrate_pilot(control_dir, injected_dir)
+
+    assert output["FAR"] == pytest.approx(2.0 / 3.0)
+    assert output["FAR_fail"] == pytest.approx(1.0 / 3.0)
+    assert output["FAR_counts"] == {
+        "post_warmup_total": 3,
+        "post_warmup_fail": 1,
+        "post_warmup_warnfail": 2,
+    }
+
+
 def test_calibrate_missing_injected_results(tmp_path: Path) -> None:
     control_dir = tmp_path / "control"
     injected_dir = tmp_path / "injected"
@@ -436,9 +475,6 @@ def test_calibrate_rejects_empty_window_signature_ref_hash(tmp_path: Path) -> No
     assert "window_signature_ref" in exc_info.value.message
 
 
-@pytest.mark.xfail(
-    reason=("calibrate_pilot gate-event parsing currently rejects 'skip' decisions; see docs/audit_core_20260212.md")
-)
 def test_calibrate_skip_gate_events(tmp_path: Path) -> None:
     control_dir = tmp_path / "control"
     injected_dir = tmp_path / "injected"
@@ -458,7 +494,17 @@ def test_calibrate_skip_gate_events(tmp_path: Path) -> None:
         data_corrupt_at=0,
     )
 
-    calibrate_pilot(control_dir, injected_dir)
+    output = calibrate_pilot(control_dir, injected_dir)
+
+    assert output["control_final_decision"] == "skip"
+    assert output["FAR"] is None
+    assert output["FAR_fail"] is None
+    assert output["FAR_counts"] == {
+        "post_warmup_total": 0,
+        "post_warmup_fail": 0,
+        "post_warmup_warnfail": 0,
+    }
+    assert output["calibration_status"] == "incomplete"
 
 
 def test_cli_calibrate_exit_codes(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

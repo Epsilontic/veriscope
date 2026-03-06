@@ -115,6 +115,78 @@ def test_emit_gpt_artifacts_writes_and_validates(tmp_path: Path) -> None:
     assert raw_results["metrics_ref"] == {"path": "run.json", "format": "legacy_v0", "count": 2}
 
 
+def test_emit_gpt_artifacts_window_signature_hash_changes_with_policy_params(tmp_path: Path) -> None:
+    base_cfg = {
+        "metric_interval": 16,
+        "gate_window": 16,
+        "gate_warmup": 32,
+        "gate_epsilon": 0.08,
+        "gate_eps_sens": 0.04,
+        "gate_eps_stat_alpha": 0.05,
+        "gate_eps_stat_max_frac": 0.25,
+        "gate_policy": "either",
+        "gate_persistence_k": 2,
+        "gate_min_evidence": 16,
+        "gate_min_metrics_exceeding": 1,
+        "gate_gain_thresh": 0.0,
+        "gate_bins": 16,
+        "gate_cal_ranges": {"m1": [0.0, 1.0]},
+        "regime_enabled": True,
+        "regime_epsilon": 0.12,
+        "regime_epsilon_mult": 1.5,
+        "regime_eps_stat_alpha": 0.05,
+        "regime_eps_stat_max_frac": 0.25,
+        "regime_policy": "either",
+        "regime_persistence_k": 2,
+        "regime_build_min_iter": -1,
+        "regime_build_max_iter": -1,
+        "regime_build_span": 1500,
+        "regime_build_gap_iters": -1,
+        "regime_build_max_dw": 0.08,
+        "regime_build_min_gain": -0.01,
+        "regime_min_evidence": 50,
+        "regime_min_windows": 5,
+        "pre_reference_change_policy": "ignore",
+    }
+
+    emitted_a = emit_gpt_artifacts_v1(
+        outdir=tmp_path / "out_a",
+        run_id="run_sig_a",
+        started_ts_utc=datetime(2026, 1, 1, 0, 0, 0),
+        ended_ts_utc=None,
+        gate_preset="tuned_v0",
+        overrides=None,
+        resolved_gate_cfg=base_cfg,
+        gate_history=[],
+    )
+    emitted_b = emit_gpt_artifacts_v1(
+        outdir=tmp_path / "out_b",
+        run_id="run_sig_b",
+        started_ts_utc=datetime(2026, 1, 1, 0, 0, 0),
+        ended_ts_utc=None,
+        gate_preset="tuned_v0",
+        overrides=None,
+        resolved_gate_cfg={**base_cfg, "gate_eps_sens": 0.05},
+        gate_history=[],
+    )
+
+    ws_a = json.loads((tmp_path / "out_a" / "window_signature.json").read_text(encoding="utf-8"))
+    gate_controls = ws_a["gate_controls"]
+    assert gate_controls["gate_eps_sens"] == 0.04
+    assert gate_controls["gate_eps_stat_alpha"] == 0.05
+    assert gate_controls["gate_eps_stat_max_frac"] == 0.25
+    assert gate_controls["gate_bins"] == 16
+    assert gate_controls["gate_cal_ranges"] == {"m1": [0.0, 1.0]}
+    assert gate_controls["gate_min_metrics_exceeding"] == 1
+    assert gate_controls["gate_persistence_k"] == 2
+    assert gate_controls["gate_window"] == 16
+    assert gate_controls["gate_warmup"] == 32
+    assert gate_controls["regime_epsilon"] == 0.12
+    assert gate_controls["regime_epsilon_mult"] == 1.5
+
+    assert emitted_a.window_signature_hash != emitted_b.window_signature_hash
+
+
 def test_emit_skipped_gate_sanitizes_nonfinite_audit_values(tmp_path: Path) -> None:
     outdir = tmp_path / "out"
 
