@@ -46,6 +46,23 @@ class TestGateEngineSemantics:
         assert a["per_metric_tv"] == {}
         assert a["per_metric_n"] == {}
 
+    def test_both_empty_after_finite_filter_triggers_not_evaluated(self, fr_window, make_gate_engine):
+        ge = make_gate_engine(fr_window, min_evidence=0, policy="either")
+
+        past = {"test_metric": np.full(4, np.nan, dtype=float)}
+        recent = {"test_metric": np.full(4, np.nan, dtype=float)}
+        counts = {"test_metric": 0}
+
+        r = ge.check(past, recent, counts, gain_bits=0.1, kappa_sens=0.0, eps_stat_value=0.0)
+        a = r.audit
+        assert r.ok is True
+        assert r.warn is False
+        assert a["evaluated"] is False
+        assert a["reason"] == "not_evaluated_no_finite_metrics"
+        assert np.isnan(a["worst_DW"])
+        assert a["per_metric_tv"] == {}
+        assert a["per_metric_n"] == {}
+
     def test_identical_distributions_pass(self, fr_window, make_gate_engine):
         ge = make_gate_engine(fr_window, min_evidence=0, policy="either", gain_thresh=0.0, eps_sens=0.0)
 
@@ -184,22 +201,18 @@ class TestGateEngineSemantics:
         assert "test_metric" in rescue
         assert rescue["test_metric"].get("tv_rescue_used_observed_range") is True
 
-    def test_empty_window_fail_loudly(self, fr_window, make_gate_engine, force_zero_tv):
+    def test_empty_window_is_not_evaluated(self, fr_window, make_gate_engine, force_zero_tv):
         ge = make_gate_engine(fr_window, min_evidence=0, policy="either", gain_thresh=0.0, eps_sens=0.0)
 
         past = {"test_metric": np.array([], dtype=float)}
         recent = {"test_metric": np.array([], dtype=float)}
-        counts = {"test_metric": 10}
+        counts = {"test_metric": 0}
 
         r = ge.check(past, recent, counts, gain_bits=0.1, kappa_sens=np.nan, eps_stat_value=0.0)
-        assert r.ok is False
+        assert r.ok is True
         assert r.warn is False
-        assert r.audit["evaluated"] is True
-        assert r.audit["reason"] == "empty_window"
-        npts = r.audit.get("window_debug_n_points", {}).get("test_metric", {})
-        assert npts.get("past") == 0
-        assert npts.get("recent") == 0
-        assert "test_metric" in r.audit.get("window_debug_empty_metrics", [])
+        assert r.audit["evaluated"] is False
+        assert r.audit["reason"] == "not_evaluated_no_finite_metrics"
 
     def test_degenerate_window_persistence_counter_monotone(self, fr_window, make_gate_engine, force_zero_tv):
         ge = make_gate_engine(
@@ -439,6 +452,43 @@ class TestGateEngineSemantics:
         assert r4.warn is False
         assert r4.audit["consecutive_exceedances_after"] == 3
 
+    def test_both_empty_metric_does_not_reset_persistence_counter(self, fr_window, make_gate_engine):
+        ge = make_gate_engine(
+            fr_window,
+            min_evidence=0,
+            policy="persistence",
+            persistence_k=2,
+            gain_thresh=0.0,
+            eps_sens=0.0,
+        )
+
+        drift_past = {"test_metric": np.full(200, 0.1, dtype=float)}
+        drift_recent = {"test_metric": np.full(200, 0.9, dtype=float)}
+        drift_counts = {"test_metric": 200}
+
+        r1 = ge.check(drift_past, drift_recent, drift_counts, gain_bits=0.1, kappa_sens=0.0, eps_stat_value=0.0)
+        assert r1.audit["evaluated"] is True
+        assert r1.audit["consecutive_exceedances_after"] == 1
+        assert r1.ok is True
+        assert r1.warn is True
+
+        empty_past = {"test_metric": np.full(4, np.nan, dtype=float)}
+        empty_recent = {"test_metric": np.full(4, np.nan, dtype=float)}
+        empty_counts = {"test_metric": 0}
+        r2 = ge.check(empty_past, empty_recent, empty_counts, gain_bits=0.1, kappa_sens=0.0, eps_stat_value=0.0)
+        assert r2.audit["evaluated"] is False
+        assert r2.audit["reason"] == "not_evaluated_no_finite_metrics"
+        assert r2.audit["consecutive_exceedances_after"] == 1
+        assert r2.ok is True
+        assert r2.warn is False
+
+        r3 = ge.check(drift_past, drift_recent, drift_counts, gain_bits=0.1, kappa_sens=0.0, eps_stat_value=0.0)
+        assert r3.audit["evaluated"] is True
+        assert r3.audit["consecutive_exceedances_after"] == 2
+        assert r3.audit["persistence_fail"] is True
+        assert r3.ok is False
+        assert r3.warn is False
+
     def test_gain_nan_does_not_warn(self, fr_window, make_gate_engine):
         ge = make_gate_engine(
             fr_window,
@@ -541,6 +591,103 @@ class TestGateEngineSemantics:
 
         assert np.isfinite(a["margin_change_eff"])
         assert np.isclose(a["margin_change_eff"], 0.0, atol=1e-12)
+
+    def test_one_sided_missing_metric_does_not_dilute_weighted_dw(
+        self, make_window_decl, make_fr_window, make_gate_engine
+    ):
+        from veriscope.core.calibration import aggregate_epsilon_stat
+
+        wd = make_window_decl(
+            ["m1", "m2"],
+            epsilon=1.0,
+            weights={"m1": 0.5, "m2": 0.5},
+            bins=10,
+            cal_ranges={"m1": (0.0, 1.0), "m2": (0.0, 1.0)},
+        )
+        fr = make_fr_window(wd)
+        ge = make_gate_engine(fr, min_evidence=0, policy="either", gain_thresh=0.0, eps_sens=0.0)
+
+        past = {"m1": np.full(300, 0.1), "m2": np.full(300, 0.1)}
+        recent = {"m1": np.full(300, 0.9), "m2": np.full(300, np.nan)}
+        counts = {"m1": 300, "m2": 0}
+        eps_stat_value = aggregate_epsilon_stat(wd, counts, alpha=0.05)
+
+        r = ge.check(past, recent, counts, gain_bits=0.1, kappa_sens=0.0, eps_stat_value=eps_stat_value)
+        a = r.audit
+        assert a["evaluated"] is True
+        assert np.isclose(float(a["worst_DW"]), 1.0, atol=1e-12)
+        assert np.isnan(float(a["per_metric_tv"]["m2"]))
+        assert a["dw_exceeds_threshold"] is True
+        assert r.ok is False
+        assert r.warn is False
+
+    def test_min_metrics_exceeding_uses_evaluable_metric_count(
+        self, make_window_decl, make_fr_window, make_gate_engine
+    ):
+        wd = make_window_decl(
+            ["m1", "m2"],
+            epsilon=0.01,
+            weights={"m1": 0.5, "m2": 0.5},
+            bins=10,
+            cal_ranges={"m1": (0.0, 1.0), "m2": (0.0, 1.0)},
+        )
+        fr = make_fr_window(wd)
+        ge = make_gate_engine(
+            fr,
+            min_evidence=0,
+            policy="either",
+            gain_thresh=0.0,
+            eps_sens=0.0,
+            min_metrics_exceeding=2,
+        )
+
+        past = {"m1": np.full(300, 0.1), "m2": np.full(8, np.nan)}
+        recent = {"m1": np.full(300, 0.9), "m2": np.full(8, np.nan)}
+        counts = {"m1": 300, "m2": 0}
+
+        r = ge.check(past, recent, counts, gain_bits=0.1, kappa_sens=0.0, eps_stat_value=0.0)
+        a = r.audit
+        assert a["evaluated"] is True
+        assert a["min_metrics_exceeding_effective"] == 1
+        assert a["n_metrics_exceeding"] == 1
+        assert a["metrics_exceeding"] == ["m1"]
+        assert a["multi_metric_filtered"] is False
+        assert a["dw_exceeds_threshold"] is True
+        assert r.ok is False
+        assert r.warn is False
+
+    def test_missing_metric_cannot_lower_dw_simply_by_disappearing(
+        self, make_window_decl, make_fr_window, make_gate_engine
+    ):
+        wd = make_window_decl(
+            ["m1", "m2"],
+            epsilon=1.0,
+            weights={"m1": 0.5, "m2": 0.5},
+            bins=10,
+            cal_ranges={"m1": (0.0, 1.0), "m2": (0.0, 1.0)},
+        )
+        fr = make_fr_window(wd)
+        ge = make_gate_engine(fr, min_evidence=0, policy="either", gain_thresh=0.0, eps_sens=0.0)
+
+        past = {"m1": np.full(300, 0.1), "m2": np.full(300, 0.1)}
+        both_drift_recent = {"m1": np.full(300, 0.9), "m2": np.full(300, 0.9)}
+        missing_recent = {"m1": np.full(300, 0.9), "m2": np.full(300, np.nan)}
+
+        counts_both = {"m1": 300, "m2": 300}
+        counts_missing = {"m1": 300, "m2": 0}
+
+        r_both = ge.check(past, both_drift_recent, counts_both, gain_bits=0.1, kappa_sens=0.0, eps_stat_value=0.0)
+        r_missing = ge.check(
+            past,
+            missing_recent,
+            counts_missing,
+            gain_bits=0.1,
+            kappa_sens=0.0,
+            eps_stat_value=0.0,
+        )
+
+        assert np.isclose(float(r_both.audit["worst_DW"]), 1.0, atol=1e-12)
+        assert np.isclose(float(r_missing.audit["worst_DW"]), 1.0, atol=1e-12)
 
     def test_audit_schema_insufficient_evidence_hard_contract(self, fr_window, make_gate_engine):
         min_evidence = 16

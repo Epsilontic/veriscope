@@ -443,16 +443,13 @@ class GateEngine:
         if _apply is None:
             _apply = lambda name, arr: np.asarray(arr, float)
 
-        # Weight sum for normalization (keeps aggregated TV in [0,1] for nonnegative weights)
-        # Use abs() defensively so an accidental negative weight cannot invert the distance.
-        w_sum = float(sum(abs(float(v)) for v in wd.weights.values())) or 1.0
-
         # Track per-metric TV and n for the worst intervention
         worst = 0.0
         worst_any = False
         worst_per_metric_tv: Dict[str, float] = {}
         worst_per_metric_n: Dict[str, Tuple[int, int]] = {}
         worst_tv_inputs: Dict[str, Dict[str, np.ndarray]] = {}
+        worst_evaluable_metrics: set[str] = set()
         raw_windows: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
         raw_window_debug: Dict[str, Dict[str, Any]] = {}
 
@@ -481,11 +478,10 @@ class GateEngine:
             }
 
         for T in intervs:
-            tv_sum = 0.0
-            tv_finite = 0
             this_per_metric_tv: Dict[str, float] = {}
             this_per_metric_n: Dict[str, Tuple[int, int]] = {}
             this_tv_inputs: Dict[str, Dict[str, np.ndarray]] = {}
+            this_evaluable_tvs: list[tuple[str, float, float]] = []
 
             for m, w in wd.weights.items():
                 past_raw, recent_raw = raw_windows[m]
@@ -499,27 +495,26 @@ class GateEngine:
                 # Per-metric diagnostics (TUPLE FORMAT PRESERVED)
                 n_past = int(np.sum(np.isfinite(a)))
                 n_recent = int(np.sum(np.isfinite(b)))
+                metric_evaluable = bool(n_past > 0 and n_recent > 0 and np.isfinite(tv))
                 this_per_metric_n[m] = (n_past, n_recent)
-                this_per_metric_tv[m] = float(tv) if np.isfinite(tv) else float("nan")
-                if (
-                    np.isfinite(tv)
-                    and float(tv) == 0.0
-                    and n_past > 0
-                    and n_recent > 0
-                    and (not _array_equal_nan_safe(a, b))
-                ):
+                this_per_metric_tv[m] = float(tv) if metric_evaluable else float("nan")
+                if metric_evaluable and float(tv) == 0.0 and (not _array_equal_nan_safe(a, b)):
                     this_tv_inputs[m] = {"past": np.array(a, copy=True), "recent": np.array(b, copy=True)}
 
-                if np.isfinite(tv):
-                    tv_sum += (abs(float(w)) / w_sum) * float(tv)
-                    tv_finite += 1
+                if metric_evaluable:
+                    this_evaluable_tvs.append((str(m), abs(float(w)), float(tv)))
 
-            if tv_finite > 0 and np.isfinite(tv_sum):
+            evaluable_weight_sum = float(sum(weight for _, weight, _ in this_evaluable_tvs))
+            if evaluable_weight_sum > 0.0:
+                tv_sum = 0.0
+                for _, weight, tv_val in this_evaluable_tvs:
+                    tv_sum += (weight / evaluable_weight_sum) * tv_val
                 if (not worst_any) or (float(tv_sum) > float(worst)):
                     worst = float(tv_sum)
                     worst_per_metric_tv = dict(this_per_metric_tv)
                     worst_per_metric_n = dict(this_per_metric_n)
                     worst_tv_inputs = dict(this_tv_inputs)
+                    worst_evaluable_metrics = {name for name, _, _ in this_evaluable_tvs}
                 worst_any = True
 
         if not worst_any:
@@ -636,17 +631,19 @@ class GateEngine:
                     per_metric_tv_rescue[str(m)] = dict(rescue_meta)
 
             rescued_sum = 0.0
-            rescued_finite = 0
+            rescued_weights = 0.0
             for m, w in wd.weights.items():
                 try:
                     tv_m = float(worst_per_metric_tv.get(m, float("nan")))
                 except Exception:
                     continue
-                if np.isfinite(tv_m):
-                    rescued_sum += (abs(float(w)) / w_sum) * tv_m
-                    rescued_finite += 1
-            if rescued_finite > 0 and np.isfinite(rescued_sum):
-                worst = float(rescued_sum)
+                n_past, n_recent = worst_per_metric_n.get(m, (0, 0))
+                if np.isfinite(tv_m) and n_past > 0 and n_recent > 0:
+                    weight = abs(float(w))
+                    rescued_sum += weight * tv_m
+                    rescued_weights += weight
+            if rescued_weights > 0.0 and np.isfinite(rescued_sum):
+                worst = float(rescued_sum / rescued_weights)
 
         # Guardrail intent: if all per-metric TVs collapse to ~0, fail loudly unless raw windows are truly identical.
         per_metric_vals = list(worst_per_metric_tv.values())
@@ -687,23 +684,10 @@ class GateEngine:
         min_m_req = int(getattr(self, "min_metrics_exceeding", 1) or 1)
         min_m_req = max(1, min_m_req)
 
-        # Clamp-to-total-metrics: prefer the metrics we actually computed TVs for.
-        # Priority: wd.weights (computed loop) → wd.metrics (declared) → worst_per_metric_tv (fallback).
-        weights_dict = getattr(wd, "weights", None) or {}
-        if isinstance(weights_dict, dict) and len(weights_dict) > 0:
-            n_metrics_total = len(weights_dict)
-        else:
-            metrics_list = getattr(wd, "metrics", None) or []
-            n_metrics_total = len(metrics_list) if isinstance(metrics_list, (list, tuple)) else 0
-            if n_metrics_total <= 0 and isinstance(worst_per_metric_tv, dict):
-                n_metrics_total = len(worst_per_metric_tv)
-        n_metrics_total = max(1, int(n_metrics_total))
-
-        min_m_eff = min(min_m_req, n_metrics_total)
-
         exceeding: list[str] = []
         worst_metric: Optional[str] = None
         worst_metric_tv: Optional[float] = None
+        n_metrics_evaluable = 0
         per_metric_tv = worst_per_metric_tv if isinstance(worst_per_metric_tv, dict) else None
         if per_metric_tv is not None and np.isfinite(float(eps_eff)):
             for m, v in per_metric_tv.items():
@@ -717,11 +701,17 @@ class GateEngine:
                     continue
                 if not np.isfinite(tv):
                     continue
+                n_metrics_evaluable += 1
                 if (worst_metric_tv is None) or (tv > worst_metric_tv):
                     worst_metric_tv = float(tv)
                     worst_metric = str(m)
                 if tv > float(eps_eff):
                     exceeding.append(str(m))
+
+        if worst_evaluable_metrics:
+            n_metrics_evaluable = len(worst_evaluable_metrics)
+
+        min_m_eff = min(min_m_req, int(n_metrics_evaluable)) if n_metrics_evaluable > 0 else 0
 
         # Preserve raw exceedance for debugging/auditing
         dw_exceeds_raw = bool(dw_exceeds)
