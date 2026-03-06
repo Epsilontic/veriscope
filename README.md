@@ -13,43 +13,22 @@ Runners: **CIFAR (PyTorch)** • **GPT (nanoGPT)** • **HF (transformers)**
 
 *Detect representation collapse before it's too late.*
 
-[Quick Start](#quick-start) • [Docs](./docs/) • [Pilot kit](#pilot-kit-overview) • [CLI](#capsule-operations) • [Core API](#core-api) • [Artifacts](#output-artifacts) • [License](#license)
+[Current MVP Path](#current-mvp-path) • [Reviewer Packet](#fast-contract-review-path) • [Docs](./docs/) • [Pilot kit](#pilot-kit-overview) • [Secondary Paths](#secondary--developer-paths) • [CLI](#capsule-operations) • [Core API](#core-api) • [Artifacts](#output-artifacts) • [License](#license)
 
 </div>
 
 ---
 
-## 5-minute AI2 reviewer path
-
-Start with the synthetic reviewer packet (fast, no long training run required):
-
-```bash
-source ~/venv/bin/activate
-veriscope --help
-python -m veriscope.cli.main --help
-veriscope validate docs/examples/reviewer_packet/run_a
-veriscope report docs/examples/reviewer_packet/run_a --format text
-veriscope diff docs/examples/reviewer_packet/run_a docs/examples/reviewer_packet/run_b
-```
-
-Optional smoke run:
-
-```bash
-bash scripts/run_gpt_smoke.sh /tmp/veriscope_smoke_test -- --max_iters 1
-capdir="$(cat /tmp/veriscope_smoke_test/capdir.txt)"
-veriscope validate "$capdir"
-veriscope report "$capdir" --format text
-```
-
-Notes:
-- CPU smoke can be slow on some hosts.
-- Tiny smoke runs may end with `final_decision=skip` and zero evaluated gates; this is expected.
-
----
-
 ## Overview
 
-Veriscope is a CLI-first tool for detecting early signs of training-time failure (representation collapse / drift) *before* loss curves or eval metrics make the issue obvious. It produces **auditable, reproducible capsule artifacts** you can validate, diff, and share.
+Veriscope is a contract-first, CLI-first training gate for detecting early signs of training-time failure (representation collapse / drift) *before* loss curves or eval metrics make the issue obvious. It produces **auditable, reproducible capsule artifacts** you can validate, diff, and share.
+
+The current story is narrow on purpose:
+- **GPT-first MVP path:** single-node GPT/nanoGPT pilot workflow using `tuned_v0`, the GPT runner, and the pilot harness scripts.
+- **Reviewer packet:** `docs/examples/reviewer_packet/` is the quick synthetic contract evidence for capsule mechanics and comparison behavior.
+- **Secondary/developer paths:** HF smoke workflows, CIFAR, and lower-level Python/helper surfaces remain documented, but they are not the current integration claim.
+
+Read the repo as a GPT-first MVP path with contract-first artifacts, not as a broad plug-and-play monitor for arbitrary training loops.
 
 In ~30 seconds, what you get:
 
@@ -97,6 +76,7 @@ What Veriscope outputs:
 What it does **not** guarantee:
 - It does not prove safety or correctness of the trained model.
 - It does not replace evals; it is an early-warning and audit surface for training dynamics within a declared window.
+- It is not yet a broad, plug-and-play integration layer for arbitrary training loops; the current MVP path is the GPT pilot workflow.
 
 ---
 
@@ -232,12 +212,74 @@ Note: `SCAR_*` environment variables are legacy names used across the repository
 
 ---
 
-## Quick Start
+## Current MVP Path
 
 After installation, run Veriscope via explicit subcommands (recommended).
 Use `veriscope --help` to see the available subcommands.
 
-### Golden Path (one command)
+Start here if you want the real GPT-first MVP path rather than synthetic contract evidence.
+
+The GPT-first MVP path is the narrowest path in the repo that combines:
+- a real runner (`veriscope run gpt`)
+- a fixed pilot preset (`tuned_v0`)
+- a control/injected workflow
+- shareable report and calibration outputs
+
+Pilot harness commands (copy/paste):
+
+```bash
+# Prereq: clone and prepare nanoGPT data (see GPT runner section below).
+# Control run (baseline)
+bash scripts/pilot/run.sh ./out/pilot_control -- --dataset shakespeare_char --nanogpt_dir ./nanoGPT
+
+# Injected run (pathology via data corruption flags)
+bash scripts/pilot/run.sh ./out/pilot_injected -- --dataset shakespeare_char --nanogpt_dir ./nanoGPT \
+  --data_corrupt_at 2500 --data_corrupt_len 400 --data_corrupt_frac 0.15 --data_corrupt_mode permute
+
+# Score calibration
+python scripts/pilot/score.py \
+  --control-dir ./out/pilot_control \
+  --injected-dir ./out/pilot_injected \
+  --out calibration.json \
+  --out-md calibration.md
+```
+
+This path exercises the contract, the GPT runner, the pilot harness, and the calibration workflow together.
+
+For pilot-scoped guarantees and boundaries, see:
+- `docs/productization.md`
+- `docs/pilot/README.md`
+- `docs/incubation_readiness.md`
+- `docs/calibration_protocol_v0.md`
+
+## Fast Contract Review Path
+
+Use the reviewer packet when you want synthetic contract evidence quickly and do not want to run a training job:
+
+```bash
+source ~/venv/bin/activate
+veriscope --help
+python -m veriscope.cli.main --help
+veriscope validate docs/examples/reviewer_packet/run_a
+veriscope report docs/examples/reviewer_packet/run_a --format text
+veriscope diff docs/examples/reviewer_packet/run_a docs/examples/reviewer_packet/run_b
+```
+
+What this path is for:
+- fast inspection of capsule structure and command behavior
+- a tracked, deterministic example bundle in the repo
+- synthetic contract evidence
+
+What this path is not:
+- a `tuned_v0` performance claim
+- a calibration example
+- the current GPT-first MVP path
+
+## Secondary / Developer Paths
+
+The paths below remain useful, but they are secondary/developer paths rather than the current GPT-first MVP path.
+
+### GPT smoke run (reviewer-safe sanity check)
 
 ```bash
 bash scripts/run_gpt_smoke.sh
@@ -253,11 +295,7 @@ veriscope report ./out/gpt_smoke_YYYYMMDD_HHMMSS --format text
 For `scripts/run_gpt_smoke.sh`, smoke defaults are reviewer-safe:
 - default device is `cpu` (override with `VERISCOPE_GPT_SMOKE_DEVICE` or forwarded `--device ...`)
 - default gate preset is `tuned_v0` unless you explicitly pass `--gate_preset/--gate-preset`
-
-For pilot-scoped guarantees and boundaries, see:
-- `docs/incubation_readiness.md`
-- `docs/calibration_protocol_v0.md`
-- `docs/distributed_mode.md`
+- tiny smoke runs may end with `final_decision=skip` and zero evaluated gates; this is expected
 
 ### CIFAR smoke run (fast end-to-end)
 
@@ -349,6 +387,8 @@ If you are piloting Veriscope with a design partner, the pilot kit provides:
 - Success criteria grounded in the v0 contract.
 - A stable artifact bundle to share with Veriscope.
 
+This is the same GPT-first MVP path described above. Treat it as the current pilot workflow.
+
 Minimum share set (contract-aligned):
 - non-partial capsules: `window_signature.json`, `results.json`, `results_summary.json`
 - partial capsules: `window_signature.json` and `results_summary.json` with `partial=true`
@@ -385,7 +425,7 @@ bash scripts/pilot/negative_controls.sh ./out/pilot_control
 
 ## GPT runner (nanoGPT)
 
-The GPT runner wraps nanoGPT training with FR gating and emits a capsule directory (results summary + provenance + optional calibration CSV). For the normative artifact contract, defer to `docs/contract_v1.md`; for operational runner guidance, see `docs/productization.md`.
+The GPT runner is the primary runner for the current GPT-first MVP path. It wraps nanoGPT training with FR gating and emits a capsule directory (results summary + provenance + optional calibration CSV). For the normative artifact contract, defer to `docs/contract_v1.md`; for operational runner guidance, see `docs/productization.md`.
 
 ```bash
 # Clone nanoGPT alongside veriscope
@@ -413,6 +453,8 @@ python -m veriscope.runners.gpt.train_nanogpt \
 ---
 
 ## Core API
+
+This section is for advanced/developer use. It is not the current GPT-first MVP path.
 
 ### Window Declaration (Φ_W)
 

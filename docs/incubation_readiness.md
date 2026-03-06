@@ -19,9 +19,11 @@ For exact enum names and validator token strings, treat `docs/contract_v1.md` as
 
 ## Executive Summary
 
-Veriscope is ready for a narrow incubation lane as a CLI-first reliability gate with auditable capsules. The highest-confidence value today is not "universal detection"; it is contract-enforced decision accounting, reproducible validation, and strict comparability boundaries.
+Veriscope is ready for a narrow incubation story built around a GPT-first MVP path and contract-first artifacts. The highest-confidence value today is not a broad multi-runner platform claim; it is contract-enforced decision accounting, reproducible validation, strict comparability boundaries, and a credible GPT control/injected pilot workflow.
 
-Primary user: ML platform/research engineers who need a deterministic gate + artifact contract around long-running training jobs.
+Near-term commercialization story: one GPT-first MVP path, one fixed pilot preset family, one clear calibration workflow, and one contract-valid artifact surface.
+
+Primary user: ML platform/research engineers who need a deterministic gate + artifact contract around long-running GPT-style training jobs.
 
 ## Claims vs Non-Claims
 
@@ -39,7 +41,7 @@ Primary user: ML platform/research engineers who need a deterministic gate + art
 # 1) Thin CLI import boundary
 python -c "import veriscope.cli.main; print('cli import ok')"
 
-# 2) Golden path smoke + validation + report
+# 2) GPT-first MVP path smoke + validation + report
 bash scripts/run_gpt_smoke.sh
 veriscope validate ./out/gpt_smoke_YYYYMMDD_HHMMSS
 veriscope report ./out/gpt_smoke_YYYYMMDD_HHMMSS --format text
@@ -51,10 +53,10 @@ pytest -q tests/test_cli_validate_report.py tests/test_cli_diff.py tests/test_go
 ## 8–12 Week Partner Pilot Plan
 
 1. Weeks 1–2: Onboard and baseline.
-   - Acceptance: partner can run golden path, produce valid capsule, and share `report.md`.
+   - Acceptance: partner can run the GPT pilot path, produce a valid capsule, and share `report.md`.
    - Stop condition: cannot produce one valid capsule in target environment within 3 working days.
 2. Weeks 3–5: Calibrate within one fixed `window_signature` hash.
-   - Acceptance: calibration report artifact produced per [`docs/calibration_protocol_v0.md`](./calibration_protocol_v0.md).
+   - Acceptance: calibration report artifact produced for the GPT control/injected pair per [`docs/calibration_protocol_v0.md`](./calibration_protocol_v0.md).
    - Stop condition: no feasible preset meets error-budget constraints for the partner's chosen `W`.
 3. Weeks 6–9: Shadow mode on real runs.
    - Acceptance: gate decisions and governance logs are complete, deterministic, and operationally interpretable.
@@ -65,4 +67,4 @@ pytest -q tests/test_cli_validate_report.py tests/test_cli_diff.py tests/test_go
 
 ## Immediate Incubation Readiness Decision
 
-Ready for **narrow-scope incubation** if partner agrees that guarantees are limited to `W_inc` and that calibration validity is per-window-signature, not universal.
+Ready for **narrow-scope incubation** if partner agrees that the near-term product is a GPT-first MVP path with contract-first artifacts, that guarantees are limited to `W_inc`, and that calibration validity is per-window-signature rather than universal.

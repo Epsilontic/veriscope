@@ -14,7 +14,14 @@ Companion docs for incubation and boundary clarity:
 ## 0) One-page overview (founder + design partner)
 
 ### What the product is
-Veriscope is a CLI-first training reliability gate that flags representation drift/collapse during ML training using finite-window divergence checks (`D_W`) over declared metrics (e.g., `var_out_k`, `eff_dim`). It emits a machine-readable decision at gate-check cadence (every `gate_window` iterations) via `core/gate.py::GateEngine.check()` (optionally regime-anchored via `core/regime.py`).
+Veriscope v0 is a GPT-first MVP path for contract-enforced training decision accounting. The operative path today is the nanoGPT runner plus the pilot harness workflow (`veriscope run gpt`, `veriscope validate`, `veriscope report`, `veriscope calibrate`) under a fixed `tuned_v0` preset and a fixed window signature.
+
+The product claim is intentionally narrower than the codebase:
+- **GPT-first MVP path:** GPT/nanoGPT pilot workflow with control + injected runs and shareable report/calibration outputs.
+- **Contract-first core:** immutable capsules, read-only validation, strict comparability, and append-only governance.
+- **Secondary/developer paths:** HF runner, CIFAR flow, `UniversalStepLogger`, `ConvenienceLogger`, and `veriscope assemble` remain useful, but they are not the current MVP integration story.
+
+Inside that lane, Veriscope flags representation drift/collapse during training using finite-window divergence checks (`D_W`) over declared metrics (e.g., `var_out_k`, `eff_dim`). It emits a machine-readable decision at gate-check cadence (every `gate_window` iterations) via `core/gate.py::GateEngine.check()` (optionally regime-anchored via `core/regime.py`).
 
 **Canonical decision enum (do not infer from booleans):**
 - `decision = "pass" | "warn" | "fail" | "skip"`
@@ -26,7 +33,7 @@ Veriscope is a CLI-first training reliability gate that flags representation dri
 ML platform / research engineering teams running expensive fine-tuning or long training jobs (labs, startups, enterprise AI) where wasted GPU time and postmortems are costly, and where a CLI gate + reproducible artifacts can be adopted quickly.
 
 ### What the design-partner pilot will look like (v0)
-Partner runs Veriscope on 1–2 internal fine-tunes (run gpt shown; run hf uses the same wrapper semantics with HF-specific runner args):
+Partner runs the GPT-first MVP path on 1–2 internal fine-tunes:
 
 ```bash
 veriscope run gpt --gate-preset tuned_v0 --outdir OUTDIR -- <their training args>
@@ -34,7 +41,16 @@ veriscope validate OUTDIR
 veriscope report OUTDIR > report.md
 ```
 
-We provide: (1) stable artifact contracts, (2) validators + golden tests, (3) a Markdown report suitable for copy/paste into Slack/Notion/GitHub.
+For calibrated pilot evidence, use the GPT control/injected pair plus read-only scoring:
+
+```bash
+bash scripts/pilot/run.sh ./out/pilot_control -- --dataset shakespeare_char --nanogpt_dir ./nanoGPT
+bash scripts/pilot/run.sh ./out/pilot_injected -- --dataset shakespeare_char --nanogpt_dir ./nanoGPT \
+  --data_corrupt_at 2500 --data_corrupt_len 400 --data_corrupt_frac 0.15 --data_corrupt_mode permute
+veriscope calibrate --control-dir ./out/pilot_control --injected-dir ./out/pilot_injected
+```
+
+We provide: (1) stable artifact contracts, (2) validators + golden tests, (3) a Markdown report suitable for copy/paste into Slack/Notion/GitHub, and (4) a calibration report scoped to one fixed window signature.
 
 What success looks like (acceptance criteria, not “guarantees”)
 
@@ -60,13 +76,20 @@ Operator FAQ (read this first)
 
 Entry points
 	•	CLI: veriscope/cli/main.py
-	•	veriscope run gpt ... delegates to veriscope/runners/gpt/train_nanogpt.py
-	•	veriscope run hf ... delegates to veriscope/runners/hf/train_hf.py
-	•	veriscope run cifar ... delegates to legacy subprocess (out-of-scope v0)
+	•	GPT-first MVP path: veriscope run gpt ... delegates to veriscope/runners/gpt/train_nanogpt.py
+	•	Secondary runner: veriscope run hf ... delegates to veriscope/runners/hf/train_hf.py
+	•	Legacy/out-of-scope runner: veriscope run cifar ... delegates to legacy subprocess
 	•	Smoke scripts:
 	•	scripts/run_gpt_smoke.sh
 	•	scripts/run_hf_smoke.sh
 	•	scripts/run_cifar_smoke.sh (legacy; out-of-scope v0)
+
+Secondary/developer paths
+	•	veriscope/step_logging.py::UniversalStepLogger
+	•	veriscope/core/convenience_logger.py::ConvenienceLogger
+	•	veriscope assemble ...
+
+These surfaces matter for advanced integrations and plumbing, but they are not the GPT-first MVP path and should not be presented as the primary adoption path for design partners.
 
 What the GPT runner emits today
 	•	run_config_resolved.json (CLI provenance)
