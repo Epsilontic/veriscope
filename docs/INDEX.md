@@ -6,7 +6,8 @@ Normative precedence: [`docs/contract_v1.md`](./contract_v1.md) is authoritative
 
 ## Start Here
 
-- 5-minute reviewer path: [`README.md`](../README.md#5-minute-ai2-reviewer-path)
+- 5-minute reviewer path: [`README.md`](../README.md#fast-contract-review-path)
+- GPT Pilot Quickstart: [`docs/quickstart_gpt_pilot.md`](./quickstart_gpt_pilot.md)
 - Synthetic capsule examples: [`docs/examples/reviewer_packet/`](./examples/reviewer_packet/)
 
 ## Contract And Operations
