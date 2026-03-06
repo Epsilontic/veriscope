@@ -8,6 +8,9 @@ from typing import Optional
 
 import pytest
 
+from veriscope.cli.governance import append_run_started
+from veriscope.core.governance import append_gate_decision
+from veriscope.core.jsonutil import window_signature_sha256
 from veriscope.core.pilot_calibration import CalibrationError, calibrate_pilot
 
 
@@ -31,39 +34,101 @@ def _write_run(
     outdir.mkdir(parents=True, exist_ok=True)
     window_signature = {"schema_version": 1, "gate_controls": {"gate_window": gate_window}}
     (outdir / "window_signature.json").write_text(json.dumps(window_signature), encoding="utf-8")
+    ws_hash = window_signature_sha256(window_signature)
 
-    results = {"schema_version": 1, "gates": gates}
+    gates_out: list[dict[str, object]] = []
+    for idx, gate in enumerate(gates):
+        gate_out = dict(gate)
+        gate_out.setdefault("iter", idx)
+        decision = str(gate_out.get("decision", "skip")).strip().lower()
+        gate_out.setdefault("ok", decision != "fail")
+        gate_out.setdefault("warn", decision == "warn")
+        gate_out.setdefault(
+            "audit",
+            {
+                "evaluated": decision != "skip",
+                "reason": "not_evaluated" if decision == "skip" else f"evaluated_{decision}",
+                "policy": "test_policy",
+                "per_metric_tv": {},
+                "evidence_total": 0 if decision == "skip" else 1,
+                "min_evidence": 1,
+            },
+        )
+        gates_out.append(gate_out)
+
+    results = {
+        "schema_version": 1,
+        "run_id": outdir.name,
+        "window_signature_ref": {"hash": ws_hash, "path": "window_signature.json"},
+        "profile": {"gate_preset": "test"},
+        "run_status": "success",
+        "runner_exit_code": 0,
+        "runner_signal": None,
+        "started_ts_utc": "2026-01-01T00:00:00Z",
+        "ended_ts_utc": "2026-01-01T00:01:00Z",
+        "gates": gates_out,
+        "metrics": [],
+    }
     (outdir / "results.json").write_text(json.dumps(results), encoding="utf-8")
 
-    evaluated = sum(1 for g in gates if g.get("decision") in {"pass", "warn", "fail"})
-    warn = sum(1 for g in gates if g.get("decision") == "warn")
-    fail = sum(1 for g in gates if g.get("decision") == "fail")
-    skip = sum(1 for g in gates if g.get("decision") == "skip")
+    evaluated = sum(1 for g in gates_out if g.get("decision") in {"pass", "warn", "fail"})
+    warn = sum(1 for g in gates_out if g.get("decision") == "warn")
+    fail = sum(1 for g in gates_out if g.get("decision") == "fail")
+    skip = sum(1 for g in gates_out if g.get("decision") == "skip")
     counts = {"evaluated": evaluated, "warn": warn, "fail": fail, "skip": skip, "pass": evaluated - warn - fail}
-    summary = {"schema_version": 1, "run_status": "success", "counts": counts}
+    if fail > 0:
+        final_decision = "fail"
+    elif warn > 0:
+        final_decision = "warn"
+    elif counts["pass"] > 0:
+        final_decision = "pass"
+    else:
+        final_decision = "skip"
+    summary = {
+        "schema_version": 1,
+        "run_id": outdir.name,
+        "window_signature_ref": {"hash": ws_hash, "path": "window_signature.json"},
+        "profile": {"gate_preset": "test"},
+        "run_status": "success",
+        "runner_exit_code": 0,
+        "runner_signal": None,
+        "started_ts_utc": "2026-01-01T00:00:00Z",
+        "ended_ts_utc": "2026-01-01T00:01:00Z",
+        "counts": counts,
+        "final_decision": final_decision,
+    }
+    if fail > 0:
+        summary["first_fail_iter"] = min(int(g["iter"]) for g in gates_out if g.get("decision") == "fail")
     (outdir / "results_summary.json").write_text(json.dumps(summary), encoding="utf-8")
+    if fail > 0:
+        (outdir / "first_fail_iter.txt").write_text(f"{summary['first_fail_iter']}\n", encoding="utf-8")
 
     run_cfg = {"schema_version": 1, "resolved_gate_cfg": {"gate_warmup": gate_warmup}}
     if data_corrupt_at is not None:
         run_cfg["data_corrupt_at"] = int(data_corrupt_at)
     (outdir / "run_config_resolved.json").write_text(json.dumps(run_cfg), encoding="utf-8")
 
-    gov_lines = []
-    for idx, gate in enumerate(gates):
-        payload = {
-            "iter": gate.get("iter"),
-            "decision": gate.get("decision"),
-            "audit": gate.get("audit", {}),
-        }
-        entry = {
-            "schema_version": 1,
-            "rev": idx + 1,
-            "ts_utc": "2026-01-01T00:00:00Z",
-            "event_type": "gate_decision_v1",
-            "payload": payload,
-        }
-        gov_lines.append(json.dumps(entry))
-    (outdir / "governance_log.jsonl").write_text("\n".join(gov_lines) + "\n", encoding="utf-8")
+    append_run_started(
+        outdir,
+        run_id=outdir.name,
+        outdir_path=outdir,
+        argv=["pytest", "score_fixture"],
+        code_identity={"package_version": "test"},
+        window_signature_ref={"hash": ws_hash, "path": "window_signature.json"},
+        entrypoint={"kind": "runner", "name": "tests.score_fixture"},
+        ts_utc="2026-01-01T00:00:00Z",
+    )
+    for gate in gates_out:
+        append_gate_decision(
+            outdir,
+            run_id=outdir.name,
+            iter_num=int(gate["iter"]),
+            decision=str(gate["decision"]),
+            ok=bool(gate["ok"]),
+            warn=bool(gate["warn"]),
+            audit=dict(gate["audit"]),
+            ts_utc="2026-01-01T00:00:00Z",
+        )
 
 
 def test_scoring_far_and_delay(tmp_path: Path) -> None:
@@ -208,5 +273,5 @@ def test_scoring_missing_iter_raises(tmp_path: Path) -> None:
     bad_entry = {"event_type": "gate_decision_v1", "payload": {"decision": "pass"}}
     (control_dir / "governance_log.jsonl").write_text(json.dumps(bad_entry) + "\n", encoding="utf-8")
 
-    with pytest.raises(CalibrationError, match="MISSING_GATE_ITER"):
+    with pytest.raises(CalibrationError, match="INVALID_CONTROL_CAPSULE"):
         calibrate_pilot(control_dir, injected_dir)

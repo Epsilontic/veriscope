@@ -102,6 +102,21 @@ class HFRunConfig:
     data_corrupt_mask_id: Optional[int]
 
 
+def _ensure_full_capsule_emission_allowed(
+    *,
+    world_size: int,
+    barrier_status: str,
+    governance_failure: Optional[str],
+) -> None:
+    if governance_failure:
+        raise RuntimeError(f"HF governance append failed; refusing full artifact emission: {governance_failure}")
+    if int(world_size) > 1 and str(barrier_status) != "performed":
+        raise RuntimeError(
+            "DDP finalize barrier not performed; refusing full artifact emission "
+            f"(world_size={int(world_size)}, status={barrier_status})"
+        )
+
+
 def _jsonable_float(x: float) -> Optional[float]:
     """Convert float to JSON-safe value: finite -> float, non-finite -> None."""
     try:
@@ -1268,6 +1283,7 @@ def _run_body(
     started_ts = datetime.now(timezone.utc)
     window_signature = _build_window_signature(cfg, created_ts_utc=started_ts)
     window_signature_ref: Dict[str, Any] = {"path": "window_signature.json"}
+    governance_failure: Optional[str] = None
     if _is_chief():
         try:
             window_signature_path = cfg.outdir / "window_signature.json"
@@ -1290,6 +1306,8 @@ def _run_body(
             )
         except Exception as exc:
             logger.warning("Failed to append governance run_started entry: %s", exc)
+            if governance_failure is None:
+                governance_failure = f"run_started_v1: {exc}"
 
     if _is_chief():
         if cfg.data_corrupt_len > 0 and cfg.data_corrupt_frac > 0.0:
@@ -1548,6 +1566,8 @@ def _run_body(
                         )
                     except Exception as exc:
                         logger.warning("Failed to append governance gate decision: %s", exc)
+                        if governance_failure is None:
+                            governance_failure = f"gate_decision_v1: {exc}"
 
             step += 1
             batch_idx += 1
@@ -1614,6 +1634,11 @@ def _run_body(
                 )
                 _DDP_BARRIER_WARNED = True
         if _is_chief():
+            _ensure_full_capsule_emission_allowed(
+                world_size=world_size,
+                barrier_status=barrier_status,
+                governance_failure=governance_failure,
+            )
             # Chief-only emission: only rank 0 writes artifacts and manifest.
             emit_hf_artifacts_v1(
                 outdir=cfg.outdir,

@@ -10,7 +10,7 @@ from typing import Any, Dict, Optional
 import pytest
 
 from veriscope.cli.comparability import comparable, comparable_explain, load_run_metadata
-from veriscope.cli.governance import append_run_started
+from veriscope.cli.governance import append_governance_log, append_run_started
 from veriscope.cli.diff import diff_outdirs
 from veriscope.cli.report import render_report_compare
 from veriscope.cli.validate import validate_outdir
@@ -258,7 +258,69 @@ def test_diff_rejects_missing_governance_log(tmp_path: Path) -> None:
 
     result = diff_outdirs(outdir_a, outdir_b)
     assert result.exit_code == 2
-    assert "Missing governance_log.jsonl for results.json" in result.stderr
+
+
+def test_diff_rejects_governance_without_run_started(tmp_path: Path) -> None:
+    outdir_a = tmp_path / "run_a"
+    outdir_b = tmp_path / "run_b"
+    _make_minimal_artifacts(outdir_a, run_id="run_a")
+    _make_minimal_artifacts(outdir_b, run_id="run_b")
+    gov_path = outdir_b / "governance_log.jsonl"
+    gov_path.unlink()
+    append_governance_log(
+        outdir_b,
+        event_type="artifact_note",
+        payload={"run_id": "run_b", "note": "manual note only"},
+        ts_utc=_iso_z(T0),
+        actor="tester",
+    )
+
+    result = diff_outdirs(outdir_a, outdir_b)
+
+    assert result.exit_code == 2
+    assert "GOVERNANCE_RUN_STARTED_MISSING" in result.stderr
+
+
+def test_diff_rejects_governance_results_divergence(tmp_path: Path) -> None:
+    outdir_a = tmp_path / "run_a"
+    outdir_b = tmp_path / "run_b"
+    _make_minimal_artifacts(outdir_a, run_id="run_a")
+    _make_minimal_artifacts(outdir_b, run_id="run_b")
+    gov_path = outdir_b / "governance_log.jsonl"
+    gov_path.unlink()
+    ws_hash = canonical_json_sha256(_read_json_dict(outdir_b / "window_signature.json"))
+    append_run_started(
+        outdir_b,
+        run_id="run_b",
+        outdir_path=outdir_b,
+        argv=["pytest", "diff_fixture"],
+        code_identity={"package_version": "test"},
+        window_signature_ref={"hash": ws_hash, "path": "window_signature.json"},
+        entrypoint={"kind": "runner", "name": "tests.diff_fixture"},
+        ts_utc=_iso_z(T0),
+    )
+    append_gate_decision(
+        outdir_b,
+        run_id="run_b",
+        iter_num=999,
+        decision="fail",
+        ok=False,
+        warn=False,
+        audit={
+            "evaluated": True,
+            "reason": "evaluated_fail",
+            "policy": "test_policy",
+            "per_metric_tv": {},
+            "evidence_total": 1,
+            "min_evidence": 1,
+        },
+        ts_utc=_iso_z(T0),
+    )
+
+    result = diff_outdirs(outdir_a, outdir_b)
+
+    assert result.exit_code == 2
+    assert "GOVERNANCE_RESULTS_DIVERGENCE" in result.stderr
 
 
 def test_report_compare_rejects_missing_governance_log(tmp_path: Path) -> None:

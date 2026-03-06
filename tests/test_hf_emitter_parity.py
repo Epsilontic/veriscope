@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
+
 from veriscope.core.artifacts import AuditV1, GateRecordV1, ProfileV1, ResultsV1, WindowSignatureRefV1
 from veriscope.core.jsonutil import (
     atomic_write_json,
@@ -10,7 +12,7 @@ from veriscope.core.jsonutil import (
     canonical_json_sha256,
     read_json_obj,
 )
-from veriscope.runners.hf.emit_artifacts import emit_hf_artifacts_v1
+from veriscope.runners.hf.emit_artifacts import GovernanceAppendError, emit_hf_artifacts_v1
 
 
 def test_atomic_write_pydantic_json_supports_kwargs(tmp_path: Path) -> None:
@@ -67,6 +69,7 @@ def test_emit_hf_artifacts_uses_on_disk_window_signature_hash(tmp_path: Path) ->
         run_status="success",
         runner_exit_code=0,
         runner_signal=None,
+        strict_governance=False,
     )
 
     ws_on_disk = read_json_obj(emitted.window_signature_path)
@@ -116,9 +119,36 @@ def test_emit_hf_artifacts_writes_first_fail_marker(tmp_path: Path) -> None:
         run_status="success",
         runner_exit_code=0,
         runner_signal=None,
+        strict_governance=False,
     )
 
     summary = read_json_obj(emitted.results_summary_path)
     assert summary["counts"]["fail"] == 1
     assert summary["first_fail_iter"] == 5
     assert (outdir / "first_fail_iter.txt").read_text(encoding="utf-8") == "5\n"
+
+
+def test_emit_hf_artifacts_rejects_invalid_governance_log(tmp_path: Path) -> None:
+    outdir = tmp_path / "hf_emit_invalid_governance"
+    outdir.mkdir(parents=True, exist_ok=True)
+    (outdir / "governance_log.jsonl").write_text("{bad json\n", encoding="utf-8")
+    window_signature = {"schema_version": 1, "transport": {"name": "hf_hidden_state_v1", "cadence": "every_1_steps"}}
+    started = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    ended = datetime(2024, 1, 1, 0, 1, tzinfo=timezone.utc)
+
+    with pytest.raises(GovernanceAppendError, match="Invalid governance_log.jsonl"):
+        emit_hf_artifacts_v1(
+            outdir=outdir,
+            run_id="run-emit-invalid-governance",
+            started_ts_utc=started,
+            ended_ts_utc=ended,
+            gate_preset="tuned_v0",
+            window_signature=window_signature,
+            gate_records=[],
+            run_status="success",
+            runner_exit_code=0,
+            runner_signal=None,
+        )
+
+    assert not (outdir / "results.json").exists()
+    assert not (outdir / "results_summary.json").exists()

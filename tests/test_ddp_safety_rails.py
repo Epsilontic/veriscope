@@ -213,10 +213,150 @@ def test_ddp_non_chief_skips_artifact_emission(tmp_path: Path, monkeypatch: pyte
         run_status="success",
         runner_exit_code=0,
         runner_signal=None,
+        strict_governance=False,
     )
 
     assert result.emitted is False
     assert not outdir.exists()
+
+
+def test_hf_finalize_barrier_failure_blocks_full_emission(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_fake_torch_ddp_init(monkeypatch)
+    sys.modules.pop("veriscope.runners.hf.train_hf", None)
+    train_hf = importlib.import_module("veriscope.runners.hf.train_hf")
+
+    with pytest.raises(RuntimeError, match="DDP finalize barrier not performed"):
+        train_hf._ensure_full_capsule_emission_allowed(
+            world_size=2,
+            barrier_status="skipped_error",
+            governance_failure=None,
+        )
+
+
+def test_hf_run_started_failure_blocks_full_emission(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_fake_torch_ddp_init(monkeypatch)
+
+    transformers_mod = types.ModuleType("transformers")
+
+    class _FakeTokenizer:
+        pad_token = None
+        eos_token = "<eos>"
+        eos_token_id = 0
+        mask_token_id = 0
+        pad_token_id = None
+        vocab_size = 8
+
+        def __len__(self) -> int:
+            return int(self.vocab_size)
+
+    class _FakeModel:
+        def __init__(self) -> None:
+            self.config = types.SimpleNamespace(tie_word_embeddings=False, use_cache=False, vocab_size=8)
+
+        def to(self, _device: object) -> "_FakeModel":
+            return self
+
+        def parameters(self) -> list[object]:
+            return []
+
+        def buffers(self) -> list[object]:
+            return []
+
+        def train(self) -> None:
+            return None
+
+    transformers_mod.AutoTokenizer = types.SimpleNamespace(from_pretrained=lambda *_args, **_kwargs: _FakeTokenizer())
+    transformers_mod.AutoModelForCausalLM = types.SimpleNamespace(
+        from_pretrained=lambda *_args, **_kwargs: _FakeModel()
+    )
+    monkeypatch.setitem(sys.modules, "transformers", transformers_mod)
+
+    sys.modules.pop("veriscope.runners.hf.train_hf", None)
+    train_hf = importlib.import_module("veriscope.runners.hf.train_hf")
+
+    class _FakeDevice:
+        def __init__(self, spec: object) -> None:
+            self.type = str(spec)
+            self.index = None
+
+        def __str__(self) -> str:
+            return self.type
+
+    optimizer = types.SimpleNamespace(param_groups=[{"lr": 0.01}], step=lambda: None, zero_grad=lambda: None)
+    monkeypatch.setattr(train_hf.torch, "device", lambda spec: _FakeDevice(spec))
+    monkeypatch.setattr(
+        train_hf.torch,
+        "optim",
+        types.SimpleNamespace(AdamW=lambda *_args, **_kwargs: optimizer),
+        raising=False,
+    )
+    monkeypatch.setattr(train_hf, "_is_chief", lambda: True)
+    monkeypatch.setattr(train_hf, "ddp_can_communicate", lambda: False)
+    monkeypatch.setattr(train_hf, "_tokenize_dataset", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(train_hf, "HFMetricComputer", lambda *args, **kwargs: object())
+    monkeypatch.setattr(train_hf, "_build_window_decl", lambda _cfg: object())
+    monkeypatch.setattr(train_hf, "_build_gate_engine", lambda _cfg, _decl: object())
+    monkeypatch.setattr(train_hf, "_build_window_signature", lambda _cfg, *, created_ts_utc: {"schema_version": 1})
+    monkeypatch.setattr(train_hf, "build_code_identity", lambda **_kwargs: {"package_version": "test"})
+    monkeypatch.setattr(
+        train_hf,
+        "build_distributed_context",
+        lambda: {"distributed_mode": "single_process", "world_size_observed": 1},
+    )
+    monkeypatch.setattr(
+        train_hf, "append_run_started", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("boom"))
+    )
+
+    emitted = {"called": False}
+
+    def _emit_fail(*_args: object, **_kwargs: object) -> None:
+        emitted["called"] = True
+        raise AssertionError("emit_hf_artifacts_v1 should not be reached after run_started failure")
+
+    monkeypatch.setattr(train_hf, "emit_hf_artifacts_v1", _emit_fail)
+
+    cfg = train_hf.HFRunConfig(
+        model="fake-model",
+        dataset_name="fake-dataset",
+        dataset_config=None,
+        dataset_path=None,
+        dataset_split="train",
+        dataset_text_column="text",
+        outdir=tmp_path / "hf_run_started_failure",
+        run_id="run-started-fail",
+        force=False,
+        max_steps=0,
+        batch_size=1,
+        lr=0.01,
+        seed=123,
+        cadence=1,
+        block_size=1,
+        device="cpu",
+        grad_clip=0.0,
+        gate_preset="tuned_v0",
+        gate_window=1,
+        gate_epsilon=0.1,
+        gate_min_evidence=1,
+        gate_gain_thresh=0.0,
+        gate_policy="persistence",
+        gate_persistence_k=1,
+        rp_dim=1,
+        lr_spike_at=-1,
+        lr_spike_len=0,
+        lr_spike_mult=1.0,
+        lr_spike_verify=False,
+        data_corrupt_at=-1,
+        data_corrupt_len=0,
+        data_corrupt_frac=0.0,
+        data_corrupt_mode="replace",
+        data_corrupt_target="input_ids",
+        data_corrupt_mask_id=0,
+    )
+
+    with pytest.raises(RuntimeError, match="run_started_v1: boom"):
+        train_hf._run_body(cfg, argv=["train_hf.py"], rank=0, world_size=1, seed_rank=123)
+
+    assert emitted["called"] is False
 
 
 def test_ddp_gate_returns_skip_with_audit(monkeypatch: pytest.MonkeyPatch) -> None:

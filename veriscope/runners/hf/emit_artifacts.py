@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
+from veriscope.core.governance import validate_governance_log
 from veriscope.core.artifacts import (
     CountsV1,
     GateRecordV1,
@@ -29,6 +30,10 @@ from veriscope.core.jsonutil import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class GovernanceAppendError(RuntimeError):
+    """Raised when governance preconditions are not satisfied for strict HF emission."""
 
 
 @dataclass(frozen=True)
@@ -89,6 +94,7 @@ def emit_hf_artifacts_v1(
     run_status: str = "success",
     runner_exit_code: Optional[int] = None,
     runner_signal: Optional[str] = None,
+    strict_governance: bool = True,
 ) -> EmittedArtifactsV1:
     outdir = Path(outdir)
     if not ddp_is_chief():
@@ -101,6 +107,16 @@ def emit_hf_artifacts_v1(
             emitted=False,
         )
     outdir.mkdir(parents=True, exist_ok=True)
+
+    if strict_governance:
+        gov_path = outdir / "governance_log.jsonl"
+        if not gov_path.exists():
+            raise GovernanceAppendError("Missing governance_log.jsonl for HF artifact emission")
+        gov_validation = validate_governance_log(gov_path)
+        if not gov_validation.ok:
+            raise GovernanceAppendError(
+                f"Invalid governance_log.jsonl for HF artifact emission: {gov_validation.errors}"
+            )
 
     window_signature_path = outdir / "window_signature.json"
     if window_signature_path.exists():

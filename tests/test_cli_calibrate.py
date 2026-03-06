@@ -9,6 +9,8 @@ from typing import Any, Dict, List, Optional
 import pytest
 
 from veriscope.cli.calibrate import run_calibrate
+from veriscope.cli.governance import append_run_started
+from veriscope.core.governance import append_gate_decision
 from veriscope.core.jsonutil import window_signature_sha256
 from veriscope.core.pilot_calibration import CalibrationError, calibrate_pilot
 
@@ -30,6 +32,7 @@ def _write_capsule(
     with_run_config: bool = True,
     with_governance: bool = True,
     data_corrupt_at: Optional[int] = None,
+    gate_preset: str = "test",
 ) -> None:
     outdir.mkdir(parents=True, exist_ok=True)
 
@@ -40,33 +43,70 @@ def _write_capsule(
     ws_hash = window_signature_sha256(window_signature)
     _write_json(outdir / "window_signature.json", window_signature)
 
+    gates_out: List[Dict[str, Any]] = []
+    for idx, gate in enumerate(gates or []):
+        gate_out = dict(gate)
+        if "iter" not in gate_out:
+            gate_out["iter"] = idx
+        decision = str(gate_out.get("decision", "skip")).strip().lower()
+        if "ok" not in gate_out:
+            gate_out["ok"] = decision != "fail"
+        if "warn" not in gate_out:
+            gate_out["warn"] = decision == "warn"
+        if "audit" not in gate_out:
+            gate_out["audit"] = {
+                "evaluated": decision != "skip",
+                "reason": "not_evaluated" if decision == "skip" else f"evaluated_{decision}",
+                "policy": "test_policy",
+                "per_metric_tv": {},
+                "evidence_total": 0 if decision == "skip" else 1,
+                "min_evidence": 1,
+            }
+        gates_out.append(gate_out)
+
+    counts = {
+        "evaluated": sum(1 for gate in gates_out if gate.get("decision") in {"pass", "warn", "fail"}),
+        "skip": sum(1 for gate in gates_out if gate.get("decision") == "skip"),
+        "pass": sum(1 for gate in gates_out if gate.get("decision") == "pass"),
+        "warn": sum(1 for gate in gates_out if gate.get("decision") == "warn"),
+        "fail": sum(1 for gate in gates_out if gate.get("decision") == "fail"),
+    }
+    if counts["fail"] > 0:
+        final_decision = "fail"
+    elif counts["warn"] > 0:
+        final_decision = "warn"
+    elif counts["pass"] > 0:
+        final_decision = "pass"
+    else:
+        final_decision = "skip"
+
     results_summary = {
         "schema_version": 1,
         "run_id": run_id,
         "window_signature_ref": {"hash": ws_hash, "path": "window_signature.json"},
-        "profile": {"gate_preset": "test"},
+        "profile": {"gate_preset": gate_preset},
         "run_status": "success",
         "runner_exit_code": 0,
         "runner_signal": None,
         "started_ts_utc": "2026-01-01T00:00:00Z",
         "ended_ts_utc": "2026-01-01T00:01:00Z",
-        "counts": {"evaluated": 1, "skip": 0, "pass": 1, "warn": 0, "fail": 0},
-        "final_decision": "pass",
+        "counts": counts,
+        "final_decision": final_decision,
     }
+    if counts["fail"] > 0:
+        results_summary["first_fail_iter"] = min(
+            int(gate["iter"]) for gate in gates_out if gate.get("decision") == "fail"
+        )
     _write_json(outdir / "results_summary.json", results_summary)
+    if counts["fail"] > 0:
+        (outdir / "first_fail_iter.txt").write_text(f"{results_summary['first_fail_iter']}\n", encoding="utf-8")
 
     if with_results:
-        gates_out: List[Dict[str, Any]] = []
-        for idx, gate in enumerate(gates or []):
-            gate_out = dict(gate)
-            if "iter" not in gate_out:
-                gate_out["iter"] = idx
-            gates_out.append(gate_out)
         results = {
             "schema_version": 1,
             "run_id": run_id,
             "window_signature_ref": {"hash": ws_hash, "path": "window_signature.json"},
-            "profile": {"gate_preset": "test"},
+            "profile": {"gate_preset": gate_preset},
             "run_status": "success",
             "runner_exit_code": 0,
             "runner_signal": None,
@@ -78,22 +118,28 @@ def _write_capsule(
         _write_json(outdir / "results.json", results)
 
     if with_governance:
-        gov_lines: List[str] = []
-        for idx, gate in enumerate(gates or []):
-            payload = {
-                "iter": gate.get("iter", idx),
-                "decision": gate.get("decision"),
-                "audit": gate.get("audit", {}),
-            }
-            entry = {
-                "schema_version": 1,
-                "rev": idx + 1,
-                "ts_utc": "2026-01-01T00:00:00Z",
-                "event_type": "gate_decision_v1",
-                "payload": payload,
-            }
-            gov_lines.append(json.dumps(entry))
-        (outdir / "governance_log.jsonl").write_text("\n".join(gov_lines) + "\n", encoding="utf-8")
+        append_run_started(
+            outdir,
+            run_id=run_id,
+            outdir_path=outdir,
+            argv=["pytest", "calibration_fixture"],
+            code_identity={"package_version": "test"},
+            window_signature_ref={"hash": ws_hash, "path": "window_signature.json"},
+            entrypoint={"kind": "runner", "name": "tests.calibration_fixture"},
+            ts_utc="2026-01-01T00:00:00Z",
+        )
+        for gate in gates_out:
+            decision = str(gate.get("decision"))
+            append_gate_decision(
+                outdir,
+                run_id=run_id,
+                iter_num=int(gate["iter"]),
+                decision=decision,
+                ok=bool(gate["ok"]),
+                warn=bool(gate["warn"]),
+                audit=dict(gate.get("audit", {})),
+                ts_utc="2026-01-01T00:00:00Z",
+            )
 
     if with_run_config:
         resolved_gate_cfg: Dict[str, Any] = {}
@@ -169,14 +215,13 @@ def test_calibrate_missing_injected_results(tmp_path: Path) -> None:
         run_id="injected",
         gate_warmup=0,
         with_results=False,
-        with_governance=False,
+        with_governance=True,
     )
 
-    output = calibrate_pilot(control_dir, injected_dir)
+    with pytest.raises(CalibrationError) as exc_info:
+        calibrate_pilot(control_dir, injected_dir)
 
-    assert output["Delay_W"] is None
-    assert output["calibration_status"] == "incomplete"
-    assert "injected.gate_events_missing" in output["missing_fields"]
+    assert exc_info.value.token == "INVALID_INJECTED_CAPSULE"
 
 
 def test_calibrate_invalid_injected_results(tmp_path: Path) -> None:
@@ -193,19 +238,17 @@ def test_calibrate_invalid_injected_results(tmp_path: Path) -> None:
         injected_dir,
         run_id="injected",
         gate_warmup=0,
-        with_governance=False,
+        with_governance=True,
     )
     (injected_dir / "results.json").write_text("{not-json", encoding="utf-8")
 
-    output = calibrate_pilot(control_dir, injected_dir)
+    with pytest.raises(CalibrationError) as exc_info:
+        calibrate_pilot(control_dir, injected_dir)
 
-    assert output["Delay_W"] is None
-    assert output["calibration_status"] == "incomplete"
-    assert "injected.delay_warn_missing" in output["missing_fields"]
-    assert "injected.injection_onset_missing" in output["missing_fields"]
+    assert exc_info.value.token == "INVALID_INJECTED_CAPSULE"
 
 
-def test_calibrate_governance_log_empty_marks_missing(tmp_path: Path) -> None:
+def test_calibrate_rejects_governance_results_divergence(tmp_path: Path) -> None:
     control_dir = tmp_path / "control"
     injected_dir = tmp_path / "injected"
 
@@ -214,7 +257,6 @@ def test_calibrate_governance_log_empty_marks_missing(tmp_path: Path) -> None:
         run_id="control",
         gate_warmup=0,
         gates=[{"iter": 0, "decision": "pass"}],
-        with_governance=False,
         data_corrupt_at=0,
     )
     _write_capsule(
@@ -222,32 +264,58 @@ def test_calibrate_governance_log_empty_marks_missing(tmp_path: Path) -> None:
         run_id="injected",
         gate_warmup=0,
         gates=[{"iter": 0, "decision": "warn"}],
-        with_governance=False,
         data_corrupt_at=0,
     )
-    empty_entry_control = {
-        "schema_version": 1,
-        "rev": 1,
-        "ts_utc": "2026-01-01T00:00:00Z",
-        "event_type": "run_started_v1",
-        "payload": {"run_id": "control"},
+    stale_fail = {
+        "evaluated": True,
+        "reason": "evaluated_fail",
+        "policy": "test_policy",
+        "per_metric_tv": {},
+        "evidence_total": 1,
+        "min_evidence": 1,
     }
-    empty_entry_injected = {
-        "schema_version": 1,
-        "rev": 1,
-        "ts_utc": "2026-01-01T00:00:00Z",
-        "event_type": "run_started_v1",
-        "payload": {"run_id": "injected"},
-    }
-    (control_dir / "governance_log.jsonl").write_text(json.dumps(empty_entry_control) + "\n", encoding="utf-8")
-    (injected_dir / "governance_log.jsonl").write_text(json.dumps(empty_entry_injected) + "\n", encoding="utf-8")
+    append_gate_decision(
+        control_dir,
+        run_id="control",
+        iter_num=0,
+        decision="fail",
+        ok=False,
+        warn=False,
+        audit=stale_fail,
+        ts_utc="2026-01-01T00:00:00Z",
+    )
 
-    output = calibrate_pilot(control_dir, injected_dir)
+    with pytest.raises(CalibrationError) as exc_info:
+        calibrate_pilot(control_dir, injected_dir)
 
-    assert output["control_gate_events_source"] == "governance_log_empty"
-    assert output["injected_gate_events_source"] == "governance_log_empty"
-    assert "control.gate_events_missing" in output["missing_fields"]
-    assert "injected.gate_events_missing" in output["missing_fields"]
+    assert exc_info.value.token == "INVALID_CONTROL_CAPSULE"
+    assert "GOVERNANCE_RESULTS_DIVERGENCE" in exc_info.value.message
+
+
+def test_calibrate_rejects_gate_preset_mismatch_by_default(tmp_path: Path) -> None:
+    control_dir = tmp_path / "control"
+    injected_dir = tmp_path / "injected"
+
+    _write_capsule(
+        control_dir,
+        run_id="control",
+        gate_warmup=0,
+        gates=[{"iter": 0, "decision": "pass"}],
+        gate_preset="alpha",
+    )
+    _write_capsule(
+        injected_dir,
+        run_id="injected",
+        gate_warmup=0,
+        gates=[{"iter": 0, "decision": "warn"}],
+        data_corrupt_at=0,
+        gate_preset="beta",
+    )
+
+    with pytest.raises(CalibrationError) as exc_info:
+        calibrate_pilot(control_dir, injected_dir)
+
+    assert exc_info.value.token == "GATE_PRESET_MISMATCH"
 
 
 def test_calibrate_rejects_window_signature_hash_mismatch(tmp_path: Path) -> None:
@@ -302,7 +370,8 @@ def test_calibrate_rejects_summary_hash_tampered(tmp_path: Path) -> None:
     with pytest.raises(CalibrationError) as exc_info:
         calibrate_pilot(control_dir, injected_dir)
 
-    assert exc_info.value.token == "WINDOW_SIGNATURE_HASH_MISMATCH"
+    assert exc_info.value.token == "INVALID_CONTROL_CAPSULE"
+    assert "window_signature_ref" in exc_info.value.message
 
 
 def test_calibrate_rejects_missing_window_signature_ref(tmp_path: Path) -> None:
@@ -332,7 +401,8 @@ def test_calibrate_rejects_missing_window_signature_ref(tmp_path: Path) -> None:
     with pytest.raises(CalibrationError) as exc_info:
         calibrate_pilot(control_dir, injected_dir)
 
-    assert exc_info.value.token == "MISSING_WINDOW_SIGNATURE_REF"
+    assert exc_info.value.token == "INVALID_CONTROL_CAPSULE"
+    assert "window_signature_ref" in exc_info.value.message
 
 
 def test_calibrate_rejects_empty_window_signature_ref_hash(tmp_path: Path) -> None:
@@ -362,7 +432,8 @@ def test_calibrate_rejects_empty_window_signature_ref_hash(tmp_path: Path) -> No
     with pytest.raises(CalibrationError) as exc_info:
         calibrate_pilot(control_dir, injected_dir)
 
-    assert exc_info.value.token == "MISSING_WINDOW_SIGNATURE_REF_HASH"
+    assert exc_info.value.token == "INVALID_CONTROL_CAPSULE"
+    assert "window_signature_ref" in exc_info.value.message
 
 
 @pytest.mark.xfail(

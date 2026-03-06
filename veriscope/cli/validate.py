@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -22,7 +23,7 @@ except Exception:  # pragma: no cover
 from veriscope.cli.governance import load_distributed_meta
 from veriscope.core.governance import read_governance_log, validate_governance_log
 from veriscope.core.artifacts import ManualJudgementV1, ResultsSummaryV1, ResultsV1
-from veriscope.core.jsonutil import window_signature_sha256
+from veriscope.core.jsonutil import canonical_json_sha256, window_signature_sha256
 
 
 @dataclass(frozen=True)
@@ -43,6 +44,16 @@ class _RunStartedBinding:
     window_signature_hash: Optional[str]
 
 
+@dataclass(frozen=True)
+class _GovernanceGateDecision:
+    line_no: int
+    run_id: Optional[str]
+    outdir: Optional[str]
+    iter_num: Optional[int]
+    decision: Optional[str]
+    audit_digest: str
+
+
 _RUN_GOVERNANCE_EVENTS = frozenset(
     {
         "run_started_v1",
@@ -52,6 +63,29 @@ _RUN_GOVERNANCE_EVENTS = frozenset(
     }
 )
 _ALLOWED_DISTRIBUTED_MODES = frozenset({"single_process", "replicated_single_chief_emit", "ddp_wrapped"})
+_AUDIT_DIGEST_KEYS = (
+    "evaluated",
+    "reason",
+    "policy",
+    "worst_DW",
+    "eps_eff",
+    "evidence_total",
+    "min_evidence",
+    "per_metric_tv",
+    "ddp_agg",
+    "ddp_barrier_status",
+    "aggregation_method",
+    "world_size",
+    "base_reason",
+    "change_reason",
+    "regime_ok",
+    "regime_check_ran",
+    "regime_ref_ready",
+    "regime_ref_windows",
+    "regime_worst_DW",
+    "regime_eps_eff",
+    "eps_regime_eff",
+)
 
 
 def _read_text_utf8(path: Path) -> str:
@@ -293,6 +327,149 @@ def _collect_run_started_bindings(path: Path) -> tuple[_RunStartedBinding, ...]:
             )
         )
     return tuple(bindings)
+
+
+def _normalize_decision(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    decision = str(value).strip().lower()
+    if decision in {"pass", "warn", "fail", "skip"}:
+        return decision
+    return None
+
+
+def _normalize_per_metric_tv(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    normalized: dict[str, Any] = {}
+    for key, item in value.items():
+        item_value = item
+        if isinstance(item_value, float) and item_value == 0.0:
+            item_value = 0.0
+        normalized[str(key)] = item_value
+    return normalized
+
+
+def _audit_digest_payload(audit: Any) -> dict[str, Any]:
+    if hasattr(audit, "model_dump") and callable(getattr(audit, "model_dump")):
+        raw = audit.model_dump(mode="json", by_alias=True, exclude_none=False)
+    elif isinstance(audit, dict):
+        raw = dict(audit)
+    else:
+        raw = {}
+
+    payload: dict[str, Any] = {}
+    payload["evaluated"] = bool(raw.get("evaluated", False))
+
+    reason = raw.get("reason")
+    if reason is not None:
+        payload["reason"] = str(reason)
+
+    policy = raw.get("policy")
+    if policy is not None:
+        payload["policy"] = str(policy)
+
+    worst_dw = raw.get("worst_DW")
+    if worst_dw is None:
+        worst_dw = raw.get("worst_dw")
+    if worst_dw is not None:
+        payload["worst_DW"] = worst_dw
+
+    eps_eff = raw.get("eps_eff")
+    if eps_eff is None:
+        eps_eff = raw.get("eps_eff_value")
+    if eps_eff is not None:
+        payload["eps_eff"] = eps_eff
+
+    payload["per_metric_tv"] = _normalize_per_metric_tv(raw.get("per_metric_tv"))
+
+    for key in _AUDIT_DIGEST_KEYS:
+        if key in {"evaluated", "reason", "policy", "worst_DW", "eps_eff", "per_metric_tv"}:
+            continue
+        value = raw.get(key)
+        if value is not None:
+            payload[key] = value
+
+    return payload
+
+
+def _audit_digest(audit: Any) -> str:
+    return canonical_json_sha256(_audit_digest_payload(audit))
+
+
+def _normalize_governance_outdir(outdir: Optional[str]) -> Optional[str]:
+    if not isinstance(outdir, str) or not outdir.strip():
+        return None
+    return outdir.strip()
+
+
+def _outdir_matches(expected_outdir_raw: str, expected_outdir_norm: str, observed_outdir: Optional[str]) -> bool:
+    if observed_outdir is None:
+        return False
+    if observed_outdir == expected_outdir_raw:
+        return True
+    return _normalize_path_for_compare(observed_outdir) == expected_outdir_norm
+
+
+def _collect_governance_gate_decisions(path: Path) -> tuple[_GovernanceGateDecision, ...]:
+    decisions: list[_GovernanceGateDecision] = []
+    for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        raw = line.strip()
+        if not raw:
+            continue
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        event = obj.get("event") or obj.get("event_type")
+        if event != "gate_decision_v1":
+            continue
+        payload = obj.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        run_id = payload.get("run_id")
+        binding_run_id = run_id.strip() if isinstance(run_id, str) and run_id.strip() else None
+        outdir = payload.get("outdir")
+        binding_outdir = _normalize_governance_outdir(outdir)
+        decisions.append(
+            _GovernanceGateDecision(
+                line_no=line_no,
+                run_id=binding_run_id,
+                outdir=binding_outdir,
+                iter_num=_coerce_int(payload.get("iter")),
+                decision=_normalize_decision(payload.get("decision")),
+                audit_digest=_audit_digest(payload.get("audit")),
+            )
+        )
+    return tuple(decisions)
+
+
+def _results_gate_counter(results: ResultsV1) -> Counter[tuple[int, str, str]]:
+    counter: Counter[tuple[int, str, str]] = Counter()
+    for gate in results.gates:
+        counter[(int(gate.iter), str(gate.decision), _audit_digest(gate.audit))] += 1
+    return counter
+
+
+def _governance_gate_counter(
+    gate_decisions: tuple[_GovernanceGateDecision, ...],
+    *,
+    expected_run_id: str,
+    expected_outdir_raw: str,
+    expected_outdir_norm: str,
+) -> Counter[tuple[int, str, str]]:
+    counter: Counter[tuple[int, str, str]] = Counter()
+    for decision in gate_decisions:
+        if decision.run_id != expected_run_id:
+            continue
+        if not _outdir_matches(expected_outdir_raw, expected_outdir_norm, decision.outdir):
+            continue
+        if decision.iter_num is None or decision.decision is None:
+            continue
+        counter[(int(decision.iter_num), decision.decision, decision.audit_digest)] += 1
+    return counter
 
 
 def _normalize_path_for_compare(path_value: str) -> str:
@@ -691,6 +868,7 @@ def validate_outdir(
                     run_cfg = {}
                 overrides_required = overrides_required or _run_config_overrides_present(run_cfg)
 
+            require_strict_governance_binding = strict_identity and not allow_missing_governance
             run_governance_present = any(
                 gov_result.event_counts.get(event_name, 0) > 0
                 for event_name in (
@@ -721,6 +899,7 @@ def validate_outdir(
             if run_governance_present:
                 governance_run_ids, governance_outdirs = _collect_governance_bindings(gov_path)
                 run_started_bindings = _collect_run_started_bindings(gov_path)
+                governance_gate_decisions = _collect_governance_gate_decisions(gov_path)
                 expected_run_id: Optional[str] = None
                 if res is not None:
                     expected_run_id = res.run_id
@@ -805,7 +984,47 @@ def validate_outdir(
                                 errors=tuple(errors),
                             )
 
-                    if not any(binding.window_signature_hash == ws_hash for binding in expected_bindings):
+                    matching_run_started = [
+                        binding for binding in expected_bindings if binding.window_signature_hash == ws_hash
+                    ]
+
+                    if require_strict_governance_binding and not expected_bindings:
+                        token = (
+                            "ERROR:GOVERNANCE_RUN_STARTED_MISSING "
+                            f"run_id={expected_run_id!r} outdir={expected_outdir_raw!r}"
+                        )
+                        if allow_invalid_governance:
+                            warnings.append(token.replace("ERROR", "WARNING", 1))
+                        else:
+                            errors.append(token)
+                            return ValidationResult(
+                                False,
+                                token,
+                                window_signature_hash=ws_hash,
+                                partial=False,
+                                warnings=tuple(warnings),
+                                errors=tuple(errors),
+                            )
+
+                    if require_strict_governance_binding and len(matching_run_started) > 1:
+                        token = (
+                            "ERROR:GOVERNANCE_DUPLICATE_RUN_STARTED "
+                            f"entries={len(matching_run_started)} run_id={expected_run_id!r} outdir={expected_outdir_raw!r}"
+                        )
+                        if allow_invalid_governance:
+                            warnings.append(token.replace("ERROR", "WARNING", 1))
+                        else:
+                            errors.append(token)
+                            return ValidationResult(
+                                False,
+                                token,
+                                window_signature_hash=ws_hash,
+                                partial=False,
+                                warnings=tuple(warnings),
+                                errors=tuple(errors),
+                            )
+
+                    if not matching_run_started:
                         observed_hashes = sorted(
                             {
                                 binding.window_signature_hash
@@ -829,7 +1048,45 @@ def validate_outdir(
                                 errors=tuple(errors),
                             )
 
-            if run_governance_present and res.gates:
+                    if require_strict_governance_binding and res is not None:
+                        results_counter = _results_gate_counter(res)
+                        governance_counter = _governance_gate_counter(
+                            governance_gate_decisions,
+                            expected_run_id=expected_run_id,
+                            expected_outdir_raw=expected_outdir_raw,
+                            expected_outdir_norm=expected_outdir_norm,
+                        )
+                        if results_counter != governance_counter:
+                            results_only = sorted(
+                                {
+                                    (iter_num, decision, digest[:12])
+                                    for iter_num, decision, digest in (results_counter - governance_counter).elements()
+                                }
+                            )
+                            governance_only = sorted(
+                                {
+                                    (iter_num, decision, digest[:12])
+                                    for iter_num, decision, digest in (governance_counter - results_counter).elements()
+                                }
+                            )
+                            token = (
+                                "ERROR:GOVERNANCE_RESULTS_DIVERGENCE "
+                                f"results_only={results_only!r} governance_only={governance_only!r}"
+                            )
+                            if allow_invalid_governance:
+                                warnings.append(token.replace("ERROR", "WARNING", 1))
+                            else:
+                                errors.append(token)
+                                return ValidationResult(
+                                    False,
+                                    token,
+                                    window_signature_hash=ws_hash,
+                                    partial=False,
+                                    warnings=tuple(warnings),
+                                    errors=tuple(errors),
+                                )
+
+            if run_governance_present and res is not None and res.gates and not require_strict_governance_binding:
                 required_gate_events = len(res.gates)
                 gate_events = gov_result.event_counts.get("gate_decision_v1", 0)
                 if gate_events < required_gate_events:
@@ -850,6 +1107,21 @@ def validate_outdir(
                             warnings=tuple(warnings),
                             errors=tuple(errors),
                         )
+
+            if require_strict_governance_binding and not run_governance_present:
+                token = "ERROR:GOVERNANCE_RUN_STARTED_MISSING run_started_v1 entry required for strict validation"
+                if allow_invalid_governance:
+                    warnings.append(token.replace("ERROR", "WARNING", 1))
+                else:
+                    errors.append(token)
+                    return ValidationResult(
+                        False,
+                        token,
+                        window_signature_hash=ws_hash,
+                        partial=False,
+                        warnings=tuple(warnings),
+                        errors=tuple(errors),
+                    )
 
     distributed_meta = load_distributed_meta(outdir)
     distributed_world_size = _distributed_world_size(distributed_meta)

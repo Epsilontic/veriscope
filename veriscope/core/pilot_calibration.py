@@ -91,6 +91,16 @@ def _parse_optional_float(value: Any) -> Optional[float]:
         return None
 
 
+def _extract_summary_gate_preset(summary: Dict[str, Any], *, label: str) -> str:
+    profile = summary.get("profile")
+    if not isinstance(profile, dict):
+        _die("MISSING_GATE_PRESET", f"{label} results_summary.json missing profile")
+    gate_preset = profile.get("gate_preset")
+    if not isinstance(gate_preset, str) or not gate_preset.strip():
+        _die("MISSING_GATE_PRESET", f"{label} results_summary.json missing profile.gate_preset")
+    return gate_preset.strip()
+
+
 def _resolve_gate_window(
     window_signature: Dict[str, Any],
     control_run_config: Optional[Dict[str, Any]],
@@ -420,12 +430,37 @@ def calibrate_pilot(
     injected_dir: Path,
     *,
     injection_onset_iter: Optional[int] = None,
+    allow_gate_preset_mismatch: bool = False,
 ) -> Dict[str, Any]:
     control_dir = Path(control_dir)
     injected_dir = Path(injected_dir)
 
+    # Keep the core module import-light; calibration uses CLI validation only at runtime.
+    from veriscope.cli.validate import validate_outdir
+
     control_summary = _load_json(control_dir / "results_summary.json", "MISSING_RESULTS_SUMMARY")
     injected_summary = _load_json(injected_dir / "results_summary.json", "MISSING_RESULTS_SUMMARY")
+
+    control_validation = validate_outdir(
+        control_dir,
+        strict_identity=True,
+        allow_partial=False,
+        allow_missing_governance=False,
+        allow_invalid_governance=False,
+    )
+    if not control_validation.ok:
+        _die("INVALID_CONTROL_CAPSULE", control_validation.message)
+
+    injected_validation = validate_outdir(
+        injected_dir,
+        strict_identity=True,
+        allow_partial=False,
+        allow_missing_governance=False,
+        allow_invalid_governance=False,
+    )
+    if not injected_validation.ok:
+        _die("INVALID_INJECTED_CAPSULE", injected_validation.message)
+
     if control_summary.get("run_status") != "success":
         _die("RUN_STATUS_NOT_SUCCESS", "control run_status != success")
     if injected_summary.get("run_status") != "success":
@@ -468,6 +503,14 @@ def calibrate_pilot(
             f"control/injected window signature hash mismatch: {control_window_hash} != {injected_window_hash}",
         )
 
+    control_gate_preset = _extract_summary_gate_preset(control_summary, label="control")
+    injected_gate_preset = _extract_summary_gate_preset(injected_summary, label="injected")
+    if not allow_gate_preset_mismatch and control_gate_preset != injected_gate_preset:
+        _die(
+            "GATE_PRESET_MISMATCH",
+            f"control/injected gate_preset mismatch: {control_gate_preset!r} != {injected_gate_preset!r}",
+        )
+
     control_run_cfg = None
     injected_run_cfg = None
     control_run_cfg_path = control_dir / "run_config_resolved.json"
@@ -480,8 +523,10 @@ def calibrate_pilot(
     window_signature = control_window_signature
     gate_window, gate_window_source = _resolve_gate_window(window_signature, control_run_cfg, injected_run_cfg)
 
-    control_events, control_events_source, control_warnings = _read_gate_events(control_dir)
-    injected_events, injected_events_source, injected_warnings = _read_gate_events(injected_dir)
+    control_events, control_warnings = _read_results_gate_events(control_dir / "results.json")
+    injected_events, injected_warnings = _read_results_gate_events(injected_dir / "results.json")
+    control_events_source = "results.json"
+    injected_events_source = "results.json"
 
     missing_fields: List[str] = []
 

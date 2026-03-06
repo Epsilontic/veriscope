@@ -80,6 +80,7 @@ def main() -> int:
                 run_status="success",
                 runner_exit_code=0,
                 runner_signal=None,
+                strict_governance=False,
             )
 
         if should_fail:

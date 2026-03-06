@@ -48,7 +48,7 @@ mkdir -p "$outdir"
 {
   git rev-parse HEAD 2>/dev/null || echo "unknown"
 } > "$outdir/git_sha.txt"
-python - <<'PY' > "$outdir/version.txt"
+"${PYTHON:-python3}" - <<'PY' > "$outdir/version.txt"
 import veriscope
 print(veriscope.__version__)
 PY

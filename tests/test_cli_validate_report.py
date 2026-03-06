@@ -378,6 +378,98 @@ def test_validate_accepts_governance_binding_when_window_hash_matches(minimal_ar
     assert v.ok, v.message
 
 
+def test_validate_strict_rejects_governance_without_run_started(minimal_artifact_dir: Path) -> None:
+    gov_path = minimal_artifact_dir / "governance_log.jsonl"
+    gov_path.unlink()
+    append_governance_log(
+        minimal_artifact_dir,
+        event_type="artifact_note",
+        payload={"run_id": "test_run_fixture", "note": "manual note only"},
+        ts_utc=_iso_z(T0),
+        actor="tester",
+    )
+
+    v = validate_outdir(
+        minimal_artifact_dir,
+        strict_identity=True,
+        allow_partial=False,
+        allow_missing_governance=False,
+        allow_invalid_governance=False,
+    )
+
+    assert not v.ok
+    assert "GOVERNANCE_RUN_STARTED_MISSING" in v.message
+
+
+def test_validate_strict_rejects_governance_results_divergence(minimal_artifact_dir: Path) -> None:
+    gov_path = minimal_artifact_dir / "governance_log.jsonl"
+    gov_path.unlink()
+    ws_hash = canonical_json_sha256(_read_json_dict(minimal_artifact_dir / "window_signature.json"))
+    append_run_started(
+        minimal_artifact_dir,
+        run_id="test_run_fixture",
+        outdir_path=minimal_artifact_dir,
+        argv=["pytest", "fixture"],
+        code_identity={"package_version": "test"},
+        window_signature_ref={"hash": ws_hash, "path": "window_signature.json"},
+        entrypoint={"kind": "runner", "name": "tests.fixture"},
+        ts_utc=_iso_z(T0),
+    )
+    append_gate_decision(
+        minimal_artifact_dir,
+        run_id="test_run_fixture",
+        iter_num=999,
+        decision="fail",
+        ok=False,
+        warn=False,
+        audit={
+            "evaluated": True,
+            "reason": "evaluated_fail",
+            "policy": "test_policy",
+            "per_metric_tv": {"m": 0.9},
+            "evidence_total": 16,
+            "min_evidence": 16,
+        },
+        ts_utc=_iso_z(T0),
+    )
+
+    v = validate_outdir(
+        minimal_artifact_dir,
+        strict_identity=True,
+        allow_partial=False,
+        allow_missing_governance=False,
+        allow_invalid_governance=False,
+    )
+
+    assert not v.ok
+    assert "GOVERNANCE_RESULTS_DIVERGENCE" in v.message
+
+
+def test_validate_strict_rejects_duplicate_run_started(minimal_artifact_dir: Path) -> None:
+    ws_hash = canonical_json_sha256(_read_json_dict(minimal_artifact_dir / "window_signature.json"))
+    append_run_started(
+        minimal_artifact_dir,
+        run_id="test_run_fixture",
+        outdir_path=minimal_artifact_dir,
+        argv=["pytest", "fixture", "--different"],
+        code_identity={"package_version": "test", "git_sha": "different"},
+        window_signature_ref={"hash": ws_hash, "path": "window_signature.json"},
+        entrypoint={"kind": "runner", "name": "tests.fixture"},
+        ts_utc=_iso_z(T1),
+    )
+
+    v = validate_outdir(
+        minimal_artifact_dir,
+        strict_identity=True,
+        allow_partial=False,
+        allow_missing_governance=False,
+        allow_invalid_governance=False,
+    )
+
+    assert not v.ok
+    assert "GOVERNANCE_DUPLICATE_RUN_STARTED" in v.message
+
+
 def test_validate_allows_user_code_failure_status(minimal_artifact_dir: Path) -> None:
     _rewrite_run_status(minimal_artifact_dir, "user_code_failure")
     ResultsV1.model_validate_json((minimal_artifact_dir / "results.json").read_text(encoding="utf-8"))
