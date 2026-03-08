@@ -2168,10 +2168,45 @@ def get_batch_factory(data_dir: str, block_size: int, batch_size: int, device: s
     return get_batch
 
 
-if __name__ == "__main__":
+def _normalize_runner_cli_argv(argv: List[str]) -> List[str]:
+    """
+    Treat bare "--" tokens as forwarding separators, not an argument sink.
+
+    Some wrapper paths append authoritative runner overrides after a literal
+    "--". Stripping the separators preserves normal argparse last-one-wins
+    semantics so forwarded flags still control the effective runtime config.
+    """
+    if "--" not in argv:
+        return list(argv)
+    return [token for token in argv if token != "--"]
+
+
+def _resolved_runner_argv_payload(
+    *,
+    prior_argv: Any,
+    raw_runner_argv: List[str],
+    effective_runner_argv: List[str],
+) -> Dict[str, Any] | List[str]:
+    safe_effective_argv, _ = redact_argv(list(effective_runner_argv))
+    if isinstance(prior_argv, dict):
+        merged = dict(prior_argv)
+        merged["runner_effective_argv"] = safe_effective_argv
+        safe_raw_argv, _ = redact_argv(list(raw_runner_argv))
+        if safe_raw_argv != safe_effective_argv:
+            merged["runner_raw_argv"] = safe_raw_argv
+        else:
+            merged.pop("runner_raw_argv", None)
+        return merged
+    return safe_effective_argv
+
+
+def main(argv: Optional[List[str]] = None) -> int:
     import argparse
-    import json
-    import sys
+
+    raw_cli_argv = list(sys.argv[1:] if argv is None else argv)
+    normalized_cli_argv = _normalize_runner_cli_argv(raw_cli_argv)
+    raw_runner_argv = [sys.argv[0]] + raw_cli_argv
+    effective_runner_argv = [sys.argv[0]] + normalized_cli_argv
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", default="shakespeare_char")
@@ -2467,12 +2502,7 @@ if __name__ == "__main__":
         help="Freeze GPT feature normalization when regime reference is established.",
     )
 
-    parser.add_argument(
-        "runner_args",
-        nargs=argparse.REMAINDER,
-        help=argparse.SUPPRESS,
-    )
-    args = parser.parse_args()
+    args = parser.parse_args(normalized_cli_argv)
 
     resolved_seed = _resolve_seed(args.seed, os.environ, default_seed=42)
     _seed_all(resolved_seed)
@@ -2856,12 +2886,21 @@ if __name__ == "__main__":
             dw_aggregator=dict(dw_aggregator_payload),
             gate_history=gate_history_for_emit,
             run_status=run_status,
+            argv=effective_runner_argv,
             metrics_ref=metrics_ref_for_emit,
         )
 
         # --- Resolved run config artifact (canonical, stable) ---
         env_safe, env_capture = prepare_env_capture(os.environ.copy())
-        safe_argv, _argv_redacted = redact_argv(list(sys.argv))
+        run_cfg_path = artifacts_outdir / "run_config_resolved.json"
+        prior_run_cfg_argv: Any = None
+        if run_cfg_path.exists():
+            try:
+                prior_run_cfg = json.loads(run_cfg_path.read_text(encoding="utf-8"))
+                if isinstance(prior_run_cfg, dict):
+                    prior_run_cfg_argv = prior_run_cfg.get("argv")
+            except Exception:
+                prior_run_cfg_argv = None
 
         run_cfg_obj: Dict[str, Any] = {
             "schema_version": 1,
@@ -2878,7 +2917,11 @@ if __name__ == "__main__":
             "metric_interval": int(config.metric_interval),
             "out_json": str(out_path),
             "artifacts_outdir": str(artifacts_outdir),
-            "argv": safe_argv,
+            "argv": _resolved_runner_argv_payload(
+                prior_argv=prior_run_cfg_argv,
+                raw_runner_argv=raw_runner_argv,
+                effective_runner_argv=effective_runner_argv,
+            ),
             "gate_preset": str(args.gate_preset),
             "gate_preset_effective": gate_preset_effective,
             "cli_gate_overrides": dict(cli_gate_overrides),
@@ -2909,8 +2952,6 @@ if __name__ == "__main__":
             run_cfg_obj["data_corrupt_frac"] = float(config.data_corrupt_frac)
         if getattr(config, "data_corrupt_mode", None) is not None:
             run_cfg_obj["data_corrupt_mode"] = str(config.data_corrupt_mode)
-
-        run_cfg_path = artifacts_outdir / "run_config_resolved.json"
 
         # Write once to normalize serialization (datetimes -> ISO strings, etc.), then hash what is on disk.
         # The stored hash authenticates the *content without the hash field itself*.
@@ -3031,7 +3072,7 @@ if __name__ == "__main__":
             "lr_spike_len": config.lr_spike_len,
             "lr_spike_mult": config.lr_spike_mult,
         },
-        "argv": list(sys.argv),
+        "argv": list(effective_runner_argv),
     }
 
     window_decl_payload = None
@@ -3105,3 +3146,8 @@ if __name__ == "__main__":
         f"{'all' if bool(args.save_all_metrics) else 'selected subset'})"
     )
     print(f"Wrote results JSON to: {out_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
