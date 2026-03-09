@@ -21,7 +21,7 @@ The product claim is intentionally narrower than the codebase:
 - **Contract-first core:** immutable capsules, read-only validation, strict comparability, and append-only governance.
 - **Secondary/developer paths:** HF runner, CIFAR flow, `UniversalStepLogger`, `ConvenienceLogger`, and `veriscope assemble` remain useful, but they are not the current MVP integration story.
 
-Inside that lane, Veriscope flags representation drift/collapse during training using finite-window divergence checks (`D_W`) over declared metrics (e.g., `var_out_k`, `eff_dim`). It emits a machine-readable decision at gate-check cadence (every `gate_window` iterations) via `core/gate.py::GateEngine.check()` (optionally regime-anchored via `core/regime.py`).
+Inside that lane, Veriscope flags representation drift/collapse during training using finite-window divergence checks (`D_W`) over declared metrics (e.g., `var_out_k`, `eff_dim`). It emits a machine-readable decision at gate-check cadence (every `gate_window` iterations) via `core/gate.py::GateEngine.check()` (optionally regime-anchored via `core/regime.py`). The nanoGPT runner also supports an opt-in diagnostic probe, `--phase_probe_local_ref`, that records both the authoritative reference comparison (`main_ref_*`) and the immediately preceding local-window comparison (`local_ref_*`) so a run can surface "stable but shifted" phases without changing the default gate decision.
 
 **Canonical decision enum (do not infer from booleans):**
 - `decision = "pass" | "warn" | "fail" | "skip"`

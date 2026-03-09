@@ -115,6 +115,116 @@ def test_emit_gpt_artifacts_writes_and_validates(tmp_path: Path) -> None:
     assert raw_results["metrics_ref"] == {"path": "run.json", "format": "legacy_v0", "count": 2}
 
 
+def test_emit_gpt_artifacts_preserves_phase_probe_audit_in_results_and_governance(tmp_path: Path) -> None:
+    outdir = tmp_path / "out"
+
+    gate_history = [
+        {
+            "iter": 16,
+            "decision": "fail",
+            "ok": False,
+            "warn": False,
+            "reason": "regime_fail",
+            "audit": {
+                "evaluated": True,
+                "reason": "regime_fail",
+                "policy": "either",
+                "worst_DW": 0.42,
+                "eps_eff": 0.08,
+                "per_metric_tv": {"m1": 0.95},
+                "evidence_total": 32,
+                "min_evidence": 16,
+                "phase_probe_active": True,
+                "phase_probe_reason": "stable_shifted_reference_candidate",
+                "local_ref_available": True,
+                "local_ref_reason": "immediately_preceding_window",
+                "local_ref_window": {"start_iter": 0, "end_iter": 15, "n_snapshots": 16},
+                "main_ref_available": True,
+                "main_ref_reason": "frozen_reference",
+                "main_ref_per_metric_tv": {"m1": 0.95},
+                "main_ref_per_metric_n": {"m1": [16, 16]},
+                "main_ref_worst_metric": "m1",
+                "main_ref_worst_metric_tv": 0.95,
+                "main_ref_worst_DW": 0.42,
+                "main_ref_eps": 0.12,
+                "main_ref_eps_eff": 0.16,
+                "main_ref_ok_stab": False,
+                "main_ref_established_at": 0,
+                "local_ref_windows_built": 1,
+                "local_ref_evidence_total": 32,
+                "local_ref_per_metric_tv": {"m1": 0.0},
+                "local_ref_per_metric_n": {"m1": [16, 16]},
+                "local_ref_worst_metric": "m1",
+                "local_ref_worst_metric_tv": 0.0,
+                "local_ref_worst_DW": 0.0,
+                "local_ref_eps": 0.12,
+                "local_ref_eps_eff": 0.16,
+                "local_ref_ok_stab": True,
+                "local_phase_candidate": True,
+                "local_phase_stable": True,
+            },
+        }
+    ]
+
+    emit_gpt_artifacts_v1(
+        outdir=outdir,
+        run_id="run_phase_probe",
+        started_ts_utc=datetime(2026, 1, 1, 0, 0, 0),
+        ended_ts_utc=datetime(2026, 1, 1, 0, 1, 0),
+        gate_preset="tuned_v0",
+        overrides=None,
+        resolved_gate_cfg={"gate_window": 16, "min_evidence": 16, "gate_epsilon": 0.08},
+        metric_interval=16,
+        metric_pipeline={"transport": "DeclTransport"},
+        metrics_ref={"path": "run.json", "format": "legacy_v0", "count": 1},
+        gate_history=gate_history,
+    )
+
+    results = json.loads((outdir / "results.json").read_text(encoding="utf-8"))
+    gate_audit = results["gates"][0]["audit"]
+    assert gate_audit["phase_probe_active"] is True
+    assert gate_audit["phase_probe_reason"] == "stable_shifted_reference_candidate"
+    assert gate_audit["per_metric_tv"] == {"m1": 0.95}
+    assert gate_audit["local_ref_available"] is True
+    assert gate_audit["local_ref_reason"] == "immediately_preceding_window"
+    assert gate_audit["local_ref_window"] == {"start_iter": 0, "end_iter": 15, "n_snapshots": 16}
+    assert gate_audit["main_ref_available"] is True
+    assert gate_audit["main_ref_reason"] == "frozen_reference"
+    assert gate_audit["main_ref_per_metric_tv"] == {"m1": 0.95}
+    assert gate_audit["main_ref_worst_DW"] == pytest.approx(0.42)
+    assert gate_audit["local_ref_windows_built"] == 1
+    assert gate_audit["local_ref_evidence_total"] == 32
+    assert gate_audit["local_ref_per_metric_tv"] == {"m1": 0.0}
+    assert gate_audit["local_ref_per_metric_n"] == {"m1": [16, 16]}
+    assert gate_audit["local_ref_worst_metric"] == "m1"
+    assert gate_audit["local_ref_worst_metric_tv"] == pytest.approx(0.0)
+    assert gate_audit["local_ref_worst_DW"] == pytest.approx(0.0)
+    assert gate_audit["local_ref_eps"] == pytest.approx(0.12)
+    assert gate_audit["local_ref_eps_eff"] == pytest.approx(0.16)
+    assert gate_audit["local_ref_ok_stab"] is True
+    assert "local_ref_gain_bits" not in gate_audit
+    assert gate_audit["local_phase_candidate"] is True
+    assert gate_audit["local_phase_stable"] is True
+
+    gate_events = []
+    for line in (outdir / "governance_log.jsonl").read_text(encoding="utf-8").splitlines():
+        entry = json.loads(line)
+        if entry.get("event") == "gate_decision_v1":
+            gate_events.append(entry)
+    assert len(gate_events) == 1
+
+    gov_audit = gate_events[0]["payload"]["audit"]
+    assert gov_audit["phase_probe_active"] is True
+    assert gov_audit["phase_probe_reason"] == "stable_shifted_reference_candidate"
+    assert gov_audit["per_metric_tv"] == {"m1": 0.95}
+    assert gov_audit["local_ref_available"] is True
+    assert gov_audit["local_ref_window"] == {"start_iter": 0, "end_iter": 15, "n_snapshots": 16}
+    assert gov_audit["main_ref_available"] is True
+    assert gov_audit["main_ref_per_metric_tv"] == {"m1": 0.95}
+    assert gov_audit["local_phase_candidate"] is True
+    assert gov_audit["local_phase_stable"] is True
+
+
 def test_emit_gpt_artifacts_window_signature_hash_changes_with_policy_params(tmp_path: Path) -> None:
     base_cfg = {
         "metric_interval": 16,

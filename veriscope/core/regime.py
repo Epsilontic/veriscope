@@ -886,6 +886,10 @@ class RegimeAnchoredGateEngine:
             return None
         return self._regimes.get(self._active_regime_id)
 
+    def get_current_reference(self) -> Optional[RegimeReference]:
+        """Supported accessor for the current active frozen reference."""
+        return self.current_reference
+
     @property
     def regime_epsilon(self) -> float:
         """Epsilon threshold used for regime divergence check."""

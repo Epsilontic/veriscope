@@ -442,13 +442,16 @@ veriscope run gpt --outdir ./out/gpt_run --force -- \
   --gate_preset tuned_v0
 ```
 
+For diagnostic runs, `--phase_probe_local_ref` adds a shadow phase probe to each gate audit. It records both the authoritative reference comparison (`main_ref_*`) and the immediately preceding local-window comparison (`local_ref_*`) so you can distinguish "far from early reference but locally stable" from "still drifting" without changing pass/fail semantics by default.
+
 Advanced: run the module directly (bypasses the CLI wrapper):
 
 ```bash
 python -m veriscope.runners.gpt.train_nanogpt \
   --dataset shakespeare_char \
   --nanogpt_dir ./nanoGPT \
-  --gate_preset tuned_v0
+  --gate_preset tuned_v0 \
+  --phase_probe_local_ref
 ```
 ---
 

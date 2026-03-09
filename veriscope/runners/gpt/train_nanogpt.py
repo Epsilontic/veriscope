@@ -64,7 +64,7 @@ import time
 import warnings
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, is_dataclass
-from typing import Any, Dict, List, Optional, Tuple, Set, cast
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Set, cast
 
 import numpy as np
 import torch
@@ -507,6 +507,17 @@ def _coerce_int(value: Any, default: int = 0) -> int:
         return int(default)
 
 
+def _coerce_opt_bool(value: Any) -> Optional[bool]:
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    if isinstance(value, (int, np.integer)):
+        if int(value) == 0:
+            return False
+        if int(value) == 1:
+            return True
+    return None
+
+
 def _compute_metrics_exceeding(per_metric_tv: Dict[str, Any], eps_eff: float) -> Tuple[List[str], str]:
     if not isinstance(per_metric_tv, dict) or not per_metric_tv:
         return [], "combined_only_no_tv"
@@ -636,6 +647,362 @@ def _strip_regime_audit_fields(audit_in: Dict[str, Any]) -> Dict[str, Any]:
     for key in list(audit.keys()):
         if str(key).startswith("regime_"):
             audit.pop(key, None)
+    return audit
+
+
+def _slice_window_identity(slice_data: Sequence[Dict[str, Any]]) -> Tuple[Optional[Dict[str, int]], Optional[str]]:
+    iters: List[int] = []
+    for d in slice_data:
+        it = d.get("iter", None)
+        if it is None:
+            continue
+        try:
+            iters.append(int(it))
+        except Exception:
+            continue
+    if not iters:
+        return None, None
+    start_iter = int(min(iters))
+    end_iter = int(max(iters))
+    meta = {
+        "start_iter": start_iter,
+        "end_iter": end_iter,
+        "n_snapshots": int(len(iters)),
+    }
+    return meta, f"window:{start_iter}:{end_iter}"
+
+
+def _extract_metric_window(slice_data: Sequence[Dict[str, Any]], key: str) -> np.ndarray:
+    vals = [float(d.get(key, np.nan)) for d in slice_data]
+    arr = np.array(vals, dtype=float)
+    return arr[np.isfinite(arr)]
+
+
+def _build_metric_window_block(
+    slice_data: Sequence[Dict[str, Any]],
+    metrics: Sequence[str],
+) -> Dict[str, Any]:
+    window_range, window_id = _slice_window_identity(slice_data)
+    return {
+        "slice": list(slice_data),
+        "window": window_range,
+        "window_id": window_id,
+        "metrics": {m: _extract_metric_window(slice_data, m) for m in metrics},
+    }
+
+
+def _build_pairwise_metric_counts(
+    past: Dict[str, np.ndarray],
+    recent: Dict[str, np.ndarray],
+    metrics: Sequence[str],
+) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for m in metrics:
+        counts[str(m)] = min(len(past.get(m, np.array([], dtype=float))), len(recent.get(m, np.array([], dtype=float))))
+    return counts
+
+
+def _clone_phase_probe_gate_engine(source_engine: Any) -> Any:
+    from veriscope.core.gate import GateEngine
+
+    policy = getattr(source_engine, "policy", "either")
+    policy_value = getattr(policy, "value", policy)
+    return GateEngine(
+        frwin=getattr(source_engine, "win"),
+        gain_thresh=float(getattr(source_engine, "gain_thr", 0.0)),
+        eps_stat_alpha=float(getattr(source_engine, "alpha", 0.05)),
+        eps_stat_max_frac=float(getattr(source_engine, "cap_frac", 0.25)),
+        eps_sens=float(getattr(source_engine, "eps_sens", 0.0)),
+        min_evidence=int(getattr(source_engine, "min_evidence", 0)),
+        policy=str(policy_value),
+        persistence_k=int(getattr(source_engine, "persistence_k", 2)),
+        min_metrics_exceeding=int(getattr(source_engine, "min_metrics_exceeding", 1)),
+        trend_n=int(getattr(source_engine, "_trend_n", 8)),
+    )
+
+
+def _compute_local_phase_probe(
+    *,
+    source_engine: Any,
+    window_decl: Any,
+    local_ref_block: Dict[str, Any],
+    current_block: Dict[str, Any],
+    iter_num: int,
+) -> Dict[str, Any]:
+    local_ref = dict(local_ref_block.get("metrics", {}) or {})
+    current = dict(current_block.get("metrics", {}) or {})
+    metrics = list(getattr(window_decl, "weights", {}).keys())
+    counts_by_metric = _build_pairwise_metric_counts(local_ref, current, metrics)
+
+    try:
+        probe_engine = _clone_phase_probe_gate_engine(source_engine)
+    except Exception:
+        return {
+            "local_ref_available": False,
+            "local_ref_reason": "probe_engine_unavailable",
+            "local_ref_windows_built": 0,
+            "local_ref_evidence_total": 0,
+        }
+
+    try:
+        eps_stat_value = aggregate_epsilon_stat(
+            window_decl,
+            counts_by_metric,
+            alpha=float(getattr(source_engine, "alpha", 0.05)),
+        )
+    except Exception:
+        eps_stat_value = 0.0
+
+    result = probe_engine.check(
+        past=local_ref,
+        recent=current,
+        counts_by_metric=counts_by_metric,
+        gain_bits=float("nan"),
+        kappa_sens=0.0,
+        eps_stat_value=float(eps_stat_value),
+        iter_num=int(iter_num),
+        window_ref_range=local_ref_block.get("window"),
+        window_cur_range=current_block.get("window"),
+        ref_window_id=local_ref_block.get("window_id"),
+        cur_window_id=current_block.get("window_id"),
+    )
+    probe_audit = dict(getattr(result, "audit", {}) or {})
+
+    payload: Dict[str, Any] = {
+        "local_ref_available": bool(probe_audit.get("evaluated", False)),
+        "local_ref_reason": (
+            "immediately_preceding_window"
+            if bool(probe_audit.get("evaluated", False))
+            else str(probe_audit.get("reason") or "local_ref_not_evaluable")
+        ),
+        "local_ref_windows_built": 1,
+        "local_ref_evidence_total": _coerce_int(
+            probe_audit.get("evidence_total", probe_audit.get("total_evidence", 0)),
+            default=0,
+        ),
+    }
+
+    if local_ref_block.get("window") is not None:
+        payload["local_ref_window"] = dict(local_ref_block["window"])
+
+    if not bool(payload["local_ref_available"]):
+        return payload
+
+    per_metric_tv = probe_audit.get("per_metric_tv")
+    if isinstance(per_metric_tv, dict):
+        payload["local_ref_per_metric_tv"] = dict(per_metric_tv)
+
+    per_metric_n = probe_audit.get("per_metric_n")
+    if isinstance(per_metric_n, dict):
+        payload["local_ref_per_metric_n"] = dict(per_metric_n)
+
+    worst_metric = probe_audit.get("worst_metric")
+    if worst_metric is not None and str(worst_metric).strip():
+        payload["local_ref_worst_metric"] = str(worst_metric)
+
+    worst_metric_tv = _coerce_float(probe_audit.get("worst_metric_tv", float("nan")))
+    if np.isfinite(worst_metric_tv):
+        payload["local_ref_worst_metric_tv"] = worst_metric_tv
+
+    local_ref_worst_dw = _coerce_float(probe_audit.get("worst_DW", float("nan")))
+    if np.isfinite(local_ref_worst_dw):
+        payload["local_ref_worst_DW"] = local_ref_worst_dw
+
+    local_ref_eps = _coerce_float(probe_audit.get("eps", float("nan")))
+    if np.isfinite(local_ref_eps):
+        payload["local_ref_eps"] = local_ref_eps
+
+    local_ref_eps_eff = _coerce_float(probe_audit.get("eps_eff", float("nan")))
+    if np.isfinite(local_ref_eps_eff):
+        payload["local_ref_eps_eff"] = local_ref_eps_eff
+
+    local_ref_ok_stab = _coerce_opt_bool(probe_audit.get("ok_stab"))
+    if local_ref_ok_stab is not None:
+        payload["local_ref_ok_stab"] = bool(local_ref_ok_stab)
+
+    return payload
+
+
+def _compute_main_reference_phase_probe(
+    *,
+    source_engine: Any,
+    window_decl: Any,
+    reference_metrics: Dict[str, np.ndarray],
+    reference_counts: Dict[str, int],
+    current_block: Dict[str, Any],
+    iter_num: int,
+    ref_established_at: Optional[int],
+) -> Dict[str, Any]:
+    try:
+        probe_engine = _clone_phase_probe_gate_engine(source_engine)
+    except Exception:
+        return {
+            "main_ref_available": False,
+            "main_ref_reason": "probe_engine_unavailable",
+            "main_ref_evidence_total": 0,
+        }
+
+    current = dict(current_block.get("metrics", {}) or {})
+    metrics = list(getattr(window_decl, "weights", {}).keys())
+    counts_by_metric: Dict[str, int] = {}
+    for m in metrics:
+        ref_n = int(reference_counts.get(m, len(reference_metrics.get(m, np.array([], dtype=float)))))
+        cur_n = len(current.get(m, np.array([], dtype=float)))
+        counts_by_metric[str(m)] = min(ref_n, cur_n)
+
+    try:
+        eps_stat_value = aggregate_epsilon_stat(
+            window_decl,
+            counts_by_metric,
+            alpha=float(getattr(source_engine, "alpha", 0.05)),
+        )
+    except Exception:
+        eps_stat_value = 0.0
+
+    result = probe_engine.check(
+        past=reference_metrics,
+        recent=current,
+        counts_by_metric=counts_by_metric,
+        gain_bits=float("nan"),
+        kappa_sens=0.0,
+        eps_stat_value=float(eps_stat_value),
+        iter_num=int(iter_num),
+        window_ref_range=None,
+        window_cur_range=current_block.get("window"),
+        ref_window_id=None,
+        cur_window_id=current_block.get("window_id"),
+    )
+    probe_audit = dict(getattr(result, "audit", {}) or {})
+
+    payload: Dict[str, Any] = {
+        "main_ref_available": bool(probe_audit.get("evaluated", False)),
+        "main_ref_reason": (
+            "frozen_reference"
+            if bool(probe_audit.get("evaluated", False))
+            else str(probe_audit.get("reason") or "reference_not_evaluable")
+        ),
+        "main_ref_evidence_total": _coerce_int(
+            probe_audit.get("evidence_total", probe_audit.get("total_evidence", 0)),
+            default=0,
+        ),
+    }
+    if ref_established_at is not None:
+        payload["main_ref_established_at"] = int(ref_established_at)
+
+    if not bool(payload["main_ref_available"]):
+        return payload
+
+    per_metric_tv = probe_audit.get("per_metric_tv")
+    if isinstance(per_metric_tv, dict):
+        payload["main_ref_per_metric_tv"] = dict(per_metric_tv)
+
+    per_metric_n = probe_audit.get("per_metric_n")
+    if isinstance(per_metric_n, dict):
+        payload["main_ref_per_metric_n"] = dict(per_metric_n)
+
+    worst_metric = probe_audit.get("worst_metric")
+    if worst_metric is not None and str(worst_metric).strip():
+        payload["main_ref_worst_metric"] = str(worst_metric)
+
+    worst_metric_tv = _coerce_float(probe_audit.get("worst_metric_tv", float("nan")))
+    if np.isfinite(worst_metric_tv):
+        payload["main_ref_worst_metric_tv"] = worst_metric_tv
+
+    main_ref_worst_dw = _coerce_float(probe_audit.get("worst_DW", float("nan")))
+    if np.isfinite(main_ref_worst_dw):
+        payload["main_ref_worst_DW"] = main_ref_worst_dw
+
+    main_ref_eps = _coerce_float(probe_audit.get("eps", float("nan")))
+    if np.isfinite(main_ref_eps):
+        payload["main_ref_eps"] = main_ref_eps
+
+    main_ref_eps_eff = _coerce_float(probe_audit.get("eps_eff", float("nan")))
+    if np.isfinite(main_ref_eps_eff):
+        payload["main_ref_eps_eff"] = main_ref_eps_eff
+
+    main_ref_ok_stab = _coerce_opt_bool(probe_audit.get("ok_stab"))
+    if main_ref_ok_stab is not None:
+        payload["main_ref_ok_stab"] = bool(main_ref_ok_stab)
+
+    return payload
+
+
+def _get_phase_probe_authoritative_reference(gate_engine: Any) -> Any:
+    getter = getattr(gate_engine, "get_current_reference", None)
+    if callable(getter):
+        try:
+            return getter()
+        except Exception:
+            return None
+    return None
+
+
+def _merge_phase_probe_local_ref_audit(
+    audit_in: Dict[str, Any],
+    *,
+    config: "TrainConfig",
+    local_probe: Optional[Dict[str, Any]],
+    main_ref_probe: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    audit = dict(audit_in or {})
+    if not bool(getattr(config, "phase_probe_local_ref", False)):
+        return audit
+
+    payload = dict(local_probe or {})
+    main_ref_payload = dict(main_ref_probe or {})
+    if not payload:
+        payload = {
+            "local_ref_available": False,
+            "local_ref_reason": "insufficient_recent_history",
+            "local_ref_windows_built": 0,
+            "local_ref_evidence_total": 0,
+        }
+    audit.update(payload)
+    if main_ref_payload:
+        audit.update(main_ref_payload)
+
+    local_ref_available = bool(audit.get("local_ref_available", False))
+    local_ok_stab = _coerce_opt_bool(audit.get("local_ref_ok_stab"))
+    evaluated = bool(audit.get("evaluated", False))
+    regime_check_ran = bool(audit.get("regime_check_ran", False))
+    regime_ok = _coerce_opt_bool(audit.get("regime_ok"))
+    regime_warn = bool(audit.get("regime_warn", False))
+    main_ref_available = bool(audit.get("main_ref_available", False))
+    main_ref_ok_stab = _coerce_opt_bool(audit.get("main_ref_ok_stab"))
+    main_ref_declared = bool(("main_ref_available" in audit) or ("main_ref_reason" in audit))
+    main_ok_stab = _coerce_opt_bool(audit.get("ok_stab"))
+    main_warn = bool(audit.get("change_warn", False) or audit.get("warn_pending", False))
+    regime_shifted = bool(regime_check_ran and (regime_ok is False or regime_warn))
+    main_ref_shifted = bool(main_ref_available and main_ref_ok_stab is False)
+    main_shifted = bool(
+        evaluated and (main_ok_stab is False or bool(audit.get("dw_exceeds_threshold", False)) or main_warn)
+    )
+    if regime_check_ran:
+        global_shifted = regime_shifted
+    elif main_ref_declared:
+        global_shifted = main_ref_shifted
+    else:
+        global_shifted = main_shifted
+    authoritative_reference_available = bool(regime_check_ran or main_ref_available)
+    local_phase_candidate = bool(local_ref_available and global_shifted)
+    local_phase_stable = bool(local_phase_candidate and local_ok_stab is True)
+
+    if not local_ref_available:
+        phase_probe_reason = str(audit.get("local_ref_reason") or "local_ref_unavailable")
+    elif local_phase_candidate and local_phase_stable:
+        phase_probe_reason = "stable_shifted_reference_candidate"
+    elif local_phase_candidate:
+        phase_probe_reason = "unstable_drift_candidate"
+    elif authoritative_reference_available:
+        phase_probe_reason = "reference_stable"
+    else:
+        phase_probe_reason = "reference_unavailable"
+
+    audit["phase_probe_active"] = True
+    audit["phase_probe_reason"] = str(phase_probe_reason)
+    audit["local_phase_candidate"] = local_phase_candidate
+    audit["local_phase_stable"] = local_phase_stable
+
     return audit
 
 
@@ -806,6 +1173,7 @@ class TrainConfig:
     # - "persistence": FAIL if stability fails for K consecutive evaluated checks
     gate_policy: str = "either"
     gate_persistence_k: int = 2  # For persistence: consecutive exceedances to FAIL
+    phase_probe_local_ref: bool = False  # Diagnostic-only local-reference / stable-shift probe
 
     # Regime-anchored detection (reference-based drift)
     regime_enabled: bool = True
@@ -911,6 +1279,7 @@ class VeriscopeGatedTrainer:
                 "gate_persistence_k": config.gate_persistence_k,
             },
         )
+        self._phase_probe_source_engine = base_gate_engine
 
         # Determine EARLIEST pathology start for auto build window computation
         pathology_start: Optional[int] = None
@@ -1386,6 +1755,7 @@ class VeriscopeGatedTrainer:
                 row_base_reason=reason,
                 row_change_reason=reason,
             )
+            audit = _merge_phase_probe_local_ref_audit(audit, config=cfg, local_probe=None, main_ref_probe=None)
             decision = _derive_gate_decision(evaluated=False, ok=True, warn=False)
             gate_row = {
                 "ok": True,
@@ -1420,34 +1790,21 @@ class VeriscopeGatedTrainer:
             _validate_gate_row(gate_row)
             return gate_row
 
-        # Get past and recent windows (in metric snapshots)
-        recent = self.metric_history[-(2 * Wm) :]
-        past_slice = recent[:Wm]
-        recent_slice = recent[Wm:]
-
-        def _slice_window_identity(slice_data: List[Dict[str, Any]]) -> Tuple[Optional[Dict[str, int]], Optional[str]]:
-            iters: List[int] = []
-            for d in slice_data:
-                it = d.get("iter", None)
-                if it is None:
-                    continue
-                try:
-                    iters.append(int(it))
-                except Exception:
-                    continue
-            if not iters:
-                return None, None
-            start_iter = int(min(iters))
-            end_iter = int(max(iters))
-            meta = {
-                "start_iter": start_iter,
-                "end_iter": end_iter,
-                "n_snapshots": int(len(iters)),
-            }
-            return meta, f"window:{start_iter}:{end_iter}"
-
-        ref_window_range, ref_window_id = _slice_window_identity(past_slice)
-        cur_window_range, cur_window_id = _slice_window_identity(recent_slice)
+        # Explicit gate blocks from metric history:
+        # - current_block: snapshots used as the current gate window
+        # - local_ref_block: the immediately preceding admissible block of equal width
+        current_slice = self.metric_history[-Wm:]
+        local_ref_slice = self.metric_history[-(2 * Wm) : -Wm]
+        metrics = list(self.window_decl.weights.keys())
+        local_ref_block = _build_metric_window_block(local_ref_slice, metrics)
+        current_block = _build_metric_window_block(current_slice, metrics)
+        past_dict = dict(local_ref_block["metrics"])
+        recent_dict = dict(current_block["metrics"])
+        counts = _build_pairwise_metric_counts(past_dict, recent_dict, metrics)
+        ref_window_range = local_ref_block.get("window")
+        ref_window_id = local_ref_block.get("window_id")
+        cur_window_range = current_block.get("window")
+        cur_window_id = current_block.get("window_id")
 
         # --- Spike attribution (overlap-based, not check-iter-based) ---
         spike_active = False
@@ -1473,29 +1830,13 @@ class VeriscopeGatedTrainer:
                 return False
 
             spike_active = s0 <= int(self.iter_num) < s1
-            spike_overlap_past = _overlaps_spike(past_slice)
-            spike_overlap_recent = _overlaps_spike(recent_slice)
+            spike_overlap_past = _overlaps_spike(local_ref_slice)
+            spike_overlap_recent = _overlaps_spike(current_slice)
             spike_any_overlap = spike_overlap_past or spike_overlap_recent
 
-        # Build metric arrays
-        metrics = list(self.window_decl.weights.keys())
-
-        def _extract(slice_data: List[Dict], key: str) -> np.ndarray:
-            vals = [float(d.get(key, np.nan)) for d in slice_data]
-            arr = np.array(vals, dtype=float)
-            return arr[np.isfinite(arr)]
-
-        past_dict = {m: _extract(past_slice, m) for m in metrics}
-        recent_dict = {m: _extract(recent_slice, m) for m in metrics}
-
-        # Count evidence
-        counts = {}
-        for m in metrics:
-            counts[m] = min(len(past_dict[m]), len(recent_dict[m]))
-
         # Compute prequential gain (bits/sample)
-        recent_losses = [d.get("loss", np.nan) for d in recent_slice]
-        recent_baselines = [d.get("ewma_loss", np.nan) for d in recent_slice]
+        recent_losses = [d.get("loss", np.nan) for d in current_slice]
+        recent_baselines = [d.get("ewma_loss", np.nan) for d in current_slice]
 
         gain_vals: List[float] = []
         for loss_val, baseline_val in zip(recent_losses, recent_baselines):
@@ -1503,6 +1844,39 @@ class VeriscopeGatedTrainer:
                 gain_vals.append((baseline_val - loss_val) / math.log(2))  # bits
 
         gain_bits = float(np.mean(gain_vals)) if gain_vals else float("nan")
+
+        local_phase_probe: Optional[Dict[str, Any]] = None
+        main_reference_phase_probe: Optional[Dict[str, Any]] = None
+        if bool(getattr(cfg, "phase_probe_local_ref", False)):
+            local_phase_probe = _compute_local_phase_probe(
+                source_engine=getattr(self, "_phase_probe_source_engine", None),
+                window_decl=self.window_decl,
+                local_ref_block=local_ref_block,
+                current_block=current_block,
+                iter_num=int(self.iter_num),
+            )
+            current_reference = _get_phase_probe_authoritative_reference(self.gate_engine)
+            if current_reference is not None:
+                ref_established_at = getattr(current_reference, "established_at", None)
+                try:
+                    ref_established_at_int = int(ref_established_at) if ref_established_at is not None else None
+                except Exception:
+                    ref_established_at_int = None
+                main_reference_phase_probe = _compute_main_reference_phase_probe(
+                    source_engine=getattr(self, "_phase_probe_source_engine", None),
+                    window_decl=self.window_decl,
+                    reference_metrics=dict(getattr(current_reference, "metrics", {}) or {}),
+                    reference_counts=dict(getattr(current_reference, "counts", {}) or {}),
+                    current_block=current_block,
+                    iter_num=int(self.iter_num),
+                    ref_established_at=ref_established_at_int,
+                )
+            elif getattr(self, "_regime_wrapper_enabled", False):
+                main_reference_phase_probe = {
+                    "main_ref_available": False,
+                    "main_ref_reason": "reference_not_ready",
+                    "main_ref_evidence_total": 0,
+                }
 
         # Use gate engine
         result = self.gate_engine.check(
@@ -1575,6 +1949,12 @@ class VeriscopeGatedTrainer:
             audit = _strip_regime_audit_fields(audit)
         if audit.get("regime_D_W") is None and audit.get("regime_worst_DW") is not None:
             audit["regime_D_W"] = audit.get("regime_worst_DW")
+        audit = _merge_phase_probe_local_ref_audit(
+            audit,
+            config=cfg,
+            local_probe=local_phase_probe,
+            main_ref_probe=main_reference_phase_probe,
+        )
         evaluated = bool(audit.get("evaluated", True))
         ok, warn = canonicalize_runner_gate_flags(ok=ok, warn=warn, audit=audit)
 
@@ -2370,6 +2750,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="For persistence policy: consecutive evaluated exceedances required to FAIL.",
     )
     parser.add_argument(
+        "--phase_probe_local_ref",
+        action="store_true",
+        help=(
+            "Emit a diagnostic-only local-reference / stable-shift probe that compares the current "
+            "window to the immediately preceding admissible window block. Does not change pass/fail semantics."
+        ),
+    )
+    parser.add_argument(
         "--lr_spike_at",
         type=int,
         default=-1,
@@ -2628,6 +3016,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         # Gate config
         gate_enabled=True,
         gate_persistence_k=args.gate_persistence_k,
+        phase_probe_local_ref=bool(args.phase_probe_local_ref),
         # Regime config
         regime_enabled=regime_enabled,
         regime_build_min_iter=args.regime_build_min_iter,
@@ -2776,6 +3165,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         regime_cfg_for_signature = getattr(gate_engine_for_signature, "config", None)
 
         # Build a resolved gate config dict for the artifact signature.
+        # Keep diagnostic-only flags like phase_probe_local_ref out of the window signature so
+        # comparability continues to reflect decision semantics rather than audit verbosity.
         resolved_gate_cfg: Dict[str, Any] = {
             "metric_interval": int(config.metric_interval),
             "gate_window": int(config.gate_window),
@@ -2915,6 +3306,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             "gate_warmup": int(config.gate_warmup),
             "gate_window": int(config.gate_window),
             "metric_interval": int(config.metric_interval),
+            "phase_probe_local_ref": bool(config.phase_probe_local_ref),
             "out_json": str(out_path),
             "artifacts_outdir": str(artifacts_outdir),
             "argv": _resolved_runner_argv_payload(
@@ -3047,6 +3439,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             "gate_min_metrics_exceeding": int(config.gate_min_metrics_exceeding),
             "gate_eps_stat_max_frac": config.gate_eps_stat_max_frac,
             "gate_gain_thresh": config.gate_gain_thresh,
+            "phase_probe_local_ref": bool(config.phase_probe_local_ref),
         },
         "regime": {
             "regime_enabled": config.regime_enabled,

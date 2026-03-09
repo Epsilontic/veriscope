@@ -135,6 +135,26 @@ Finite-window invariant:
 - If `counts.fail == 0`, `first_fail_iter` must be `null`.
 - `first_fail_iter.txt` must exist iff `first_fail_iter` is non-null.
 
+## Optional Diagnostic Audit Fields
+
+Gate `audit` objects MAY include additional runner-specific diagnostic fields. These are optional and do not change the v1 contract as long as the canonical decision fields remain unchanged.
+
+For the nanoGPT runner, enabling `--phase_probe_local_ref` may add a local-reference / phase-probe namespace to each gate audit, including fields such as:
+- `phase_probe_active`, `phase_probe_reason`
+- `main_ref_available`, `main_ref_reason`, `main_ref_per_metric_tv`, `main_ref_per_metric_n`
+- `main_ref_worst_metric`, `main_ref_worst_metric_tv`, `main_ref_worst_DW`
+- `main_ref_eps`, `main_ref_eps_eff`, `main_ref_ok_stab`
+- `local_ref_available`, `local_ref_reason`, `local_ref_window`, `local_ref_windows_built`
+- `local_ref_evidence_total`, `local_ref_per_metric_tv`, `local_ref_per_metric_n`
+- `local_ref_worst_metric`, `local_ref_worst_metric_tv`, `local_ref_worst_DW`
+- `local_ref_eps`, `local_ref_eps_eff`, `local_ref_ok_stab`
+- `local_phase_candidate`, `local_phase_stable`
+
+Semantics:
+- These fields are diagnostic-only and shadow-mode by default.
+- They MUST NOT change the default `pass | warn | fail | skip` decision policy unless a separate explicit opt-in decision flag says otherwise.
+- A stable local phase (`local_phase_stable=true`) does not override a fail against the early/reference regime in the default policy.
+
 ## Comparable(A,B)
 
 Runs A and B are comparable iff:
